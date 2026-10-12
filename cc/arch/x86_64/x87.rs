@@ -48,7 +48,7 @@ impl X86_64CodeGen {
         self.stack_mem(self.x87_scratch_slot())
     }
 
-    fn x87_scratch_slot(&self) -> i32 {
+    fn x87_scratch_slot(&self) -> i64 {
         self.x87_scratch
             .expect("the allocator reserves the x87 scratch for every `uses_x87_scratch`")
             .slot()
@@ -215,7 +215,7 @@ impl X86_64CodeGen {
     /// area, 16-byte aligned and 16 bytes wide. `emit_va_arg_float` models
     /// only the SSE class, so it went looking in the XMM save area and read a
     /// `double`-sized hole -- the argument always came back as zero.
-    pub(super) fn emit_va_arg_x87(&mut self, ap_base: Reg, ap_base_offset: i32, dst_loc: &Loc) {
+    pub(super) fn emit_va_arg_x87(&mut self, ap_base: Reg, ap_base_offset: i64, dst_loc: &Loc) {
         let Loc::Stack(dst_offset) = dst_loc else {
             // An x87 value only ever lives in a stack slot; without one there
             // is nowhere to pop ST(0) to, and pushing it would unbalance the

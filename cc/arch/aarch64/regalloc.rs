@@ -800,7 +800,7 @@ impl VReg {
 /// signed `i32`, keeps the callee's frame from being confused with the
 /// caller's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct LocalSlot(i32);
+pub struct LocalSlot(i64);
 
 impl LocalSlot {
     /// No slot yet: a record made before its slot is placed, and completed
@@ -808,7 +808,7 @@ impl LocalSlot {
     const PENDING: LocalSlot = LocalSlot(0);
 
     /// The slot at `displacement`, below the frame pointer.
-    pub fn from_displacement(displacement: i32) -> Self {
+    pub fn from_displacement(displacement: i64) -> Self {
         debug_assert!(
             displacement < 0,
             "a local slot lies below the frame pointer"
@@ -817,7 +817,7 @@ impl LocalSlot {
     }
 
     /// The displacement the addressing helpers work in.
-    pub fn displacement(self) -> i32 {
+    pub fn displacement(self) -> i64 {
         self.0
     }
 }
@@ -967,7 +967,7 @@ pub fn param_layout(
 /// Starts at 16 -- past the saved frame pointer and return address -- and grows
 /// upwards, which is the opposite direction from [`LocalSlot`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct IncomingOff(i32);
+pub struct IncomingOff(i64);
 
 impl IncomingOff {
     /// The first incoming stack argument, just above the saved FP and LR.
@@ -988,14 +988,14 @@ impl IncomingOff {
     /// frame ceiling can still overflow their total. The caller checks the
     /// end once, with [`crate::arch::regalloc::check_incoming_area`].
     pub fn take(next: &mut IncomingOff, slot: StackSlot) -> Self {
-        let base = i64::from(IncomingOff::FIRST.0);
-        let (at, end) = slot.place(i64::from(next.0) - base);
-        next.0 = i32::try_from(base + end).unwrap_or(i32::MAX);
-        IncomingOff(i32::try_from(base + at).unwrap_or(i32::MAX))
+        let base = IncomingOff::FIRST.0;
+        let (at, end) = slot.place(next.0 - base);
+        next.0 = base.saturating_add(end);
+        IncomingOff(base.saturating_add(at))
     }
 
     /// The displacement the addressing helpers work in.
-    pub fn displacement(self) -> i32 {
+    pub fn displacement(self) -> i64 {
         self.0
     }
 }
@@ -1551,7 +1551,7 @@ pub struct RegAlloc {
     /// `with_global_registers`.
     global_registers: Vec<Reg>,
     /// Next stack slot offset
-    stack_offset: i32,
+    stack_offset: i64,
     /// A source position for this function, for the frame diagnostics
     /// `grow_frame` and [`crate::abi::slot_bytes`] emit. `new_frame_slot` and
     /// `IncomingOff::take` have no `&Function` to recover one from.
@@ -1938,7 +1938,7 @@ impl RegAlloc {
 
     /// A fresh frame slot of `size` bytes at `alignment`, shared with
     /// nothing, as a displacement.
-    fn new_frame_slot(&mut self, size: i32, alignment: i32) -> i32 {
+    fn new_frame_slot(&mut self, size: i64, alignment: i32) -> i64 {
         debug_assert!(
             alignment <= self.frame_base.align(),
             "slot wants {alignment}-byte alignment but the frame was laid out \
@@ -2002,11 +2002,12 @@ impl RegAlloc {
         let mut slot = vec![LocalSlot::PENDING; coloring.slots.len()];
         for n in order {
             let shape = coloring.slots[n];
-            slot[n] = LocalSlot::from_displacement(self.new_frame_slot(shape.bytes, shape.align));
+            slot[n] =
+                LocalSlot::from_displacement(self.new_frame_slot(shape.bytes.into(), shape.align));
         }
         for (&p, &n) in &coloring.slot_of {
             self.locations.insert(p, Loc::Stack(slot[n]));
-            self.slot_bytes.insert(p, homed[&p].bytes);
+            self.slot_bytes.insert(p, homed[&p].bytes.into());
         }
         for arg in &mut self.spilled_args {
             arg.to_stack_offset = slot[coloring.slot_of[&arg.pseudo]];
@@ -2118,7 +2119,8 @@ impl RegAlloc {
                     self.func_pos,
                     "an aggregate returned by a call",
                 );
-                let size = size.max(8);
+                let size = i32::try_from(size.max(8))
+                    .expect("a value returned in registers is at most four of them");
                 let alignment = crate::abi::slot_align(types.align(typ));
                 self.home_on_stack(interval.pseudo, SlotShape::new(size, alignment));
                 continue;
@@ -2521,11 +2523,8 @@ impl RegAlloc {
                             slot.displacement()
                         )
                     });
-                    let lo = i64::from(slot.displacement());
-                    vec![Cell::Frame {
-                        lo,
-                        hi: lo + i64::from(bytes),
-                    }]
+                    let lo = slot.displacement();
+                    vec![Cell::Frame { lo, hi: lo + bytes }]
                 }
                 Loc::IncomingArg(o) => vec![Cell::Incoming(o.displacement())],
                 Loc::Imm(_) | Loc::FImm(..) | Loc::Global(_) => Vec::new(),
@@ -2577,7 +2576,7 @@ impl RegAlloc {
         let mut reserved: Vec<(&'static str, Cell<RegUnit>)> = self
             .guard_slot
             .map(|slot| {
-                let lo = i64::from(slot.displacement());
+                let lo = slot.displacement();
                 ("the canary's slot", Cell::Frame { lo, hi: lo + 8 })
             })
             .into_iter()
@@ -2619,8 +2618,9 @@ impl RegAlloc {
     /// Get stack size needed (aligned to max local alignment, minimum 16).
     /// When max_local_align > 16, rounds base to max_align then adds (max_align - 1)
     /// padding so the aligned base register (x19) always finds an aligned start.
-    pub fn stack_size(&self) -> i32 {
+    pub fn stack_size(&self) -> i64 {
         if let FrameBase::Aligned { align, .. } = self.frame_base {
+            let align = i64::from(align);
             let base = (self.stack_offset + align - 1) & !(align - 1);
             base + align - 1
         } else {
@@ -2731,7 +2731,7 @@ mod tests {
             );
             assert_eq!(
                 IncomingOff::take(&mut next, slot(align, align)).displacement(),
-                first + align as i32,
+                first + align as i64,
                 "an {align}-aligned argument rounds within the argument area"
             );
         }
@@ -2768,7 +2768,7 @@ mod tests {
                 params.push((format!("s{}", params.len()), t));
             }
             let layout = param_layout(&params, &types, stacked);
-            let got: Vec<i32> = layout.places[16..]
+            let got: Vec<i64> = layout.places[16..]
                 .iter()
                 .map(|p| match p {
                     ParamPlace::Stack { at, .. } => {

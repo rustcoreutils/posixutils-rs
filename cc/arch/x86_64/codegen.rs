@@ -43,14 +43,14 @@ pub struct X86_64CodeGen {
     /// Callee-saved registers used in current function (for epilogue)
     pub(super) callee_saved_regs: Vec<Reg>,
     /// Offset to add to stack locations to account for callee-saved registers
-    pub(super) callee_saved_offset: i32,
+    pub(super) callee_saved_offset: i64,
     /// Bytes the prologue allocates for locals: what a dynamically aligned
     /// frame addresses them from.
-    pub(super) stack_alloc_size: i32,
+    pub(super) stack_alloc_size: i64,
     /// The stack-protector canary's slot, when this function has one.
-    pub(super) stack_guard: Option<i32>,
+    pub(super) stack_guard: Option<i64>,
     /// Offset from rbp to register save area (for variadic functions)
-    pub(super) reg_save_area_offset: i32,
+    pub(super) reg_save_area_offset: i64,
     /// GP argument registers the named parameters consumed, for `va_start`'s
     /// `gp_offset` (variadic functions only).
     pub(super) named_gp_regs: usize,
@@ -64,7 +64,7 @@ pub struct X86_64CodeGen {
     /// consuming a register, and `IncomingOff::take` may insert alignment
     /// padding, so no multiple of eight derived from register overflow can
     /// express where the area actually ends.
-    pub(super) named_incoming_end: i32,
+    pub(super) named_incoming_end: i64,
     /// Counter for generating unique internal labels
     pub(super) unique_label_counter: u32,
     /// External symbols (need GOT access on macOS)
@@ -200,7 +200,7 @@ impl X86_64CodeGen {
     /// Nothing corrects for the outgoing-argument area here. Reserving one
     /// moves `%rsp`, which is exactly why the aligned base is a register the
     /// prologue sets once instead.
-    pub(super) fn stack_mem(&self, offset: i32) -> MemAddr {
+    pub(super) fn stack_mem(&self, offset: i64) -> MemAddr {
         if let FrameBase::Aligned { reg, .. } = self.frame_base {
             MemAddr::BaseOffset {
                 base: reg,
@@ -222,7 +222,7 @@ impl X86_64CodeGen {
     /// `%rbp + slot + byte` by hand -- as several emitters did -- addresses the
     /// caller's incoming-argument area instead, which is a different frame
     /// entirely.
-    pub(super) fn stack_field(&self, slot: i32, byte: i32) -> MemAddr {
+    pub(super) fn stack_field(&self, slot: i64, byte: i64) -> MemAddr {
         self.stack_mem(slot - byte)
     }
 
@@ -479,7 +479,7 @@ impl X86_64CodeGen {
     /// out as `movsd tv(%rip)`: the variable's initialization image rather
     /// than this thread's copy, and for an `extern` one a non-TLS reference
     /// the linker rejects. And the RIP-relative form dropped `offset`.
-    pub(super) fn global_mem(&mut self, name: &str, offset: i32, scratch: Reg) -> MemAddr {
+    pub(super) fn global_mem(&mut self, name: &str, offset: i64, scratch: Reg) -> MemAddr {
         if self.is_tls_symbol(name) {
             let symbol = Symbol::global(name.to_string());
             if offset == 0 {

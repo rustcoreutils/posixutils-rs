@@ -72,7 +72,7 @@ pub enum Cell<U> {
     /// the backend chooses, as long as it is one coordinate.
     Frame { lo: i64, hi: i64 },
     /// The incoming argument at this offset of the caller's frame.
-    Incoming(i32),
+    Incoming(i64),
 }
 
 /// Which pseudos a [`Clobber`] spares.

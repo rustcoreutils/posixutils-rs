@@ -67,8 +67,8 @@ pub(super) const CALLEE_SAVED_XMM: [XmmReg; 10] = [
 /// Where argument position `n` arrives, as an `%rbp` displacement in the
 /// callee: past the saved `%rbp` and the return address, in the caller's
 /// outgoing area -- the shadow slot for a register position.
-pub(super) fn incoming_offset(position: usize) -> i32 {
-    16 + (position * WIN64_POSITION_BYTES) as i32
+pub(super) fn incoming_offset(position: usize) -> i64 {
+    16 + (position * WIN64_POSITION_BYTES) as i64
 }
 
 /// The register a position's value travels in.
@@ -158,19 +158,19 @@ impl X86_64CodeGen {
     /// The `%rbp` displacement of the save slot of the `k`th saved XMM
     /// register: sixteen-byte slots below the pushed general registers, at a
     /// sixteen-byte aligned address since `%rbp` is one.
-    fn win64_xmm_slot(&self, k: usize) -> i32 {
-        let gp_pushed = (self.callee_saved_regs.len() as i32 * 8 + 15) & !15;
-        -(gp_pushed + 16 * (k as i32 + 1))
+    fn win64_xmm_slot(&self, k: usize) -> i64 {
+        let gp_pushed = (self.callee_saved_regs.len() as i64 * 8 + 15) & !15;
+        -(gp_pushed + 16 * (k as i64 + 1))
     }
 
     /// The bytes the XMM save area adds below the pushed registers,
     /// including the padding that makes it start sixteen-byte aligned.
-    pub(super) fn win64_xmm_area_bytes(&self) -> i32 {
+    pub(super) fn win64_xmm_area_bytes(&self) -> i64 {
         if self.win64_xmm_saves.is_empty() {
             return 0;
         }
-        let gp_bytes = self.callee_saved_regs.len() as i32 * 8;
-        ((gp_bytes + 15) & !15) - gp_bytes + 16 * self.win64_xmm_saves.len() as i32
+        let gp_bytes = self.callee_saved_regs.len() as i64 * 8;
+        ((gp_bytes + 15) & !15) - gp_bytes + 16 * self.win64_xmm_saves.len() as i64
     }
 
     /// Reserve the XMM save area and save every register in it, with the
@@ -183,7 +183,7 @@ impl X86_64CodeGen {
         }
         self.push_lir(X86Inst::Sub {
             size: OperandSize::B64,
-            src: GpOperand::Imm(area as i64),
+            src: GpOperand::Imm(area),
             dst: Reg::Rsp,
         });
         for (k, xmm) in self.win64_xmm_saves.clone().into_iter().enumerate() {
@@ -291,7 +291,7 @@ impl X86_64CodeGen {
     fn win64_outgoing_slot(n: usize) -> MemAddr {
         MemAddr::BaseOffset {
             base: Reg::Rsp,
-            offset: (n * WIN64_POSITION_BYTES) as i32,
+            offset: (n * WIN64_POSITION_BYTES) as i64,
         }
     }
 

@@ -217,7 +217,7 @@ impl X86_64CodeGen {
     /// zero-extends to 64 bits, so `movq %reg, mem` is correct.
     /// For 8/16-bit values, store the actual size to avoid clobbering adjacent
     /// struct fields when the "slot" is really a struct member.
-    fn store_to_stack_slot(&mut self, src: Reg, stack_offset: i32) {
+    fn store_to_stack_slot(&mut self, src: Reg, stack_offset: i64) {
         self.push_lir(X86Inst::Mov {
             size: OperandSize::B64,
             src: GpOperand::Reg(src),
@@ -296,7 +296,7 @@ impl X86_64CodeGen {
     pub(super) fn scalar_mem_operand(
         &mut self,
         addr: PseudoId,
-        disp: i32,
+        disp: i64,
         scratch: Reg,
     ) -> MemAddr {
         match self.get_location(addr) {
@@ -387,7 +387,7 @@ impl X86_64CodeGen {
     /// FS segment (Local Exec, or Initial Exec with the offset loaded into
     /// `scratch`), external through the GOT (the address loaded into
     /// `scratch`), anything else RIP-relative.
-    fn global_mem_operand(&mut self, name: &str, disp: i32, scratch: Reg) -> MemAddr {
+    fn global_mem_operand(&mut self, name: &str, disp: i64, scratch: Reg) -> MemAddr {
         let symbol = Symbol::named(name);
         // TLS first: an external thread-local must not take the GOT path.
         if self.is_tls_symbol(name) {
@@ -492,13 +492,13 @@ impl X86_64CodeGen {
     /// The halves share their middle bytes, which come back the same from
     /// both reads, so OR-ing them is exact -- and neither read passes the end
     /// of the object.
-    fn emit_overlapped_load(&mut self, base: Reg, offset: i32, width: i64, high: i64, dst: Reg) {
+    fn emit_overlapped_load(&mut self, base: Reg, offset: i64, width: i64, high: i64, dst: Reg) {
         // R10 and R11 are the only scratch registers, and `dst` is either an
         // allocated register or R10 -- never R11. R11 also carries the
         // computed address at several callers, which is why the half that
         // lands in `base` is read last.
         let scratch = Reg::R11;
-        let halves = [(offset, dst), (offset + high as i32, scratch)];
+        let halves = [(offset, dst), (offset + high, scratch)];
         let halves = if dst == base {
             [halves[1], halves[0]]
         } else {
@@ -580,7 +580,7 @@ impl X86_64CodeGen {
                     if insn.offset != 0 {
                         self.push_lir(X86Inst::Add {
                             size: OperandSize::B64,
-                            src: GpOperand::Imm(insn.displacement().into()),
+                            src: GpOperand::Imm(insn.displacement()),
                             dst: Reg::R10,
                         });
                     }
@@ -630,7 +630,7 @@ impl X86_64CodeGen {
                     if insn.offset != 0 {
                         self.push_lir(X86Inst::Add {
                             size: OperandSize::B64,
-                            src: GpOperand::Imm(insn.displacement().into()),
+                            src: GpOperand::Imm(insn.displacement()),
                             dst: Reg::R10,
                         });
                     }
@@ -670,7 +670,7 @@ impl X86_64CodeGen {
                     if insn.offset != 0 {
                         self.push_lir(X86Inst::Add {
                             size: OperandSize::B64,
-                            src: GpOperand::Imm(insn.displacement().into()),
+                            src: GpOperand::Imm(insn.displacement()),
                             dst: Reg::R10,
                         });
                     }
@@ -881,7 +881,7 @@ impl X86_64CodeGen {
                     if insn.offset != 0 {
                         self.push_lir(X86Inst::Add {
                             size: OperandSize::B64,
-                            src: GpOperand::Imm(insn.displacement().into()),
+                            src: GpOperand::Imm(insn.displacement()),
                             dst: Reg::R11,
                         });
                     }
@@ -934,10 +934,10 @@ impl X86_64CodeGen {
     /// where no XMM register may be touched, through %rax, saved around
     /// the copy since it may hold a live pseudo. A base of %rsp is read
     /// past the push.
-    pub(super) fn copy_eightbytes(&mut self, src: (Reg, i32), dst: (Reg, i32), count: u32) {
-        let at = |(base, offset): (Reg, i32), i: u32, pushed: i32| MemAddr::BaseOffset {
+    pub(super) fn copy_eightbytes(&mut self, src: (Reg, i64), dst: (Reg, i64), count: u32) {
+        let at = |(base, offset): (Reg, i64), i: u32, pushed: i64| MemAddr::BaseOffset {
             base,
-            offset: offset + (i * 8) as i32 + if base == Reg::Rsp { pushed } else { 0 },
+            offset: offset + i64::from(i * 8) + if base == Reg::Rsp { pushed } else { 0 },
         };
         if !self.base.isa.has_sse2() {
             debug_assert!(src.0 != Reg::Rax && dst.0 != Reg::Rax);
@@ -1122,7 +1122,7 @@ impl X86_64CodeGen {
                 if insn.offset != 0 {
                     self.push_lir(X86Inst::Add {
                         size: OperandSize::B64,
-                        src: GpOperand::Imm(insn.displacement().into()),
+                        src: GpOperand::Imm(insn.displacement()),
                         dst: Reg::R11,
                     });
                 }
@@ -1139,7 +1139,7 @@ impl X86_64CodeGen {
 
         // Store zeros to each qword
         for i in 0..num_qwords {
-            let byte_offset = (i * 8) as i32;
+            let byte_offset = (i * 8) as i64;
             self.push_lir(X86Inst::Mov {
                 size: OperandSize::B64,
                 src: GpOperand::Reg(Reg::R10),

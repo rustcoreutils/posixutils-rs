@@ -23,7 +23,7 @@ use crate::units::{Align, Bits, ByteSize};
 #[derive(Clone, Copy)]
 enum VaAggDst {
     /// A stack slot; the slot is the aggregate.
-    Slot(i32),
+    Slot(i64),
     /// A register holding the aggregate's address.
     Addr(Reg),
     /// A register that *is* the aggregate, which fits in it.
@@ -63,8 +63,8 @@ impl X86_64CodeGen {
         // - overflow_arg_area = where the variadic stack arguments begin
         // - reg_save_area = pointer to where we saved the argument registers
 
-        let gp_offset = (self.named_gp_regs * 8) as i32;
-        let fp_offset = 48 + (self.named_fp_regs * 16) as i32;
+        let gp_offset = (self.named_gp_regs * 8) as i64;
+        let fp_offset = 48 + (self.named_fp_regs * 16) as i64;
         let reg_save_base = self.reg_save_area_offset;
 
         match ap_loc {
@@ -72,7 +72,7 @@ impl X86_64CodeGen {
                 // gp_offset = offset to next variadic GP arg
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B32,
-                    src: GpOperand::Imm(gp_offset as i64),
+                    src: GpOperand::Imm(gp_offset),
                     dst: GpOperand::Mem(MemAddr::BaseOffset {
                         base: Reg::Rbp,
                         offset,
@@ -81,7 +81,7 @@ impl X86_64CodeGen {
                 // fp_offset = offset to next variadic FP arg (48 + fixed_fp_params * 16)
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B32,
-                    src: GpOperand::Imm(fp_offset as i64),
+                    src: GpOperand::Imm(fp_offset),
                     dst: GpOperand::Mem(self.stack_field(offset, 4)),
                 });
                 // Past every named parameter that occupies the incoming
@@ -126,13 +126,13 @@ impl X86_64CodeGen {
                 // gp_offset = offset to next variadic GP arg
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B32,
-                    src: GpOperand::Imm(gp_offset as i64),
+                    src: GpOperand::Imm(gp_offset),
                     dst: GpOperand::Mem(MemAddr::BaseOffset { base: r, offset: 0 }),
                 });
                 // fp_offset = offset to next variadic FP arg
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B32,
-                    src: GpOperand::Imm(fp_offset as i64),
+                    src: GpOperand::Imm(fp_offset),
                     dst: GpOperand::Mem(MemAddr::BaseOffset { base: r, offset: 4 }),
                 });
                 // Past every named parameter that occupies the incoming
@@ -178,10 +178,10 @@ impl X86_64CodeGen {
     fn emit_va_arg_int(
         &mut self,
         ap_base: Reg,
-        ap_base_offset: i32,
+        ap_base_offset: i64,
         dst_loc: &Loc,
         arg_size: Bits,
-        arg_bytes: i32,
+        arg_bytes: i64,
         label_suffix: u32,
     ) {
         // Registers used here: R10 holds `gp_offset`, RAX the address being
@@ -316,7 +316,7 @@ impl X86_64CodeGen {
     fn emit_va_arg_int128(
         &mut self,
         ap_base: Reg,
-        ap_base_offset: i32,
+        ap_base_offset: i64,
         dst_loc: &Loc,
         label_suffix: u32,
     ) {
@@ -549,9 +549,9 @@ impl X86_64CodeGen {
     fn va_copy_bytes(
         &mut self,
         src_base: Reg,
-        src_off: i32,
+        src_off: i64,
         dst: VaAggDst,
-        dst_off: i32,
+        dst_off: i64,
         nbytes: ByteSize,
     ) {
         // A register destination *is* the aggregate, so it takes one load of
@@ -593,12 +593,12 @@ impl X86_64CodeGen {
                 to,
                 qwords,
             );
-            at = (qwords * 8) as i32;
+            at = qwords * 8;
             rest = ByteSize::new(nbytes.get() % 8);
         }
         for (off, chunk) in crate::ir::memexpand::block_chunks(rest) {
             let size = OperandSize::from_bits(chunk.bits());
-            let done = at + off as i32;
+            let done = at + off;
             self.push_lir(X86Inst::Mov {
                 size,
                 src: GpOperand::Mem(MemAddr::BaseOffset {
@@ -634,7 +634,7 @@ impl X86_64CodeGen {
     fn emit_va_arg_aggregate(
         &mut self,
         ap_base: Reg,
-        ap_off: i32,
+        ap_off: i64,
         dst_loc: &Loc,
         arg_type: crate::types::TypeId,
         types: &TypeTable,
@@ -659,8 +659,8 @@ impl X86_64CodeGen {
             // the overflow area and no register guard applies.
             _ => Vec::new(),
         };
-        let num_gp = classes.iter().filter(|c| **c == RegClass::Integer).count() as i32;
-        let num_sse = classes.iter().filter(|c| **c == RegClass::Sse).count() as i32;
+        let num_gp = classes.iter().filter(|c| **c == RegClass::Integer).count() as i64;
+        let num_sse = classes.iter().filter(|c| **c == RegClass::Sse).count() as i64;
 
         let overflow_label = Label::internal("va_agg_overflow", label_suffix);
         let done_label = Label::internal("va_agg_done", label_suffix);
@@ -669,7 +669,7 @@ impl X86_64CodeGen {
         // (48 plus eight SSE registers of 16 bytes). An aggregate needs all of
         // its eightbytes in registers or none of them.
         let mut guarded = false;
-        for (field, avail, need, step) in [(0i32, 48i64, num_gp, 8i64), (4, 176, num_sse, 16)] {
+        for (field, avail, need, step) in [(0i64, 48i64, num_gp, 8i64), (4, 176, num_sse, 16)] {
             if need == 0 {
                 continue;
             }
@@ -684,7 +684,7 @@ impl X86_64CodeGen {
             });
             self.push_lir(X86Inst::Cmp {
                 size: OperandSize::B32,
-                src: GpOperand::Imm(avail - step * need as i64),
+                src: GpOperand::Imm(avail - step * need),
                 dst: GpOperand::Reg(Reg::Rcx),
             });
             self.push_lir(X86Inst::Jcc {
@@ -711,10 +711,10 @@ impl X86_64CodeGen {
                 8
             };
             // Register path: one entry at a time, each from its own area.
-            let mut at = 0i32;
+            let mut at = 0i64;
             for class in classes.iter() {
                 let (field, step) = match class {
-                    RegClass::Sse => (4i32, 16i64),
+                    RegClass::Sse => (4i64, 16i64),
                     _ => (0, 8),
                 };
                 // %rax = reg_save_area + offset.
@@ -922,7 +922,7 @@ impl X86_64CodeGen {
             );
         } else {
             let arg_size = types.value_bits(arg_type).max(Bits::new(32));
-            let arg_bytes = arg_size.bytes_exact().max(8) as i32;
+            let arg_bytes = arg_size.bytes_exact().max(8) as i64;
             self.emit_va_arg_int(
                 base_reg,
                 base_offset,
@@ -946,7 +946,7 @@ impl X86_64CodeGen {
     /// -- *holds* a pointer to the object (a `va_list` parameter, which
     /// decays, or `*p_va`), wherever the allocator put it, so the pointer is
     /// loaded and the object is at offset 0 from it.
-    fn va_list_base(&mut self, ap: PseudoId, scratch: Reg) -> Option<(Reg, i32)> {
+    fn va_list_base(&mut self, ap: PseudoId, scratch: Reg) -> Option<(Reg, i64)> {
         match self.get_location(ap) {
             Loc::Stack(offset) if self.pseudos.is_sym(ap) => match self.stack_mem(offset) {
                 MemAddr::BaseOffset { base, offset } => Some((base, offset)),
@@ -1439,7 +1439,7 @@ impl X86_64CodeGen {
         &mut self,
         bytes: i64,
         insn: X86Inst,
-        mut tail: impl FnMut(&mut Self, i32, OperandSize),
+        mut tail: impl FnMut(&mut Self, i64, OperandSize),
     ) {
         let qwords = bytes / 8;
         if qwords > 0 {
@@ -1453,12 +1453,12 @@ impl X86_64CodeGen {
         for (off, chunk) in crate::ir::memexpand::block_chunks(ByteSize::new(
             u64::try_from(bytes % 8).expect("a byte count is not negative"),
         )) {
-            tail(self, off as i32, OperandSize::from_bits(chunk.bits()));
+            tail(self, off, OperandSize::from_bits(chunk.bits()));
         }
         self.push_lir(X86Inst::Lea {
             addr: MemAddr::BaseOffset {
                 base: Reg::Rdi,
-                offset: -(qwords as i32) * 8,
+                offset: -qwords * 8,
             },
             dst: Reg::Rax,
         });
@@ -1681,16 +1681,16 @@ impl X86_64CodeGen {
 /// fourth, whether or not the shadow stack is on when the program runs.
 struct SjljLayout {
     /// The shadow-stack pointer's word, under return protection only.
-    ssp: Option<i32>,
+    ssp: Option<i64>,
     /// The stack pointer's word.
-    sp: i32,
+    sp: i64,
 }
 
 impl SjljLayout {
     /// The frame pointer's word.
-    const FP: i32 = 0;
+    const FP: i64 = 0;
     /// The resume address's word.
-    const RESUME: i32 = 8;
+    const RESUME: i64 = 8;
 
     fn for_protection(cf: crate::target::CfProtection) -> Self {
         if cf.ret {

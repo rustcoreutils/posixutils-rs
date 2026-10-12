@@ -159,7 +159,7 @@ pub(crate) fn darwin_va_slot(
 /// they can end on any byte; every variadic slot starts on at least an
 /// eight-byte boundary ([`darwin_va_slot`]). The caller lays the first one
 /// out from here, and the callee's `va_start` points here.
-pub(crate) fn darwin_va_area_start(named_end: i32) -> i32 {
+pub(crate) fn darwin_va_area_start(named_end: i64) -> i64 {
     (named_end + 7) & !7
 }
 

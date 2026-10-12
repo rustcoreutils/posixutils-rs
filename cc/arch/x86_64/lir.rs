@@ -28,7 +28,7 @@ use std::fmt::Write;
 #[derive(Debug, Clone, PartialEq)]
 pub enum MemAddr {
     /// [base + offset] - Register indirect with displacement
-    BaseOffset { base: Reg, offset: i32 },
+    BaseOffset { base: Reg, offset: i64 },
 
     /// [rip + symbol] - PC-relative addressing for position-independent code
     RipRelative(Symbol),

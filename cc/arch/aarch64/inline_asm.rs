@@ -28,7 +28,7 @@ use crate::units::Bits;
 /// address, or the value of a register operand the allocator gave no register.
 enum OperandSetup {
     /// `reg = base + offset`: the operand *is* this stack object.
-    Object { base: Reg, offset: i32 },
+    Object { base: Reg, offset: i64 },
     /// `reg = [slot]`: the operand's address was spilled there.
     Spilled(MemAddr),
     /// `reg = &name + offset`.
@@ -1013,12 +1013,12 @@ impl Aarch64CodeGen {
         let setup = match loc {
             Loc::Stack(_) | Loc::IncomingArg(_) if self.pseudos.is_sym(pseudo) => {
                 let (base, offset) = self.loc_addr_parts(loc).unwrap();
-                let offset = offset + object_offset;
+                let offset = offset + i64::from(object_offset);
                 let bytes = i64::from(size_bits.bytes_exact());
                 let fits = if mem == Some(AsmMemClass::BaseOnly) {
                     offset == 0
                 } else if matches!(bytes, 1 | 2 | 4 | 8 | 16) {
-                    single_offset_fits(offset.into(), bytes)
+                    single_offset_fits(offset, bytes)
                 } else {
                     (-256..=255).contains(&offset)
                 };
@@ -1083,7 +1083,7 @@ impl Aarch64CodeGen {
             OperandSetup::Object { base, offset } => self.push_lir(Aarch64Inst::Add {
                 size: OperandSize::B64,
                 src1: base,
-                src2: GpOperand::Imm(offset.into()),
+                src2: GpOperand::Imm(offset),
                 dst: reg,
             }),
             OperandSetup::Spilled(addr) => self.push_lir(Aarch64Inst::Ldr {

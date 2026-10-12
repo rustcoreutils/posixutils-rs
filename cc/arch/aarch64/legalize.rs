@@ -332,9 +332,9 @@ fn single_addr(
     out: &mut Vec<Aarch64Inst>,
 ) -> Result<MemAddr, Unencodable> {
     match addr {
-        MemAddr::BaseOffset { base, offset } if !single_offset_fits(offset.into(), bytes) => {
+        MemAddr::BaseOffset { base, offset } if !single_offset_fits(offset, bytes) => {
             debug_assert_ne!(base, LEGALIZE_REG);
-            let off = i64::from(offset);
+            let off = offset;
             // Keep an encodable low part in the instruction when the high
             // part is one shifted add: two instructions rather than three.
             let lo = off & 0xFFF;
@@ -348,7 +348,7 @@ fn single_addr(
                 });
                 return Ok(MemAddr::BaseOffset {
                     base: LEGALIZE_REG,
-                    offset: lo as i32,
+                    offset: lo,
                 });
             }
             address_into_scratch(base, off, out);
@@ -372,13 +372,13 @@ fn pair_addr(
     out: &mut Vec<Aarch64Inst>,
 ) -> Result<MemAddr, Unencodable> {
     match addr {
-        MemAddr::BaseOffset { base, offset } if !pair_offset_fits(offset.into(), bytes) => {
+        MemAddr::BaseOffset { base, offset } if !pair_offset_fits(offset, bytes) => {
             debug_assert_ne!(base, LEGALIZE_REG);
-            address_into_scratch(base, offset.into(), out);
+            address_into_scratch(base, offset, out);
             Ok(MemAddr::Base(LEGALIZE_REG))
         }
         MemAddr::PreIndex { offset, .. } | MemAddr::PostIndex { offset, .. }
-            if !pair_offset_fits(offset.into(), bytes) =>
+            if !pair_offset_fits(offset, bytes) =>
         {
             Err(Unencodable(
                 "a pre- or post-indexed pair load or store past its scaled range",
@@ -393,7 +393,7 @@ fn bare_addr(addr: MemAddr, out: &mut Vec<Aarch64Inst>) -> Result<MemAddr, Unenc
     match addr {
         MemAddr::BaseOffset { base, offset } if offset != 0 => {
             debug_assert_ne!(base, LEGALIZE_REG);
-            address_into_scratch(base, offset.into(), out);
+            address_into_scratch(base, offset, out);
             Ok(MemAddr::Base(LEGALIZE_REG))
         }
         MemAddr::PreIndex { .. } | MemAddr::PostIndex { .. } => Err(Unencodable(
@@ -597,7 +597,7 @@ mod tests {
         s
     }
 
-    fn ldr(size: OperandSize, off: i32) -> Aarch64Inst {
+    fn ldr(size: OperandSize, off: i64) -> Aarch64Inst {
         Aarch64Inst::Ldr {
             size,
             addr: MemAddr::BaseOffset {
@@ -608,7 +608,7 @@ mod tests {
         }
     }
 
-    fn stp(off: i32) -> Aarch64Inst {
+    fn stp(off: i64) -> Aarch64Inst {
         Aarch64Inst::Stp {
             size: OperandSize::B64,
             src1: Reg::X0,

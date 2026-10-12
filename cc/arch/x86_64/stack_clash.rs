@@ -40,7 +40,7 @@ impl X86_64CodeGen {
         self.push_lir(X86Inst::StackProbe {
             addr: MemAddr::BaseOffset {
                 base: Reg::Rsp,
-                offset: offset as i32,
+                offset,
             },
         });
     }
@@ -79,7 +79,7 @@ impl X86_64CodeGen {
                 self.push_lir(X86Inst::Lea {
                     addr: MemAddr::BaseOffset {
                         base: Reg::Rsp,
-                        offset: -(rounded as i32),
+                        offset: -rounded,
                     },
                     dst: Reg::R11,
                 });
@@ -210,7 +210,7 @@ impl X86_64CodeGen {
         self.push_lir(X86Inst::Lea {
             addr: MemAddr::BaseOffset {
                 base: Reg::Rsp,
-                offset: -(bytes as i32),
+                offset: -bytes,
             },
             dst: Reg::R11,
         });

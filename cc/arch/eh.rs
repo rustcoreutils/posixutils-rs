@@ -75,7 +75,7 @@ pub enum CallArgsArea {
     Fixed(i64),
     /// `sp` was realigned by an amount only known at run time, and its old
     /// value stored this many bytes above the new one.
-    Realigned { saved_sp: i32 },
+    Realigned { saved_sp: i64 },
 }
 
 /// The landing of a call whose argument area was realigned: a few
@@ -84,7 +84,7 @@ pub enum CallArgsArea {
 /// which knows the instructions ([`CodeGenBase::take_eh_detours`]).
 pub struct SpDetour {
     pub label: Label,
-    pub saved_sp: i32,
+    pub saved_sp: i64,
     pub pad: Label,
 }
 

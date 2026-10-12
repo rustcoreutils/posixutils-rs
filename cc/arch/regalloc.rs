@@ -54,30 +54,29 @@ pub use verify::{
 /// then looped forever, pushing instructions until the compiler ran out of
 /// memory.
 pub fn grow_frame(
-    offset: &mut i32,
-    size: i32,
+    offset: &mut i64,
+    size: i64,
     alignment: i32,
     frame_align: i32,
     pos: crate::diag::Position,
-) -> i32 {
+) -> i64 {
     let align = i64::from(alignment.max(1));
-    let mut want = i64::from(*offset);
+    let mut want = *offset;
     if alignment > 8 {
         want = (want + align - 1) & !(align - 1);
     }
-    want += (i64::from(size.max(0)) + align - 1) & !(align - 1);
+    want += (size.max(0) + align - 1) & !(align - 1);
     let limit = TypeTable::MAX_STACK_OBJECT_BYTES as i64 - 2 * i64::from(frame_align.max(16));
-    match i32::try_from(want) {
-        Ok(n) if i64::from(n) <= limit => *offset = n,
-        _ => {
-            crate::diag::error_args(
-                pos,
-                "this function's stack frame needs {0} bytes, \
-                 past the {1} bytes a frame can address",
-                &[&want.to_string(), &limit.max(0).to_string()],
-            );
-            *offset = offset.saturating_add(8);
-        }
+    if want <= limit {
+        *offset = want;
+    } else {
+        crate::diag::error_args(
+            pos,
+            "this function's stack frame needs {0} bytes, \
+             past the {1} bytes a frame can address",
+            &[&want.to_string(), &limit.max(0).to_string()],
+        );
+        *offset = offset.saturating_add(8);
     }
     *offset
 }
@@ -87,7 +86,7 @@ pub fn grow_frame(
 /// Each parameter is inside the frame ceiling on its own; their sum is not,
 /// and `IncomingOff::take` saturates rather than wrapping so this one check
 /// at the end of a function's parameter layout sees it.
-pub fn check_incoming_area(end: i32, pos: crate::diag::Position) {
+pub fn check_incoming_area(end: i64, pos: crate::diag::Position) {
     if end as usize > TypeTable::MAX_STACK_OBJECT_BYTES {
         crate::diag::error_args(
             pos,
@@ -161,7 +160,7 @@ impl<L: Clone> From<HashMap<PseudoId, L>> for LocationMap<L> {
 /// records it here too. The allocation verifier (`check_assignment`)
 /// compares slots by these extents: two pseudos whose bytes overlap may
 /// not be live together.
-pub type SlotBytes = HashMap<PseudoId, i32>;
+pub type SlotBytes = HashMap<PseudoId, i64>;
 
 const DEFAULT_INTERVAL_CAPACITY: usize = 64;
 const DEFAULT_CONSTRAINT_CAPACITY: usize = 16;
@@ -936,7 +935,7 @@ pub fn local_slot(
     local: &crate::ir::LocalVar,
     types: &TypeTable,
     pos: crate::diag::Position,
-) -> (i32, i32) {
+) -> (i64, i32) {
     let bytes = crate::abi::slot_bytes(types.byte_size(local.typ), pos, "an automatic object");
     let align = local
         .explicit_align
@@ -991,12 +990,12 @@ pub fn place_locals(
     pos: crate::diag::Position,
     intervals: &[LiveInterval],
     set: LocalSet,
-    mut new_slot: impl FnMut(i32, i32) -> i32,
-) -> Vec<(PseudoId, i32, i32)> {
+    mut new_slot: impl FnMut(i64, i32) -> i64,
+) -> Vec<(PseudoId, i64, i64)> {
     struct Shared {
-        bytes: i32,
+        bytes: i64,
         align: i32,
-        offset: i32,
+        offset: i64,
         owners: Vec<(usize, usize)>,
     }
     let lifetime: HashMap<PseudoId, (usize, usize)> = intervals
@@ -2407,7 +2406,7 @@ mod tests {
     #[test]
     fn test_grow_frame_reserves_what_follows() {
         let pos = crate::diag::Position::default();
-        let limit = TypeTable::MAX_STACK_OBJECT_BYTES as i32 - 2 * 16;
+        let limit = TypeTable::MAX_STACK_OBJECT_BYTES as i64 - 2 * 16;
         let mut offset = 0;
         assert_eq!(grow_frame(&mut offset, limit, 8, 16, pos), limit);
 

@@ -1113,14 +1113,14 @@ impl X86_64CodeGen {
                 return "0".to_string();
             };
             return match loc {
-                Loc::Stack(slot) => self.stack_field(*slot, offset).format(&target),
-                Loc::IncomingArg(off) => format!("{}(%rbp)", off + offset),
+                Loc::Stack(slot) => self.stack_field(*slot, offset.into()).format(&target),
+                Loc::IncomingArg(off) => format!("{}(%rbp)", off + i64::from(offset)),
                 Loc::Global(name) => {
                     if self.is_tls_symbol(name) || self.needs_got_access(name) {
                         let temp = find_temp_reg(reserved, used, pos);
                         used.insert(temp);
                         let name = name.clone();
-                        self.global_mem(&name, offset, temp).format(&target)
+                        self.global_mem(&name, offset.into(), temp).format(&target)
                     } else if offset == 0 {
                         format!("{}(%rip)", self.format_symbol_name(name))
                     } else {

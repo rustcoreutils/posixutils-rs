@@ -512,7 +512,7 @@ impl X86_64CodeGen {
     /// An allocated base register is copied to `scratch`: the atomic
     /// sequences overwrite RAX, RCX, R8 and R9 after resolving the address,
     /// and any of them can be where the allocator put the pointer.
-    fn atomic_mem_operand(&mut self, addr: PseudoId, disp: i32, scratch: Reg) -> MemAddr {
+    fn atomic_mem_operand(&mut self, addr: PseudoId, disp: i64, scratch: Reg) -> MemAddr {
         match self.scalar_mem_operand(addr, disp, scratch) {
             MemAddr::BaseOffset { base, offset } if Reg::allocatable().contains(&base) => {
                 self.push_lir(X86Inst::Mov {

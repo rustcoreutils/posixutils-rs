@@ -21,12 +21,12 @@ use crate::types::TypeTable;
 use crate::units::{Align, Bits, ByteSize};
 
 /// Bytes of the variadic register save area holding x0-x7.
-pub(super) const VA_GR_SAVE_BYTES: i32 = 8 * 8;
+pub(super) const VA_GR_SAVE_BYTES: i64 = 8 * 8;
 /// Bytes of the variadic register save area holding q0-q7.
 ///
 /// Whole `q` registers, not `d`: an unnamed `long double` is binary128 on
 /// AAPCS64 and fills the slot.
-pub(super) const VA_VR_SAVE_BYTES: i32 = 8 * 16;
+pub(super) const VA_VR_SAVE_BYTES: i64 = 8 * 16;
 
 // AAPCS64 `va_list` field offsets (Linux/FreeBSD). The type is
 //
@@ -43,11 +43,11 @@ pub(super) const VA_VR_SAVE_BYTES: i32 = 8 * 16;
 // which meant `va_arg(ap, double)` read a GP slot -- the incoming d0-d7 were
 // never spilled at all -- and an `ap` handed to `vsnprintf` did not match what
 // libc expected.
-const VA_STACK_OFF: i32 = 0;
-const VA_GR_TOP_OFF: i32 = 8;
-const VA_VR_TOP_OFF: i32 = 16;
-const VA_GR_OFFS_OFF: i32 = 24;
-const VA_VR_OFFS_OFF: i32 = 28;
+const VA_STACK_OFF: i64 = 0;
+const VA_GR_TOP_OFF: i64 = 8;
+const VA_VR_TOP_OFF: i64 = 16;
+const VA_GR_OFFS_OFF: i64 = 24;
+const VA_VR_OFFS_OFF: i64 = 28;
 
 /// How an aggregate argument reaches `va_arg`, per AAPCS64 §6.4.2.
 ///
@@ -141,7 +141,7 @@ impl Aarch64CodeGen {
     }
 
     /// Store a 32-bit immediate into a `va_list` field.
-    fn store_va_i32(&mut self, ap: Reg, field: i32, value: i32, scratch: Reg) {
+    fn store_va_i32(&mut self, ap: Reg, field: i64, value: i64, scratch: Reg) {
         // Build the bit pattern rather than the signed value: the offsets are
         // negative, and only the low 32 bits reach memory.
         self.emit_mov_imm(scratch, (value as u32) as i64, Bits::new(32));
@@ -156,11 +156,11 @@ impl Aarch64CodeGen {
     }
 
     /// Store `x29 + offset` into a `va_list` pointer field.
-    fn store_va_frame_ptr(&mut self, ap: Reg, field: i32, frame_offset: i32, scratch: Reg) {
+    fn store_va_frame_ptr(&mut self, ap: Reg, field: i64, frame_offset: i64, scratch: Reg) {
         self.push_lir(Aarch64Inst::Add {
             size: OperandSize::B64,
             src1: Reg::X29,
-            src2: GpOperand::Imm(frame_offset as i64),
+            src2: GpOperand::Imm(frame_offset),
             dst: scratch,
         });
         self.push_lir(Aarch64Inst::Str {
@@ -205,8 +205,8 @@ impl Aarch64CodeGen {
         // start past them.
         let gr_top = self.reg_save_area_offset + VA_GR_SAVE_BYTES;
         let vr_top = gr_top + VA_VR_SAVE_BYTES;
-        let gr_offs = -((8 - self.num_fixed_gp_params.min(8) as i32) * 8);
-        let vr_offs = -((8 - self.num_fixed_fp_params.min(8) as i32) * 16);
+        let gr_offs = -((8 - self.num_fixed_gp_params.min(8) as i64) * 8);
+        let vr_offs = -((8 - self.num_fixed_fp_params.min(8) as i64) * 16);
 
         let Some(ap) = self.va_list_addr(&ap_loc, scratch1) else {
             return;
@@ -267,7 +267,7 @@ impl Aarch64CodeGen {
         if self.base.target.os == crate::target::Os::MacOS {
             let slot = crate::abi::aapcs64::darwin_va_slot(pos, types, arg_type, &self.base.target);
             let align = crate::abi::slot_align(slot.align);
-            self.emit_va_arg_darwin(&ap_loc, &dst_loc, type_bits, is_fp, agg, align);
+            self.emit_va_arg_darwin(&ap_loc, &dst_loc, type_bits, is_fp, agg, align.into());
         } else {
             self.emit_va_arg_aapcs64(
                 &ap_loc,
@@ -275,7 +275,8 @@ impl Aarch64CodeGen {
                 type_bits,
                 is_fp,
                 agg,
-                crate::abi::slot_align(crate::abi::aapcs64::argument_alignment(types, arg_type)),
+                crate::abi::slot_align(crate::abi::aapcs64::argument_alignment(types, arg_type))
+                    .into(),
             );
         }
     }
@@ -295,7 +296,7 @@ impl Aarch64CodeGen {
         type_bits: Bits,
         is_fp: bool,
         agg: VaAggKind,
-        align: i32,
+        align: i64,
     ) {
         let (scratch0, scratch1, scratch2) = Reg::scratch_regs();
         let Some(ap) = self.va_list_addr_pinned(ap_loc, scratch2) else {
@@ -311,10 +312,10 @@ impl Aarch64CodeGen {
             self.push_lir(Aarch64Inst::Add {
                 size: OperandSize::B64,
                 src1: scratch0,
-                src2: GpOperand::Imm((align - 1) as i64),
+                src2: GpOperand::Imm(align - 1),
                 dst: scratch0,
             });
-            self.emit_mov_imm(scratch1, -(align as i64), Bits::new(64));
+            self.emit_mov_imm(scratch1, -align, Bits::new(64));
             self.push_lir(Aarch64Inst::And {
                 size: OperandSize::B64,
                 src1: scratch0,
@@ -409,7 +410,7 @@ impl Aarch64CodeGen {
         type_bits: Bits,
         is_fp: bool,
         agg: VaAggKind,
-        align: i32,
+        align: i64,
     ) {
         let (scratch0, scratch1, scratch2) = Reg::scratch_regs();
         let Some(ap) = self.va_list_addr_pinned(ap_loc, scratch2) else {
@@ -445,7 +446,7 @@ impl Aarch64CodeGen {
             // whatever `offs` was, so the argument comes off the stack, and
             // the committed offset pins every later general argument there
             // too -- NGRN becoming 8, as the caller had it.
-            VaAggKind::Stacked { .. } => i64::from(VA_GR_SAVE_BYTES) + 8,
+            VaAggKind::Stacked { .. } => VA_GR_SAVE_BYTES + 8,
             VaAggKind::Scalar if is_fp => 16,
             VaAggKind::Scalar => stack_step,
         };
@@ -561,10 +562,10 @@ impl Aarch64CodeGen {
             self.push_lir(Aarch64Inst::Add {
                 size: OperandSize::B64,
                 src1: Reg::X17,
-                src2: GpOperand::Imm(stack_align as i64 - 1),
+                src2: GpOperand::Imm(stack_align - 1),
                 dst: scratch0,
             });
-            self.emit_mov_imm(scratch1, -(stack_align as i64), Bits::new(64));
+            self.emit_mov_imm(scratch1, -stack_align, Bits::new(64));
             self.push_lir(Aarch64Inst::And {
                 size: OperandSize::B64,
                 src1: scratch0,
@@ -646,7 +647,7 @@ impl Aarch64CodeGen {
             // stride is selected the same way the address was, and the copy
             // walks it rather than branching on which source won.
             self.emit_mov_imm(Reg::X16, 16, Bits::new(64));
-            self.emit_mov_imm(Reg::X17, elem.bytes as i64, Bits::new(64));
+            self.emit_mov_imm(Reg::X17, elem.bytes, Bits::new(64));
             self.push_lir(Aarch64Inst::Csel {
                 size: OperandSize::B64,
                 cond: CondCode::Sle,
@@ -677,7 +678,7 @@ impl Aarch64CodeGen {
         &mut self,
         dst_loc: &Loc,
         addr: Reg,
-        off: i32,
+        off: i64,
         bytes: ByteSize,
         holds_value: bool,
     ) {
@@ -709,7 +710,7 @@ impl Aarch64CodeGen {
                     self.push_lir(Aarch64Inst::Add {
                         size: OperandSize::B64,
                         src1: base,
-                        src2: GpOperand::Imm(disp.into()),
+                        src2: GpOperand::Imm(disp),
                         dst: Reg::X16,
                     });
                 }
@@ -726,7 +727,7 @@ impl Aarch64CodeGen {
                 self.push_lir(Aarch64Inst::Add {
                     size: OperandSize::B64,
                     src1: addr,
-                    src2: GpOperand::Imm(off.into()),
+                    src2: GpOperand::Imm(off),
                     dst: addr,
                 });
             }
@@ -735,7 +736,6 @@ impl Aarch64CodeGen {
         }
         for (done, chunk) in crate::ir::memexpand::block_chunks(bytes) {
             let size = OperandSize::from_bits(chunk.bits());
-            let done = done as i32;
             self.push_lir(Aarch64Inst::Ldr {
                 size,
                 addr: MemAddr::BaseOffset {
@@ -787,7 +787,7 @@ impl Aarch64CodeGen {
         count: u8,
         holds_value: bool,
     ) {
-        for i in 0..count as i32 {
+        for i in 0..count as i64 {
             self.push_lir(Aarch64Inst::LdrFp {
                 size: elem.size,
                 addr: MemAddr::Base(addr),
@@ -816,7 +816,7 @@ impl Aarch64CodeGen {
                         self.push_lir(Aarch64Inst::Lsl {
                             size: OperandSize::B64,
                             src: Reg::X16,
-                            amount: GpOperand::Imm(delta as i64 * 8),
+                            amount: GpOperand::Imm(delta * 8),
                             dst: Reg::X16,
                         });
                         self.push_lir(Aarch64Inst::Orr {
@@ -837,7 +837,7 @@ impl Aarch64CodeGen {
                 }),
                 _ => return,
             }
-            if i + 1 < count as i32 {
+            if i + 1 < count as i64 {
                 self.push_lir(Aarch64Inst::Add {
                     size: OperandSize::B64,
                     src1: addr,
@@ -940,7 +940,7 @@ impl Aarch64CodeGen {
         // Darwin's va_list is one pointer; everywhere else it is the 32-byte
         // AAPCS64 record, and copying only the first 8 bytes left the copy
         // with a garbage `__gr_top` and offsets.
-        let bytes: i32 = if self.base.target.os == crate::target::Os::MacOS {
+        let bytes: i64 = if self.base.target.os == crate::target::Os::MacOS {
             8
         } else {
             32

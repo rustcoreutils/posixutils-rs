@@ -584,7 +584,7 @@ pub fn memory_class_bytes(types: &TypeTable, typ: TypeId) -> Option<ByteSize> {
 /// - x86-64: 80-bit extended precision, padded to 16 bytes per element
 /// - AArch64/Linux: 128-bit IEEE quad precision, 16 bytes per element
 /// - AArch64/macOS: 64-bit (same as double), 8 bytes per element
-pub fn complex_fp_info(types: &TypeTable, target: &Target, complex_typ: TypeId) -> (FpSize, i32) {
+pub fn complex_fp_info(types: &TypeTable, target: &Target, complex_typ: TypeId) -> (FpSize, i64) {
     let base = types.complex_base(complex_typ);
     match types.kind(base) {
         TypeKind::Float16 => (FpSize::Half, 2),
@@ -1157,13 +1157,13 @@ pub enum Directive {
     SizeToHere { sym: Symbol },
 
     /// .cfi_def_cfa register, offset - set CFA to register + offset
-    CfiDefCfa { reg: String, offset: i32 },
+    CfiDefCfa { reg: String, offset: i64 },
 
     /// .cfi_def_cfa_offset offset - set CFA offset from current register
-    CfiDefCfaOffset(i32),
+    CfiDefCfaOffset(i64),
 
     /// .cfi_offset register, offset - register saved at CFA+offset
-    CfiOffset { reg: String, offset: i32 },
+    CfiOffset { reg: String, offset: i64 },
 
     /// .cfi_def_cfa_register register - CFA is now based on this register
     CfiDefCfaRegister(String),
@@ -1388,7 +1388,7 @@ impl Directive {
         }
     }
 
-    pub fn cfi_offset(reg: impl Into<String>, offset: i32) -> Self {
+    pub fn cfi_offset(reg: impl Into<String>, offset: i64) -> Self {
         Directive::CfiOffset {
             reg: reg.into(),
             offset,
@@ -1403,7 +1403,7 @@ impl Directive {
         Directive::CfiRestore(reg.into())
     }
 
-    pub fn cfi_def_cfa(reg: impl Into<String>, offset: i32) -> Self {
+    pub fn cfi_def_cfa(reg: impl Into<String>, offset: i64) -> Self {
         Directive::CfiDefCfa {
             reg: reg.into(),
             offset,

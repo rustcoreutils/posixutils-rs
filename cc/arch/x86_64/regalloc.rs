@@ -744,10 +744,10 @@ pub enum Loc {
     /// In an XMM register (floating-point)
     Xmm(XmmReg),
     /// On the stack at [rbp - offset]
-    Stack(i32),
+    Stack(i64),
     /// Incoming stack argument at [rbp + offset] (positive offset, above return address)
     /// Used for function parameters 7+ that are passed on the stack by the caller
-    IncomingArg(i32),
+    IncomingArg(i64),
     /// Immediate integer constant
     Imm(i128),
     /// Immediate float constant (value, size in bits)
@@ -791,7 +791,7 @@ pub struct SpilledArg {
     /// The register the argument originally arrived in
     pub from_reg: Reg,
     /// The stack offset where it was spilled to
-    pub to_stack_offset: i32,
+    pub to_stack_offset: i64,
 }
 
 /// XMM argument that was spilled from an XMM register to the stack.
@@ -803,7 +803,7 @@ pub struct SpilledXmmArg {
     /// The XMM register the argument originally arrived in
     pub from_xmm: XmmReg,
     /// The stack offset where it was spilled to
-    pub to_stack_offset: i32,
+    pub to_stack_offset: i64,
     /// The move width. A `__float128` argument is a whole XMM; storing it as
     /// a `double` dropped its top half.
     pub size: FpSize,
@@ -822,7 +822,7 @@ pub struct RegAlloc {
     /// [`RegAlloc::with_stack_guard`].
     guard_requested: bool,
     /// The canary's slot: the frame's first, so above every other local.
-    guard_slot: Option<i32>,
+    guard_slot: Option<i64>,
     /// What `%rsp` is a multiple of at a call; see
     /// [`RegAlloc::with_incoming_stack_align`].
     incoming_stack_align: i32,
@@ -845,9 +845,9 @@ pub struct RegAlloc {
     /// consuming no register, and step 5 charges nothing for an argument that
     /// did not fit. A separate tally of "how many registers overflowed" can
     /// express neither, nor the alignment padding `IncomingOff::take` inserts.
-    named_incoming_end: i32,
+    named_incoming_end: i64,
     /// Next stack slot offset
-    stack_offset: i32,
+    stack_offset: i64,
     /// Reserved when the function converts a long double to an integer.
     x87_scratch: Option<X87Scratch>,
     x87_control_words: Option<X87ControlWords>,
@@ -874,7 +874,7 @@ pub struct RegAlloc {
     /// Such a parameter is given a *local* sixteen-byte slot as its location,
     /// because that is where the prologue copies it to; the caller's offset has
     /// nowhere else to live, and the prologue must not recompute it.
-    int128_incoming: BTreeMap<PseudoId, i32>,
+    int128_incoming: BTreeMap<PseudoId, i64>,
     /// Arguments spilled from caller-saved registers to stack
     spilled_args: Vec<SpilledArg>,
     /// XMM arguments spilled from XMM registers to stack
@@ -1195,14 +1195,14 @@ impl Clobbering {
 /// one way to address it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct X87Scratch {
-    slot: i32,
+    slot: i64,
 }
 
 impl X87Scratch {
     /// Two eight-byte halves: `emit_x87_float_to_u64` uses both at once.
-    pub(super) const BYTES: i32 = 16;
+    pub(super) const BYTES: i64 = 16;
 
-    pub(super) fn slot(self) -> i32 {
+    pub(super) fn slot(self) -> i64 {
         self.slot
     }
 }
@@ -1218,24 +1218,24 @@ impl X87Scratch {
 /// containing such a conversion, and only for those.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct X87ControlWords {
-    slot: i32,
+    slot: i64,
 }
 
 impl X87ControlWords {
     /// Bytes reserved: the two 16-bit words, rounded up to the eight every
     /// other slot is laid out in, so the slots after this one stay aligned.
-    const BYTES: i32 = 8;
+    const BYTES: i64 = 8;
 
     /// The stack slot the two words are fields of.
-    pub(super) fn slot(self) -> i32 {
+    pub(super) fn slot(self) -> i64 {
         self.slot
     }
 
     /// Byte offset of the control word found on entry, restored afterwards.
-    pub(super) const SAVED: i32 = 0;
+    pub(super) const SAVED: i64 = 0;
 
     /// Byte offset of the truncating copy loaded around the `fistp`.
-    pub(super) const TRUNCATING: i32 = 2;
+    pub(super) const TRUNCATING: i64 = 2;
 }
 
 /// Where the next stack-passed argument starts, measured from `%rbp` in the
@@ -1247,7 +1247,7 @@ impl X87ControlWords {
 /// through `IncomingOff::take`, which applies the rounding; aarch64's
 /// `IncomingOff::take` is the same shape.
 #[derive(Clone, Copy)]
-struct IncomingOff(i32);
+struct IncomingOff(i64);
 
 impl IncomingOff {
     /// The first stacked argument sits above the saved `%rbp` and the return
@@ -1274,13 +1274,12 @@ impl IncomingOff {
     /// Summed in `i64` and saturated: two stacked arguments each inside the
     /// frame ceiling can still overflow their total. The caller checks the
     /// end once, with [`crate::arch::regalloc::check_incoming_area`].
-    fn take(next: &mut IncomingOff, bytes: i32, align: i32) -> i32 {
+    fn take(next: &mut IncomingOff, bytes: i64, align: i32) -> i64 {
         let align = i64::from(align.max(8));
-        let base = i64::from(IncomingOff::FIRST.0);
-        let at = base + ((i64::from(next.0) - base + align - 1) & !(align - 1));
-        let end = at + ((i64::from(bytes) + 7) & !7);
-        next.0 = i32::try_from(end).unwrap_or(i32::MAX);
-        i32::try_from(at).unwrap_or(i32::MAX)
+        let base = IncomingOff::FIRST.0;
+        let at = base.saturating_add((next.0 - base + align - 1) & !(align - 1));
+        next.0 = at.saturating_add((bytes + 7) & !7);
+        at
     }
 }
 
@@ -1352,7 +1351,7 @@ impl RegAlloc {
     }
 
     /// The canary's slot, if [`RegAlloc::with_stack_guard`] asked for one.
-    pub fn stack_guard_slot(&self) -> Option<i32> {
+    pub fn stack_guard_slot(&self) -> Option<i64> {
         self.guard_slot
     }
 
@@ -1562,11 +1561,11 @@ impl RegAlloc {
     fn reserve_x87_frame(&mut self, func: &Function, types: &TypeTable) {
         let insns = || func.blocks.iter().flat_map(|block| &block.insns);
         let frame_align = self.frame_align();
-        let mut reserve = |bytes: i32| {
+        let mut reserve = |bytes: i64| {
             crate::arch::regalloc::grow_frame(
                 &mut self.stack_offset,
                 bytes,
-                bytes,
+                bytes as i32,
                 frame_align,
                 self.func_pos,
             )
@@ -2184,7 +2183,7 @@ impl RegAlloc {
     }
 
     /// Where a stack-passed `__int128` parameter arrives, if it did.
-    pub fn int128_incoming(&self, pseudo: PseudoId) -> Option<i32> {
+    pub fn int128_incoming(&self, pseudo: PseudoId) -> Option<i64> {
         self.int128_incoming.get(&pseudo).copied()
     }
 
@@ -2199,7 +2198,7 @@ impl RegAlloc {
     }
 
     /// The `%rbp` displacement where the variadic arguments begin.
-    pub fn named_incoming_end(&self) -> i32 {
+    pub fn named_incoming_end(&self) -> i64 {
         self.named_incoming_end
     }
 
@@ -2253,7 +2252,7 @@ impl RegAlloc {
     }
 
     /// A fresh frame slot of `size` bytes at `alignment`, shared with nothing.
-    fn new_frame_slot(&mut self, size: i32, alignment: i32) -> i32 {
+    fn new_frame_slot(&mut self, size: i64, alignment: i32) -> i64 {
         if alignment > self.max_local_align {
             self.max_local_align = alignment;
         }
@@ -2314,11 +2313,11 @@ impl RegAlloc {
         let mut offset = vec![0; coloring.slots.len()];
         for n in order {
             let shape = coloring.slots[n];
-            offset[n] = self.new_frame_slot(shape.bytes, shape.align);
+            offset[n] = self.new_frame_slot(shape.bytes.into(), shape.align);
         }
         for (&p, &n) in &coloring.slot_of {
             self.locations.insert(p, Loc::Stack(offset[n]));
-            self.slot_bytes.insert(p, homed[&p].bytes);
+            self.slot_bytes.insert(p, homed[&p].bytes.into());
         }
         let slot = |p: PseudoId| offset[coloring.slot_of[&p]];
         for arg in &mut self.spilled_args {
@@ -2935,11 +2934,8 @@ impl RegAlloc {
                             func.name
                         )
                     });
-                    let lo = -i64::from(*n);
-                    vec![Cell::Frame {
-                        lo,
-                        hi: lo + i64::from(bytes),
-                    }]
+                    let lo = -(*n);
+                    vec![Cell::Frame { lo, hi: lo + bytes }]
                 }
                 Loc::IncomingArg(o) => vec![Cell::Incoming(*o)],
                 Loc::Imm(_) | Loc::FImm(..) | Loc::Global(_) => Vec::new(),
@@ -3002,12 +2998,9 @@ impl RegAlloc {
             }
         }
 
-        let frame = |slot: i32, bytes: i32| {
-            let lo = -i64::from(slot);
-            Cell::Frame {
-                lo,
-                hi: lo + i64::from(bytes),
-            }
+        let frame = |slot: i64, bytes: i64| {
+            let lo = -slot;
+            Cell::Frame { lo, hi: lo + bytes }
         };
         let mut reserved = Vec::new();
         if let Some(slot) = self.guard_slot {
@@ -3063,8 +3056,8 @@ impl RegAlloc {
         base.max(self.max_local_align).max(16)
     }
 
-    pub fn stack_size(&self) -> i32 {
-        let align = self.max_local_align.max(16);
+    pub fn stack_size(&self) -> i64 {
+        let align = i64::from(self.max_local_align.max(16));
         (self.stack_offset + align - 1) & !(align - 1)
     }
 
@@ -3143,7 +3136,7 @@ mod tests {
         for align in [32, 64] {
             let mut next = IncomingOff::FIRST;
             assert_eq!(
-                IncomingOff::take(&mut next, align, align),
+                IncomingOff::take(&mut next, align, align as i32),
                 first,
                 "an {align}-aligned argument arriving first starts at the area base"
             );
@@ -3155,7 +3148,7 @@ mod tests {
             let mut next = IncomingOff::FIRST;
             assert_eq!(IncomingOff::take(&mut next, 8, 8), first);
             assert_eq!(
-                IncomingOff::take(&mut next, align, align),
+                IncomingOff::take(&mut next, align, align as i32),
                 first + align,
                 "an {align}-aligned argument rounds within the argument area"
             );
@@ -3518,7 +3511,7 @@ mod arg_location_tests {
 
         // Past the sixth, arguments arrive in the caller's frame: 16 bytes up
         // from the frame pointer (saved rbp + return address), then every 8.
-        for (i, want) in [(6u32, 16i32), (7, 24), (8, 32)] {
+        for (i, want) in [(6u32, 16i64), (7, 24), (8, 32)] {
             assert_eq!(
                 locs.get(PseudoId(i)),
                 Some(Loc::IncomingArg(want)),

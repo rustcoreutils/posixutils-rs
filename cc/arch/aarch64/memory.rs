@@ -331,7 +331,7 @@ impl Aarch64CodeGen {
     fn compute_mem_addr(
         &mut self,
         addr: PseudoId,
-        insn_offset: i32,
+        insn_offset: i64,
         temp_reg: Reg,
     ) -> ComputedAddr {
         let addr_loc = self.get_location(addr);
@@ -382,7 +382,7 @@ impl Aarch64CodeGen {
     /// and store uses: a `Sym`'s slot is the object, so its address is taken;
     /// any other pseudo's slot holds a pointer, which is loaded. Loading every
     /// operand as a value read a local object's contents as its address.
-    pub(super) fn emit_addr_into(&mut self, addr: PseudoId, disp: i32, dst: Reg) {
+    pub(super) fn emit_addr_into(&mut self, addr: PseudoId, disp: i64, dst: Reg) {
         let (base, offset) = match self.compute_mem_addr(addr, disp, dst) {
             ComputedAddr::Global(name) => {
                 self.emit_load_addr(&name, dst);
@@ -398,7 +398,7 @@ impl Aarch64CodeGen {
             self.push_lir(Aarch64Inst::Add {
                 size: OperandSize::B64,
                 src1: base,
-                src2: GpOperand::Imm(offset.into()),
+                src2: GpOperand::Imm(offset),
                 dst,
             });
         } else if base != dst {
@@ -420,7 +420,7 @@ impl Aarch64CodeGen {
     /// of the object. Rounding the access up to the next width instead, which
     /// is what a bare `from_bits` does, reads up to three bytes too far and
     /// faults whenever a 3, 5, 6 or 7 byte object ends a page.
-    fn emit_overlapped_load(&mut self, base: Reg, offset: i32, width: i64, high: i64, dst: Reg) {
+    fn emit_overlapped_load(&mut self, base: Reg, offset: i64, width: i64, high: i64, dst: Reg) {
         // `dst` is an allocated register or X9, so it is never X16 or X17;
         // `base` may be either, since that is what carries a computed address.
         let scratch = if base == Reg::X16 { Reg::X17 } else { Reg::X16 };
@@ -432,7 +432,7 @@ impl Aarch64CodeGen {
         // Whichever half lands in `base` has to be read last: after
         // coalescing, `dst` can be the very register holding the address.
         // `scratch` is chosen above so that it never is.
-        let halves = [(offset, dst), (offset + high as i32, scratch)];
+        let halves = [(offset, dst), (offset + high, scratch)];
         let halves = if dst == base {
             [halves[1], halves[0]]
         } else {
@@ -699,7 +699,7 @@ impl Aarch64CodeGen {
                 self.push_lir(Aarch64Inst::Add {
                     size: OperandSize::B64,
                     src1: base,
-                    src2: GpOperand::Imm(total_offset as i64),
+                    src2: GpOperand::Imm(total_offset),
                     dst: Reg::X16,
                 });
             }
@@ -731,7 +731,7 @@ impl Aarch64CodeGen {
                     self.push_lir(Aarch64Inst::Add {
                         size: OperandSize::B64,
                         src1: base,
-                        src2: GpOperand::Imm(total_offset as i64),
+                        src2: GpOperand::Imm(total_offset),
                         dst: Reg::X17,
                     });
                 } else {
@@ -745,7 +745,7 @@ impl Aarch64CodeGen {
                         self.push_lir(Aarch64Inst::Add {
                             size: OperandSize::B64,
                             src1: Reg::X17,
-                            src2: GpOperand::Imm(insn.displacement().into()),
+                            src2: GpOperand::Imm(insn.displacement()),
                             dst: Reg::X17,
                         });
                     }
@@ -756,7 +756,7 @@ impl Aarch64CodeGen {
                     self.push_lir(Aarch64Inst::Add {
                         size: OperandSize::B64,
                         src1: r,
-                        src2: GpOperand::Imm(insn.displacement().into()),
+                        src2: GpOperand::Imm(insn.displacement()),
                         dst: Reg::X17,
                     });
                 } else if r != Reg::X17 {
@@ -775,7 +775,7 @@ impl Aarch64CodeGen {
 
         // Copy qword by qword using X9 as temp
         for i in 0..num_qwords {
-            let byte_offset = (i * 8) as i32;
+            let byte_offset = (i * 8) as i64;
             self.push_lir(Aarch64Inst::Ldr {
                 size: OperandSize::B64,
                 addr: MemAddr::BaseOffset {
@@ -807,7 +807,7 @@ impl Aarch64CodeGen {
                 self.push_lir(Aarch64Inst::Add {
                     size: OperandSize::B64,
                     src1: base,
-                    src2: GpOperand::Imm(total_offset as i64),
+                    src2: GpOperand::Imm(total_offset),
                     dst: Reg::X17,
                 });
             }
@@ -816,7 +816,7 @@ impl Aarch64CodeGen {
                     self.push_lir(Aarch64Inst::Add {
                         size: OperandSize::B64,
                         src1: r,
-                        src2: GpOperand::Imm(insn.displacement().into()),
+                        src2: GpOperand::Imm(insn.displacement()),
                         dst: Reg::X17,
                     });
                 } else if r != Reg::X17 {
@@ -833,7 +833,7 @@ impl Aarch64CodeGen {
                     self.push_lir(Aarch64Inst::Add {
                         size: OperandSize::B64,
                         src1: Reg::X17,
-                        src2: GpOperand::Imm(insn.displacement().into()),
+                        src2: GpOperand::Imm(insn.displacement()),
                         dst: Reg::X17,
                     });
                 }
@@ -843,7 +843,7 @@ impl Aarch64CodeGen {
 
         // Store zeros using XZR (zero register) - aarch64 has hardware zero reg!
         for i in 0..num_qwords {
-            let byte_offset = (i * 8) as i32;
+            let byte_offset = (i * 8) as i64;
             self.push_lir(Aarch64Inst::Str {
                 size: OperandSize::B64,
                 src: Reg::Xzr,
@@ -1020,7 +1020,7 @@ mod tests {
                 src1,
                 src2: GpOperand::Imm(imm),
                 dst: Reg::X10,
-            }] if *src1 == base && *imm == i64::from(offset)
+            }] if *src1 == base && *imm == offset
         ));
 
         cg.base.lir_buffer.clear();

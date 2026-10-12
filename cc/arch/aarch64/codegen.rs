@@ -46,25 +46,25 @@ pub struct Aarch64CodeGen {
     /// Current function's pseudos (for looking up values)
     pub(super) pseudos: crate::arch::codegen::PseudoTable,
     /// Total frame size for current function
-    pub(super) frame_size: i32,
+    pub(super) frame_size: i64,
     /// Where the current function's frame areas lie.
     pub(super) layout: crate::arch::aarch64::frame::FrameLayout,
     /// Offset from FP to register save area (for variadic functions)
-    pub(super) reg_save_area_offset: i32,
+    pub(super) reg_save_area_offset: i64,
     /// Number of fixed GP parameters (for variadic functions)
     pub(super) num_fixed_gp_params: usize,
     /// Number of fixed FP/SIMD parameters (for variadic functions)
     pub(super) num_fixed_fp_params: usize,
     /// Bytes of incoming stack arguments consumed by named parameters
     /// (for variadic functions whose named parameters overflow the registers)
-    pub(super) named_stack_param_bytes: i32,
+    pub(super) named_stack_param_bytes: i64,
     /// Where the pre-call `%sp` was saved, for a Darwin variadic call whose
     /// argument area needs more than the sixteen bytes `%sp` is guaranteed.
     ///
     /// Such a call realigns `%sp` by an amount only known at run time, so the
     /// area cannot be released with the matching `add` every other call uses;
     /// the old value is read back from this offset instead.
-    pub(super) darwin_va_sp_slot: Option<i32>,
+    pub(super) darwin_va_sp_slot: Option<i64>,
     /// External symbols (need GOT access on macOS)
     pub(super) extern_symbols: HashSet<String>,
     /// The registers the unit's file-scope register variables are, which no
@@ -81,7 +81,7 @@ pub struct Aarch64CodeGen {
     unique_label_counter: u32,
     /// Bytes the prologue allocates for locals: what a dynamically aligned
     /// frame addresses them from.
-    pub(super) stack_alloc_size: i32,
+    pub(super) stack_alloc_size: i64,
     /// The stack-protector canary's slot, when this function has one.
     pub(super) stack_guard: Option<LocalSlot>,
     /// Sym pseudo ID → type size in bits (for distinguishing scalar vs struct stores)
@@ -134,7 +134,7 @@ impl Aarch64CodeGen {
     /// For local variables (negative offsets), this accounts for the
     /// register save area in varargs functions which is placed at the
     /// end of the frame (after locals).
-    fn stack_offset(&self, offset: i32) -> i32 {
+    fn stack_offset(&self, offset: i64) -> i64 {
         if offset < 0 {
             if let FrameBase::Aligned { align, .. } = self.frame_base {
                 // Over-aligned locals: x19-relative addressing.
@@ -143,7 +143,7 @@ impl Aarch64CodeGen {
                 // start of the locals area. Offset from x19 = base_rounded + regalloc_offset.
                 // Since base_rounded is a multiple of max_align and regalloc aligns each
                 // local's position to its alignment, the result preserves alignment.
-                let base_rounded = self.stack_alloc_size - (align - 1);
+                let base_rounded = self.stack_alloc_size - (i64::from(align) - 1);
                 base_rounded + offset
             } else {
                 // Measured down from the top of the locals; see
@@ -166,14 +166,14 @@ impl Aarch64CodeGen {
     /// Private and raw: callers name their frame through the typed helpers
     /// below, so that the sign is applied by the producer rather than
     /// re-derived here.
-    fn stack_base_reg(&self, raw_offset: i32) -> Reg {
+    fn stack_base_reg(&self, raw_offset: i64) -> Reg {
         match self.frame_base.reg() {
             Some(base) if raw_offset < 0 => base,
             _ => Reg::X29,
         }
     }
 
-    fn raw_mem(&self, raw_offset: i32, extra: i32) -> MemAddr {
+    fn raw_mem(&self, raw_offset: i64, extra: i64) -> MemAddr {
         MemAddr::BaseOffset {
             base: self.stack_base_reg(raw_offset),
             offset: self.stack_offset(raw_offset) + extra,
@@ -191,24 +191,24 @@ impl Aarch64CodeGen {
     }
 
     /// The address of byte `byte` of the object in callee-frame slot `slot`.
-    pub(super) fn stack_mem_plus(&self, slot: LocalSlot, extra: i32) -> MemAddr {
+    pub(super) fn stack_mem_plus(&self, slot: LocalSlot, extra: i64) -> MemAddr {
         self.raw_mem(slot.displacement(), extra)
     }
 
     /// The address of byte `byte` of an incoming stack argument.
-    pub(super) fn incoming_mem_plus(&self, off: IncomingOff, extra: i32) -> MemAddr {
+    pub(super) fn incoming_mem_plus(&self, off: IncomingOff, extra: i64) -> MemAddr {
         self.raw_mem(off.displacement(), extra)
     }
 
     /// The address of byte `byte` of the object in stack slot `slot`.
-    pub(super) fn stack_field(&self, slot: LocalSlot, byte: i32) -> MemAddr {
+    pub(super) fn stack_field(&self, slot: LocalSlot, byte: i64) -> MemAddr {
         self.stack_mem_plus(slot, byte)
     }
 
     /// The base register and displacement addressing whatever frame `loc`
     /// names, for the sites that materialize an address with an `add` rather
     /// than folding it into a load or store.
-    pub(super) fn loc_addr_parts(&self, loc: &Loc) -> Option<(Reg, i32)> {
+    pub(super) fn loc_addr_parts(&self, loc: &Loc) -> Option<(Reg, i64)> {
         let raw = match loc {
             Loc::Stack(slot) => slot.displacement(),
             Loc::IncomingArg(off) => off.displacement(),
@@ -218,7 +218,7 @@ impl Aarch64CodeGen {
     }
 
     /// [`Self::loc_mem`] plus a byte offset into the object.
-    pub(super) fn loc_mem_plus(&self, loc: &Loc, extra: i32) -> Option<MemAddr> {
+    pub(super) fn loc_mem_plus(&self, loc: &Loc, extra: i64) -> Option<MemAddr> {
         let raw = match loc {
             Loc::Stack(slot) => slot.displacement(),
             Loc::IncomingArg(off) => off.displacement(),
@@ -294,7 +294,7 @@ impl Aarch64CodeGen {
     pub(super) fn emit_block(
         &mut self,
         block: &crate::ir::BasicBlock,
-        frame_info: &(i32, Vec<Reg>, Vec<VReg>),
+        frame_info: &(i64, Vec<Reg>, Vec<VReg>),
         types: &TypeTable,
     ) {
         // Always emit block ID label for consistency with jumps
@@ -577,7 +577,7 @@ impl Aarch64CodeGen {
     fn emit_insn(
         &mut self,
         insn: &Instruction,
-        frame_info: &(i32, Vec<Reg>, Vec<VReg>),
+        frame_info: &(i64, Vec<Reg>, Vec<VReg>),
         types: &TypeTable,
     ) {
         // Emit .loc directive for debug info
@@ -744,7 +744,7 @@ impl Aarch64CodeGen {
                             self.push_lir(Aarch64Inst::Add {
                                 size: OperandSize::B64,
                                 src1: base,
-                                src2: GpOperand::Imm(adjusted.into()),
+                                src2: GpOperand::Imm(adjusted),
                                 dst: dst_reg,
                             });
                         }

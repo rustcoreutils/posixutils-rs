@@ -2629,10 +2629,14 @@ impl Instruction {
     /// an offset afterwards (`validate.rs` I6). The backends used to narrow
     /// with `as i32`, which wrapped a member more than 2 GiB into a struct to
     /// a displacement gigabytes away.
-    pub fn displacement(&self) -> i32 {
+    ///
+    /// Handed out as an `i64`, the width every frame displacement it is
+    /// added to is computed in.
+    pub fn displacement(&self) -> i64 {
         debug_assert!(self.op.addresses_memory());
-        i32::try_from(self.offset)
-            .expect("a memory access offset past i32 reached a backend; Linearizer::emit folds it")
+        let disp = i32::try_from(self.offset)
+            .expect("a memory access offset past i32 reached a backend; Linearizer::emit folds it");
+        i64::from(disp)
     }
 
     pub fn load(target: PseudoId, addr: PseudoId, offset: i64, typ: TypeId, size: Bits) -> Self {

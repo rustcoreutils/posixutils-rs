@@ -32,13 +32,13 @@ pub enum MemAddr {
     Base(Reg),
 
     /// [base, #offset] - Register indirect with immediate offset
-    BaseOffset { base: Reg, offset: i32 },
+    BaseOffset { base: Reg, offset: i64 },
 
     /// [base, #offset]! - Pre-indexed (base updated before access)
-    PreIndex { base: Reg, offset: i32 },
+    PreIndex { base: Reg, offset: i64 },
 
     /// [base], #offset - Post-indexed (base updated after access)
-    PostIndex { base: Reg, offset: i32 },
+    PostIndex { base: Reg, offset: i64 },
 }
 
 impl MemAddr {

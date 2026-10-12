@@ -61,12 +61,8 @@ use crate::units::{Align, Bits, ByteSize};
 /// The placeholder is one eightbyte: non-zero, so the `& !(align - 1)`
 /// roundings and the `while done < bytes` copy loops that consume it still
 /// terminate, and small enough that nothing it feeds overflows in turn.
-pub fn slot_bytes(bytes: ByteSize, pos: crate::diag::Position, what: &str) -> i32 {
-    let bytes = checked_slot_size(bytes, pos, what);
-    match i32::try_from(bytes.get()) {
-        Ok(slot) => slot,
-        Err(_) => unreachable!("MAX_STACK_OBJECT_BYTES is below i32::MAX"),
-    }
+pub fn slot_bytes(bytes: ByteSize, pos: crate::diag::Position, what: &str) -> i64 {
+    checked_slot_size(bytes, pos, what).to_i64()
 }
 
 /// [`slot_bytes`] kept as a size: `bytes` itself when a frame slot can hold

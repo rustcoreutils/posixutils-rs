@@ -31,7 +31,7 @@ use crate::target::{ProbePlan, StackClash};
 
 /// Where each interval's probe goes: the caller's allowance above the new
 /// `sp`.
-const STEP_PROBE: i32 = StackClash::AARCH64_CALLER_GUARD as i32;
+const STEP_PROBE: i64 = StackClash::AARCH64_CALLER_GUARD;
 
 impl Aarch64CodeGen {
     /// The protection in force, which must only be asked for while it is on.
@@ -40,7 +40,7 @@ impl Aarch64CodeGen {
     }
 
     /// `str xzr, [sp, #offset]`: a probe.
-    fn probe_at(&mut self, offset: i32) {
+    fn probe_at(&mut self, offset: i64) {
         self.push_lir(Aarch64Inst::Str {
             size: OperandSize::B64,
             src: Reg::Xzr,
@@ -71,7 +71,7 @@ impl Aarch64CodeGen {
     /// within the guard. Returns the CFA's offset after. The loop counts
     /// down to X17, which is free at a prologue and at a call's argument
     /// setup, and describes the CFA from it while `sp` moves.
-    fn emit_probe_steps(&mut self, plan: ProbePlan, cfa: Option<i32>) -> Option<i32> {
+    fn emit_probe_steps(&mut self, plan: ProbePlan, cfa: Option<i64>) -> Option<i64> {
         let stack_clash = self.stack_clash();
         let arch = self.base.target.arch;
         let interval = stack_clash.interval(arch);
@@ -91,7 +91,7 @@ impl Aarch64CodeGen {
                     dst: Reg::X17,
                 });
                 if let Some(c) = cfa {
-                    self.push_cfi(Directive::cfi_def_cfa("x17", c + rounded as i32));
+                    self.push_cfi(Directive::cfi_def_cfa("x17", c + rounded));
                 }
                 let top = self.next_unique_label("probe_frame");
                 self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(top.clone())));
@@ -107,7 +107,7 @@ impl Aarch64CodeGen {
                     target: top,
                 });
                 if let Some(c) = cfa {
-                    let after = c + rounded as i32;
+                    let after = c + rounded;
                     self.push_cfi(Directive::cfi_def_cfa("sp", after));
                     cfa = Some(after);
                 }
@@ -124,11 +124,11 @@ impl Aarch64CodeGen {
     }
 
     /// `sp` down by `bytes`, described when `cfa` is known.
-    fn lower_sp(&mut self, bytes: i64, cfa: Option<i32>) -> Option<i32> {
+    fn lower_sp(&mut self, bytes: i64, cfa: Option<i64>) -> Option<i64> {
         match cfa {
             Some(c) => {
-                self.emit_sp_adjust(-(bytes as i32), c);
-                Some(c + bytes as i32)
+                self.emit_sp_adjust(-bytes, c);
+                Some(c + bytes)
             }
             None => {
                 self.sub_sp(bytes);
@@ -141,8 +141,8 @@ impl Aarch64CodeGen {
     /// is `sp` on entry: one move, or under the protection, once the frame
     /// reaches the guard less the caller's 1 KiB, gcc's probes. The frame
     /// record the prologue stores next, at the new `sp`, is the last probe.
-    pub(super) fn emit_frame_allocation(&mut self, total_frame: i32) {
-        match self.base.frame_probe_plan(i64::from(total_frame)) {
+    pub(super) fn emit_frame_allocation(&mut self, total_frame: i64) {
+        match self.base.frame_probe_plan(total_frame) {
             None => self.emit_sp_adjust(-total_frame, 0),
             Some(plan) => {
                 self.emit_probe_steps(plan, Some(0));

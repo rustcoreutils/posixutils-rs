@@ -1851,7 +1851,7 @@ impl X86_64CodeGen {
     pub(super) fn emit_va_arg_float(
         &mut self,
         ap_base: Reg,
-        ap_base_offset: i32,
+        ap_base_offset: i64,
         dst_loc: &Loc,
         arg_type: TypeId,
         label_suffix: u32,

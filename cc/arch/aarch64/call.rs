@@ -72,13 +72,13 @@ impl StackArg {
 struct PlacedArg {
     arg: StackArg,
     slot: StackSlot,
-    offset: i32,
+    offset: i64,
 }
 
 /// Stacked arguments laid out, and the byte just past the last of them.
 struct StackLayout {
     args: Vec<PlacedArg>,
-    end: i32,
+    end: i64,
 }
 
 /// Which argument registers a walk over the arguments may still hand out.
@@ -125,7 +125,7 @@ impl Aarch64CodeGen {
         insn: &Instruction,
         args_start: usize,
         types: &TypeTable,
-    ) -> i32 {
+    ) -> i64 {
         // `variadic_arg_start` counts the call's own arguments, while
         // `insn.src` carries the hidden sret pointer ahead of them, so the two
         // are one apart for a call that returns in memory. Comparing them
@@ -167,14 +167,14 @@ impl Aarch64CodeGen {
                     &self.base.target,
                 )
             });
-            let (start, end) = slot.place(i64::from(at));
+            let (start, end) = slot.place(at);
             max_align = max_align.max(crate::abi::slot_align(slot.align));
             placed.push(PlacedArg {
                 arg,
                 slot,
-                offset: i32::try_from(start).unwrap_or(i32::MAX),
+                offset: start,
             });
-            at = i32::try_from(end).unwrap_or(i32::MAX);
+            at = end;
         }
         if placed.is_empty() {
             return 0;
@@ -194,10 +194,10 @@ impl Aarch64CodeGen {
             // The reservation covers the arguments, the worst-case rounding
             // and the saved pointer, so the slot at `aligned_bytes` is always
             // inside it.
-            let reserve = aligned_bytes + max_align + 16;
+            let reserve = aligned_bytes + i64::from(max_align) + 16;
             // How far the rounding moves `sp` is known only when it runs, so
             // `-fstack-clash-protection` probes the most it can be first.
-            self.emit_probe_ahead(i64::from(reserve + max_align - 16));
+            self.emit_probe_ahead(reserve + i64::from(max_align) - 16);
             self.push_lir(Aarch64Inst::Add {
                 size: OperandSize::B64,
                 src1: Reg::sp(),
@@ -207,7 +207,7 @@ impl Aarch64CodeGen {
             self.push_lir(Aarch64Inst::Sub {
                 size: OperandSize::B64,
                 src1: Reg::sp(),
-                src2: GpOperand::Imm(reserve as i64),
+                src2: GpOperand::Imm(reserve),
                 dst: Reg::X17,
             });
             // A negative mask is not a logical immediate here, so it is
@@ -228,7 +228,7 @@ impl Aarch64CodeGen {
             });
             // The rounding below the reservation takes at most the
             // alignment less the sixteen `sp` already has.
-            self.base.sp_lowered(i64::from(reserve + max_align - 16));
+            self.base.sp_lowered(reserve + i64::from(max_align) - 16);
             self.push_lir(Aarch64Inst::Str {
                 size: OperandSize::B64,
                 src: Reg::X16,
@@ -239,8 +239,8 @@ impl Aarch64CodeGen {
             });
             self.darwin_va_sp_slot = Some(aligned_bytes);
         } else {
-            self.emit_call_area(aligned_bytes as i64);
-            self.base.sp_lowered(aligned_bytes as i64);
+            self.emit_call_area(aligned_bytes);
+            self.base.sp_lowered(aligned_bytes);
         }
 
         self.store_stack_args(placed, types);
@@ -257,7 +257,7 @@ impl Aarch64CodeGen {
         insn: &Instruction,
         args_start: usize,
         types: &TypeTable,
-    ) -> i32 {
+    ) -> i64 {
         let stack_args_info = self.assign_arg_registers(
             insn,
             args_start..insn.src.len(),
@@ -277,8 +277,8 @@ impl Aarch64CodeGen {
         // the area, and summing the sizes alone under-reserved it.
         let aligned_bytes = (placed.end + 15) & !15;
 
-        self.emit_call_area(aligned_bytes as i64);
-        self.base.sp_lowered(aligned_bytes as i64);
+        self.emit_call_area(aligned_bytes);
+        self.base.sp_lowered(aligned_bytes);
 
         self.store_stack_args(placed.args, types);
 
@@ -472,7 +472,7 @@ impl Aarch64CodeGen {
                         self.load_object_bytes(
                             int_arg_regs[int_arg_idx],
                             base,
-                            (k * 8) as i32,
+                            (k * 8) as i64,
                             take,
                         );
                         int_arg_idx += 1;
@@ -674,14 +674,11 @@ impl Aarch64CodeGen {
                 PlacedArg {
                     arg,
                     slot,
-                    offset: i32::try_from(start).unwrap_or(i32::MAX),
+                    offset: start,
                 }
             })
             .collect();
-        StackLayout {
-            args,
-            end: i32::try_from(at).unwrap_or(i32::MAX),
-        }
+        StackLayout { args, end: at }
     }
 
     /// Store each stacked argument at its offset from SP, writing no more
@@ -744,7 +741,7 @@ impl Aarch64CodeGen {
                 let (fp_size, imag_offset) = complex_fp_info(types, &self.base.target, typ);
                 let addr = self.aggregate_arg_address(stack_arg.pseudo);
 
-                for (step, elem_off) in [(0i32, 0i32), (1, imag_offset)].into_iter() {
+                for (step, elem_off) in [(0i64, 0i64), (1, imag_offset)].into_iter() {
                     self.push_lir(Aarch64Inst::LdrFp {
                         size: fp_size,
                         dst: VReg::V16,
@@ -775,7 +772,6 @@ impl Aarch64CodeGen {
                 let src = self.aggregate_arg_address(stack_arg.pseudo);
                 for (done, chunk) in crate::ir::memexpand::block_chunks(bytes) {
                     let size = OperandSize::from_bits(chunk.bits());
-                    let done = done as i32;
                     self.push_lir(Aarch64Inst::Ldr {
                         size,
                         addr: MemAddr::BaseOffset {
@@ -809,7 +805,7 @@ impl Aarch64CodeGen {
                         src: VReg::V16,
                         addr: MemAddr::BaseOffset {
                             base: Reg::SP,
-                            offset: offset + i as i32 * elem.bytes,
+                            offset: offset + i as i64 * elem.bytes,
                         },
                     });
                 }
@@ -884,7 +880,7 @@ impl Aarch64CodeGen {
     /// A width the hardware loads directly (1, 2, 4, 8) is one instruction.
     /// A ragged width is assembled from the pieces `block_chunks` gives, each
     /// shifted to its place, which is what clang emits for the same argument.
-    fn load_object_bytes(&mut self, dst: Reg, base: Reg, offset: i32, bytes: ByteSize) {
+    fn load_object_bytes(&mut self, dst: Reg, base: Reg, offset: i64, bytes: ByteSize) {
         for (at, chunk) in crate::ir::memexpand::block_chunks(bytes) {
             let size = OperandSize::from_bits(chunk.bits());
             // The first piece lands in `dst`; the rest are shifted into it
@@ -895,7 +891,7 @@ impl Aarch64CodeGen {
                 dst: into,
                 addr: MemAddr::BaseOffset {
                     base,
-                    offset: offset + at as i32,
+                    offset: offset + at,
                 },
             });
             if at != 0 {
@@ -934,7 +930,7 @@ impl Aarch64CodeGen {
                 self.push_lir(Aarch64Inst::Add {
                     size: OperandSize::B64,
                     src1: base,
-                    src2: GpOperand::Imm(disp as i64),
+                    src2: GpOperand::Imm(disp),
                     dst: Reg::X9,
                 });
                 Reg::X9
@@ -991,7 +987,7 @@ impl Aarch64CodeGen {
         types: &TypeTable,
     ) {
         let fp_size = elem.size;
-        let delta = index as i32 * elem.bytes;
+        let delta = index as i64 * elem.bytes;
         if types.byte_size(typ) > ByteSize::new(8) {
             let base = self.aggregate_arg_address(arg);
             self.push_lir(Aarch64Inst::LdrFp {
@@ -1020,7 +1016,7 @@ impl Aarch64CodeGen {
                     self.push_lir(Aarch64Inst::Lsr {
                         size: OperandSize::B64,
                         src: r,
-                        amount: GpOperand::Imm(delta as i64 * 8),
+                        amount: GpOperand::Imm(delta * 8),
                         dst: Reg::X9,
                     });
                     Reg::X9
@@ -1064,11 +1060,11 @@ impl Aarch64CodeGen {
         &mut self,
         insn: &Instruction,
         func_name: &str,
-        stack_args: i32,
+        stack_args: i64,
     ) {
         let area = match self.darwin_va_sp_slot {
             Some(saved_sp) => CallArgsArea::Realigned { saved_sp },
-            None => CallArgsArea::Fixed(i64::from(stack_args) * 16),
+            None => CallArgsArea::Fixed(stack_args * 16),
         };
         let site = self.base.eh_call_begin(insn, area);
         if insn.extra().indirect_target.is_some() {
@@ -1107,7 +1103,7 @@ impl Aarch64CodeGen {
     }
 
     /// Clean up stack after call
-    pub(super) fn cleanup_call_stack(&mut self, stack_args: i32) {
+    pub(super) fn cleanup_call_stack(&mut self, stack_args: i64) {
         // A realigned Darwin variadic area consumed an amount only known at
         // run time, so the matching `add` below cannot undo it; the pre-call
         // `%sp` was stored just above the arguments instead.
@@ -1133,10 +1129,10 @@ impl Aarch64CodeGen {
             self.push_lir(Aarch64Inst::Add {
                 size: OperandSize::B64,
                 src1: Reg::sp(),
-                src2: GpOperand::Imm((stack_args * 16) as i64),
+                src2: GpOperand::Imm(stack_args * 16),
                 dst: Reg::sp(),
             });
-            self.base.sp_raised(i64::from(stack_args * 16));
+            self.base.sp_raised(stack_args * 16);
         }
     }
 
@@ -1344,7 +1340,7 @@ impl Aarch64CodeGen {
                     self.push_lir(Aarch64Inst::StrFp {
                         size: fp_size,
                         src: vregs[i as usize],
-                        addr: self.stack_mem_plus(*offset, i as i32 * elem_size),
+                        addr: self.stack_mem_plus(*offset, i as i64 * elem_size),
                     });
                 }
             }
@@ -1355,7 +1351,7 @@ impl Aarch64CodeGen {
                         src: vregs[i as usize],
                         addr: MemAddr::BaseOffset {
                             base: *r,
-                            offset: i as i32 * elem_size,
+                            offset: i as i64 * elem_size,
                         },
                     });
                 }
@@ -1373,13 +1369,13 @@ impl Aarch64CodeGen {
 #[derive(Clone, Copy)]
 pub(super) struct HfaElem {
     pub(super) size: FpSize,
-    pub(super) bytes: i32,
+    pub(super) bytes: i64,
 }
 
 impl HfaElem {
     /// The size of `count` elements packed at their own stride.
     pub(super) fn packed(self, count: u8) -> ByteSize {
-        ByteSize::new(u64::from(count) * u64::from(self.bytes.unsigned_abs()))
+        ByteSize::new(u64::from(count) * self.bytes.unsigned_abs())
     }
 
     pub(super) fn of(base: HfaBase) -> HfaElem {
@@ -1391,7 +1387,7 @@ impl HfaElem {
         };
         HfaElem {
             size,
-            bytes: i32::try_from(base.bytes().get()).expect("an element is at most sixteen bytes"),
+            bytes: i64::try_from(base.bytes().get()).expect("an element is at most sixteen bytes"),
         }
     }
 }

@@ -402,6 +402,8 @@ impl Parser<'_> {
             gnu_extern_inline: attrs.gnu_inline_only(specs.storage_class),
         });
         self.settle_visibility(name, linkage, true, &mut attrs.symbol.visibility);
+        let ident = self.idents.get_opt(name).unwrap_or("").to_string();
+        attrs.symbol.call_diagnostics.name_function(&ident);
         // After the definition the name has the composite type of it and any
         // earlier declaration (C17 6.2.7p4): `int (*fp(void))[6] { .. }`
         // keeps the extent an earlier `int (*fp(void))[];` lacked, and an

@@ -2958,6 +2958,9 @@ pub struct CallDiagnostics {
     pub error: Option<String>,
     /// `warning("msg")`: each such call is a warning, `-Wattribute-warning`.
     pub warning: Option<String>,
+    /// The function's C identifier, which the reports name, as gcc's do: a
+    /// call names the symbol, which an asm label may have renamed.
+    pub name: Option<String>,
 }
 
 impl CallDiagnostics {
@@ -2969,6 +2972,17 @@ impl CallDiagnostics {
         }
         if other.warning.is_some() {
             self.warning = other.warning.clone();
+        }
+        if other.name.is_some() {
+            self.name = other.name.clone();
+        }
+    }
+
+    /// Record `name`, the function's C identifier, when there is anything
+    /// to report of its calls.
+    pub fn name_function(&mut self, name: &str) {
+        if self.error.is_some() || self.warning.is_some() {
+            self.name = Some(name.to_string());
         }
     }
 }

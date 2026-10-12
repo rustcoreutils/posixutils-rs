@@ -718,11 +718,13 @@ fn report_attribute_calls(module: &Module) {
                 continue;
             };
             let pos = insn.pos.unwrap_or_default();
+            // The C name, as gcc says it, not an asm label's.
+            let named = diags.name.as_deref().unwrap_or(callee);
             if let Some(msg) = &diags.error {
                 crate::diag::error_args(
                     pos,
                     "call to '{0}' declared with attribute error: {1}",
-                    &[callee, msg],
+                    &[named, msg],
                 );
             }
             if let Some(msg) = &diags.warning {
@@ -730,7 +732,7 @@ fn report_attribute_calls(module: &Module) {
                     "attribute-warning",
                     pos,
                     "call to '{0}' declared with attribute warning: {1}",
-                    &[callee, msg],
+                    &[named, msg],
                 );
             }
         }

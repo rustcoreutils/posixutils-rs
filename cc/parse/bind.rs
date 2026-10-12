@@ -624,7 +624,10 @@ impl Parser<'_> {
         // declaration of its name has promised.
         let pending_effect = self.take_pending_fn_effect();
         let mut symbol_attrs = std::mem::take(&mut self.pending_symbol_attrs);
-        if !is_fn {
+        if is_fn {
+            let ident = self.idents.get_opt(name).unwrap_or("");
+            symbol_attrs.call_diagnostics.name_function(ident);
+        } else {
             Self::drop_ifunc(&mut symbol_attrs, pos);
             // Already warned about as a function's attribute.
             symbol_attrs.call_diagnostics = Default::default();

@@ -171,6 +171,36 @@ void after(void) __attribute__((warning("after W")));
     );
 }
 
+/// A function renamed by an asm label is reported by its C name, as gcc
+/// reports it: the call names the symbol, `g`, and the report said so.
+#[test]
+fn reports_name_the_c_identifier_not_the_asm_label() {
+    let src = r#"int f(void) __asm__("g") __attribute__((error("x")));
+int w(void) __asm__("w_impl") __attribute__((warning("y")));
+__attribute__((warning("def"))) int d(void) __asm__("d_impl");
+__attribute__((noinline)) int d(void) { return 1; }
+int l(void) __asm__("l_impl");
+int h(void) { return f() + w() + d() + l(); }
+int l(void) __attribute__((error("late")));
+int k(void) { extern int m(void) __asm__("m_impl") __attribute__((warning("blk"))); return m(); }
+"#;
+    for opt in ["-O0", "-O2"] {
+        let (ok, got) = diagnostics("attr_asm_label", src, &[opt]);
+        assert!(!ok);
+        assert_eq!(
+            got,
+            [
+                "6:22: error: call to 'f' declared with attribute error: x",
+                "6:28: warning: call to 'w' declared with attribute warning: y [-Wattribute-warning]",
+                "6:34: warning: call to 'd' declared with attribute warning: def [-Wattribute-warning]",
+                "6:40: error: call to 'l' declared with attribute error: late",
+                "8:92: warning: call to 'm' declared with attribute warning: blk [-Wattribute-warning]",
+            ],
+            "{opt}"
+        );
+    }
+}
+
 /// `-Wno-attribute-warning` silences the warnings, never the errors.
 #[test]
 fn warning_group_is_attribute_warning() {

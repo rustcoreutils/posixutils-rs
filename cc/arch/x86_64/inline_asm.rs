@@ -16,7 +16,7 @@ use crate::arch::asm_constraints::{
 use crate::arch::codegen::{impossible_constant, AsmOperandValue};
 use crate::arch::lir::{plan_parallel_moves, Directive, FpSize, MoveStep};
 use crate::arch::x86_64::codegen::X86_64CodeGen;
-use crate::arch::x86_64::lir::X86Inst;
+use crate::arch::x86_64::lir::{MemAddr, X86Inst};
 use crate::arch::x86_64::regalloc::{asm_pinned_regs, Loc, Reg, XmmReg};
 use crate::ir::{AsmConstraint, AsmData, Instruction, PseudoId};
 use crate::units::Bits;
@@ -1113,8 +1113,17 @@ impl X86_64CodeGen {
                 return "0".to_string();
             };
             return match loc {
-                Loc::Stack(slot) => self.stack_field(*slot, offset.into()).format(&target),
-                Loc::IncomingArg(off) => format!("{}(%rbp)", off + i64::from(offset)),
+                Loc::Stack(slot) => {
+                    let addr = self.stack_field(*slot, offset.into());
+                    self.asm_frame_operand(addr, reserved, used, pos)
+                }
+                Loc::IncomingArg(off) => {
+                    let addr = MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: off + i64::from(offset),
+                    };
+                    self.asm_frame_operand(addr, reserved, used, pos)
+                }
                 Loc::Global(name) => {
                     if self.is_tls_symbol(name) || self.needs_got_access(name) {
                         let temp = find_temp_reg(reserved, used, pos);
@@ -1142,11 +1151,45 @@ impl X86_64CodeGen {
         }
     }
 
+    /// The template text of a memory operand in the frame at `addr`: the
+    /// address itself while its displacement fits the instruction, and past
+    /// 32 bits a register holding it, as the global operands above take a
+    /// register for an address the template cannot spell.
+    fn asm_frame_operand(
+        &mut self,
+        addr: MemAddr,
+        reserved: &std::collections::HashSet<Reg>,
+        used: &mut std::collections::HashSet<Reg>,
+        pos: Option<crate::diag::Position>,
+    ) -> String {
+        match addr {
+            MemAddr::BaseOffset { offset, .. } if !super::legalize::fits_i32(offset) => {
+                let temp = find_temp_reg(reserved, used, pos);
+                used.insert(temp);
+                self.push_lir(X86Inst::Lea { addr, dst: temp });
+                format!("({})", temp.name64())
+            }
+            addr => addr.format(&self.base.target),
+        }
+    }
+
     /// Convert a location to an asm operand string
     fn loc_to_asm_string(&self, loc: &Loc) -> String {
         match loc {
             Loc::Reg(r) => format!("%{}", self.reg_name_64(*r)),
-            Loc::Stack(offset) => self.stack_mem(*offset).format(&self.base.target),
+            Loc::Stack(offset) => {
+                let addr = self.stack_mem(*offset);
+                if let MemAddr::BaseOffset { offset, .. } = addr {
+                    if !super::legalize::fits_i32(offset) {
+                        crate::diag::error(
+                            self.base.func_pos,
+                            "an asm operand's stack slot lies past the displacement \
+                             an instruction can hold",
+                        );
+                    }
+                }
+                addr.format(&self.base.target)
+            }
             Loc::IncomingArg(offset) => {
                 format!("{}(%rbp)", offset)
             }

@@ -18,6 +18,7 @@ mod float;
 pub(crate) mod fp_regs;
 mod frame;
 mod inline_asm;
+mod legalize;
 pub mod lir;
 pub mod macros;
 pub(crate) mod mapping;

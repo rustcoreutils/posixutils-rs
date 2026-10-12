@@ -893,6 +893,9 @@ pub struct RegAlloc {
     max_local_align: i32,
     /// How this function's locals are addressed.
     frame_base: FrameBase,
+    /// The register held back for displacements past 32 bits, if the frame
+    /// may have any; see [`far_scratch_of`].
+    far_scratch: Option<Reg>,
     /// The size of every frame slot handed to a pseudo; see
     /// [`crate::arch::regalloc::SlotBytes`].
     slot_bytes: crate::arch::regalloc::SlotBytes,
@@ -1036,6 +1039,42 @@ impl FrameBase {
             FrameBase::Aligned { reg, .. } => Some(reg),
         }
     }
+}
+
+/// The register a function whose frame may reach past `i32` holds back as
+/// its *far scratch*: `super::legalize` loads each displacement no 32-bit
+/// field holds into it with `movabsq` and addresses through it.
+///
+/// Decided before allocation, from `crate::arch::regalloc::frame_reach`, an
+/// upper bound on every frame displacement, so allocation runs once; a
+/// function under the bound -- every frame under two gigabytes -- gives
+/// nothing up and comes out as it did. Callee-saved, so the prologue saves
+/// it like any register the function writes; and one the function's inline
+/// asm has not claimed, nor the frame base, nor a global register variable,
+/// for the reasons [`FrameBase::of`] gives. Taken from the far end of the
+/// callee-saved set, where the frame base is taken from the near one.
+fn far_scratch_of(
+    func: &Function,
+    types: &TypeTable,
+    global_registers: &[Reg],
+    frame_base: FrameBase,
+) -> Option<Reg> {
+    if crate::arch::regalloc::frame_reach(func, types) <= i32::MAX as u64 {
+        return None;
+    }
+    let mut claimed = FrameBase::asm_claimed_regs(func);
+    claimed.extend(global_registers.iter().copied());
+    claimed.extend(frame_base.reg());
+    const CANDIDATES: [Reg; 5] = [Reg::R15, Reg::R14, Reg::R13, Reg::R12, Reg::Rbx];
+    let reg = CANDIDATES.into_iter().find(|r| !claimed.contains(r));
+    if reg.is_none() {
+        crate::diag::error(
+            crate::arch::func_pos(func),
+            "inline asm claims every callee-saved register, leaving none \
+             to address this function's frame past two gigabytes",
+        );
+    }
+    reg
 }
 
 /// Whether a constraint point may leave `p` in a register it clobbers --
@@ -1315,6 +1354,7 @@ impl RegAlloc {
             live_out: Vec::new(),
             max_local_align: 8,
             frame_base: FrameBase::Rbp,
+            far_scratch: None,
             slot_bytes: HashMap::new(),
             arg_span: HashMap::new(),
             tls_access: crate::target::TlsAccess::ElfStatic,
@@ -1374,6 +1414,11 @@ impl RegAlloc {
         if let Some(base) = self.frame_base.reg() {
             // The prologue writes it, so the function must save it.
             self.used_callee_saved.push(base);
+        }
+        self.far_scratch = far_scratch_of(func, types, &self.global_registers, self.frame_base);
+        if let Some(scratch) = self.far_scratch {
+            // So does the legalizer, wherever it needs it.
+            self.used_callee_saved.push(scratch);
         }
         let allocatable = self.allocatable_regs();
         // Before any other slot: the first is the highest, nearest the saved
@@ -3080,12 +3125,18 @@ impl RegAlloc {
     /// and withholding the base from `free_regs` alone left it free to hand
     /// out the very register the prologue overwrites.
     fn allocatable_regs(&self) -> Vec<Reg> {
-        let claimed = self.frame_base.reg();
+        let claimed = [self.frame_base.reg(), self.far_scratch];
         Reg::allocatable()
             .iter()
             .copied()
-            .filter(|r| Some(*r) != claimed && !self.global_registers.contains(r))
+            .filter(|r| !claimed.contains(&Some(*r)) && !self.global_registers.contains(r))
             .collect()
+    }
+
+    /// The register this function reaches far displacements through, if its
+    /// frame may have any; see [`far_scratch_of`].
+    pub fn far_scratch(&self) -> Option<Reg> {
+        self.far_scratch
     }
 
     /// Get callee-saved registers that need to be preserved
@@ -3371,6 +3422,44 @@ mod tests {
         let neighbors: Vec<PseudoId> = graph.neighbors(PseudoId(1)).collect();
         assert!(neighbors.contains(&PseudoId(2)), "{neighbors:?}");
         assert!(!neighbors.contains(&PseudoId(3)), "{neighbors:?}");
+    }
+
+    /// Only a frame that may reach past `i32` holds back a far scratch: the
+    /// last callee-saved register the frame base, a global register variable
+    /// and inline asm leave it. Every other frame gives nothing up.
+    #[test]
+    fn far_scratch_only_for_a_frame_past_two_gigabytes() {
+        use crate::ir::{BasicBlock, BasicBlockId, Function};
+        use crate::types::Type;
+        let mut types = crate::types::TypeTable::new(&crate::target::Target::host());
+        let big = types.intern(Type::array(types.char_id, 3_000_000_000));
+        let small = types.intern(Type::array(types.char_id, 4096));
+        let func = |typ, clobbers: &[&str]| {
+            let mut func = Function::new("f", types.void_id);
+            func.add_local("a", PseudoId(1), typ, None, None);
+            let mut block = BasicBlock::new(BasicBlockId(0));
+            if !clobbers.is_empty() {
+                block.insns.push(make_asm_insn(clobbers, &[]));
+            }
+            func.blocks.push(block);
+            func
+        };
+        let near = func(small, &[]);
+        assert_eq!(far_scratch_of(&near, &types, &[], FrameBase::Rbp), None);
+        let far = func(big, &[]);
+        assert_eq!(
+            far_scratch_of(&far, &types, &[], FrameBase::Rbp),
+            Some(Reg::R15)
+        );
+        let base = FrameBase::Aligned {
+            reg: Reg::R13,
+            align: 32,
+        };
+        let claimed = func(big, &["r15"]);
+        assert_eq!(
+            far_scratch_of(&claimed, &types, &[Reg::R14], base),
+            Some(Reg::R12)
+        );
     }
 
     /// A `Q` operand is pinned to the first of %rax..%rdx that the statement

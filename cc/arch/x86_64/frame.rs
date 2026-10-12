@@ -265,6 +265,7 @@ impl X86_64CodeGen {
         }
         self.max_local_align = alloc.max_local_align();
         self.frame_base = alloc.frame_base();
+        self.far_scratch = alloc.far_scratch();
         self.x87_scratch = alloc.x87_scratch();
         self.x87_control_words = alloc.x87_control_words();
         // Pad callee_saved_offset to multiple of 16 so that 16-byte-aligned

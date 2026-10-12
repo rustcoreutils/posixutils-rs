@@ -672,6 +672,57 @@ mod tests {
         assert!(pair_offset_fits(1008, 16) && !pair_offset_fits(1024, 16));
     }
 
+    /// A frame past four gigabytes: the whole displacement goes into X15, a
+    /// MOVZ and a MOVK for each further halfword, and the access goes
+    /// through it -- on either side of x29, and for a pair.
+    #[test]
+    fn test_offsets_past_32_bits_go_through_the_scratch() {
+        let tib = 1i64 << 40;
+        assert_eq!(
+            asm(&run(ldr(OperandSize::B64, tib + 8))),
+            "    movz x15, #8\n    movk x15, #256, lsl #32\n    \
+             add x15, x29, x15\n    ldr x0, [x15]\n"
+        );
+        assert_eq!(
+            asm(&run(ldr(OperandSize::B64, -(tib + 16)))),
+            "    movz x15, #16\n    movk x15, #256, lsl #32\n    \
+             sub x15, x29, x15\n    ldr x0, [x15]\n"
+        );
+        // Every halfword set: one MOVZ and three MOVKs.
+        let out = run(ldr(OperandSize::B64, 0x1234_5678_9ABC_DEF0));
+        assert!(
+            asm(&out).starts_with(
+                "    movz x15, #57072\n    movk x15, #39612, lsl #16\n    \
+                 movk x15, #22136, lsl #32\n    movk x15, #4660, lsl #48\n"
+            ),
+            "{}",
+            asm(&out)
+        );
+        let out = run(stp(tib));
+        assert!(all_encodable(&out), "{}", asm(&out));
+        assert!(asm(&out).ends_with("stp x0, x1, [x15]\n"), "{}", asm(&out));
+    }
+
+    /// The prologue's allocation of a frame that size: the magnitude in X15
+    /// and the extended-register form, which is the one that takes `sp`.
+    #[test]
+    fn test_sp_moves_past_32_bits_go_through_the_scratch() {
+        let sub = Aarch64Inst::Sub {
+            size: OperandSize::B64,
+            src1: Reg::SP,
+            src2: GpOperand::Imm((1 << 40) + 32),
+            dst: Reg::SP,
+        };
+        assert_eq!(
+            asm(&run(sub)),
+            "    movz x15, #32\n    movk x15, #256, lsl #32\n    sub sp, sp, x15\n"
+        );
+        assert_eq!(
+            asm(&run(add(Reg::SP, 5 << 32, Reg::SP))),
+            "    movz x15, #5, lsl #32\n    add sp, sp, x15\n"
+        );
+    }
+
     #[test]
     fn test_far_load_expands_through_the_scratch() {
         let out = run(ldr(OperandSize::B64, 40000));

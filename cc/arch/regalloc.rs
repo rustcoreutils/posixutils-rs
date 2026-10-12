@@ -97,6 +97,69 @@ pub fn check_incoming_area(end: i64, pos: crate::diag::Position) {
     }
 }
 
+/// An upper bound on the bytes any frame displacement of `func` can span:
+/// how far from the frame pointer a local, a spill slot, a stacked
+/// argument, the variadic save area or a stack-pointer adjustment can lie.
+///
+/// Measured before allocation, from what the frame is made of, and never
+/// less than what allocation then lays out: every local counted whole and
+/// unshared, with its alignment's worth of padding; every pseudo as a spill
+/// slot of the largest kind; every parameter and the largest call's
+/// arguments as stacked; and the largest offset an access adds to its
+/// address. [`TypeTable::FRAME_HEADROOM_BYTES`] covers what the prologue adds.
+///
+/// x86-64 asks it to decide whether a function needs a far scratch register
+/// before it allocates the others (`far_scratch_of` in x86_64/regalloc.rs), so
+/// that allocation runs once; aarch64 has X15 for every function and does
+/// not ask. Saturating: a sum past `u64` is past every limit anyway.
+pub fn frame_reach(func: &Function, types: &TypeTable) -> u64 {
+    let object = |typ: crate::types::TypeId| {
+        types
+            .byte_size(typ)
+            .get()
+            .saturating_add(types.align(typ).bytes())
+    };
+    let locals = func
+        .locals
+        .values()
+        .map(|l| object(l.typ).saturating_add(u64::from(l.explicit_align.unwrap_or(0))))
+        .fold(0u64, u64::saturating_add);
+    let params = func
+        .params
+        .iter()
+        .map(|(_, typ)| object(*typ).saturating_add(16))
+        .fold(0u64, u64::saturating_add);
+    let mut call_args = 0u64;
+    let mut access = 0u64;
+    for insn in func.blocks.iter().flat_map(|b| b.insns.iter()) {
+        if insn.op == crate::ir::Opcode::Call {
+            let args = insn
+                .extra()
+                .arg_types
+                .iter()
+                .map(|t| object(*t).saturating_add(8))
+                .fold(16u64, u64::saturating_add);
+            call_args = call_args.max(args);
+        }
+        if insn.op.addresses_memory() {
+            access = access.max(insn.offset.unsigned_abs());
+        }
+    }
+    // The widest slot a pseudo is spilled to, with its alignment.
+    const SPILL_SLOT_BYTES: u64 = 64;
+    let spills = (func.pseudos.len() as u64).saturating_mul(SPILL_SLOT_BYTES);
+    [
+        locals,
+        params,
+        call_args,
+        access,
+        spills,
+        TypeTable::FRAME_HEADROOM_BYTES as u64,
+    ]
+    .into_iter()
+    .fold(0u64, u64::saturating_add)
+}
+
 // ============================================================================
 // LocationMap — single owner for PseudoId → Loc bindings
 // ============================================================================

@@ -30,6 +30,11 @@ pub enum MemAddr {
     /// [base + offset] - Register indirect with displacement
     BaseOffset { base: Reg, offset: i64 },
 
+    /// `(%base,%index)`: base plus index, unscaled. Only the legalizer builds
+    /// one, for a displacement no 32-bit field holds: `movabsq` puts the
+    /// displacement in `index` first (see `super::legalize`).
+    BaseIndex { base: Reg, index: Reg },
+
     /// [rip + symbol] - PC-relative addressing for position-independent code
     RipRelative(Symbol),
 
@@ -104,6 +109,9 @@ impl MemAddr {
                 } else {
                     format!("{}({})", offset, base.name64())
                 }
+            }
+            MemAddr::BaseIndex { base, index } => {
+                format!("({},{})", base.name64(), index.name64())
             }
             MemAddr::RipRelative(sym) => {
                 format!("{}(%rip)", sym.format_for_target(target))
@@ -614,7 +622,7 @@ impl PackedOp {
 }
 
 /// x86-64 Low-level IR instruction
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum X86Inst {
     // ========================================================================
     // Data Movement

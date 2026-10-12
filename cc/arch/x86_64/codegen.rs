@@ -118,6 +118,9 @@ pub struct X86_64CodeGen {
     /// the part of the frame the prologue leaves unprobed. See
     /// `X86_64CodeGen::emit_frame_allocation`.
     pub(super) unprobed_frame: i64,
+    /// The register the current function reaches displacements past 32
+    /// bits through, when its frame may have any; see `super::legalize`.
+    pub(super) far_scratch: Option<Reg>,
 }
 
 impl X86_64CodeGen {
@@ -153,6 +156,7 @@ impl X86_64CodeGen {
             win64_xmm_saves: Vec::new(),
             incoming_pointers: HashSet::new(),
             unprobed_frame: 0,
+            far_scratch: None,
         }
     }
 
@@ -173,9 +177,15 @@ impl X86_64CodeGen {
         });
     }
 
-    /// Push a LIR instruction to the buffer (deferred emission)
+    /// Push a LIR instruction to the buffer (deferred emission), through
+    /// [`super::legalize::legalize`]: one whose displacement or immediate is
+    /// past 32 bits goes through the function's far scratch.
     pub(super) fn push_lir(&mut self, inst: X86Inst) {
-        self.base.push_lir(inst);
+        let mut out = Vec::with_capacity(1);
+        super::legalize::legalize(inst, self.far_scratch, &mut out);
+        for inst in out {
+            self.base.push_lir(inst);
+        }
     }
 
     /// Save `reg` on the stack in the body, for a [`Self::pop_saved`] to

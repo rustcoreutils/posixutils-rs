@@ -15,10 +15,18 @@
 
 use crate::common::{compile_and_run, preprocess_text, run_c17};
 
+/// The preprocessed text without its line markers, which name the source
+/// file: a temporary whose random name could hold any needle.
+fn text_of(out: &str) -> String {
+    out.split_inclusive('\n')
+        .filter(|l| !l.starts_with("# "))
+        .collect()
+}
+
 /// Assert the preprocessed text contains `needle`.
 fn assert_has(out: &str, needle: &str, what: &str) {
     assert!(
-        out.contains(needle),
+        text_of(out).contains(needle),
         "{}: expected {:?} in -E output:\n{}",
         what,
         needle,
@@ -29,7 +37,7 @@ fn assert_has(out: &str, needle: &str, what: &str) {
 /// Assert the preprocessed text does *not* contain `needle`.
 fn assert_lacks(out: &str, needle: &str, what: &str) {
     assert!(
-        !out.contains(needle),
+        !text_of(out).contains(needle),
         "{}: did not expect {:?} in -E output:\n{}",
         what,
         needle,

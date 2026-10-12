@@ -448,6 +448,20 @@ impl Parser<'_> {
         if let Some(attrs) = &fn_attrs {
             let body_follows = self.is_special(b'{') || self.is_declaration_start();
             if scope == DeclScope::File && first && body_follows {
+                // gcc's grammar has no attribute and no asm label between a
+                // definition's declarator and its body: the first it takes
+                // with an error, the second is a syntax error.
+                match self.extension_just_ended() {
+                    Some("__attribute__" | "__attribute") => diag::error(
+                        pos,
+                        "attributes should be specified before the declarator in a function definition",
+                    ),
+                    Some(_) if self.is_special(b'{') => diag::error(
+                        self.current_pos(),
+                        "expected ',' or ';' before '{' token",
+                    ),
+                    _ => {}
+                }
                 // C17 6.9.1p2: the declarator itself gives a definition its
                 // function type; one that came from a typedef has no
                 // parameter list for the body to name.

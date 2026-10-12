@@ -54,15 +54,15 @@ int caller(int x) { return small(x) + small_ok(x); }
     }
 }
 
-/// The attribute is honoured in either spelling and wherever it sits -- before
-/// or after the declaration specifiers, on the definition, or on nothing but
-/// an earlier prototype, which is how gcc treats it.
+/// The attribute is honoured in either spelling and wherever gcc takes it --
+/// before or after the declaration specifiers of the definition, or on
+/// nothing but an earlier prototype. After a definition's declarator gcc
+/// refuses it (`definition_attributes_after_the_declarator`).
 #[test]
 fn codegen_noinline_spellings_and_placement() {
     for src in [
         "static __attribute__((noinline)) int f(int x) { return x + 1; }\nint g(int x){return f(x);}",
         "__attribute__((noinline)) static int f(int x) { return x + 1; }\nint g(int x){return f(x);}",
-        "static int f(int x) __attribute__((noinline)) { return x + 1; }\nint g(int x){return f(x);}",
         "static __attribute__((__noinline__)) int f(int x) { return x + 1; }\nint g(int x){return f(x);}",
         "static int f(int x) __attribute__((noinline));\nstatic int f(int x) { return x + 1; }\nint g(int x){return f(x);}",
     ] {

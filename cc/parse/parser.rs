@@ -650,6 +650,40 @@ impl<'a> Parser<'a> {
         None
     }
 
+    /// The GNU extension the tokens just before the current one end with --
+    /// `__attribute__((...))` or `__asm__("...")` -- by its keyword's
+    /// spelling, if they end with one.
+    pub(super) fn extension_just_ended(&self) -> Option<&str> {
+        let special = |t: &Token, c: u8| matches!(t.value, TokenValue::Special(v) if v == c as u32);
+        let mut i = self.pos.checked_sub(1)?;
+        if !special(self.tokens.get(i)?, b')') {
+            return None;
+        }
+        let mut depth = 0usize;
+        loop {
+            let t = self.tokens.get(i)?;
+            if special(t, b')') {
+                depth += 1;
+            } else if special(t, b'(') {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            i = i.checked_sub(1)?;
+        }
+        let keyword = self.tokens.get(i.checked_sub(1)?)?;
+        match &keyword.value {
+            TokenValue::Ident(id) => self.idents.get_opt(*id).filter(|k| {
+                matches!(
+                    *k,
+                    "__attribute__" | "__attribute" | "asm" | "__asm" | "__asm__"
+                )
+            }),
+            _ => None,
+        }
+    }
+
     pub(crate) fn is_special(&self, c: u8) -> bool {
         self.peek_special() == Some(c as u32)
     }

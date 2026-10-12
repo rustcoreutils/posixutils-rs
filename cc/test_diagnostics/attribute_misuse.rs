@@ -320,3 +320,38 @@ fn malloc_and_copy_arguments_as_gcc_reads_them() {
         assert!(got.is_empty(), "{decl}: {got:#?}");
     }
 }
+
+/// gcc's grammar puts a function definition's attributes before its
+/// declarator: one after it is gcc's error, and an asm label there is a
+/// syntax error, as in gcc 13.
+#[test]
+fn definition_attributes_after_the_declarator() {
+    for (src, said) in [
+        (
+            "void f(void) __attribute__((noinline)) { }\n",
+            "error: attributes should be specified before the declarator in a function definition",
+        ),
+        (
+            "void f(void) __attribute__((noinline)) __attribute__((cold)) { }\n",
+            "error: attributes should be specified before the declarator in a function definition",
+        ),
+        (
+            "void (*f(void))(void) __attribute__((noinline)) { return 0; }\n",
+            "error: attributes should be specified before the declarator in a function definition",
+        ),
+        (
+            "void f(void) __asm__(\"g\") { }\n",
+            "error: expected ',' or ';' before '{' token",
+        ),
+    ] {
+        assert_eq!(messages("def_attr_after", src), [said], "{src}");
+    }
+    for src in [
+        "__attribute__((noinline)) void f(void) { }\n",
+        "void __attribute__((noinline)) f(void) { }\n",
+        "void f(int x __attribute__((unused))) { }\n",
+        "void f(void) __attribute__((noinline));\nvoid f(void) { }\n",
+    ] {
+        assert!(messages("def_attr_before", src).is_empty(), "{src}");
+    }
+}

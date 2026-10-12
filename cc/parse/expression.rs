@@ -1515,6 +1515,8 @@ impl<'a> Parser<'a> {
                 None => Some(self.array_size_from_elements(&elements, elem_type)),
             }
             .unwrap_or_else(|| self.array_size_from_elements(&elements, elem_type));
+            // A designator can size the array past what an object may be.
+            self.check_array_bound(elem_type, array_size, paren_pos)?;
             self.types.intern(Type::array(elem_type, array_size))
         } else {
             typ

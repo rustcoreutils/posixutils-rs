@@ -684,6 +684,22 @@ fn diagnostics_object_larger_than_the_compiler_can_describe() {
             "array_one_past_ptrdiff_max",
             "typedef char T[9223372036854775808UL];\nint main(void){ return 0; }\n",
         ),
+        // An array sized by its initializer is measured as well: a designator
+        // past the bound used to give an object of 2^63 + 16 bytes, and one
+        // whose size overflowed `u64` an internal compiler error (before
+        // that, a wrapped `.size`).
+        (
+            "array_sized_by_designator",
+            "long a[] = {[0x1000000000000001] = 1};\nint main(void){ return 0; }\n",
+        ),
+        (
+            "array_sized_by_designator_past_u64",
+            "long a[] = {[0x2000000000000001] = 1};\nint main(void){ return 0; }\n",
+        ),
+        (
+            "compound_literal_sized_by_designator",
+            "int main(void){ return ((long[]){[0x1000000000000001] = 1})[0]; }\n",
+        ),
     ] {
         compile_expect_error(
             name,

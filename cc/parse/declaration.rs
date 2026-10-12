@@ -752,6 +752,11 @@ impl Parser<'_> {
         };
 
         if let Some(size) = new_size {
+            // A designator can size the array past what an object may be.
+            if let Err(e) = self.check_array_bound(elem_type, size, init.pos) {
+                diag::error(e.pos, &e.message);
+                return typ;
+            }
             // Update type with actual size from initializer
             // Preserve modifiers (like const, static)
             let modifiers = self.types.modifiers(typ);
@@ -787,19 +792,32 @@ impl Parser<'_> {
         pos: Position,
     ) -> Result<TypeId, ParseError> {
         if let ArrayExtent::Known(count) = extent {
-            let total = self.types.byte_size(elem).checked_mul(count as u64);
-            let max = self.types.max_object_bytes();
-            if total.is_none_or(|total| total > max) {
-                return Err(ParseError::new(
-                    format!(
-                        "size of array is too large: it exceeds the maximum \
-                         object size of {max} bytes"
-                    ),
-                    pos,
-                ));
-            }
+            self.check_array_bound(elem, count, pos)?;
         }
         Ok(self.types.intern(Type::array_of(elem, extent)))
+    }
+
+    /// Refuse an array of `count` elements of `elem` past
+    /// [`TypeTable::max_object_bytes`]: the one bound every array type is
+    /// held to, whether its extent was written or an initializer gave it.
+    pub(super) fn check_array_bound(
+        &self,
+        elem: TypeId,
+        count: usize,
+        pos: Position,
+    ) -> Result<(), ParseError> {
+        let total = self.types.byte_size(elem).checked_mul(count as u64);
+        let max = self.types.max_object_bytes();
+        if total.is_none_or(|total| total > max) {
+            return Err(ParseError::new(
+                format!(
+                    "size of array is too large: it exceeds the maximum \
+                     object size of {max} bytes"
+                ),
+                pos,
+            ));
+        }
+        Ok(())
     }
 
     /// Refuse an object the backend cannot give a stack slot.

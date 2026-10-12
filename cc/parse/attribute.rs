@@ -1972,6 +1972,13 @@ impl Parser<'_> {
     /// so it changes nothing but is placed by the same rule.
     fn apply_pending_fn_type_attrs(&mut self, typ: TypeId) -> TypeId {
         let pending = std::mem::take(&mut self.pending_fn_type);
+        self.apply_fn_type_attrs(pending, typ)
+    }
+
+    /// [`Self::apply_pending_fn_type_attrs`] for the attributes `pending`,
+    /// by the same placement rule: what a grouped declarator holds is
+    /// placed on the type the group is derived over.
+    pub(super) fn apply_fn_type_attrs(&mut self, pending: FnTypeAttrs, typ: TypeId) -> TypeId {
         if pending.conv.is_none() && pending.nocf_check.is_none() && pending.vector_pcs.is_none() {
             return typ;
         }
@@ -2347,6 +2354,17 @@ pub(super) struct FnTypeAttrs {
     nocf_check: Option<Position>,
     /// `aarch64_vector_pcs` (aarch64 only).
     vector_pcs: Option<Position>,
+}
+
+impl FnTypeAttrs {
+    /// Take on `inner`'s attributes, which a group nested in this
+    /// declarator wrote, for the type this level will place them on; one
+    /// written here first is kept.
+    pub(super) fn absorb(&mut self, inner: FnTypeAttrs) {
+        self.conv = self.conv.or(inner.conv);
+        self.nocf_check = self.nocf_check.or(inner.nocf_check);
+        self.vector_pcs = self.vector_pcs.or(inner.vector_pcs);
+    }
 }
 
 /// Every slot an attribute list writes for the declaration being parsed.

@@ -253,3 +253,70 @@ int main(void) {
 "#;
     compile_and_run_everywhere("asm_flag_outputs_goto", src);
 }
+
+/// Flag outputs of every type gcc lays out as an integer: `__int128`, and a
+/// struct, union or array of 1, 2, 4, 8 or 16 bytes whose members are no
+/// floating value filling it. The whole object is written, 0 or 1 in its
+/// low byte and zeros above, as gcc writes the integer mode. c17 refused
+/// all of these ("invalid type for 'asm' flag output").
+#[test]
+fn asm_flag_outputs_integer_layout_types() {
+    let src = r#"
+#include <string.h>
+#if defined(__x86_64__)
+#define CMP "cmp %2, %1"
+#define EQ "=@ccz"
+#elif defined(__aarch64__)
+#define CMP "cmp %1, %2"
+#define EQ "=@cceq"
+#endif
+#define FLAG(T, a, b) ({ T x; memset(&x, 0xa5, sizeof x); \
+    __asm__(CMP : EQ(x) : "r"((long)(a)), "r"((long)(b))); check(&x, sizeof x, (a) == (b)); })
+
+static int bad;
+static void check(const void *p, unsigned n, int want) {
+    const unsigned char *b = p;
+    if (b[0] != want) bad = 1;
+    for (unsigned i = 1; i < n; i++)
+        if (b[i] != 0) bad = 1;
+}
+
+struct S1 { char c; };
+struct S2 { char a, b; };
+struct S4 { int i; };
+struct S8 { long l; };
+struct S16 { long a, b; };
+struct FF { float a, b; };
+struct FI { float f; int i; };
+struct BF { int b : 3; };
+struct NS { struct S2 s; short t; };
+struct A2 { short a[2]; };
+union UF { float f; };
+union UL { long l; char c[8]; };
+struct LI { long a; int b; };
+
+int main(void) {
+    for (int a = 0; a < 2; a++) {
+        FLAG(__int128, a, 1);
+        FLAG(unsigned __int128, a, 1);
+        FLAG(struct S1, a, 1);
+        FLAG(struct S2, a, 1);
+        FLAG(struct S4, a, 1);
+        FLAG(struct S8, a, 1);
+        FLAG(struct S16, a, 1);
+        FLAG(struct FF, a, 1);
+        FLAG(struct FI, a, 1);
+        FLAG(struct BF, a, 1);
+        FLAG(struct NS, a, 1);
+        FLAG(struct A2, a, 1);
+        FLAG(union UF, a, 1);
+        FLAG(union UL, a, 1);
+        FLAG(struct LI, a, 1);
+        typedef char C4[4];
+        FLAG(C4, a, 1);
+    }
+    return bad;
+}
+"#;
+    compile_and_run_everywhere("asm_flag_outputs_layouts", src);
+}

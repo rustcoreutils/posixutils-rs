@@ -612,6 +612,18 @@ impl FloatClass {
     }
 }
 
+/// The class of machine mode gcc gives a type, as far as
+/// [`TypeTable::integer_mode_bits`] needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MachineMode {
+    /// An integer mode of this many bits: QImode to TImode.
+    Int(u32),
+    /// A floating, complex or vector mode.
+    Other,
+    /// No mode: BLKmode.
+    Blk,
+}
+
 // Type Representation
 
 /// How many elements an array type has (C17 6.7.6.2p4): a number the
@@ -2895,6 +2907,93 @@ impl TypeTable {
             },
             _ => return None,
         })
+    }
+
+    /// The width of the integer machine mode gcc gives `id` -- QImode to
+    /// TImode, 8 to 128 bits -- or `None` where gcc gives it a floating,
+    /// complex or vector mode, or none (BLKmode). What gcc asks of a flag
+    /// output's operand, which may therefore be an `__int128` or a small
+    /// struct, union or array laid out as an integer.
+    ///
+    /// gcc's layout rules (`stor-layout.cc`): a struct whose one member fills
+    /// it takes that member's mode (`struct { double d; }` is DFmode), a
+    /// union only an integer one, and otherwise each is the integer mode of
+    /// its size, unless a member has no mode; an array of one element takes
+    /// the element's, and of more the integer mode of its size; a vector has
+    /// a vector mode where the target has one -- x86-64 down to two bytes,
+    /// aarch64 at eight and sixteen -- and is otherwise an integer.
+    pub fn integer_mode_bits(&self, id: TypeId) -> Option<u32> {
+        match self.machine_mode(id) {
+            MachineMode::Int(bits) => Some(bits),
+            MachineMode::Other | MachineMode::Blk => None,
+        }
+    }
+
+    /// gcc's machine mode for `id`, as far as [`Self::integer_mode_bits`]
+    /// needs it.
+    fn machine_mode(&self, id: TypeId) -> MachineMode {
+        let bits_of = |bytes: u64| match bytes {
+            1 | 2 | 4 | 8 | 16 => MachineMode::Int(bytes as u32 * 8),
+            _ => MachineMode::Blk,
+        };
+        if self.is_complex(id) || self.is_float(id) {
+            return MachineMode::Other;
+        }
+        let bytes = self.byte_size(id).get();
+        if self.is_vector(id) {
+            let vector_mode = match self.target_arch {
+                Arch::X86_64 => (2..=16).contains(&bytes),
+                Arch::Aarch64 => bytes == 8 || bytes == 16,
+            };
+            return if vector_mode {
+                MachineMode::Other
+            } else {
+                bits_of(bytes)
+            };
+        }
+        match self.kind(id) {
+            TypeKind::Array => {
+                let elem = self.base_type(id).unwrap_or(id);
+                match (self.array_extent(id), self.machine_mode(elem)) {
+                    (ArrayExtent::Known(_), MachineMode::Blk) => MachineMode::Blk,
+                    (ArrayExtent::Known(_), m) if bytes == self.byte_size(elem).get() => m,
+                    (ArrayExtent::Known(_), _) => bits_of(bytes),
+                    _ => MachineMode::Blk,
+                }
+            }
+            TypeKind::Struct | TypeKind::Union => {
+                let Some(comp) = self.composite(id).filter(|c| c.is_complete) else {
+                    return MachineMode::Blk;
+                };
+                let mut whole = None;
+                for m in &comp.members {
+                    let size = self.byte_size(m.typ).get();
+                    // A flexible array member has no size, and gcc then gives
+                    // the struct no mode.
+                    let flexible = self.kind(m.typ) == TypeKind::Array
+                        && self.array_extent(m.typ) == ArrayExtent::Unknown;
+                    let mode = self.machine_mode(m.typ);
+                    if flexible || (mode == MachineMode::Blk && size != 0) {
+                        return MachineMode::Blk;
+                    }
+                    if m.bit_width.is_none() && size == bytes {
+                        whole = Some(mode);
+                    }
+                }
+                let is_struct = self.kind(id) == TypeKind::Struct;
+                match whole {
+                    Some(m) if is_struct => m,
+                    Some(m @ MachineMode::Int(_)) => m,
+                    _ => bits_of(bytes),
+                }
+            }
+            _ if self.is_integer(id)
+                || matches!(self.kind(id), TypeKind::Pointer | TypeKind::Bool) =>
+            {
+                bits_of(bytes)
+            }
+            _ => MachineMode::Blk,
+        }
     }
 
     /// The real type a floating complex `*` or `/` whose halves have type

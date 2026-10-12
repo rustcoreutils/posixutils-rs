@@ -8,8 +8,8 @@
 //
 // Flag output operands, `"=@cc<cond>"`, and what gcc refuses of them: a
 // condition the target does not name, alternatives, a flag constraint on an
-// input, a type that is not an integer or a pointer, and a template naming
-// the operand.
+// input, a type gcc gives no integer machine mode, and a template naming the
+// operand.
 //
 
 use super::asm_constraints::{expect_accepted, expect_rejected, A64, OPTS, X86};
@@ -141,6 +141,70 @@ fn asm_flag_output_in_asm_goto_is_read_on_every_path() {
         let asm = expect_accepted("asm_flag_goto_a64", &a64, A64, opt);
         assert_eq!(asm.matches(", eq\n").count(), 2, "{opt}:\n{asm}");
         assert!(asm.contains("b.eq .L.asm_goto_flags."), "{opt}:\n{asm}");
+    }
+}
+
+/// The operand types gcc takes for a flag output, by the machine mode it
+/// gives each: an integer mode, QImode to TImode, and nothing else. Each
+/// verdict is gcc 13's on both targets, the object's value used after the
+/// statement (gcc at -O1 and up checks no output whose value is dead).
+#[test]
+fn asm_flag_output_types_by_machine_mode() {
+    let decls = "struct S1 { char c; }; struct S2 { char a, b; }; struct S16 { long a, b; };\n\
+                 struct FF { float a, b; }; struct D1 { double d; }; union UF { float f; };\n\
+                 struct NF { struct { float f; } in; }; struct BF { int b : 3; };\n\
+                 struct B3 { char c[3]; char d; }; struct P5 { char c; int i; } __attribute__((packed));\n\
+                 struct LD { long double l; }; struct E0 { };\n\
+                 typedef char c4 __attribute__((vector_size(4)));\n\
+                 typedef char c1 __attribute__((vector_size(1)));\n\
+                 typedef short s8 __attribute__((vector_size(8)));\n";
+    // (type, x86-64 takes it, aarch64 takes it)
+    let cases: &[(&str, bool, bool)] = &[
+        ("__int128", true, true),
+        ("unsigned __int128", true, true),
+        ("struct S1", true, true),
+        ("struct S2", true, true),
+        ("struct S16", true, true),
+        ("struct FF", true, true),
+        ("union UF", true, true),
+        ("struct BF", true, true),
+        ("char[4]", true, true),
+        ("c1", true, true),
+        ("c4", false, true),
+        ("s8", false, false),
+        ("struct D1", false, false),
+        ("struct NF", false, false),
+        ("struct B3", false, false),
+        ("struct P5", false, false),
+        ("struct LD", false, false),
+        ("struct E0", false, false),
+        ("char[3]", false, false),
+        ("float[1]", false, false),
+        ("_Complex int", false, false),
+        ("double", false, false),
+    ];
+    for &(typ, x86, a64) in cases {
+        let (name, dims) = match typ.split_once('[') {
+            Some((base, rest)) => (base.to_string(), format!("[{rest}")),
+            None => (typ.to_string(), String::new()),
+        };
+        for (target, takes, cond) in [(X86, x86, "z"), (A64, a64, "eq")] {
+            let src = format!(
+                "{decls}void sink(void *);\n\
+                 void f(long a) {{\n\
+                 {name} x{dims}; __asm__(\"\" : \"=@cc{cond}\"(x) : \"r\"(a));\n\
+                 sink(&x);\n\
+                 }}\n"
+            );
+            for opt in OPTS {
+                if takes {
+                    expect_accepted("asm_flag_type", &src, target, opt);
+                } else {
+                    let wanted = "invalid type for 'asm' flag output";
+                    expect_rejected("asm_flag_type", &src, target, opt, wanted, 11);
+                }
+            }
+        }
     }
 }
 

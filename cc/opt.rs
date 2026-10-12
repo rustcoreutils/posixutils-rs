@@ -668,6 +668,9 @@ pub fn optimize_module(
             dce::run(func);
             func.remove_nops();
         }
+        // Two operands pinned to one register can share it only when they
+        // hold one value, which the optimizer is what proves.
+        asm_operand::resolve_pinned_registers(func, target.arch, opt.optimizes());
     }
 
     // An address that survived everything above would reach the link as an

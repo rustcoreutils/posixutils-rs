@@ -10,7 +10,9 @@
 // status cannot show. Moved from `tests/codegen/regalloc.rs`.
 //
 
-use super::asm_probe::{asm_for_with, body_of, AARCH64_LINUX};
+use super::asm_probe::{
+    asm_for_with, assert_body_lacks, body_of, stack_use, AARCH64_LINUX, X86_64_LINUX,
+};
 
 /// A value is read back at the width it was stored at.
 ///
@@ -61,4 +63,73 @@ __attribute__((noinline)) int many_fcmp(double a, double b) {
             );
         }
     }
+}
+
+/// Each value of `chain` is the result of one call and an argument of the
+/// next: it is never live *across* a call, so it needs no callee-saved
+/// register, and the incoming argument, already in the register the first
+/// call takes it in, needs no frame slot. The frame is gcc's: the return
+/// address and the saved frame pointer.
+///
+/// Every call position used to count as crossing for its own result and
+/// for every value whose positions merely spanned it, so each of these
+/// values took `%rbx` or `%r12`, and `a` a frame slot: 48 bytes.
+#[test]
+fn values_between_calls_take_no_callee_saved_register() {
+    let src = "long g(long);\n\
+               long chain(long a) {\n\
+                   long x = g(a) + 1; long y = g(x) + 2; long z = g(y) + 3;\n\
+                   return g(z);\n\
+               }\n";
+    let used = stack_use("chain_frame", X86_64_LINUX, src, &["-O2"]);
+    assert_eq!(used["chain"], 16, "{used:?}");
+    let asm = asm_for_with("chain_regs", X86_64_LINUX, src, &["-O2"]);
+    for reg in ["%rbx", "%r12", "%r13", "%r14", "%r15"] {
+        assert_body_lacks(&asm, "chain", reg, "no value lives across a call");
+    }
+}
+
+/// `x` is computed before a branch and read only on the arm that makes no
+/// call; the arm with the call is laid out between them, so the hull of
+/// `x`'s positions spans the call, but `x` is dead there. It takes a
+/// caller-saved register: no callee-saved register is saved, on either
+/// target.
+#[test]
+fn a_value_whose_positions_span_a_call_it_is_dead_across_is_caller_saved() {
+    let src = "long g(long);\n\
+               long spans_call(long a, long b) {\n\
+                   long x = a * b;\n\
+                   if (b > 3) return g(a) + 1;\n\
+                   return (x ^ a) + x;\n\
+               }\n";
+    let used = stack_use("spans_call_frame", X86_64_LINUX, src, &["-O2"]);
+    assert_eq!(used["spans_call"], 16, "{used:?}");
+    let asm = asm_for_with("spans_call_x86", X86_64_LINUX, src, &["-O2"]);
+    for reg in ["%rbx", "%r12", "%r13", "%r14", "%r15"] {
+        assert_body_lacks(&asm, "spans_call", reg, "x is dead across the call");
+    }
+    let asm = asm_for_with("spans_call_a64", AARCH64_LINUX, src, &["-O2"]);
+    for reg in ["x19", "x20", "x21"] {
+        assert_body_lacks(&asm, "spans_call", reg, "x is dead across the call");
+    }
+}
+
+/// The same for a constraint: `x`'s positions span an `idivq`, which
+/// writes `%rax` and `%rdx`, but `x` is dead there, so it may take `%rax`
+/// -- the first register the colorer tries.
+#[test]
+fn a_value_dead_across_a_distant_divide_may_take_rax() {
+    let src = "long spans_div(long a, long b, long c) {\n\
+                   long x = a - b;\n\
+                   if (c > 3) return a / c;\n\
+                   return x + b;\n\
+               }\n";
+    let asm = asm_for_with("spans_div", X86_64_LINUX, src, &["-O2"]);
+    let body = body_of(&asm, "spans_div");
+    let sub = body
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("subq"))
+        .unwrap_or_else(|| panic!("no subq in:\n{body}"));
+    assert!(sub.ends_with("%rax"), "`{sub}`:\n{body}");
 }

@@ -15,33 +15,6 @@ keeping one here reads as a backlog item nobody is picking up.
 
 ## Technical Debt
 
-### Stack frames are larger than gcc's
-
-CPython hardcodes `C_RECURSION_LIMIT 10000` (`Include/cpython/pystate.h`),
-tuned to gcc's frame sizes. At `-O2` on the default 8 MB stack, `test_call`,
-`test_compile` and `test_isinstance` recurse toward that limit and run out of
-stack before the counter trips, so the acceptance gate has to run under
-`ulimit -s 65536`. Done is the CPython `-O2` suite passing on the default
-8 MB stack.
-
-Locals are not what inflates a frame: locals whose lifetimes never meet share
-a slot (`arch::regalloc::local_lifetimes`, `place_locals`), and no prologue
-zeroes its frame. Spilling is: c17 keeps in the frame what gcc keeps in
-registers, and the interpreter loop, `_PyEval_EvalFrameDefault`, is both the
-largest frame and the function that recurses. Two contributors, in both
-allocators:
-
-- A floating-point value live across a call or a block boundary always goes to
-  a stack slot (`run_chordal_color`): the chordal pass never gives such a value
-  a register, not even a callee-saved one where the ABI has them (aarch64
-  `d8`-`d15`).
-- There is no live-range splitting, so a value spilled anywhere is spilled
-  everywhere, which is what a large function's register pressure turns into.
-
-A slot stays at least eight bytes, and that is not part of this gap: the back
-ends move register-passed values and aggregate tails a whole eightbyte at a
-time (see `arch::regalloc::local_slot`).
-
 ### R10 and R11 are never allocated
 
 `Reg::allocatable()` (`arch/x86_64/regalloc.rs`) leaves out R10 and R11 in

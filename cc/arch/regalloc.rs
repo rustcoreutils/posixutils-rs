@@ -195,83 +195,55 @@ pub struct ConstraintPoint<R> {
 }
 
 impl<R> ConstraintPoint<R> {
-    /// May `interval` sit in a register this point clobbers?
+    /// May `pseudo` sit in a register this point clobbers? `across` says
+    /// whether it is live across the point ([`Crossing::across`]).
     ///
     /// Being an operand of the clobbering instruction is not enough on its
     /// own. `mulq` and `idivq` read an operand out of a fixed register and
     /// write their result back over it, so an operand whose value is still
     /// wanted *after* the instruction is destroyed by it. The exemption is
-    /// only sound at the two ends of a live range:
+    /// only sound for an operand not live across the instruction:
     ///
-    /// - the range starts here, so the pseudo *is* what the instruction
+    /// - it is defined here, so the pseudo *is* what the instruction
     ///   produces (the `%rdx` half of a `mulq`, the quotient in `%rax`);
-    /// - the range ends here, so the value has been consumed and nothing
-    ///   reads it again.
+    /// - it dies here, so the value has been consumed and nothing reads it
+    ///   again.
     ///
-    /// A range that spans the point strictly is live on both sides, and the
+    /// An operand live across the point is live on both sides, and the
     /// instruction overwrites it in between. That is what left a 128-bit
     /// product's cross term computed from the low half of its own multiply.
-    pub fn operand_survives(&self, pseudo: PseudoId, start: usize, end: usize) -> bool {
-        self.involved_pseudos.contains(&pseudo) && (start >= self.position || end <= self.position)
+    pub fn operand_survives(&self, pseudo: PseudoId, across: bool) -> bool {
+        self.involved_pseudos.contains(&pseudo) && !across
     }
 }
 
-/// The registers each candidate may not take because a constraint point
-/// inside its live range clobbers them -- unless `exempt` says the interval
-/// is one the point may clobber, which is where the backends differ.
+/// The registers each candidate may not take because a constraint point it
+/// touches clobbers them -- unless `exempt` says the pseudo is one the point
+/// may clobber, which is where the backends differ.
 ///
-/// An exemption belongs to an operand of the point, so `exempt` is asked only
-/// about points whose `involved_pseudos` name the interval's pseudo; both
-/// backends' rules already require that.
+/// A point touches what is live across it, what it reads and what it
+/// defines ([`Crossing`]); `exempt` is told which of these the pseudo is
+/// live across. Asked by exact liveness, not by an interval: a value whose
+/// positions merely span a point -- dead on the path through it -- is free
+/// to take the registers it clobbers.
 ///
-/// Each register is looked up once per interval: the points clobbering it
-/// inside the interval are counted by binary search over their positions, and
-/// the register is forbidden unless every one of them excuses the interval.
-/// The work is intervals x registers, not intervals x points. Visiting every
-/// point an interval spans was quadratic for a function with many labels and
-/// gotos, whose merged live ranges each span most of the function.
+/// Every point must have its [`Crossing`] in `crossings`. The work is the
+/// points times what each touches.
 pub fn constraint_clobbers<R: Copy + Ord>(
     constraint_points: &[ConstraintPoint<R>],
-    intervals: &[LiveInterval],
+    crossings: &HashMap<usize, Crossing>,
     candidates: &std::collections::BTreeSet<PseudoId>,
-    exempt: impl Fn(&ConstraintPoint<R>, &LiveInterval) -> bool,
+    exempt: impl Fn(&ConstraintPoint<R>, PseudoId, bool) -> bool,
 ) -> BTreeMap<PseudoId, std::collections::BTreeSet<R>> {
-    // Positions of the points clobbering each register, one per point.
-    let mut clobbered_at: BTreeMap<R, Vec<usize>> = BTreeMap::new();
-    // The points each pseudo is an operand of, one entry per point.
-    let mut operand_of: HashMap<PseudoId, Vec<&ConstraintPoint<R>>> = HashMap::new();
-    for cp in constraint_points {
-        let regs: std::collections::BTreeSet<R> = cp.clobbers.iter().copied().collect();
-        for r in regs {
-            clobbered_at.entry(r).or_default().push(cp.position);
-        }
-        let operands: std::collections::BTreeSet<PseudoId> =
-            cp.involved_pseudos.iter().copied().collect();
-        for p in operands {
-            operand_of.entry(p).or_default().push(cp);
-        }
-    }
-    for positions in clobbered_at.values_mut() {
-        positions.sort_unstable();
-    }
-
     let mut forbidden: BTreeMap<PseudoId, std::collections::BTreeSet<R>> = BTreeMap::new();
-    for interval in intervals.iter().filter(|i| candidates.contains(&i.pseudo)) {
-        // A point is inside the interval when start <= position <= end.
-        let excused: Vec<&ConstraintPoint<R>> = operand_of
-            .get(&interval.pseudo)
-            .into_iter()
-            .flatten()
-            .copied()
-            .filter(|cp| interval.start <= cp.position && cp.position <= interval.end)
-            .filter(|cp| exempt(cp, interval))
-            .collect();
-        for (&r, positions) in &clobbered_at {
-            let inside = positions.partition_point(|&q| q <= interval.end)
-                - positions.partition_point(|&q| q < interval.start);
-            let excused_here = excused.iter().filter(|cp| cp.clobbers.contains(&r)).count();
-            if inside > excused_here {
-                forbidden.entry(interval.pseudo).or_default().insert(r);
+    for cp in constraint_points {
+        let crossing = &crossings[&cp.position];
+        for (p, across) in crossing.touching() {
+            if candidates.contains(&p) && !exempt(cp, p, across) {
+                forbidden
+                    .entry(p)
+                    .or_default()
+                    .extend(cp.clobbers.iter().copied());
             }
         }
     }
@@ -355,14 +327,101 @@ pub fn returns_twice_constraint<R: Copy>(
     (regs.to_vec(), insn.target.into_iter().collect())
 }
 
-/// Check if a live interval crosses any call position.
-/// Note: We use <= for the end check because values used as call arguments
-/// (where interval.end == call_pos) need to survive until after argument
-/// setup, which clobbers caller-saved registers before the actual call.
-pub fn interval_crosses_call(interval: &LiveInterval, call_positions: &[usize]) -> bool {
-    call_positions
-        .iter()
-        .any(|&call_pos| interval.start <= call_pos && call_pos <= interval.end)
+/// What one instruction must preserve, reads and defines: the answer to
+/// "does this value cross this call, or this constraint point", by exact
+/// liveness rather than by the hull of a value's positions, which spans
+/// every block laid out between its first and last -- live there or not.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Crossing {
+    /// Live just after the instruction and not defined by it: what it must
+    /// leave as it found it.
+    pub across: Vec<PseudoId>,
+    /// What it reads ([`DefsUses`]).
+    pub uses: Vec<PseudoId>,
+    /// What it defines.
+    pub defs: Vec<PseudoId>,
+    /// It is an inline asm, which may write the registers it clobbers after
+    /// it has written its outputs.
+    pub is_asm: bool,
+}
+
+impl Crossing {
+    /// Every pseudo the instruction touches, once each, with whether it is
+    /// live across it.
+    pub fn touching(&self) -> impl Iterator<Item = (PseudoId, bool)> + '_ {
+        let mut seen: std::collections::BTreeSet<PseudoId> = self.across.iter().copied().collect();
+        let rest: Vec<PseudoId> = self
+            .uses
+            .iter()
+            .chain(&self.defs)
+            .copied()
+            .filter(|&p| seen.insert(p))
+            .collect();
+        self.across
+            .iter()
+            .map(|&p| (p, true))
+            .chain(rest.into_iter().map(|p| (p, false)))
+    }
+
+    /// What a call destroys in a caller-saved register: every value live
+    /// across it, and every argument it reads -- see [`crossings`].
+    pub fn call_crossers(&self) -> impl Iterator<Item = PseudoId> + '_ {
+        self.across.iter().chain(&self.uses).copied()
+    }
+
+    /// What an instruction that destroys a whole register bank -- a call,
+    /// or an asm whose clobber list names the bank's registers -- destroys
+    /// there: [`Crossing::call_crossers`], and an asm's outputs too, which
+    /// the template may have written before it writes a clobbered
+    /// register. A call writes its result after everything it clobbers.
+    pub fn bank_crossers(&self) -> impl Iterator<Item = PseudoId> + '_ {
+        let defs: &[PseudoId] = if self.is_asm { &self.defs } else { &[] };
+        self.call_crossers().chain(defs.iter().copied())
+    }
+}
+
+/// Each instruction at `positions` (as [`compute_live_intervals`] numbers
+/// them) with its [`Crossing`], by one backward walk over the pseudos that
+/// have liveness: not a constant, nor a symbol, which live in no register.
+///
+/// A call's own result is not live across it: the call writes it after it
+/// returns, into whatever register it was given. An argument is, for the
+/// caller-saved registers, by [`Crossing::call_crossers`]: a call's lowering
+/// stages its arguments through caller-saved registers before it reads them
+/// all, so an argument there may be overwritten before it is read. A
+/// backend that knows better for a particular call says so itself.
+pub fn crossings(
+    func: &Function,
+    live_out: &[HashSet<PseudoId>],
+    positions: &std::collections::BTreeSet<usize>,
+) -> HashMap<usize, Crossing> {
+    let tracked = |p: PseudoId| {
+        !func.get_pseudo(p).is_some_and(|ps| {
+            matches!(
+                ps.kind,
+                PseudoKind::Val(_) | PseudoKind::FVal(_) | PseudoKind::Sym(_)
+            )
+        })
+    };
+    let mut out = HashMap::with_capacity(positions.len());
+    walk_live_after(func, live_out, tracked, |pos, insn, du, live| {
+        if positions.contains(&pos) {
+            out.insert(
+                pos,
+                Crossing {
+                    across: live
+                        .iter()
+                        .copied()
+                        .filter(|p| !du.defs.contains(p))
+                        .collect(),
+                    uses: du.uses.clone(),
+                    defs: du.defs.clone(),
+                    is_asm: insn.op == Opcode::Asm,
+                },
+            );
+        }
+    });
+    out
 }
 
 /// Result of liveness analysis: intervals, constraint points, and per-block liveness sets.
@@ -1283,27 +1342,6 @@ pub fn alloca_results(func: &Function) -> Vec<PseudoId> {
         .collect()
 }
 
-/// Does anything overwrite `reg` while `interval` is live -- a constraint
-/// point that clobbers it and does not exempt the interval's pseudo?
-///
-/// The coloring pass asks the same question of the pseudos it places, through
-/// [`constraint_clobbers`], which is where each backend's `exempt` rule comes
-/// from; an ABI-pinned argument never reaches that pass, so
-/// [`gp_args_overwritten`] asks it here.
-pub fn clobbered_while_live<R: PartialEq>(
-    interval: &LiveInterval,
-    reg: R,
-    constraint_points: &[ConstraintPoint<R>],
-    exempt: impl Fn(&ConstraintPoint<R>, &LiveInterval) -> bool,
-) -> bool {
-    constraint_points.iter().any(|cp| {
-        interval.start <= cp.position
-            && cp.position <= interval.end
-            && cp.clobbers.contains(&reg)
-            && !exempt(cp, interval)
-    })
-}
-
 /// The ABI-pinned GP arguments that must leave their register for a frame
 /// slot, because something overwrites that register while they are live --
 /// each with the register it arrived in.
@@ -1311,9 +1349,9 @@ pub fn clobbered_while_live<R: PartialEq>(
 /// An argument arrives pre-colored in its ABI register and never goes through
 /// coloring, so the forbidden-color machinery that keeps an ordinary value out
 /// of a clobbered register does not apply to it. `overwritten` says whether its
-/// register is destroyed within its interval: a call (every argument register
-/// is caller-saved), or a constraint point that clobbers it
-/// ([`clobbered_while_live`]) -- inline asm, an atomic's fixed scratch, a
+/// register is destroyed while it is live: a call (every argument register is
+/// caller-saved), or a constraint point that clobbers it
+/// ([`constraint_clobbers`]) -- inline asm, an atomic's fixed scratch, a
 /// thread-local sequence that calls a resolver or getter. One rule for both
 /// backends: aarch64 once asked only about calls, so a thread-local access
 /// under the descriptor or Mach-O TLV model, which returns its result in x0,
@@ -1326,13 +1364,13 @@ pub fn clobbered_while_live<R: PartialEq>(
 pub fn gp_args_overwritten<R: Copy>(
     intervals: &[LiveInterval],
     reg_of: impl Fn(PseudoId) -> Option<R>,
-    overwritten: impl Fn(&LiveInterval, R) -> bool,
+    overwritten: impl Fn(PseudoId, R) -> bool,
 ) -> Vec<(PseudoId, R)> {
     intervals
         .iter()
         .filter_map(|interval| {
             let reg = reg_of(interval.pseudo)?;
-            overwritten(interval, reg).then_some((interval.pseudo, reg))
+            overwritten(interval.pseudo, reg).then_some((interval.pseudo, reg))
         })
         .collect()
 }
@@ -1562,8 +1600,9 @@ pub fn build_interference_graph(
 /// those live just after it.
 ///
 /// The one per-instruction liveness walk the allocators' exact questions
-/// share: what a stack slot may be shared with, and what is live across an
-/// instruction that returns twice.
+/// share: what a stack slot may be shared with, what is live across an
+/// instruction that returns twice, and what crosses a call or a constraint
+/// point ([`crossings`]).
 pub(crate) fn walk_live_after(
     func: &Function,
     live_out: &[HashSet<PseudoId>],
@@ -2554,142 +2593,119 @@ mod tests {
         }
     }
 
-    fn interval(p: u32, start: usize, end: usize) -> LiveInterval {
-        LiveInterval {
-            pseudo: PseudoId(p),
-            start,
-            end,
-            in_loop: false,
+    /// `.L0: cbr %0, .L1, .L2; .L1: %3 = %0 + %0; br .L3;
+    /// .L2: %4 = call g(%0); %5 = %4 + %0; ret %5; .L3: ret %3` -- the call
+    /// at position 4. `%3`'s positions span the call, laid out between its
+    /// def and its use, but it is dead there; `%0` is an argument of the
+    /// call and live after it; `%4` is the call's result.
+    fn call_between() -> (Function, usize) {
+        use crate::ir::{BasicBlock, Pseudo};
+        let types = TypeTable::new(&crate::target::Target::host());
+        let mut f = Function::new("f", types.long_id);
+        f.add_param("p", types.long_id);
+        f.add_pseudo(Pseudo::arg(PseudoId(0), 0));
+        for id in 3..6 {
+            f.add_pseudo(Pseudo::reg(PseudoId(id), id));
         }
-    }
-
-    /// A point clobbers every candidate live across it, ends inclusive, and
-    /// nothing else: not an interval that ended before it, not one that
-    /// starts after it, not a non-candidate, and not one `exempt` excuses.
-    #[test]
-    fn test_constraint_clobbers_sweep() {
-        let intervals = [
-            interval(1, 0, 10),
-            interval(2, 5, 5),
-            interval(3, 6, 30),
-            interval(4, 0, 40),
-            interval(5, 26, 40),
-        ];
-        let points = [
-            ConstraintPoint {
-                position: 25,
-                clobbers: vec![2u8],
-                involved_pseudos: vec![PseudoId(3)],
-            },
-            ConstraintPoint {
-                position: 5,
-                clobbers: vec![1u8],
-                involved_pseudos: vec![],
-            },
-        ];
-        let candidates: std::collections::BTreeSet<PseudoId> =
-            [1, 2, 3, 5].into_iter().map(PseudoId).collect();
-        let forbidden = constraint_clobbers(&points, &intervals, &candidates, |cp, i| {
-            cp.involved_pseudos.contains(&i.pseudo)
-        });
-        let expect: BTreeMap<PseudoId, std::collections::BTreeSet<u8>> =
-            [(PseudoId(1), [1u8].into()), (PseudoId(2), [1u8].into())].into();
-        assert_eq!(forbidden, expect);
-    }
-
-    /// The answer of pairing every point with every interval it lies in.
-    fn clobbers_by_pairing(
-        points: &[ConstraintPoint<u8>],
-        intervals: &[LiveInterval],
-        candidates: &std::collections::BTreeSet<PseudoId>,
-        exempt: impl Fn(&ConstraintPoint<u8>, &LiveInterval) -> bool,
-    ) -> BTreeMap<PseudoId, std::collections::BTreeSet<u8>> {
-        let mut forbidden: BTreeMap<PseudoId, std::collections::BTreeSet<u8>> = BTreeMap::new();
-        for cp in points {
-            for i in intervals.iter().filter(|i| candidates.contains(&i.pseudo)) {
-                if i.start <= cp.position && cp.position <= i.end && !exempt(cp, i) {
-                    forbidden
-                        .entry(i.pseudo)
-                        .or_default()
-                        .extend(cp.clobbers.iter().copied());
-                }
-            }
-        }
-        forbidden.retain(|_, regs| !regs.is_empty());
-        forbidden
-    }
-
-    /// Agrees with pairing on overlapping intervals, a pseudo with two
-    /// intervals, points clobbering one register twice or none, points that
-    /// name an operand twice, and both backends' exemption rules.
-    #[test]
-    fn test_constraint_clobbers_matches_pairing() {
-        let mut seed = 0x2545_f491_4f6c_dd1du64;
-        let mut next = |bound: usize| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            (seed % bound as u64) as usize
+        f.next_pseudo = 6;
+        let [b0, b1, b2, b3] = [0, 1, 2, 3].map(BasicBlockId);
+        let add = |t: u32, a: u32| {
+            Instruction::binop(
+                Opcode::Add,
+                PseudoId(t),
+                PseudoId(a),
+                PseudoId(0),
+                types.long_id,
+                64,
+            )
         };
-        for _ in 0..200 {
-            let intervals: Vec<LiveInterval> = (0..12)
-                .map(|_| {
-                    let start = next(60);
-                    interval(next(8) as u32, start, start + next(30))
-                })
-                .collect();
-            let points: Vec<ConstraintPoint<u8>> = (0..10)
-                .map(|_| ConstraintPoint {
-                    position: next(90),
-                    clobbers: (0..next(4)).map(|_| next(5) as u8).collect(),
-                    involved_pseudos: (0..next(3)).map(|_| PseudoId(next(8) as u32)).collect(),
-                })
-                .collect();
-            let candidates: std::collections::BTreeSet<PseudoId> =
-                (0..8).filter(|p| p % 3 != 2).map(PseudoId).collect();
-            let operand = |cp: &ConstraintPoint<u8>, i: &LiveInterval| {
-                cp.involved_pseudos.contains(&i.pseudo)
-            };
-            let survives = |cp: &ConstraintPoint<u8>, i: &LiveInterval| {
-                cp.operand_survives(i.pseudo, i.start, i.end)
-            };
-            assert_eq!(
-                constraint_clobbers(&points, &intervals, &candidates, operand),
-                clobbers_by_pairing(&points, &intervals, &candidates, operand)
-            );
-            assert_eq!(
-                constraint_clobbers(&points, &intervals, &candidates, survives),
-                clobbers_by_pairing(&points, &intervals, &candidates, survives)
-            );
+        let mut entry = BasicBlock::new(b0);
+        entry.add_insn(Instruction::new(Opcode::Entry));
+        entry.add_insn(Instruction::cbr(PseudoId(0), b1, b2));
+        entry.children = vec![b1, b2];
+        let mut def = BasicBlock::new(b1);
+        def.add_insn(add(3, 0));
+        def.add_insn(Instruction::br(b3));
+        def.parents = vec![b0];
+        def.children = vec![b3];
+        let mut call = BasicBlock::new(b2);
+        call.add_insn(Instruction::call(
+            Some(PseudoId(4)),
+            "g",
+            vec![PseudoId(0)],
+            vec![types.long_id],
+            types.long_id,
+            64,
+        ));
+        call.add_insn(add(5, 4));
+        call.add_insn(Instruction::ret(Some(PseudoId(5))));
+        call.parents = vec![b0];
+        let mut uses = BasicBlock::new(b3);
+        uses.add_insn(Instruction::ret(Some(PseudoId(3))));
+        uses.parents = vec![b1];
+        for b in [entry, def, call, uses] {
+            f.add_block(b);
         }
+        f.entry = b0;
+        (f, 4)
     }
 
-    /// The work does not grow with intervals x points. Every interval spans
-    /// every point, as the merged live ranges of a function full of gotos do,
-    /// and the exemption rule is asked only about the points each pseudo is an
-    /// operand of: one per interval here, where pairing asked about all of
-    /// them.
+    /// What crosses an instruction is what is live just after it and not
+    /// defined there: not a value whose positions merely span it, nor its
+    /// own result.
     #[test]
-    fn test_constraint_clobbers_work_is_not_pairwise() {
-        const N: usize = 4000;
-        let intervals: Vec<LiveInterval> = (0..N).map(|p| interval(p as u32, 0, 2 * N)).collect();
-        let points: Vec<ConstraintPoint<u8>> = (0..N)
-            .map(|p| ConstraintPoint {
-                position: 2 * p + 1,
-                clobbers: vec![(p % 3) as u8],
-                involved_pseudos: vec![PseudoId(p as u32)],
-            })
-            .collect();
+    fn a_crossing_is_exact_liveness() {
+        let (f, call) = call_between();
+        let r = compute_live_intervals(&f, |_| None::<(Vec<()>, Vec<PseudoId>)>);
+        let span = r
+            .intervals
+            .iter()
+            .find(|i| i.pseudo == PseudoId(3))
+            .unwrap();
+        assert!(
+            span.start < call && call < span.end,
+            "{span:?} spans the call"
+        );
+        let at = crossings(&f, &r.live_out, &[call].into());
+        let c = &at[&call];
+        assert_eq!(c.across, [PseudoId(0)]);
+        assert_eq!(c.uses, [PseudoId(0)]);
+        assert_eq!(c.defs, [PseudoId(4)]);
+        let crossers: Vec<PseudoId> = c.call_crossers().collect();
+        assert!(!crossers.contains(&PseudoId(3)), "dead across the call");
+        assert!(!crossers.contains(&PseudoId(4)), "the call's own result");
+    }
+
+    /// A constraint point forbids its clobbers to what it touches -- what is
+    /// live across it, what it reads and what it defines -- unless `exempt`
+    /// excuses it, and to nothing else: not to a value whose positions merely
+    /// span it. x86-64's rule excuses an operand that is not live across
+    /// the point.
+    #[test]
+    fn a_constraint_point_clobbers_what_it_touches() {
+        let (f, call) = call_between();
+        let r = compute_live_intervals(&f, |_| None::<(Vec<()>, Vec<PseudoId>)>);
+        let at = crossings(&f, &r.live_out, &[call].into());
         let candidates: std::collections::BTreeSet<PseudoId> =
-            (0..N as u32).map(PseudoId).collect();
-        let asked = std::cell::Cell::new(0usize);
-        let forbidden = constraint_clobbers(&points, &intervals, &candidates, |cp, i| {
-            asked.set(asked.get() + 1);
-            cp.involved_pseudos.contains(&i.pseudo)
-        });
-        assert_eq!(asked.get(), N);
-        // Every pseudo still meets the other points clobbering each register.
-        assert!(forbidden.values().all(|regs| regs.len() == 3));
-        assert_eq!(forbidden.len(), N);
+            [0, 3, 4, 5].into_iter().map(PseudoId).collect();
+        let point = |involved: Vec<PseudoId>| ConstraintPoint {
+            position: call,
+            clobbers: vec![7u8],
+            involved_pseudos: involved,
+        };
+        let forbidden = |cp: ConstraintPoint<u8>| {
+            constraint_clobbers(&[cp], &at, &candidates, |cp, p, across| {
+                cp.operand_survives(p, across)
+            })
+        };
+        let seven: std::collections::BTreeSet<u8> = [7].into();
+        let none = forbidden(point(Vec::new()));
+        assert_eq!(
+            none,
+            [(PseudoId(0), seven.clone()), (PseudoId(4), seven.clone())].into()
+        );
+        // The result is excused; the argument, live across, is not.
+        let operands = forbidden(point(vec![PseudoId(4), PseudoId(0)]));
+        assert_eq!(operands, [(PseudoId(0), seven)].into());
     }
 }

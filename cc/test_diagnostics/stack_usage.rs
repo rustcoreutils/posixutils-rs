@@ -73,7 +73,7 @@ fn stack_usage_warns_over_the_limit() {
             "su.c:2:12: warning: stack usage is 128 bytes",
             "su.c:4:5: warning: stack usage might be 48 bytes",
             "su.c:5:5: warning: stack usage might be unbounded",
-            "su.c:6:5: warning: stack usage is 32 bytes",
+            "su.c:6:5: warning: stack usage is 16 bytes",
         ],
         "{c}"
     );

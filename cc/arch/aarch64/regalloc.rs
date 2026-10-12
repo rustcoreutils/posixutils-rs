@@ -43,8 +43,7 @@ use crate::abi::aapcs64::{StackSlot, StackedArgs};
 use crate::arch::asm_constraints::{operand_pins, AsmRegClass, PinnedGp};
 use crate::arch::regalloc::{
     asm_clobbered, compute_live_intervals, find_call_positions, find_insn_positions,
-    identify_fp_pseudos, interval_crosses_call, ConstraintPoint, LiveInterval, LivenessResult,
-    SlotShape,
+    identify_fp_pseudos, ConstraintPoint, Crossing, LiveInterval, LivenessResult, SlotShape,
 };
 use crate::float::FloatVal;
 use crate::ir::{AsmData, Function, Instruction, Opcode, PseudoId, PseudoKind};
@@ -1260,12 +1259,75 @@ pub fn get_constraint_info_aarch64(
     Some((clobbers, involved))
 }
 
-/// Whether a constraint point may leave `interval`'s pseudo in a register
-/// it clobbers: only when the pseudo is one of the point's own operands. The
+/// Whether a constraint point may leave `p` in a register it clobbers: only
+/// when `p` is one of the point's own operands, live across it or not. The
 /// one rule for aarch64, asked both when coloring and when deciding whether
 /// an ABI-pinned argument must leave its register.
-fn exempt_from_clobber(cp: &ConstraintPoint<Reg>, interval: &LiveInterval) -> bool {
-    cp.involved_pseudos.contains(&interval.pseudo)
+fn exempt_from_clobber(cp: &ConstraintPoint<Reg>, p: PseudoId, _across: bool) -> bool {
+    cp.involved_pseudos.contains(&p)
+}
+
+/// What crosses each call and each constraint point that matters, by exact
+/// liveness ([`crate::arch::regalloc::crossings`]): the one answer every
+/// clobber question of this allocator reads.
+struct Clobbering {
+    crossings: HashMap<usize, Crossing>,
+    /// The calls' positions.
+    calls: Vec<usize>,
+    /// The positions that end every FP value live across them: the calls,
+    /// and each inline asm that clobbers a V register.
+    fp_calls: Vec<usize>,
+    /// The constraint points that clobber a register a value may be in, or
+    /// an argument arrives in: the others clobber only codegen scratch.
+    points: Vec<ConstraintPoint<Reg>>,
+}
+
+impl Clobbering {
+    fn of(
+        func: &Function,
+        live_out: &[HashSet<PseudoId>],
+        calls: &[usize],
+        fp_calls: Vec<usize>,
+        constraint_points: &[ConstraintPoint<Reg>],
+        allocatable: &[Reg],
+    ) -> Self {
+        let points: Vec<ConstraintPoint<Reg>> = constraint_points
+            .iter()
+            .filter(|cp| {
+                cp.clobbers.iter().any(|r| {
+                    allocatable.contains(r) || Reg::arg_regs().contains(r) || *r == Reg::X8
+                })
+            })
+            .cloned()
+            .collect();
+        let mut positions: std::collections::BTreeSet<usize> = calls.iter().copied().collect();
+        positions.extend(&fp_calls);
+        positions.extend(points.iter().map(|cp| cp.position));
+        Self {
+            crossings: crate::arch::regalloc::crossings(func, live_out, &positions),
+            calls: calls.to_vec(),
+            fp_calls,
+            points,
+        }
+    }
+
+    /// Every pseudo some call touches: live across it, or an argument.
+    fn gp_call_touched(&self) -> HashSet<PseudoId> {
+        self.calls
+            .iter()
+            .flat_map(|pos| self.crossings[pos].call_crossers())
+            .collect()
+    }
+
+    /// Every pseudo that crosses an instruction ending the FP values live
+    /// across it, an argument and an asm's output included
+    /// ([`Crossing::bank_crossers`]).
+    fn fp_call_crossers(&self) -> HashSet<PseudoId> {
+        self.fp_calls
+            .iter()
+            .flat_map(|pos| self.crossings[pos].bank_crossers())
+            .collect()
+    }
 }
 
 /// Bytes a spilled floating-point pseudo needs on the stack.
@@ -1561,25 +1623,19 @@ impl RegAlloc {
             is_call_like_aarch64(insn.op) || !asm_clobbered(insn, parse_fp_clobber_name).is_empty()
         });
 
-        self.spill_args_across_calls(func, types, &intervals, &call_positions, &fp_call_positions);
-        self.spill_gp_args(&intervals, |interval, reg| {
-            crate::arch::regalloc::clobbered_while_live(
-                interval,
-                reg,
-                &constraint_points,
-                exempt_from_clobber,
-            )
-        });
+        let clobbering = Clobbering::of(
+            func,
+            &self.live_out,
+            &call_positions,
+            fp_call_positions,
+            &constraint_points,
+            &self.allocatable_regs(),
+        );
+
+        self.spill_args_across_calls(func, types, &intervals, &clobbering);
         self.allocate_alloca_to_stack(func);
         self.place_locals(func, types, &intervals, rest);
-        self.run_chordal_color(
-            func,
-            types,
-            intervals,
-            &call_positions,
-            &fp_call_positions,
-            &constraint_points,
-        );
+        self.run_chordal_color(func, types, intervals, &clobbering);
         self.place_stack_slots(func);
         if cfg!(debug_assertions) {
             self.verify(func, types, &constraint_points, &call_positions);
@@ -1670,27 +1726,38 @@ impl RegAlloc {
         }
     }
 
-    /// Spill arguments in caller-saved registers if their interval crosses a call
+    /// Move an argument out of the register it arrived in when that register
+    /// is overwritten while the argument is live: a general register by the
+    /// rule every value is colored by ([`RegAlloc::gp_forbidden`]) -- a call
+    /// it crosses, or a constraint point that clobbers it -- and a V register
+    /// when it crosses a call.
     fn spill_args_across_calls(
         &mut self,
         func: &Function,
         types: &TypeTable,
         intervals: &[LiveInterval],
-        call_positions: &[usize],
-        fp_call_positions: &[usize],
+        clobbering: &Clobbering,
     ) {
-        self.spill_gp_args(intervals, |interval, _| {
-            interval_crosses_call(interval, call_positions)
+        let args: std::collections::BTreeSet<PseudoId> = self
+            .locations
+            .iter()
+            .filter(|(_, loc)| {
+                matches!(loc, Loc::Reg(r) if Reg::arg_regs().contains(r) || *r == Reg::X8)
+            })
+            .map(|(&p, _)| p)
+            .collect();
+        let forbidden = self.gp_forbidden(clobbering, &args);
+        self.spill_gp_args(intervals, |p, reg| {
+            forbidden.get(&p).is_some_and(|regs| regs.contains(&reg))
         });
 
         // Check FP arguments in caller-saved registers (v0-v7)
         let fp_arg_regs_set = VReg::arg_regs();
         let lowering = crate::arch::regalloc::AbiLowering::new(func);
+        let crossers = clobbering.fp_call_crossers();
         for interval in intervals {
             if let Some(Loc::VReg(reg)) = self.locations.get(&interval.pseudo) {
-                if fp_arg_regs_set.contains(reg)
-                    && interval_crosses_call(interval, fp_call_positions)
-                {
+                if fp_arg_regs_set.contains(reg) && crossers.contains(&interval.pseudo) {
                     let from_reg = *reg;
                     // Reserve what the value actually needs: a binary128
                     // argument is sixteen bytes, and eight left half of it
@@ -1725,7 +1792,7 @@ impl RegAlloc {
     fn spill_gp_args(
         &mut self,
         intervals: &[LiveInterval],
-        overwritten: impl Fn(&LiveInterval, Reg) -> bool,
+        overwritten: impl Fn(PseudoId, Reg) -> bool,
     ) {
         let spills = crate::arch::regalloc::gp_args_overwritten(
             intervals,
@@ -1851,12 +1918,11 @@ impl RegAlloc {
         func: &Function,
         types: &TypeTable,
         intervals: Vec<LiveInterval>,
-        call_positions: &[usize],
-        fp_call_positions: &[usize],
-        constraint_points: &[ConstraintPoint<Reg>],
+        clobbering: &Clobbering,
     ) {
         // -------- Phase 1: pre-pass --------
         let crosses_blocks = crate::arch::regalloc::live_out_anywhere(&self.live_out);
+        let crosses_calls = clobbering.fp_call_crossers();
         // What the pre-pass asks about each interval, indexed once: asking by
         // scanning the function per interval made it quadratic.
         let setval_sizes = crate::arch::regalloc::setval_sizes(func);
@@ -1945,7 +2011,7 @@ impl RegAlloc {
                 // FP cross-call/block → stack (avoids the chordal pass
                 // having to model V-bank cross-call eviction, which is
                 // not implemented yet; matches the x86_64 XMM policy).
-                let crosses_call = interval_crosses_call(interval, fp_call_positions);
+                let crosses_call = crosses_calls.contains(&interval.pseudo);
                 let crosses_block = crosses_blocks.contains(&interval.pseudo);
                 if crosses_call || crosses_block {
                     let bytes = fp_pseudo_bytes(func, interval.pseudo);
@@ -1959,22 +2025,52 @@ impl RegAlloc {
         }
 
         // -------- Phase 2: per-bank chordal coloring --------
-        self.color_gp_bank(
-            func,
-            &intervals,
-            call_positions,
-            constraint_points,
-            &gp_candidates,
-        );
+        self.color_gp_bank(func, &intervals, clobbering, &gp_candidates);
         self.color_vreg_bank(func, &vreg_candidates);
+    }
+
+    /// The X registers each of `candidates` may not take: every register a
+    /// constraint point it touches clobbers, unless it is one of the point's
+    /// operands ([`exempt_from_clobber`]), and every caller-saved register --
+    /// X8, the sret pointer's, included -- where it crosses a call
+    /// ([`Crossing::call_crossers`]).
+    fn gp_forbidden(
+        &self,
+        clobbering: &Clobbering,
+        candidates: &std::collections::BTreeSet<PseudoId>,
+    ) -> BTreeMap<PseudoId, std::collections::BTreeSet<Reg>> {
+        let mut forbidden = crate::arch::regalloc::constraint_clobbers(
+            &clobbering.points,
+            &clobbering.crossings,
+            candidates,
+            exempt_from_clobber,
+        );
+        let mut caller_saved: Vec<Reg> = self
+            .allocatable_regs()
+            .into_iter()
+            .filter(|r| !r.is_callee_saved())
+            .collect();
+        for &r in Reg::arg_regs().iter().chain(&[Reg::X8]) {
+            if !caller_saved.contains(&r) {
+                caller_saved.push(r);
+            }
+        }
+        for p in clobbering.gp_call_touched() {
+            if candidates.contains(&p) {
+                forbidden
+                    .entry(p)
+                    .or_default()
+                    .extend(caller_saved.iter().copied());
+            }
+        }
+        forbidden
     }
 
     fn color_gp_bank(
         &mut self,
         func: &Function,
         intervals: &[LiveInterval],
-        call_positions: &[usize],
-        constraint_points: &[ConstraintPoint<Reg>],
+        clobbering: &Clobbering,
         gp_candidates: &std::collections::BTreeSet<PseudoId>,
     ) {
         let by_pseudo = crate::arch::regalloc::intervals_by_pseudo(intervals);
@@ -2001,40 +2097,26 @@ impl RegAlloc {
         // target's register. Same pattern as x86_64's cmov.
         let graph = build_interference_graph(&all_vertices, func, &self.live_out, true);
 
-        // Forbidden colors:
-        //   (a) constraint clobbers — for pseudos live across the
-        //       constraint that are NOT operands. (AAPCS64 has no
-        //       implicit clobbers like x86 idiv/shift, so this is
-        //       a no-op today, but the plumbing matches x86_64.)
-        //   (b) cross-call → all caller-saved (HARD; the call clobbers
-        //       them and the value would be lost).
+        // Forbidden colors (`gp_forbidden`): constraint clobbers -- an
+        // atomic's fixed scratch, a thread-local sequence, inline asm -- for
+        // the pseudos a constraint touches that are not its operands, and
+        // every caller-saved register for one that crosses a call (HARD; the
+        // call clobbers them and the value would be lost). In-loop is only a
+        // preference, for a value no call touches.
         let allocatable = self.allocatable_regs();
         let caller_saved: Vec<Reg> = allocatable
             .iter()
             .copied()
             .filter(|r| !r.is_callee_saved())
             .collect();
-        let mut forbidden = crate::arch::regalloc::constraint_clobbers(
-            constraint_points,
-            intervals,
-            gp_candidates,
-            exempt_from_clobber,
-        );
-        let mut in_loop_set: std::collections::BTreeSet<PseudoId> =
-            std::collections::BTreeSet::new();
-        for interval in intervals {
-            if !gp_candidates.contains(&interval.pseudo) {
-                continue;
-            }
-            if interval_crosses_call(interval, call_positions) {
-                let entry = forbidden.entry(interval.pseudo).or_default();
-                for &r in &caller_saved {
-                    entry.insert(r);
-                }
-            } else if interval.in_loop {
-                in_loop_set.insert(interval.pseudo);
-            }
-        }
+        let forbidden = self.gp_forbidden(clobbering, gp_candidates);
+        let touched = clobbering.gp_call_touched();
+        let in_loop_set: std::collections::BTreeSet<PseudoId> = intervals
+            .iter()
+            .filter(|i| i.in_loop && gp_candidates.contains(&i.pseudo))
+            .filter(|i| !touched.contains(&i.pseudo))
+            .map(|i| i.pseudo)
+            .collect();
 
         let caller_first: Vec<Reg> = {
             let mut v = caller_saved.clone();

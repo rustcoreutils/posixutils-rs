@@ -225,19 +225,19 @@ fn stack_usage_x86_64_frames() {
          t.c:2:12:locals\t128\tstatic\n\
          t.c:4:5:stacked\t64\tdynamic,bounded\n\
          t.c:5:5:vla\t32\tdynamic\n\
-         t.c:7:5:al\t48\tdynamic\n\
-         t.c:8:5:keeps\t128\tdynamic,bounded\n\
-         t.c:9:5:main\t32\tstatic\n"
+         t.c:7:5:al\t32\tdynamic\n\
+         t.c:8:5:keeps\t112\tdynamic,bounded\n\
+         t.c:9:5:main\t16\tstatic\n"
     );
     // Optimized, `locals` is inlined into `main` and emitted nowhere, so
     // it has no record, as in gcc.
     assert_eq!(
         su_text("x86_o2", KINDS, &[X86_64, "-O2"]),
         "t.c:1:5:leaf\t16\tstatic\n\
-         t.c:4:5:stacked\t80\tdynamic,bounded\n\
+         t.c:4:5:stacked\t64\tdynamic,bounded\n\
          t.c:5:5:vla\t32\tdynamic\n\
-         t.c:7:5:al\t48\tdynamic\n\
-         t.c:8:5:keeps\t80\tdynamic,bounded\n\
+         t.c:7:5:al\t32\tdynamic\n\
+         t.c:8:5:keeps\t64\tdynamic,bounded\n\
          t.c:9:5:main\t128\tstatic\n"
     );
 }
@@ -253,24 +253,24 @@ fn stack_usage_aarch64_frames() {
          t.c:4:5:stacked\t48\tdynamic,bounded\n\
          t.c:5:5:vla\t32\tdynamic\n\
          t.c:7:5:al\t48\tdynamic\n\
-         t.c:8:5:keeps\t112\tdynamic,bounded\n\
-         t.c:9:5:main\t32\tstatic\n"
+         t.c:8:5:keeps\t96\tdynamic,bounded\n\
+         t.c:9:5:main\t16\tstatic\n"
     );
 }
 
 /// An over-aligned frame on x86-64 counts the most its `andq` can take:
 /// the alignment less what `%rsp` is known to be aligned to before it --
-/// 8 here, after three pushes. gcc counts the same worst case.
+/// 8 here, after one push. gcc counts the same worst case.
 #[test]
 fn stack_usage_x86_64_realigned_frame() {
     let src = "\
 extern void use(void *);
 int realign(void) { _Alignas(64) char b[64]; use(b); return 0; }
 ";
-    // 16 + 3 pushes + a 128-byte `subq` + 56.
+    // 16 + 1 push (the aligned base) + a 128-byte `subq` + 56.
     assert_eq!(
         su_text("realign", src, &[X86_64, "-O0"]),
-        "t.c:2:5:realign\t224\tstatic\n"
+        "t.c:2:5:realign\t208\tstatic\n"
     );
 }
 

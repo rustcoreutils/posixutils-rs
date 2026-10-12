@@ -690,12 +690,15 @@ impl<'a> Preprocessor<'a> {
             return;
         };
         // C17 6.10.8p2: the standard's predefined names may not be the
-        // subject of `#undef`; gcc warns, and so does this. `defined` is
-        // refused outright, as it is for `#define`.
+        // subject of `#undef`; gcc warns, and so does this -- for a name
+        // the implementation has defined. An `__STDC_` name it has not is
+        // the program's (`__STDC_WANT_LIB_EXT1__`, K.3.1.1), and quiet.
+        // `defined` is refused outright, as it is for `#define`.
         if name == "defined" {
             diag::error(pos, &gettext("\"defined\" cannot be used as a macro name"));
         } else {
-            if is_standard_predefined(&name) {
+            let predefined = self.macros.get(&name).is_some_and(|m| m.predefined);
+            if predefined && is_standard_predefined(&name) {
                 let template = "undefining \"{0}\"";
                 match builtin_macro_group(&name) {
                     Some(group) => diag::group_warning_args(group, pos, template, &[&name]),

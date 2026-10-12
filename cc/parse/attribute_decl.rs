@@ -77,15 +77,18 @@ impl Parser<'_> {
 
     /// GNU label attributes, `L: __attribute__((unused)) stmt`: consume and
     /// discard attributes after a label's colon when what follows them is a
-    /// statement. They say nothing c17 acts on -- gcc's label attributes are
-    /// `unused`, `hot` and `cold`, hints only.
+    /// statement, the null statement `;` included. They say nothing c17 acts
+    /// on -- gcc's label attributes are `unused`, `hot` and `cold`, hints
+    /// only.
     ///
-    /// Attributes followed by `;` are an attribute statement, and attributes
-    /// followed by a declaration belong to that declaration; both are left
-    /// where they are.
+    /// Attributes followed by a declaration belong to that declaration, and
+    /// `fallthrough` before `;` is the attribute statement it always is; both
+    /// are left where they are.
     ///
     /// binutils needs it: gas/read.c writes `just_record_alignment:
-    /// ATTRIBUTE_UNUSED_LABEL` straight before an `if`.
+    /// ATTRIBUTE_UNUSED_LABEL` straight before an `if`; gnulib's mountlist.c
+    /// `free_then_fail: _GL_UNUSED_LABEL;`, which read as an empty
+    /// declaration and warned.
     pub(super) fn parse_label_attributes(&mut self) {
         let mut end = self.pos;
         while self
@@ -104,13 +107,16 @@ impl Parser<'_> {
         }
         let start = self.pos;
         self.pos = end;
-        let statement_follows =
-            !self.is_special(b';') && !self.is_special(b'}') && !self.is_declaration_start();
+        let null_statement = self.is_special(b';');
+        let statement_follows = !self.is_special(b'}') && !self.is_declaration_start();
         self.pos = start;
         if statement_follows {
             let saved = self.take_pending_decl_attrs();
-            self.parse_attributes();
+            let attrs = self.parse_attributes();
             self.restore_pending_decl_attrs(saved);
+            if null_statement && attrs.find(FALLTHROUGH).is_some() {
+                self.pos = start;
+            }
         }
     }
 

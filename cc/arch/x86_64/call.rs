@@ -381,11 +381,7 @@ impl X86_64CodeGen {
         // Reserve the whole outgoing area at once, then write each argument at
         // the offset the layout gave it. Pushing in reverse could not express a
         // gap between two arguments, which is what an alignment boundary is.
-        self.push_lir(X86Inst::Sub {
-            size: OperandSize::B64,
-            src: GpOperand::Imm(info.stack_bytes as i64),
-            dst: Reg::Rsp,
-        });
+        self.emit_call_area(info.stack_bytes as i64);
         self.base.sp_lowered(info.stack_bytes as i64);
         for (n, &i) in info.stack_arg_indices.iter().enumerate() {
             let base_off = info.stack_offsets[n];

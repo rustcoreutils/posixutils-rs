@@ -197,6 +197,9 @@ impl Aarch64CodeGen {
             // and the saved pointer, so the slot at `aligned_bytes` is always
             // inside it.
             let reserve = aligned_bytes + max_align + 16;
+            // How far the rounding moves `sp` is known only when it runs, so
+            // `-fstack-clash-protection` probes the most it can be first.
+            self.emit_probe_ahead(i64::from(reserve + max_align - 16));
             self.push_lir(Aarch64Inst::Add {
                 size: OperandSize::B64,
                 src1: Reg::sp(),
@@ -238,12 +241,7 @@ impl Aarch64CodeGen {
             });
             self.darwin_va_sp_slot = Some(aligned_bytes);
         } else {
-            self.push_lir(Aarch64Inst::Sub {
-                size: OperandSize::B64,
-                src1: Reg::sp(),
-                src2: GpOperand::Imm(aligned_bytes as i64),
-                dst: Reg::sp(),
-            });
+            self.emit_call_area(aligned_bytes as i64);
             self.base.sp_lowered(aligned_bytes as i64);
         }
 
@@ -281,12 +279,7 @@ impl Aarch64CodeGen {
         // the area, and summing the sizes alone under-reserved it.
         let aligned_bytes = (placed.end + 15) & !15;
 
-        self.push_lir(Aarch64Inst::Sub {
-            size: OperandSize::B64,
-            src1: Reg::sp(),
-            src2: GpOperand::Imm(aligned_bytes as i64),
-            dst: Reg::sp(),
-        });
+        self.emit_call_area(aligned_bytes as i64);
         self.base.sp_lowered(aligned_bytes as i64);
 
         self.store_stack_args(placed.args, types);

@@ -113,6 +113,11 @@ Options beyond the POSIX set (`-B -c -D -E -G -g -I -L -l -O -o -R -s -U`):
    diagnostics.
  * `-fstack-usage` and `-Wstack-usage=` — each function's stack use, in gcc's
    `.su` file and warnings, to compare c17's frames with gcc's.
+ * `-fstack-clash-protection`, with `--param stack-clash-protection-guard-size=`
+   and `-probe-interval=` — probe the stack as gcc does wherever a frame,
+   `alloca`, a VLA or a call's stacked arguments could jump the guard page.
+   `-fstack-check` (and `=specific`, `=generic`) is an alias of it, not gcc's
+   older mechanism; `-fstack-check=no` and `-fno-stack-check` withdraw it.
  * A GCC-compatibility argument rewriter accepts and maps `-std=`, `-f*`,
    `-m*`, the `-fpic` family (`-fPIC`/`-fpic`/`-fPIE`/`-fpie` and their
    `-fno-` forms, last one wins), `-ftls-model=`, `-pie`/`-no-pie`,

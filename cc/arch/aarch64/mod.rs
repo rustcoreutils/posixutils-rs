@@ -25,5 +25,6 @@ mod memory;
 pub mod regalloc;
 mod relax;
 mod simd;
+mod stack_clash;
 
 pub use macros::{get_branch_protection_macros, get_darwin_macros, get_macros};

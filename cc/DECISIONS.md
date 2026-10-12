@@ -158,6 +158,30 @@ themselves. No torture test depends on it.
 | Darwin: `ms_abi` with `long double`, `_Float16` or an eight-byte vector | clang's Win64 lowering of these differs from gcc's: it returns `long double` in ST0 where gcc writes it through the hidden return pointer, it disagrees on `_Float16`, and it passes and returns an eight-byte vector by reference where gcc uses a general register. c17 follows gcc throughout, so on Apple -- the only host where the other half of an interop pair is clang -- `codegen_ms_abi_types_interoperate_with_gcc` and `vector_abi_interop_ms_abi` leave these shapes out of the cross-check there (`WIDE_SCALARS`, `EIGHT_BYTE_VECTOR`). What c17 compiles alone still carries them: `codegen_ms_abi_inlines_across_conventions` at every optimization level for the two scalars, and a two-unit run for the vector. `__float128` is a separate matter: Apple's targets have none at all, and c17 refuses it there exactly as clang does |
 | `max_align_t` | `long double` here (`<stddef.h>`: size 16, alignment 16); gcc's is a struct of `long long` and `long double` (size 32, alignment 16), on x86-64 and aarch64 alike. The alignment, which is what C17 7.19p2 specifies, agrees; `sizeof`, and the layout of any struct holding one, differ |
 
+### Stack probes
+
+`-fstack-clash-protection` probes as gcc 13 does (`target::StackClash`), with
+three deliberate differences.
+
+- **`-fstack-check` is an alias of `-fstack-clash-protection`.** User decision.
+  gcc's `-fstack-check` is an older, different mechanism: it probes a fixed
+  distance below the stack pointer for Ada's overflow checks, and gcc turns it
+  off whenever the clash protection is on -- which Debian's and Ubuntu's gcc
+  have by default, so there `-fstack-check` already means the clash probes,
+  with a warning. c17 maps `-fstack-check`, `=specific` and `=generic` onto the
+  clash probes; `-fstack-check=no` and `-fno-stack-check` withdraw that request
+  and only it, the two staying separate requests as in gcc.
+- **x86-64 probes a large outgoing argument area.** c17 reserves each call's
+  stacked arguments with one `subq`; once that area and what the prologue left
+  unprobed could reach the guard, it is probed as an `alloca` is. gcc pushes
+  its arguments, each push a probe, but reserves a large by-value aggregate's
+  area unprobed, and the copy into it or the call's return address can land
+  beyond the guard.
+- **Darwin is probed too.** clang's driver drops the option for Apple targets,
+  whose own defence is `___chkstk_darwin`. The probes are plain stores
+  that are right on any stack with a guard page, so c17 emits the same ones
+  for Mach-O as for ELF rather than take the option and do nothing.
+
 ## GNU extensions: what c17 will and will not grow
 
 This is a **decision table, not a backlog**. Frequency in real source is the

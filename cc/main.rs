@@ -616,9 +616,9 @@ struct Args {
           allow_hyphen_values = true, hide = true)]
     unsupported_options: Vec<String>,
 
-    /// `-fstack-clash-protection`, last of it and `-fno-` winning (rewritten
-    /// by `preprocess_args_from`): c17 probes no stack, and warns for each
-    /// function whose stack gcc would probe.
+    /// `-fstack-clash-protection`, last of it and `-fno-` winning, or
+    /// `-fstack-check`, its alias (rewritten by `preprocess_args_from`):
+    /// probe the stack wherever it could jump the guard page.
     #[arg(long = "c17-stack-clash", hide = true)]
     stack_clash: bool,
 
@@ -2151,6 +2151,9 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
     let mut unwind = Vec::new();
     // `-fstack-clash-protection`, last one wins.
     let mut stack_clash = false;
+    // `-fstack-check`, c17's alias of it, last of its own forms winning;
+    // see `f_options::stack_check`.
+    let mut stack_check = false;
     // `-fstack-protector`, its levels and `-fno-stack-protector`: last wins.
     let mut stack_protector = None;
     // `--param ssp-buffer-size=`, last wins.
@@ -2402,6 +2405,9 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
             i += 1;
         } else if arg == "-fstack-clash-protection" || arg == "-fno-stack-clash-protection" {
             stack_clash = arg == "-fstack-clash-protection";
+            i += 1;
+        } else if let Some(on) = arg.strip_prefix("-f").and_then(f_options::stack_check) {
+            stack_check = on;
             i += 1;
         } else if let Some(level) = arg
             .strip_prefix("-f")
@@ -2658,7 +2664,7 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
             .into_iter()
             .map(|(_, arg)| format!("--c17-unsupported={arg}")),
     );
-    if stack_clash {
+    if stack_clash || stack_check {
         trailer.push("--c17-stack-clash".to_string());
     }
     if omit_frame_pointer {
@@ -4759,6 +4765,11 @@ mod tests {
             "-fno-unsigned-char",
             "-fstack-clash-protection",
             "-fno-stack-clash-protection",
+            "-fstack-check",
+            "-fstack-check=specific",
+            "-fstack-check=generic",
+            "-fstack-check=no",
+            "-fno-stack-check",
             "-fstack-usage",
             "-fno-stack-usage",
             "-ftls-model=initial-exec",
@@ -4781,6 +4792,14 @@ mod tests {
         assert!(run_preprocess(&["-fstack-clash-protection"]).contains(&"--c17-stack-clash".into()));
         assert!(
             !run_preprocess(&["-fstack-clash-protection", "-fno-stack-clash-protection"])
+                .contains(&"--c17-stack-clash".into())
+        );
+        // `-fstack-check` is its alias, withdrawn by its own `-fno-`.
+        assert!(run_preprocess(&["-fstack-check"]).contains(&"--c17-stack-clash".into()));
+        assert!(!run_preprocess(&["-fstack-check", "-fstack-check=no"])
+            .contains(&"--c17-stack-clash".into()));
+        assert!(
+            run_preprocess(&["-fstack-check", "-fno-stack-clash-protection"])
                 .contains(&"--c17-stack-clash".into())
         );
     }

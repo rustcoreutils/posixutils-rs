@@ -11,7 +11,7 @@
 // output, like gcc's `-fasynchronous-unwind-tables`, not something `-g` adds.
 //
 
-use crate::common::{compile_and_run_aarch64, create_c_file, run_c17};
+use crate::common::{compile_and_run_aarch64_with, create_c_file, run_c17};
 
 /// Every frame shape the prologue has: callee-saved general and FP registers
 /// live across a call, `alloca` and a VLA moving the stack pointer after the
@@ -93,17 +93,22 @@ fn run_host_plain(name: &str, src: &str, opts: &[&str]) -> i32 {
 /// `.cfi_startproc` and nothing else: every function claimed its return
 /// address was still at the entry stack pointer. On aarch64 the walk stopped
 /// after one frame; on x86-64 it read past the frame and invented thirty.
+///
+/// And with `-fstack-clash-protection`, whose probes move the stack pointer
+/// in the prologue of `big` (on x86-64) and after `dyn`'s `alloca` and VLA.
 #[test]
 fn codegen_backtrace_walks_every_frame() {
     let src = backtrace_program();
     for opt in ["-O0", "-O2"] {
-        assert_eq!(
-            run_host_plain("backtrace", &src, &[opt]),
-            0,
-            "host backtrace at {opt}"
-        );
-        if let Some(code) = compile_and_run_aarch64("backtrace", &src, opt) {
-            assert_eq!(code, 0, "aarch64 backtrace at {opt}");
+        for opts in [&[opt][..], &[opt, "-fstack-clash-protection"]] {
+            assert_eq!(
+                run_host_plain("backtrace", &src, opts),
+                0,
+                "host backtrace with {opts:?}"
+            );
+            if let Some(code) = compile_and_run_aarch64_with("backtrace", &src, opts, &[]) {
+                assert_eq!(code, 0, "aarch64 backtrace with {opts:?}");
+            }
         }
     }
 }

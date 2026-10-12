@@ -75,6 +75,7 @@ mod codegen_profiling;
 mod codegen_promotion;
 mod codegen_regalloc;
 mod codegen_sections;
+mod codegen_stack_clash;
 mod codegen_stack_protector;
 mod codegen_stack_protector_layout;
 mod codegen_stacked_args;

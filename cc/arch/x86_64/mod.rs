@@ -24,6 +24,7 @@ pub(crate) mod mapping;
 mod memory;
 pub mod regalloc;
 mod simd;
+mod stack_clash;
 mod win64;
 pub(crate) mod x87;
 

@@ -911,6 +911,10 @@ pub enum X86Inst {
     /// shadow stack. Faults when the shadow stack is off.
     Incssp { count: Reg },
 
+    /// `orq $0, addr` - a stack probe: a write to the stack that changes
+    /// nothing, made to touch the page (`-fstack-clash-protection`).
+    StackProbe { addr: MemAddr },
+
     // ========================================================================
     // Floating-Point (SSE)
     // ========================================================================
@@ -1488,6 +1492,10 @@ impl EmitAsm for X86Inst {
 
             X86Inst::Incssp { count } => {
                 let _ = writeln!(out, "    incsspq {}", count.name64());
+            }
+
+            X86Inst::StackProbe { addr } => {
+                let _ = writeln!(out, "    orq $0, {}", addr.format(target));
             }
 
             // Floating-Point

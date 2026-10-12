@@ -272,8 +272,8 @@ const PLAIN: &[(&str, Effect)] = &[
     ("no-signaling-nans", Implemented),
     ("no-signed-char", Implemented),
     ("no-signed-zeros", Accepted(Permission)),
-    // No stack probes: what c17 emits.
-    ("no-stack-check", Accepted(Default)),
+    // Withdraws `-fstack-check`; see `stack_check`.
+    ("no-stack-check", Implemented),
     // Withdraws `-fstack-clash-protection`; the driver takes both.
     ("no-stack-clash-protection", Implemented),
     // The stack protector's levels and their withdrawal:
@@ -362,12 +362,14 @@ const PLAIN: &[(&str, Effect)] = &[
     ("signaling-nans", Implemented),
     ("signed-char", Implemented),
     ("signed-zeros", Accepted(Default)),
-    // Hardening: no stack probes.
-    ("stack-check", Unsupported),
-    ("stack-check=no", Accepted(Default)),
-    // The driver takes it, and c17 warns for each function whose stack
-    // gcc would probe: one whose frame reaches the guard, or that
-    // allocates on the stack dynamically. Other functions need no probe.
+    // c17's alias of `-fstack-clash-protection`, with gcc's levels and its
+    // withdrawal; see `stack_check`.
+    ("stack-check", Implemented),
+    ("stack-check=generic", Implemented),
+    ("stack-check=no", Implemented),
+    ("stack-check=specific", Implemented),
+    // The driver takes it, and c17 probes the stack as gcc does wherever
+    // it could jump the guard page: `target::StackClash`.
     ("stack-clash-protection", Implemented),
     ("stack-protector", Implemented),
     ("stack-protector-all", Implemented),
@@ -513,8 +515,8 @@ const JOINED: &[(&str, Value, Effect)] = &[
     ("sanitize-coverage", Value::Driver, Implemented),
     ("sanitize-recover", Value::Any, Accepted(SanitizerModifier)),
     ("sanitize-trap", Value::Any, Accepted(SanitizerModifier)),
-    // `no` is in `PLAIN`. `generic` and `specific` ask for stack probes,
-    // which c17 does not emit; gcc only warns of a value it does not know.
+    // gcc's levels are in `PLAIN`. gcc only warns of a value it does not
+    // know, and ignores it, which is what c17 says it does.
     ("stack-check", Value::Any, Unsupported),
     ("strict-flex-arrays", Value::Driver, Implemented),
     ("tls-model", Value::Driver, Implemented),
@@ -630,6 +632,25 @@ fn check_value(stem: &str, kind: Value, value: &str, effect: Effect) -> Verdict 
     match fault {
         Some(line) => Verdict::Error(vec![line]),
         None => Verdict::Known(effect),
+    }
+}
+
+/// What `-f<name>` says of `-fstack-check`: `Some(true)` for a request,
+/// `Some(false)` for its withdrawal, `None` for any other option -- an
+/// unknown level among them, which gcc ignores with a warning.
+///
+/// c17 makes `-fstack-check` an alias of `-fstack-clash-protection`. gcc's
+/// is an older mechanism (probes at a fixed distance below the stack
+/// pointer, for Ada's stack-overflow checks) that gcc itself turns off when
+/// the clash protection is on, as Debian's and Ubuntu's gcc have it by
+/// default; what a C build asking for it wants is a stack that cannot be
+/// jumped. The two requests stay separate, as in gcc: each `-fno-` form
+/// withdraws its own.
+pub fn stack_check(name: &str) -> Option<bool> {
+    match name {
+        "stack-check" | "stack-check=specific" | "stack-check=generic" => Some(true),
+        "stack-check=no" | "no-stack-check" => Some(false),
+        _ => None,
     }
 }
 

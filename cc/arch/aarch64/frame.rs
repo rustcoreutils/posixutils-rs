@@ -197,7 +197,6 @@ impl Aarch64CodeGen {
             self.push_lir(Aarch64Inst::Directive(directive));
         }
         self.emit_prologue(total_frame, &callee_saved, &callee_saved_fp);
-        self.base.check_stack_clash(func, total_frame as i64);
         self.base
             .check_frame_size(i64::from(stack_size + reg_save_area_size));
 
@@ -480,7 +479,7 @@ impl Aarch64CodeGen {
     /// with `.cfi_startproc`, as gcc's `-fasynchronous-unwind-tables` does,
     /// not with `-g`. Each follows the instruction that makes it true, so the
     /// CFA and every saved register are described at every instruction.
-    fn push_cfi(&mut self, rule: Directive) {
+    pub(super) fn push_cfi(&mut self, rule: Directive) {
         if self.base.cfi.emitted() {
             self.push_lir(Aarch64Inst::Directive(rule));
         }
@@ -492,7 +491,7 @@ impl Aarch64CodeGen {
     /// The legalizer would split an immediate past 4095 into two
     /// instructions behind one LIR entry, leaving the CFA wrong between them,
     /// so the split is made here: the shifted part, then the rest.
-    fn emit_sp_adjust(&mut self, delta: i32, mut cfa: i32) {
+    pub(super) fn emit_sp_adjust(&mut self, delta: i32, mut cfa: i32) {
         let bytes = delta.abs();
         let hi = bytes & !0xFFF;
         let parts = if hi != 0 && hi != bytes && bytes < 1 << 24 {
@@ -550,8 +549,9 @@ impl Aarch64CodeGen {
             });
             self.push_cfi(Directive::CfiDefCfaOffset(total_frame));
         } else {
-            // Large frame: separate sub and stp
-            self.emit_sp_adjust(-total_frame, 0);
+            // Large frame: separate sub and stp, the sub probed under
+            // `-fstack-clash-protection` once the frame could jump the guard
+            self.emit_frame_allocation(total_frame);
             // stp x29, x30, [sp]
             self.push_lir(Aarch64Inst::Stp {
                 size: OperandSize::B64,

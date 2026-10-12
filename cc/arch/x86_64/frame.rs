@@ -323,14 +323,6 @@ impl X86_64CodeGen {
         self.emit_profile_call(func, true);
         self.emit_prologue(stack_size, reg_save_area_size, &homes);
         self.emit_profile_call(func, false);
-        // An over-aligned frame's `andq` moves `%rsp` on by up to the
-        // alignment.
-        let realign = match self.frame_base {
-            FrameBase::Aligned { align, .. } => align as i64,
-            _ => 0,
-        };
-        self.base
-            .check_stack_clash(func, self.stack_alloc_size as i64 + realign);
         self.base
             .check_frame_size(i64::from(stack_size + reg_save_area_size));
         let frame_bytes = self.prologue_bytes();
@@ -623,13 +615,15 @@ impl X86_64CodeGen {
         } else {
             alloc_size
         };
-        if alloc_size > 0 {
-            self.push_lir(X86Inst::Sub {
-                size: OperandSize::B64,
-                src: GpOperand::Imm(alloc_size as i64),
-                dst: Reg::Rsp,
-            });
+        // Under `-fstack-clash-protection` an over-aligned frame rounds
+        // `%rsp` first, probed, and then allocates, so that the allocation
+        // starts from a probed stack pointer. `alloc_size` is a multiple of
+        // the alignment, so the order leaves `%rsp` where it would be.
+        let probing = self.base.stack_clash.is_some();
+        if let (true, FrameBase::Aligned { align, .. }) = (probing, self.frame_base) {
+            self.emit_probed_realignment(align);
         }
+        self.emit_frame_allocation(i64::from(alloc_size));
 
         // Dynamic stack alignment for locals with alignment > 16.
         // After sub, emit andq to force RSP to the required alignment, then
@@ -643,11 +637,13 @@ impl X86_64CodeGen {
         // epilogue restores `%rsp` from `%rbp` and pops the base back, so
         // nothing else has to know.
         if let FrameBase::Aligned { reg, align } = self.frame_base {
-            self.push_lir(X86Inst::And {
-                size: OperandSize::B64,
-                src: GpOperand::Imm(-(align as i64)),
-                dst: Reg::Rsp,
-            });
+            if !probing {
+                self.push_lir(X86Inst::And {
+                    size: OperandSize::B64,
+                    src: GpOperand::Imm(-(align as i64)),
+                    dst: Reg::Rsp,
+                });
+            }
             self.push_lir(X86Inst::Mov {
                 size: OperandSize::B64,
                 src: GpOperand::Reg(Reg::Rsp),

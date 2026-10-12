@@ -1541,12 +1541,7 @@ impl Aarch64CodeGen {
         });
 
         // Subtract from stack pointer
-        self.push_lir(Aarch64Inst::Sub {
-            size: OperandSize::B64,
-            src1: Reg::SP,
-            src2: GpOperand::Reg(Reg::X9),
-            dst: Reg::SP,
-        });
+        self.emit_dynamic_allocation();
 
         // Return new stack pointer
         self.push_lir(Aarch64Inst::Mov {

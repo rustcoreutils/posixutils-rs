@@ -1347,11 +1347,7 @@ impl X86_64CodeGen {
         });
 
         // Subtract from stack pointer
-        self.push_lir(X86Inst::Sub {
-            size: OperandSize::B64,
-            src: GpOperand::Reg(Reg::R10),
-            dst: Reg::Rsp,
-        });
+        self.emit_dynamic_allocation();
 
         // Return new stack pointer
         self.push_lir(X86Inst::Mov {

@@ -112,6 +112,11 @@ pub struct X86_64CodeGen {
     /// the object -- [`Self::address_of_pseudo`] loads the one and takes the
     /// address of the other.
     pub(super) incoming_pointers: HashSet<PseudoId>,
+    /// Under `-fstack-clash-protection`, the most the current function's
+    /// stack pointer stands below its last probe once the prologue is done:
+    /// the part of the frame the prologue leaves unprobed. See
+    /// `X86_64CodeGen::emit_frame_allocation`.
+    pub(super) unprobed_frame: i64,
 }
 
 impl X86_64CodeGen {
@@ -146,6 +151,7 @@ impl X86_64CodeGen {
             func_conv: crate::abi::CallingConv::C,
             win64_xmm_saves: Vec::new(),
             incoming_pointers: HashSet::new(),
+            unprobed_frame: 0,
         }
     }
 

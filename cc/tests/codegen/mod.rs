@@ -83,6 +83,7 @@ mod rounding_math;
 mod scaling;
 mod sections;
 mod simd_headers;
+mod stack_clash;
 mod stack_protector;
 mod stacked_args;
 mod storage_order;

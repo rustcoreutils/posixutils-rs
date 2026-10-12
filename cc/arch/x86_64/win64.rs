@@ -268,11 +268,7 @@ impl X86_64CodeGen {
         let positions = insn.src.len().max(WIN64_REG_POSITIONS);
         let area = ((positions * WIN64_POSITION_BYTES) as i64 + 15) & !15;
         debug_assert!(area >= WIN64_SHADOW_BYTES as i64);
-        self.push_lir(X86Inst::Sub {
-            size: OperandSize::B64,
-            src: GpOperand::Imm(area),
-            dst: Reg::Rsp,
-        });
+        self.emit_call_area(area);
         self.base.sp_lowered(area);
         for (n, &arg) in insn.src.iter().enumerate() {
             let typ = insn.extra().arg_types.get(n).copied();

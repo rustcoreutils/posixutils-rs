@@ -161,8 +161,8 @@ pub struct CodeGenBase<I: LirInst> {
     /// `-fcf-protection`, which only x86-64 reads: for its landing pads, and
     /// the layout of `__builtin_setjmp`'s buffer.
     pub cf_protection: crate::target::CfProtection,
-    /// `-fstack-clash-protection` and its `--param`s; see
-    /// [`CodeGenBase::check_stack_clash`].
+    /// `-fstack-clash-protection` and its `--param`s: how the stack is
+    /// probed as it grows ([`crate::target::StackClash`]).
     pub stack_clash: Option<crate::target::StackClash>,
     /// `-fstack-protector` and its levels; see `arch::stack_protect`.
     pub stack_protector: crate::target::StackProtection,
@@ -546,29 +546,11 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         n
     }
 
-    /// Under `-fstack-clash-protection`, warn that `func` is unprobed if gcc
-    /// would probe it: when its prologue moves the stack pointer by
-    /// `adjustment` bytes, enough to step over the guard page, or when it
-    /// allocates on the stack at run time (`alloca`, a VLA). c17 emits no
-    /// probes. Any other function needs none: its prologue's step is
-    /// smaller than the guard, and the store the prologue makes at the new
-    /// stack pointer (x86-64's return address below it, aarch64's frame
-    /// record at it) touches the guard if anything does. The guard is gcc's
-    /// default: 4 KiB on x86-64; 64 KiB on aarch64, less the 1 KiB a caller
-    /// may leave untouched below its own frame.
-    pub fn check_stack_clash(&self, func: &Function, adjustment: i64) {
-        let Some(stack_clash) = self.stack_clash else {
-            return;
-        };
-        let guard = stack_clash.probed_from(self.target.arch);
-        if adjustment >= guard || super::stack_usage::allocates_at_run_time(func) {
-            crate::diag::group_warning_args(
-                crate::f_options::UNSUPPORTED_WARNING,
-                self.func_pos,
-                "'-fstack-clash-protection' is not supported; the stack of '{0}' is not probed",
-                &[&self.current_fn],
-            );
-        }
+    /// Under `-fstack-clash-protection`, how a prologue moving the stack
+    /// pointer by `bytes` probes the move; `None` when it needs no probe or
+    /// the protection is off. See [`crate::target::StackClash`].
+    pub fn frame_probe_plan(&self, bytes: i64) -> Option<crate::target::ProbePlan> {
+        self.stack_clash?.plan(self.target.arch, bytes)
     }
 
     /// `-Wframe-larger-than=`: warn, as gcc does, when this function's

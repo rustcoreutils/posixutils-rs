@@ -320,52 +320,108 @@ fn sanitizers_are_refused() {
     }
 }
 
+/// The functions of [`PROBED_SRC`] that `-fstack-clash-protection` probes,
+/// by the probe each target's assembly shows.
+const PROBED_SRC: &str = "void use(char *);\n\
+                          void small(void) { char b[64]; use(b); }\n\
+                          void big(void) { char b[70000]; use(b); }\n\
+                          void dynamic(int n) { char b[n]; use(b); }\n";
+
+/// Each function of `asm` that holds a stack probe, in order.
+fn probed_functions(asm: &str) -> Vec<String> {
+    let mut probed = Vec::new();
+    let mut current = String::new();
+    for line in asm.lines() {
+        if let Some(label) = line.strip_suffix(':').filter(|l| !l.starts_with('.')) {
+            current = label.trim_start_matches('_').to_string();
+        }
+        let probe = line.contains("orq $0,") || line.contains("str xzr, [sp");
+        if probe && !probed.contains(&current) {
+            probed.push(current.clone());
+        }
+    }
+    probed
+}
+
 /// A function whose frame reaches the guard page, or that allocates on the
-/// stack at run time, is one gcc's `-fstack-clash-protection` would probe
-/// and c17 does not: that function, and only that one, gets the warning.
+/// stack at run time, is probed -- that one, and not a small frame -- in
+/// silence, under `-Werror` too: Debian passes the option to every compile.
+/// It once warned that c17 probed nothing. `-fno-stack-clash-protection`
+/// withdraws it.
 #[test]
-fn stack_clash_protection_names_unprobed_functions() {
-    let src = "void use(char *);\n\
-               void small(void) { char b[64]; use(b); }\n\
-               void big(void) { char b[70000]; use(b); }\n\
-               void dynamic(int n) { char b[n]; use(b); }\n";
-    let (dir, path) = scratch("s.c", src);
+fn stack_clash_protection_probes_in_silence() {
+    let (dir, path) = scratch("s.c", PROBED_SRC);
     let asm = dir.path().join("s.s");
-    for target in [None, Some("--target=aarch64-unknown-linux-gnu")] {
+    for target in [
+        "--target=x86_64-unknown-linux-gnu",
+        "--target=aarch64-unknown-linux-gnu",
+    ] {
         let mut args = vec!["-fstack-clash-protection", "-Werror", "-S", "-o"];
         args.push(asm.to_str().unwrap());
         args.push(path.to_str().unwrap());
-        args.extend(target);
+        args.push(target);
         let r = run_c17(&args);
-        assert!(r.success, "{target:?}: {}", r.stderr);
-        let p = path.display();
-        assert_eq!(
-            r.stderr,
-            format!(
-                "{p}:3:1: warning: '-fstack-clash-protection' is not supported; \
-                 the stack of 'big' is not probed\n\
-                 {p}:4:1: warning: '-fstack-clash-protection' is not supported; \
-                 the stack of 'dynamic' is not probed\n"
-            ),
-            "{target:?}"
-        );
+        assert!(r.success && r.stderr.is_empty(), "{target}: {}", r.stderr);
+        let text = std::fs::read_to_string(&asm).expect("asm");
+        assert_eq!(probed_functions(&text), ["big", "dynamic"], "{target}");
 
-        for quiet in ["-w", "-fno-stack-clash-protection"] {
-            let mut args = args.clone();
-            args.push(quiet);
-            let r = run_c17(&args);
-            assert!(r.success && r.stderr.is_empty(), "{quiet}: {}", r.stderr);
-        }
+        args.push("-fno-stack-clash-protection");
+        let r = run_c17(&args);
+        assert!(r.success && r.stderr.is_empty(), "{target}: {}", r.stderr);
+        let text = std::fs::read_to_string(&asm).expect("asm");
+        assert!(probed_functions(&text).is_empty(), "{target}:\n{text}");
     }
 }
 
+/// `-fstack-check` is c17's alias of `-fstack-clash-protection`: gcc's own
+/// `-fstack-check` is an older mechanism, which Debian's and Ubuntu's gcc
+/// turn off in favour of the clash protection they enable by default.
+/// `specific` and `generic` ask for it too, `-fstack-check=no` and
+/// `-fno-stack-check` withdraw it -- and only it: the two requests are
+/// separate, as they are in gcc. An unknown value is ignored with a warning.
+#[test]
+fn stack_check_is_stack_clash_protection() {
+    let (dir, path) = scratch("c.c", PROBED_SRC);
+    let asm = dir.path().join("c.s");
+    let run = |flags: &[&str]| {
+        let mut args = vec!["--target=x86_64-unknown-linux-gnu", "-Werror", "-S", "-o"];
+        args.push(asm.to_str().unwrap());
+        args.push(path.to_str().unwrap());
+        args.extend(flags);
+        let r = run_c17(&args);
+        assert!(r.success && r.stderr.is_empty(), "{flags:?}: {}", r.stderr);
+        probed_functions(&std::fs::read_to_string(&asm).expect("asm")).len() == 2
+    };
+    for (flags, probed) in [
+        (&["-fstack-check"][..], true),
+        (&["-fstack-check=specific"], true),
+        (&["-fstack-check=generic"], true),
+        (&["-fstack-check", "-fstack-check=no"], false),
+        (&["-fstack-check", "-fno-stack-check"], false),
+        (&["-fno-stack-check", "-fstack-check"], true),
+        (&["-fstack-clash-protection", "-fno-stack-check"], true),
+        (&["-fstack-check", "-fno-stack-clash-protection"], true),
+        (&["-fstack-check=no"], false),
+    ] {
+        assert_eq!(run(flags), probed, "{flags:?}");
+    }
+    let mut args = vec!["-fstack-check=sideways", "-S", "-o"];
+    args.push(asm.to_str().unwrap());
+    args.push(path.to_str().unwrap());
+    let r = run_c17(&args);
+    assert!(r.success, "{}", r.stderr);
+    assert_eq!(
+        r.stderr,
+        "c17: warning: '-fstack-check=sideways' is not supported; ignored\n"
+    );
+}
+
 /// `--param stack-clash-protection-guard-size=` and `-probe-interval=` move
-/// where gcc probes, and so which functions c17 names. On x86-64 a frame is
-/// probed once it reaches both the guard and the interval (each a log2 of
-/// bytes, 12 by default); aarch64 takes only a guard of 12 or 16, with the
-/// interval equal to it, and probes past the guard less the caller's 1 KiB
-/// -- refusing anything else, in gcc's words, with or without the option.
-/// The parameters were accepted and changed nothing.
+/// where gcc probes, and so where c17 does. On x86-64 a frame is probed once
+/// it reaches both the guard and the interval (each a log2 of bytes, 12 by
+/// default); aarch64 takes only a guard of 12 or 16, with the interval equal
+/// to it, and probes past the guard less the caller's 1 KiB -- refusing
+/// anything else, in gcc's words, with or without the option.
 #[test]
 fn stack_clash_protection_params_move_the_threshold() {
     let src = "void use(char *);\n\
@@ -379,10 +435,11 @@ fn stack_clash_protection_params_move_the_threshold() {
         args.extend(extra);
         run_c17(&args)
     };
-    let warns = |extra: &[&str]| {
+    let probes = |extra: &[&str]| {
         let r = run(extra);
-        assert!(r.success, "{extra:?}: {}", r.stderr);
-        r.stderr.contains("the stack of 'f' is not probed")
+        assert!(r.success && r.stderr.is_empty(), "{extra:?}: {}", r.stderr);
+        let text = std::fs::read_to_string(&asm).expect("asm");
+        !probed_functions(&text).is_empty()
     };
     // The x86-64 rows name their target: on an aarch64 host the default
     // threshold is aarch64's.
@@ -408,7 +465,7 @@ fn stack_clash_protection_params_move_the_threshold() {
             true,
         ),
     ] {
-        assert_eq!(warns(extra), want, "{extra:?}");
+        assert_eq!(probes(extra), want, "{extra:?}");
     }
     for (extra, error) in [
         (

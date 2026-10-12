@@ -126,6 +126,9 @@ Supported:
   figures are c17's own frames. On AArch64 c17 moves `sp` for each call's
   stacked arguments, so such a function is `dynamic,bounded` where gcc,
   reserving the area in its frame, says `static`
+- `-fstack-clash-protection` and its `--param`s, probing the stack as gcc does
+  so that no frame, `alloca`, VLA or stacked argument area jumps the guard
+  page; `-fstack-check` is an alias of it (see [DECISIONS.md](DECISIONS.md))
 - `-fdebug-prefix-map=OLD=NEW`, `-fmacro-prefix-map=OLD=NEW` and
   `-ffile-prefix-map=OLD=NEW`, with gcc's rules: the last matching option
   wins, `OLD` is a plain string prefix, and the argument splits at its last `=`

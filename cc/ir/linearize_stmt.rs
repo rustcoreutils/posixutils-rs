@@ -3106,14 +3106,6 @@ impl<'a> super::linearize::Linearizer<'a> {
             if class.flag.is_some() && !(flag_type && size <= Bits::new(64)) {
                 error(op.expr.pos, "invalid type for 'asm' flag output");
             }
-            // The flags are read once the template has run, on the
-            // fall-through; a jump to a label would leave the output unset.
-            if class.flag.is_some() && !goto_labels.is_empty() {
-                error(
-                    op.expr.pos,
-                    "flag outputs are not supported in an 'asm goto' statement",
-                );
-            }
 
             // Non-memory output (register or value class): allocate a
             // fresh pseudo for the asm to write into.

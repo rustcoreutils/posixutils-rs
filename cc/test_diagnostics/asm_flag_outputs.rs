@@ -119,27 +119,28 @@ fn asm_flag_outputs_gcc_refuses() {
     );
 }
 
-/// c17 reads the flags on the fall-through only, so an `asm goto` with a
-/// flag output is refused rather than leave the output unset on the jump.
-/// gcc takes it.
+/// An `asm goto` with a flag output, which gcc takes: the template's jump
+/// goes to a label of c17's own that reads the flags, as the fall-through
+/// does, on its way to the label's block. `codegen::asm_flag_outputs` runs
+/// it.
 #[test]
-fn asm_flag_output_in_asm_goto_is_refused() {
+fn asm_flag_output_in_asm_goto_is_read_on_every_path() {
     let src = "int f(long a) {\n\
                int z;\n\
-               __asm__ goto(\"\" : \"=@ccz\"(z) : \"r\"(a) : : out);\n\
+               __asm__ goto(\"cmp $0, %1\\n\\tje %l2\" : \"=@ccz\"(z) : \"r\"(a) : : out);\n\
                return z;\n\
                out:\n\
-               return 2;\n\
+               return z + 2;\n\
                }\n";
+    let a64 = src.replace("cmp $0, %1\\n\\tje", "cmp %1, #0\\n\\tb.eq");
+    let a64 = a64.replace("=@ccz", "=@cceq");
     for opt in OPTS {
-        expect_rejected(
-            "asm_flag_goto",
-            src,
-            X86,
-            opt,
-            "flag outputs are not supported in an 'asm goto' statement",
-            3,
-        );
+        let asm = expect_accepted("asm_flag_goto", src, X86, opt);
+        assert_eq!(asm.matches("setz").count(), 2, "{opt}:\n{asm}");
+        assert!(asm.contains("je .L.asm_goto_flags."), "{opt}:\n{asm}");
+        let asm = expect_accepted("asm_flag_goto_a64", &a64, A64, opt);
+        assert_eq!(asm.matches(", eq\n").count(), 2, "{opt}:\n{asm}");
+        assert!(asm.contains("b.eq .L.asm_goto_flags."), "{opt}:\n{asm}");
     }
 }
 

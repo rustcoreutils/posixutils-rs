@@ -20,7 +20,9 @@ use crate::arch::asm_constraints::{
     canonical_int, AsmAccess, AsmMemClass, AsmOperandClass, AsmRegClass, FlagCondition,
 };
 use crate::arch::codegen::{impossible_constant, AsmOperandValue};
-use crate::arch::lir::{plan_parallel_moves, Directive, FpSize, MoveStep, OperandSize, Symbol};
+use crate::arch::lir::{
+    plan_parallel_moves, Directive, FpSize, Label, MoveStep, OperandSize, Symbol,
+};
 use crate::ir::{AsmData, Instruction, PseudoId};
 use crate::units::Bits;
 
@@ -748,16 +750,39 @@ impl Aarch64CodeGen {
             slots.push(slot);
         }
 
+        // An `asm goto` with flag outputs jumps to a label of c17's own for
+        // each of its labels, which reads the flags into the outputs, as the
+        // fall-through does, and goes on to the label's block. Outputs are
+        // valid on every path out of an `asm goto` (gcc's rule since gcc
+        // 11), and a flag output is written after the template, which a jump
+        // out of it skips.
+        let trampolines: Vec<(Label, Label)> = if flag_outputs.is_empty() {
+            Vec::new()
+        } else {
+            asm_data
+                .goto_labels
+                .iter()
+                .map(|(bb, _)| {
+                    (
+                        self.next_unique_label("asm_goto_flags"),
+                        Label::block(&self.base.current_fn, bb.0),
+                    )
+                })
+                .collect()
+        };
         // Convert goto_labels from (BasicBlockId, String) to (label_string, label_name)
         let goto_labels_formatted: Vec<(String, String)> = asm_data
             .goto_labels
             .iter()
-            .map(|(bb_id, name)| {
+            .enumerate()
+            .map(|(k, (bb_id, name))| {
                 // Through `Label` rather than a second spelling of the same
                 // format, so the quoting cannot be missed here.
-                let label_str = crate::arch::lir::Label::block(&self.base.current_fn, bb_id.0)
-                    .name(&self.base.target);
-                (label_str, name.clone())
+                let label = match trampolines.get(k) {
+                    Some((trampoline, _)) => trampoline.clone(),
+                    None => Label::block(&self.base.current_fn, bb_id.0),
+                };
+                (label.name(&self.base.target), name.clone())
             })
             .collect();
 
@@ -829,6 +854,22 @@ impl Aarch64CodeGen {
         // now the scratch registers are free to stage one through.
         for (cond, loc, size) in &flag_outputs {
             self.emit_flag_output(*cond, loc, *size);
+        }
+        // And on each jump's way to its label; no other output of an `asm
+        // goto` needs moving (refused above).
+        if !trampolines.is_empty() {
+            let done = self.next_unique_label("asm_goto_done");
+            self.push_lir(Aarch64Inst::B {
+                target: done.clone(),
+            });
+            for (trampoline, target) in trampolines {
+                self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(trampoline)));
+                for (cond, loc, size) in &flag_outputs {
+                    self.emit_flag_output(*cond, loc, *size);
+                }
+                self.push_lir(Aarch64Inst::B { target });
+            }
+            self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(done)));
         }
 
         // Clobbers emit nothing here. A register clobber is a constraint the

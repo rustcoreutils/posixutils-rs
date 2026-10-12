@@ -187,3 +187,69 @@ int main(void) {
 "#;
     compile_and_run_everywhere("asm_flag_outputs_homes", src);
 }
+
+/// Flag outputs of an `asm goto`, on the fall-through and on the jump to
+/// each label: outputs are valid on every path out (gcc's rule since gcc
+/// 11), so the jump reads the flags too. Several outputs, two labels, one
+/// output in memory, and a register output beside them. c17 refused flag
+/// outputs in an `asm goto`; gcc 13 takes them but reads them on the
+/// fall-through only, leaving the jump's value whatever its register held.
+#[test]
+fn asm_flag_outputs_in_asm_goto() {
+    let src = r#"
+#if defined(__x86_64__)
+#define CMP_JUMP "cmp %[b], %[a]\n\tjl %l[less]\n\tje %l[same]"
+#define EQ "e"
+#define LT "l"
+#define ULT "b"
+#elif defined(__aarch64__)
+#define CMP_JUMP "cmp %[a], %[b]\n\tb.lt %l[less]\n\tb.eq %l[same]"
+#define EQ "eq"
+#define LT "lt"
+#define ULT "lo"
+#endif
+
+int g_ult;
+
+/* 100 * path + 4 * eq + 2 * lt + ult, read on whichever path was taken. */
+__attribute__((noinline)) int classify(long a, long b) {
+    int eq, lt;
+    __asm__ goto(CMP_JUMP : "=@cc" EQ(eq), "=@cc" LT(lt), "=@cc" ULT(g_ult)
+                 : [a] "r"(a), [b] "r"(b) : : less, same);
+    return 300 + 4 * eq + 2 * lt + g_ult;
+less:
+    return 100 + 4 * eq + 2 * lt + g_ult;
+same:
+    return 200 + 4 * eq + 2 * lt + g_ult;
+}
+
+/* A register output written by the template beside a flag output. */
+__attribute__((noinline)) long with_register(long a, long b, int *eq) {
+    long d;
+#if defined(__x86_64__)
+    __asm__ goto("mov %[a], %[d]\n\tsub %[b], %[d]\n\tje %l[zero]"
+                 : [d] "=&r"(d), "=@cc" EQ(*eq) : [a] "r"(a), [b] "r"(b) : : zero);
+#elif defined(__aarch64__)
+    __asm__ goto("subs %[d], %[a], %[b]\n\tb.eq %l[zero]"
+                 : [d] "=r"(d), "=@cc" EQ(*eq) : [a] "r"(a), [b] "r"(b) : : zero);
+#endif
+    return d;
+zero:
+    return 1000 + d;
+}
+
+int main(void) {
+    /* -1 < 2 signed, but not unsigned. */
+    if (classify(-1, 2) != 100 + 2) return 1;
+    if (classify(1, 2) != 100 + 2 + 1) return 2;
+    if (classify(5, 5) != 200 + 4) return 3;
+    if (classify(6, 5) != 300) return 4;
+    if (classify(2, -1) != 300 + 1) return 5;
+    int eq = 9;
+    if (with_register(7, 7, &eq) != 1000 || eq != 1) return 6;
+    if (with_register(9, 7, &eq) != 2 || eq != 0) return 7;
+    return 0;
+}
+"#;
+    compile_and_run_everywhere("asm_flag_outputs_goto", src);
+}

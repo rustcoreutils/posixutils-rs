@@ -14,7 +14,7 @@ use crate::arch::asm_constraints::{
     canonical_int, AsmOperandClass, AsmRegClass, FlagCondition, X87Slot,
 };
 use crate::arch::codegen::{impossible_constant, AsmOperandValue};
-use crate::arch::lir::{plan_parallel_moves, Directive, FpSize, MoveStep, OperandSize};
+use crate::arch::lir::{plan_parallel_moves, Directive, FpSize, Label, MoveStep, OperandSize};
 use crate::arch::x86_64::codegen::X86_64CodeGen;
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, X86Inst};
 use crate::arch::x86_64::regalloc::{asm_pinned_regs, Loc, Reg, XmmReg};
@@ -257,8 +257,37 @@ impl X86_64CodeGen {
         self.build_output_slots(insn, asm_data, &pins, &reserved_regs, &mut build);
         self.build_input_slots(insn, asm_data, &pins, &reserved_regs, &mut build);
         self.emit_asm_prologue_moves(&mut build);
-        self.emit_asm_template(insn, asm_data, &build);
-        self.emit_asm_epilogue_moves(insn, asm_data, &build);
+        let trampolines = self.asm_goto_trampolines(asm_data, &build);
+        self.emit_asm_template(insn, asm_data, &build, &trampolines);
+        self.emit_asm_epilogue_moves(insn, asm_data, &build, &trampolines);
+    }
+
+    /// For an `asm goto` with flag outputs, a label of c17's own for each
+    /// of its labels, paired with that label's block: the template jumps
+    /// there instead, and the flags are read into the outputs on the way,
+    /// as on the fall-through. Outputs are valid on every path out of an
+    /// `asm goto` (gcc's rule since gcc 11), and a flag output is written
+    /// after the template, which a jump out of it skips. Empty otherwise.
+    fn asm_goto_trampolines(
+        &mut self,
+        asm_data: &AsmData,
+        build: &AsmOperandBuild,
+    ) -> Vec<(Label, Label)> {
+        if build.flag_outputs.is_empty() {
+            return Vec::new();
+        }
+        asm_data
+            .goto_labels
+            .iter()
+            .map(|(bb, _)| {
+                let id = self.unique_label_counter;
+                self.unique_label_counter += 1;
+                (
+                    Label::internal("asm_goto_flags", id),
+                    Label::block(&self.base.current_fn, bb.0),
+                )
+            })
+            .collect()
     }
 
     /// A `Q` operand left without a register: the statement pins or
@@ -845,18 +874,22 @@ impl X86_64CodeGen {
         insn: &Instruction,
         asm_data: &AsmData,
         build: &AsmOperandBuild,
+        trampolines: &[(Label, Label)],
     ) {
         let slots = &build.slots;
         // Convert goto_labels from (BasicBlockId, String) to (label_string, label_name)
         let goto_labels_formatted: Vec<(String, String)> = asm_data
             .goto_labels
             .iter()
-            .map(|(bb_id, name)| {
+            .enumerate()
+            .map(|(k, (bb_id, name))| {
                 // Through `Label` rather than a second spelling of the same
                 // format, so the quoting cannot be missed here.
-                let label_str = crate::arch::lir::Label::block(&self.base.current_fn, bb_id.0)
-                    .name(&self.base.target);
-                (label_str, name.clone())
+                let label = match trampolines.get(k) {
+                    Some((trampoline, _)) => trampoline.clone(),
+                    None => Label::block(&self.base.current_fn, bb_id.0),
+                };
+                (label.name(&self.base.target), name.clone())
             })
             .collect();
 
@@ -892,6 +925,7 @@ impl X86_64CodeGen {
         insn: &Instruction,
         asm_data: &AsmData,
         build: &AsmOperandBuild,
+        trampolines: &[(Label, Label)],
     ) {
         let AsmOperandBuild {
             output_moves,
@@ -975,6 +1009,28 @@ impl X86_64CodeGen {
         // temps are free to stage one through.
         for (cond, loc, size) in flag_outputs.iter() {
             self.emit_flag_output(*cond, loc, *size);
+        }
+        // An `asm goto`'s jumps read them too, each on its way to its label;
+        // no other output of one needs moving (refused above).
+        if !trampolines.is_empty() {
+            let id = self.unique_label_counter;
+            self.unique_label_counter += 1;
+            let done = Label::internal("asm_goto_done", id);
+            self.push_lir(X86Inst::Jmp {
+                target: done.clone(),
+            });
+            for (trampoline, target) in trampolines {
+                self.push_lir(X86Inst::Directive(Directive::BlockLabel(
+                    trampoline.clone(),
+                )));
+                for (cond, loc, size) in flag_outputs.iter() {
+                    self.emit_flag_output(*cond, loc, *size);
+                }
+                self.push_lir(X86Inst::Jmp {
+                    target: target.clone(),
+                });
+            }
+            self.push_lir(X86Inst::Directive(Directive::BlockLabel(done)));
         }
 
         // Clobbers emit nothing here. A register clobber is a constraint the

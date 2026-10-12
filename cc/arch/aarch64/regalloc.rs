@@ -1033,6 +1033,50 @@ pub enum Loc {
 
 // Register Allocator (Linear Scan)
 
+/// A register as the allocation verifier compares them: an X register, or
+/// one half of a V register -- a call keeps the low half of V8-V15 only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RegUnit {
+    X(Reg),
+    VLo(VReg),
+    VHi(VReg),
+}
+
+/// Every X register that can hold a value: all but the stack pointer and
+/// the zero register.
+const EVERY_X: [Reg; 30] = [
+    Reg::X0,
+    Reg::X1,
+    Reg::X2,
+    Reg::X3,
+    Reg::X4,
+    Reg::X5,
+    Reg::X6,
+    Reg::X7,
+    Reg::X8,
+    Reg::X9,
+    Reg::X10,
+    Reg::X11,
+    Reg::X12,
+    Reg::X13,
+    Reg::X14,
+    Reg::X15,
+    Reg::X16,
+    Reg::X17,
+    Reg::X19,
+    Reg::X20,
+    Reg::X21,
+    Reg::X22,
+    Reg::X23,
+    Reg::X24,
+    Reg::X25,
+    Reg::X26,
+    Reg::X27,
+    Reg::X28,
+    Reg::X29,
+    Reg::X30,
+];
+
 /// Information about an argument spilled from a caller-saved register to stack
 #[derive(Debug, Clone)]
 pub struct SpilledArg {
@@ -1384,6 +1428,12 @@ pub struct RegAlloc {
     frame_base: FrameBase,
     /// How the target stacks named parameters that overflow their registers.
     stacked_args: StackedArgs,
+    /// The size of every frame slot handed to a pseudo; see
+    /// [`crate::arch::regalloc::SlotBytes`].
+    slot_bytes: crate::arch::regalloc::SlotBytes,
+    /// An argument arriving in more than one register -- an HFA, a
+    /// two-register composite -- by how many. Its location names the first.
+    arg_span: HashMap<PseudoId, usize>,
 }
 
 impl RegAlloc {
@@ -1427,6 +1477,8 @@ impl RegAlloc {
             guard_requested: false,
             guard_slot: None,
             global_registers: Vec::new(),
+            slot_bytes: HashMap::new(),
+            arg_span: HashMap::new(),
         }
     }
 
@@ -1542,6 +1594,9 @@ impl RegAlloc {
             &fp_call_positions,
             &constraint_points,
         );
+        if cfg!(debug_assertions) {
+            self.verify(func, types, &constraint_points, &call_positions);
+        }
 
         crate::arch::regalloc::LocationMap::from(self.locations.clone())
     }
@@ -1561,6 +1616,8 @@ impl RegAlloc {
         self.live_in.clear();
         self.live_out.clear();
         self.frame_base = FrameBase::Fp;
+        self.slot_bytes.clear();
+        self.arg_span.clear();
     }
 
     /// Pre-allocate argument registers per AAPCS64.
@@ -1595,6 +1652,7 @@ impl RegAlloc {
                 ParamPlace::Absent => {}
                 ParamPlace::Fp { first, count } => {
                     self.locations.insert(pseudo, Loc::VReg(fp_arg_regs[first]));
+                    self.arg_span.insert(pseudo, count);
                     let used = &fp_arg_regs[first..first + count];
                     self.free_fp_regs.retain(|r| !used.contains(r));
                     self.fp_pseudos.insert(pseudo);
@@ -1607,6 +1665,7 @@ impl RegAlloc {
                     let slot = -self.stack_offset;
                     self.locations
                         .insert(pseudo, Loc::Stack(LocalSlot::from_displacement(slot)));
+                    self.slot_bytes.insert(pseudo, 16);
                     let used = &int_arg_regs[first..first + count];
                     self.free_regs.retain(|r| !used.contains(r));
                 }
@@ -1615,6 +1674,7 @@ impl RegAlloc {
                 // parameter's local, so what matters here is the reservation.
                 ParamPlace::Gp { first, count } => {
                     self.locations.insert(pseudo, Loc::Reg(int_arg_regs[first]));
+                    self.arg_span.insert(pseudo, count);
                     let used = &int_arg_regs[first..first + count];
                     self.free_regs.retain(|r| !used.contains(r));
                 }
@@ -1635,6 +1695,7 @@ impl RegAlloc {
             func,
             &mut self.stack_offset,
             &mut self.locations,
+            &mut self.slot_bytes,
             |off| Loc::Stack(LocalSlot::from_displacement(-off)),
         );
     }
@@ -1677,6 +1738,7 @@ impl RegAlloc {
                     });
 
                     self.locations.insert(interval.pseudo, Loc::Stack(slot));
+                    self.slot_bytes.insert(interval.pseudo, bytes);
                     self.free_fp_regs.push(from_reg);
                 }
             }
@@ -1694,6 +1756,7 @@ impl RegAlloc {
     ) {
         let int_arg_regs_set: &[Reg] = Reg::arg_regs();
         let spilled_args = &mut self.spilled_args;
+        let slot_bytes = &mut self.slot_bytes;
         let free_regs = &mut self.free_regs;
         // X8 carries the sret pointer, which a call overwrites -- the callee
         // may use X8 freely, and a call that itself returns a large aggregate
@@ -1726,6 +1789,7 @@ impl RegAlloc {
                     to_stack_offset: LocalSlot::from_displacement(-to_stack_offset),
                     bytes: 8,
                 });
+                slot_bytes.insert(pseudo, 8);
             },
             // X8 is not allocatable, so it is never handed back as free.
             |reg| {
@@ -1790,9 +1854,10 @@ impl RegAlloc {
             crate::arch::regalloc::place_locals(func, types, pos, intervals, set, |b, a| {
                 self.new_frame_slot(b, a)
             });
-        for (local, offset) in placed {
+        for (local, offset, bytes) in placed {
             self.locations
                 .insert(local, Loc::Stack(LocalSlot::from_displacement(offset)));
+            self.slot_bytes.insert(local, bytes);
             if func.local_of(local).is_some_and(|l| types.is_float(l.typ)) {
                 self.fp_pseudos.insert(local);
             }
@@ -1812,6 +1877,7 @@ impl RegAlloc {
                     interval.pseudo,
                     Loc::Stack(LocalSlot::from_displacement(reused)),
                 );
+                self.slot_bytes.insert(interval.pseudo, size);
                 self.active_stack.push(crate::arch::regalloc::ActiveSlot {
                     current: interval.clone(),
                     past,
@@ -1826,6 +1892,7 @@ impl RegAlloc {
             interval.pseudo,
             Loc::Stack(LocalSlot::from_displacement(offset)),
         );
+        self.slot_bytes.insert(interval.pseudo, size);
         if reusable {
             self.active_stack.push(crate::arch::regalloc::ActiveSlot {
                 current: interval.clone(),
@@ -2295,6 +2362,177 @@ impl RegAlloc {
                 self.alloc_stack_slot(interval, bytes, bytes, true);
             }
         }
+    }
+
+    /// Check the finished assignment against exact liveness; see
+    /// [`crate::arch::regalloc::verify_assignment`]. A debug build only.
+    ///
+    /// What this backend tells the verifier: where each location is -- a V
+    /// register as its low and high halves, the high one only for a value
+    /// wider than 64 bits (or one of unknown width), since AAPCS64 preserves
+    /// only the low half of V8-V15 across a call and writing a narrow value
+    /// zeroes the high half; what each instruction overwrites -- a call every
+    /// caller-saved X register, the low half of every caller-saved V register
+    /// and the high half of all of them, a constraint point its clobbers, an
+    /// asm the V registers it names; the canary's slot; and that an X
+    /// register or a frame slot may not hold a def and a source of the same
+    /// instruction (`csel` writes its target before reading both sources),
+    /// while a V register may, and an identity `Copy` is no instruction.
+    fn verify(
+        &self,
+        func: &Function,
+        types: &TypeTable,
+        constraint_points: &[ConstraintPoint<Reg>],
+        call_positions: &[usize],
+    ) {
+        use crate::arch::regalloc::{Assignment, Cell, Clobber, Spared};
+        // Values known to fit the low 64 bits of a V register: by their
+        // first def's width, an asm output's, or a parameter's type.
+        let mut narrow: HashSet<PseudoId> = HashSet::new();
+        let mut seen: HashSet<PseudoId> = HashSet::new();
+        for insn in func.blocks.iter().flat_map(|b| &b.insns) {
+            if let Some(t) = insn.target {
+                if seen.insert(t) && insn.size > 0 && insn.size <= 64 {
+                    narrow.insert(t);
+                }
+            }
+            if let Some(asm) = insn.extra().asm_data.as_deref() {
+                for out in asm.outputs.iter().filter(|o| !o.is_memory()) {
+                    if seen.insert(out.pseudo) && out.size > 0 && out.size <= 64 {
+                        narrow.insert(out.pseudo);
+                    }
+                }
+            }
+        }
+        for (p, t) in crate::arch::regalloc::arg_pseudo_types(func) {
+            if types.size_bits(t) <= 64 {
+                narrow.insert(p);
+            }
+        }
+        let cells = |p: PseudoId, loc: &Loc| -> Vec<Cell<RegUnit>> {
+            let span = self.arg_span.get(&p).copied().unwrap_or(1);
+            match loc {
+                Loc::Reg(r) => {
+                    let regs = Reg::arg_regs();
+                    match regs.iter().position(|x| x == r) {
+                        Some(first) if span > 1 => regs[first..first + span]
+                            .iter()
+                            .map(|&x| Cell::Reg(RegUnit::X(x)))
+                            .collect(),
+                        _ => vec![Cell::Reg(RegUnit::X(*r))],
+                    }
+                }
+                Loc::VReg(v) => {
+                    let regs = VReg::arg_regs();
+                    let run: Vec<VReg> = match regs.iter().position(|x| x == v) {
+                        Some(first) if span > 1 => regs[first..first + span].to_vec(),
+                        _ => vec![*v],
+                    };
+                    let wide = !narrow.contains(&p);
+                    run.into_iter()
+                        .flat_map(|v| {
+                            std::iter::once(Cell::Reg(RegUnit::VLo(v)))
+                                .chain(wide.then_some(Cell::Reg(RegUnit::VHi(v))))
+                        })
+                        .collect()
+                }
+                Loc::Stack(slot) => {
+                    let bytes = self.slot_bytes.get(&p).copied().unwrap_or_else(|| {
+                        panic!(
+                            "internal compiler error: {p} of `{}` has frame slot {} \
+                             but no recorded size",
+                            func.name,
+                            slot.displacement()
+                        )
+                    });
+                    let lo = i64::from(slot.displacement());
+                    vec![Cell::Frame {
+                        lo,
+                        hi: lo + i64::from(bytes),
+                    }]
+                }
+                Loc::IncomingArg(o) => vec![Cell::Incoming(o.displacement())],
+                Loc::Imm(_) | Loc::FImm(..) | Loc::Global(_) => Vec::new(),
+            }
+        };
+
+        let mut clobbers: Vec<Clobber<RegUnit>> = constraint_points
+            .iter()
+            .map(|cp| Clobber {
+                position: cp.position,
+                regs: cp.clobbers.iter().map(|&r| RegUnit::X(r)).collect(),
+                spared: Spared::Always(cp.involved_pseudos.clone()),
+                why: "the instruction",
+            })
+            .collect();
+        let caller_saved: Vec<RegUnit> = Reg::allocatable()
+            .iter()
+            .filter(|r| !r.is_callee_saved())
+            .map(|&r| RegUnit::X(r))
+            .chain(
+                VReg::allocatable()
+                    .iter()
+                    .filter(|v| !v.is_callee_saved())
+                    .map(|&v| RegUnit::VLo(v)),
+            )
+            .chain(VReg::allocatable().iter().map(|&v| RegUnit::VHi(v)))
+            .collect();
+        clobbers.extend(call_positions.iter().map(|&position| Clobber {
+            position,
+            regs: caller_saved.clone(),
+            spared: Spared::Operands,
+            why: "a call",
+        }));
+        for (position, insn) in func.blocks.iter().flat_map(|b| &b.insns).enumerate() {
+            let named: Vec<RegUnit> = asm_clobbered(insn, parse_fp_clobber_name)
+                .into_iter()
+                .flat_map(|v| [RegUnit::VLo(v), RegUnit::VHi(v)])
+                .collect();
+            if !named.is_empty() {
+                clobbers.push(Clobber {
+                    position,
+                    regs: named,
+                    spared: Spared::Nothing,
+                    why: "the asm's clobber list",
+                });
+            }
+        }
+
+        let mut reserved: Vec<(&'static str, Cell<RegUnit>)> = self
+            .guard_slot
+            .map(|slot| {
+                let lo = i64::from(slot.displacement());
+                ("the canary's slot", Cell::Frame { lo, hi: lo + 8 })
+            })
+            .into_iter()
+            .collect();
+        // Every X register this function may not colour with -- the codegen
+        // and linker scratches, x8, the frame and link registers, the frame
+        // base, the global register variables -- and the scratch V registers.
+        // The sret pointer arriving in x8 is an argument, which may.
+        let allocatable = self.allocatable_regs();
+        let held_back = EVERY_X
+            .iter()
+            .filter(|r| !allocatable.contains(r))
+            .map(|&r| RegUnit::X(r))
+            .chain(
+                [VReg::V16, VReg::V17, VReg::V18]
+                    .into_iter()
+                    .flat_map(|v| [RegUnit::VLo(v), RegUnit::VHi(v)]),
+            );
+        reserved.extend(held_back.map(|u| ("a register held back from allocation", Cell::Reg(u))));
+        let def_may_share_src = |insn: &Instruction, cell: &Cell<RegUnit>| {
+            insn.op == Opcode::Copy || matches!(cell, Cell::Reg(RegUnit::VLo(_) | RegUnit::VHi(_)))
+        };
+        crate::arch::regalloc::verify_assignment(&Assignment {
+            func,
+            live_out: &self.live_out,
+            locations: &self.locations,
+            cells: &cells,
+            clobbers,
+            reserved,
+            def_may_share_src: &def_may_share_src,
+        });
     }
 
     fn compute_live_intervals(&self, func: &Function) -> LivenessResult<Reg> {

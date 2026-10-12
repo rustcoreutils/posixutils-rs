@@ -59,6 +59,7 @@ algorithms and contracts live:
 | `ir/memloc.rs`, `ir/loadfwd.rs` | Memory analysis: what an access addresses, what may alias, and what a location holds at a point |
 | `abi/` | Calling-convention classification (System V AMD64, Microsoft x64, AAPCS64) |
 | `arch/regalloc.rs` | Shared register allocation: liveness, local lifetimes and slot sharing, spill slots |
+| `arch/regalloc/verify.rs` | The allocation verifier: in a debug build, each function's assignment is checked against exact liveness -- no two live values in one register or on one stack byte -- and an internal compiler error names the pair |
 | `arch/x86_64/`, `arch/aarch64/` | Code generators: instruction selection, frames, calls, inline asm |
 
 ## Debugging

@@ -16,6 +16,11 @@ use crate::types::{TypeId, TypeTable};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 
+mod verify;
+pub use verify::{
+    check_assignment, verify_assignment, Assignment, Cell, Clobber, Conflict, Spared, Violation,
+};
+
 /// Grow a frame's locals area by one slot, refusing a total no `i32`
 /// displacement can reach -- counting what the prologue will add to it.
 ///
@@ -146,6 +151,16 @@ impl<L: Clone> From<HashMap<PseudoId, L>> for LocationMap<L> {
         Self { inner }
     }
 }
+
+/// The size of each frame slot the allocator hands a pseudo, by pseudo.
+///
+/// A backend's `Loc::Stack` carries only an offset, and the slot's extent is
+/// decided where it is made -- a spill's width, a local's object, a 128-bit
+/// value's sixteen bytes -- so each site that binds a pseudo to a slot
+/// records it here too. The allocation verifier (`check_assignment`)
+/// compares slots by these extents: two pseudos whose bytes overlap may
+/// not be live together.
+pub type SlotBytes = HashMap<PseudoId, i32>;
 
 const DEFAULT_INTERVAL_CAPACITY: usize = 64;
 const DEFAULT_CONSTRAINT_CAPACITY: usize = 16;
@@ -951,8 +966,8 @@ pub fn local_slot(
     (bytes.max(8), align)
 }
 
-/// Each local's frame slot, as `(local, offset)`, with `new_slot(bytes,
-/// alignment)` making a fresh one.
+/// Each local's frame slot, as `(local, offset, bytes)`, with
+/// `new_slot(bytes, alignment)` making a fresh one.
 ///
 /// Locals are laid out in declaration order, as they always were: the order
 /// decides which of them land near the frame base, and an inline-asm memory
@@ -998,7 +1013,7 @@ pub fn place_locals(
     intervals: &[LiveInterval],
     set: LocalSet,
     mut new_slot: impl FnMut(i32, i32) -> i32,
-) -> Vec<(PseudoId, i32)> {
+) -> Vec<(PseudoId, i32, i32)> {
     struct Shared {
         bytes: i32,
         align: i32,
@@ -1051,7 +1066,7 @@ pub fn place_locals(
                 offset
             }
         };
-        placed.push((local.sym, offset));
+        placed.push((local.sym, offset, bytes));
     }
     placed
 }
@@ -1082,94 +1097,139 @@ fn local_lifetimes(
     block_end_pos: &[usize],
     bb_id_to_idx: &HashMap<BasicBlockId, usize>,
 ) -> HashMap<PseudoId, (usize, usize)> {
-    let locals: Vec<PseudoId> = func.locals.values().map(|l| l.sym).collect();
+    let regions = LocalRegions::of(func, block_start_pos, bb_id_to_idx);
     let last = block_end_pos.last().copied().unwrap_or(0);
-    if func.has_nonlocal_control() {
-        return locals.into_iter().map(|l| (l, (0, last))).collect();
-    }
-    let index: HashMap<PseudoId, usize> = locals.iter().enumerate().map(|(i, &l)| (l, i)).collect();
-
-    // Each block's events in order: (position, local, starts) -- a mention
-    // starts (or continues) a lifetime, a `LifetimeEnd` ends one.
-    let mut events: Vec<Vec<(usize, usize, bool)>> = vec![Vec::new(); func.blocks.len()];
-    for (b, block) in func.blocks.iter().enumerate() {
-        for (pos, insn) in (block_start_pos[b]..).zip(&block.insns) {
-            if insn.op == Opcode::LifetimeEnd {
-                if let Some(&i) = insn.extra().lifetime_of.and_then(|l| index.get(&l)) {
-                    events[b].push((pos, i, false));
-                }
-                continue;
-            }
-            for p in insn.mentioned() {
-                if let Some(&i) = index.get(&p) {
-                    events[b].push((pos, i, true));
-                }
-            }
-        }
-    }
-
-    // Forward "may be inside its lifetime", to a fixed point.
-    let mut live_in = vec![BitSet::new(locals.len()); func.blocks.len()];
-    let mut live_out = vec![BitSet::new(locals.len()); func.blocks.len()];
-    let params: HashSet<&str> = func.params.iter().map(|(n, _)| n.as_str()).collect();
-    if let Some(&entry) = bb_id_to_idx.get(&func.entry) {
-        for (name, local) in &func.locals {
-            if params.contains(name.as_str()) {
-                live_in[entry].insert(index[&local.sym]);
-            }
-        }
-    }
-    let mut work: VecDeque<usize> = (0..func.blocks.len()).collect();
-    let mut queued = vec![true; func.blocks.len()];
-    while let Some(b) = work.pop_front() {
-        queued[b] = false;
-        let mut out = live_in[b].clone();
-        for &(_, i, starts) in &events[b] {
-            if starts {
-                out.insert(i);
-            } else {
-                out.remove(i);
-            }
-        }
-        if out == live_out[b] {
-            continue;
-        }
-        for child in &func.blocks[b].children {
-            let Some(&c) = bb_id_to_idx.get(child) else {
-                continue;
-            };
-            if live_in[c].union_with(&out) && !queued[c] {
-                queued[c] = true;
-                work.push_back(c);
-            }
-        }
-        live_out[b] = out;
+    if regions.everywhere {
+        return regions.locals.into_iter().map(|l| (l, (0, last))).collect();
     }
 
     // The hull: a block's start where the object is live in, its end where
     // live out, and every event in between. Only the set bits are visited:
     // a block's sets hold the few locals live there, not every local.
-    let mut hull: Vec<Option<(usize, usize)>> = vec![None; locals.len()];
+    let mut hull: Vec<Option<(usize, usize)>> = vec![None; regions.locals.len()];
     let mut widen = |i: usize, pos: usize| {
         let (s, e) = hull[i].get_or_insert((pos, pos));
         *s = (*s).min(pos);
         *e = (*e).max(pos);
     };
     for b in 0..func.blocks.len() {
-        for i in live_in[b].iter() {
+        for i in regions.live_in[b].iter() {
             widen(i, block_start_pos[b]);
         }
-        for i in live_out[b].iter() {
+        for i in regions.live_out[b].iter() {
             widen(i, block_end_pos[b]);
         }
-        for &(pos, i, _) in &events[b] {
+        for &(pos, i, _) in &regions.events[b] {
             widen(i, pos);
         }
     }
     hull.into_iter()
         .enumerate()
-        .filter_map(|(i, span)| Some((locals[i], span?)))
+        .filter_map(|(i, span)| Some((regions.locals[i], span?)))
         .collect()
+}
+
+/// Where each local may be inside its lifetime, block by block: the
+/// forward analysis [`local_lifetimes`] takes the hull of, and the
+/// allocation verifier reads point by point.
+pub(crate) struct LocalRegions {
+    /// The locals, by index.
+    pub(crate) locals: Vec<PseudoId>,
+    /// Each block's events in order: `(position, local, starts)` -- a
+    /// mention starts (or continues) a lifetime, a `LifetimeEnd` ends one.
+    pub(crate) events: Vec<Vec<(usize, usize, bool)>>,
+    /// The locals that may be inside their lifetime entering each block.
+    pub(crate) live_in: Vec<BitSet>,
+    /// ... and leaving it.
+    pub(crate) live_out: Vec<BitSet>,
+    /// Control can come back to a point the analysis cannot see -- a
+    /// `setjmp` -- so every local is live everywhere, and the sets above
+    /// are left empty.
+    pub(crate) everywhere: bool,
+}
+
+impl LocalRegions {
+    pub(crate) fn of(
+        func: &Function,
+        block_start_pos: &[usize],
+        bb_id_to_idx: &HashMap<BasicBlockId, usize>,
+    ) -> Self {
+        let locals: Vec<PseudoId> = func.locals.values().map(|l| l.sym).collect();
+        let n = func.blocks.len();
+        if func.has_nonlocal_control() {
+            return Self {
+                live_in: vec![BitSet::new(locals.len()); n],
+                live_out: vec![BitSet::new(locals.len()); n],
+                locals,
+                events: vec![Vec::new(); n],
+                everywhere: true,
+            };
+        }
+        let index: HashMap<PseudoId, usize> =
+            locals.iter().enumerate().map(|(i, &l)| (l, i)).collect();
+
+        let mut events: Vec<Vec<(usize, usize, bool)>> = vec![Vec::new(); n];
+        for (b, block) in func.blocks.iter().enumerate() {
+            for (pos, insn) in (block_start_pos[b]..).zip(&block.insns) {
+                if insn.op == Opcode::LifetimeEnd {
+                    if let Some(&i) = insn.extra().lifetime_of.and_then(|l| index.get(&l)) {
+                        events[b].push((pos, i, false));
+                    }
+                    continue;
+                }
+                for p in insn.mentioned() {
+                    if let Some(&i) = index.get(&p) {
+                        events[b].push((pos, i, true));
+                    }
+                }
+            }
+        }
+
+        // Forward "may be inside its lifetime", to a fixed point.
+        let mut live_in = vec![BitSet::new(locals.len()); n];
+        let mut live_out = vec![BitSet::new(locals.len()); n];
+        let params: HashSet<&str> = func.params.iter().map(|(n, _)| n.as_str()).collect();
+        if let Some(&entry) = bb_id_to_idx.get(&func.entry) {
+            for (name, local) in &func.locals {
+                if params.contains(name.as_str()) {
+                    live_in[entry].insert(index[&local.sym]);
+                }
+            }
+        }
+        let mut work: VecDeque<usize> = (0..n).collect();
+        let mut queued = vec![true; n];
+        while let Some(b) = work.pop_front() {
+            queued[b] = false;
+            let mut out = live_in[b].clone();
+            for &(_, i, starts) in &events[b] {
+                if starts {
+                    out.insert(i);
+                } else {
+                    out.remove(i);
+                }
+            }
+            if out == live_out[b] {
+                continue;
+            }
+            for child in &func.blocks[b].children {
+                let Some(&c) = bb_id_to_idx.get(child) else {
+                    continue;
+                };
+                if live_in[c].union_with(&out) && !queued[c] {
+                    queued[c] = true;
+                    work.push_back(c);
+                }
+            }
+            live_out[b] = out;
+        }
+        Self {
+            locals,
+            events,
+            live_in,
+            live_out,
+            everywhere: false,
+        }
+    }
 }
 
 /// Each pseudo's live interval, by pseudo -- the first, if several.
@@ -1300,11 +1360,14 @@ where
 /// `Loc::Stack(offset)` for the result. The stack-offset sign differs
 /// (x86_64 stores `+stack_offset`, aarch64 stores `-stack_offset`), so
 /// the caller passes a `mk_stack_loc` closure that converts an i32
-/// counter into the backend's preferred `Loc::Stack` value.
+/// counter into the backend's preferred `Loc::Stack` value. Each slot's
+/// size goes in `slot_bytes`, as every frame slot's does: see
+/// [`SlotBytes`].
 pub fn assign_alloca_slots<L, F>(
     func: &Function,
     stack_offset: &mut i32,
     locations: &mut HashMap<PseudoId, L>,
+    slot_bytes: &mut SlotBytes,
     mk_stack_loc: F,
 ) where
     F: Fn(i32) -> L,
@@ -1315,6 +1378,7 @@ pub fn assign_alloca_slots<L, F>(
                 if let Some(target) = insn.target {
                     *stack_offset += 8;
                     locations.insert(target, mk_stack_loc(*stack_offset));
+                    slot_bytes.insert(target, 8);
                 }
             }
         }
@@ -1471,6 +1535,77 @@ impl InterferenceGraph {
     }
 }
 
+/// What one instruction defines and reads, among the pseudos `tracked`
+/// admits: the one enumeration the backward liveness walks share --
+/// [`build_interference_graph`] and the allocation verifier
+/// ([`check_assignment`]) -- so the two cannot disagree about what an
+/// instruction kills and what it revives.
+///
+/// The defs are the target and every register asm output. A *memory* asm
+/// output defines nothing: its pseudo is the address the template writes
+/// through, so it is a use, like every input, the sources and an indirect
+/// call's target.
+pub(crate) struct DefsUses {
+    pub(crate) defs: Vec<PseudoId>,
+    pub(crate) uses: Vec<PseudoId>,
+}
+
+/// The set a backward liveness walk keeps: what is live at the current
+/// point. [`DefsUses::step`] moves it across one instruction.
+pub(crate) trait LiveSet {
+    /// `p` is defined here, so it is not live above this point.
+    fn kill(&mut self, p: PseudoId);
+    /// `p` is read here, so it is live above this point.
+    fn revive(&mut self, p: PseudoId);
+}
+
+impl LiveSet for std::collections::BTreeSet<PseudoId> {
+    fn kill(&mut self, p: PseudoId) {
+        self.remove(&p);
+    }
+    fn revive(&mut self, p: PseudoId) {
+        self.insert(p);
+    }
+}
+
+impl DefsUses {
+    pub(crate) fn of(insn: &Instruction, tracked: impl Fn(PseudoId) -> bool) -> Self {
+        let asm = insn
+            .extra()
+            .asm_data
+            .as_deref()
+            .filter(|_| insn.op == Opcode::Asm);
+        let mut defs: Vec<PseudoId> = insn.target.into_iter().filter(|&t| tracked(t)).collect();
+        let mut uses: Vec<PseudoId> = insn.src.iter().copied().filter(|&s| tracked(s)).collect();
+        uses.extend(insn.extra().indirect_target.filter(|&p| tracked(p)));
+        if let Some(asm) = asm {
+            for output in &asm.outputs {
+                if !tracked(output.pseudo) {
+                    continue;
+                }
+                if output.is_memory() {
+                    uses.push(output.pseudo);
+                } else {
+                    defs.push(output.pseudo);
+                }
+            }
+            uses.extend(asm.inputs.iter().map(|i| i.pseudo).filter(|&p| tracked(p)));
+        }
+        Self { defs, uses }
+    }
+
+    /// Move `live` from just after the instruction to just before it: its
+    /// defs were born here, and its uses are live coming in.
+    pub(crate) fn step(&self, live: &mut impl LiveSet) {
+        for &d in &self.defs {
+            live.kill(d);
+        }
+        for &u in &self.uses {
+            live.revive(u);
+        }
+    }
+}
+
 /// Build the interference graph for pseudos in `candidates`.
 ///
 /// Walks each basic block backward maintaining the current live set.
@@ -1499,155 +1634,92 @@ pub fn build_interference_graph(
     for &c in candidates {
         graph.add_vertex(c);
     }
+    let tracked = |p: PseudoId| candidates.contains(&p);
     for (idx, block) in func.blocks.iter().enumerate() {
         let mut live: std::collections::BTreeSet<PseudoId> = live_out[idx]
             .iter()
             .copied()
-            .filter(|p| candidates.contains(p))
+            .filter(|&p| tracked(p))
             .collect();
         for insn in block.insns.iter().rev() {
-            // Collect defs of this instruction.
-            let mut defs: Vec<PseudoId> = Vec::new();
-            if let Some(target) = insn.target {
-                if candidates.contains(&target) {
-                    defs.push(target);
-                }
-            }
-            if insn.op == Opcode::Asm {
-                if let Some(asm) = &insn.extra().asm_data {
-                    for output in &asm.outputs {
-                        // A memory output defines nothing; it reads an address.
-                        if !output.is_memory() && candidates.contains(&output.pseudo) {
-                            defs.push(output.pseudo);
+            let du = DefsUses::of(insn, tracked);
+            // An early-clobber asm output, and a register output beside a
+            // memory output, may not share with what the statement reads;
+            // see `asm_must_differ`.
+            if let Some(asm) = insn.extra().asm_data.as_deref() {
+                if insn.op == Opcode::Asm {
+                    for (out, read) in asm_must_differ(asm) {
+                        if tracked(out) && tracked(read) {
+                            // `add_edge` ignores a self-edge: a tied input
+                            // is the output.
+                            graph.add_edge(out, read);
                         }
                     }
-                }
-            }
-            // An early-clobber asm output is written before the template
-            // has read its inputs, so it interferes with every one of them
-            // -- a register input, and the address of a memory operand, which
-            // the template also reads -- even an input that dies here, whose
-            // register a plain output may take. A tied input names the
-            // output's own pseudo and so shares with it by construction.
-            if insn.op == Opcode::Asm {
-                if let Some(asm) = &insn.extra().asm_data {
-                    add_early_clobber_edges(&mut graph, asm, candidates);
-                    add_memory_output_edges(&mut graph, asm, candidates);
                 }
             }
             // Each def interferes with everything currently live AND
             // with the instruction's other defs AND with each src
             // (for the lowering-correctness reason described above).
-            for &d in &defs {
+            for &d in &du.defs {
                 for &l in live.iter() {
                     if l != d {
                         graph.add_edge(d, l);
                     }
                 }
-                for &d2 in &defs {
+                for &d2 in &du.defs {
                     if d != d2 {
                         graph.add_edge(d, d2);
                     }
                 }
                 if add_def_src_edges {
                     for &src in &insn.src {
-                        if src != d && candidates.contains(&src) {
+                        if src != d && tracked(src) {
                             graph.add_edge(d, src);
                         }
                     }
                 }
             }
-            // Remove defs from live (they were born here; not live before).
-            for &d in &defs {
-                live.remove(&d);
-            }
-            // Add uses (srcs are live coming INTO this instruction).
-            for &src in &insn.src {
-                if candidates.contains(&src) {
-                    live.insert(src);
-                }
-            }
-            if let Some(indirect) = insn.extra().indirect_target {
-                if candidates.contains(&indirect) {
-                    live.insert(indirect);
-                }
-            }
-            if insn.op == Opcode::Asm {
-                if let Some(asm) = &insn.extra().asm_data {
-                    for input in &asm.inputs {
-                        if candidates.contains(&input.pseudo) {
-                            live.insert(input.pseudo);
-                        }
-                    }
-                    // A memory output is read, not written: its address must
-                    // stay live across the asm.
-                    for output in &asm.outputs {
-                        if output.is_memory() && candidates.contains(&output.pseudo) {
-                            live.insert(output.pseudo);
-                        }
-                    }
-                }
-            }
+            du.step(&mut live);
         }
     }
     graph
 }
 
-/// Edges from each early-clobber register output of one asm statement to
-/// every pseudo the statement reads: its inputs, and the addresses of its
-/// memory outputs.
-fn add_early_clobber_edges(
-    graph: &mut InterferenceGraph,
-    asm: &crate::ir::AsmData,
-    candidates: &std::collections::BTreeSet<PseudoId>,
-) {
-    let read = asm
-        .inputs
-        .iter()
-        .chain(asm.outputs.iter().filter(|o| o.is_memory()))
-        .map(|c| c.pseudo)
-        .filter(|p| candidates.contains(p));
-    let read: Vec<PseudoId> = read.collect();
-    for out in &asm.outputs {
-        if !out.is_early_clobber() || out.is_memory() || !candidates.contains(&out.pseudo) {
-            continue;
-        }
-        for &p in &read {
-            // `add_edge` ignores a self-edge: a tied input is the output.
-            graph.add_edge(out.pseudo, p);
-        }
-    }
-}
-
-/// Edges from each register output of one asm statement to the address of
-/// each of its memory outputs.
+/// The pairs `(output, read)` of one asm statement's operands that may not
+/// share a register even where `read` dies at the statement.
 ///
-/// A plain output may share a register with an input the template has
-/// finished reading, but the address of a memory output is read for the
-/// template's write through it, which may come after the register output is
-/// written. gprofng's `__collector_subget_32` is
-/// `movl %2, %0; negl %0; lock; xaddl %0, %1` with `"=r"(r), "=m"(*ptr)`:
-/// given one register for `r` and `ptr`, the `negl` overwrote the address and
-/// the `xaddl` wrote through the negated count.
-fn add_memory_output_edges(
-    graph: &mut InterferenceGraph,
-    asm: &crate::ir::AsmData,
-    candidates: &std::collections::BTreeSet<PseudoId>,
-) {
+/// - An early-clobber register output is written before the template has
+///   read its inputs, so it differs from every one of them -- a register
+///   input, and the address of a memory operand, which the template also
+///   reads -- even an input that dies here, whose register a plain output
+///   may take. A tied input names the output's own pseudo and so shares
+///   with it by construction.
+/// - A register output differs from the address of each memory output. A
+///   plain output may share a register with an input the template has
+///   finished reading, but the address of a memory output is read for the
+///   template's write through it, which may come after the register output
+///   is written. gprofng's `__collector_subget_32` is
+///   `movl %2, %0; negl %0; lock; xaddl %0, %1` with `"=r"(r), "=m"(*ptr)`:
+///   given one register for `r` and `ptr`, the `negl` overwrote the address
+///   and the `xaddl` wrote through the negated count.
+pub(crate) fn asm_must_differ(asm: &crate::ir::AsmData) -> Vec<(PseudoId, PseudoId)> {
     let addresses: Vec<PseudoId> = asm
         .outputs
         .iter()
-        .filter(|o| o.is_memory() && candidates.contains(&o.pseudo))
+        .filter(|o| o.is_memory())
         .map(|o| o.pseudo)
         .collect();
-    for out in &asm.outputs {
-        if out.is_memory() || !candidates.contains(&out.pseudo) {
-            continue;
+    let mut pairs = Vec::new();
+    for out in asm.outputs.iter().filter(|o| !o.is_memory()) {
+        if out.is_early_clobber() {
+            pairs.extend(asm.inputs.iter().map(|i| (out.pseudo, i.pseudo)));
         }
-        for &p in &addresses {
-            graph.add_edge(out.pseudo, p);
-        }
+        pairs.extend(addresses.iter().map(|&a| (out.pseudo, a)));
     }
+    pairs.retain(|&(out, read)| out != read);
+    pairs.sort_unstable();
+    pairs.dedup();
+    pairs
 }
 
 /// Walk `func` and collect every `Opcode::Copy` instruction's

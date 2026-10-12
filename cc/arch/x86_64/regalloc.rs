@@ -756,6 +756,33 @@ pub enum Loc {
     Global(String),
 }
 
+/// A register as the allocation verifier compares them: one per bank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RegUnit {
+    Gp(Reg),
+    Xmm(XmmReg),
+}
+
+/// Every general register.
+const EVERY_GP: [Reg; 16] = [
+    Reg::Rax,
+    Reg::Rbx,
+    Reg::Rcx,
+    Reg::Rdx,
+    Reg::Rsi,
+    Reg::Rdi,
+    Reg::Rbp,
+    Reg::Rsp,
+    Reg::R8,
+    Reg::R9,
+    Reg::R10,
+    Reg::R11,
+    Reg::R12,
+    Reg::R13,
+    Reg::R14,
+    Reg::R15,
+];
+
 /// Information about an argument spilled from a caller-saved register to stack
 #[derive(Debug, Clone)]
 pub struct SpilledArg {
@@ -872,6 +899,12 @@ pub struct RegAlloc {
     max_local_align: i32,
     /// How this function's locals are addressed.
     frame_base: FrameBase,
+    /// The size of every frame slot handed to a pseudo; see
+    /// [`crate::arch::regalloc::SlotBytes`].
+    slot_bytes: crate::arch::regalloc::SlotBytes,
+    /// An argument arriving in more than one register -- a `double _Complex`
+    /// in two XMM registers -- by how many. Its location names the first.
+    arg_span: HashMap<PseudoId, usize>,
 }
 
 /// How a function's locals are addressed.
@@ -1173,6 +1206,8 @@ impl RegAlloc {
             live_out: Vec::new(),
             max_local_align: 8,
             frame_base: FrameBase::Rbp,
+            slot_bytes: HashMap::new(),
+            arg_span: HashMap::new(),
             tls_access: crate::target::TlsAccess::ElfStatic,
             guard_requested: false,
             guard_slot: None,
@@ -1310,6 +1345,9 @@ impl RegAlloc {
         if win64 {
             self.win64_xmm_saves = self.win64_xmm_to_save(func);
         }
+        if cfg!(debug_assertions) {
+            self.verify(func, &constraint_points, &call_positions);
+        }
 
         crate::arch::regalloc::LocationMap::from(self.locations.clone())
     }
@@ -1416,6 +1454,8 @@ impl RegAlloc {
         self.live_in.clear();
         self.live_out.clear();
         self.max_local_align = 8;
+        self.slot_bytes.clear();
+        self.arg_span.clear();
     }
 
     /// Reserve the [`X87Scratch`] if an instruction of `func` stages a value
@@ -1854,6 +1894,7 @@ impl RegAlloc {
                         .insert(pseudo_id, Loc::Xmm(fp_arg_regs[fp_arg_idx]));
                     let used = &fp_arg_regs[fp_arg_idx..fp_arg_idx + sse_regs];
                     self.free_xmm_regs.retain(|r| !used.contains(r));
+                    self.arg_span.insert(pseudo_id, sse_regs);
                     self.fp_pseudos.insert(pseudo_id);
                     spend_arg_regs(&mut fp_arg_idx, sse_regs, fp_arg_regs.len());
                 } else {
@@ -1908,6 +1949,7 @@ impl RegAlloc {
                 self.stack_offset += 16;
                 self.locations
                     .insert(pseudo_id, Loc::Stack(self.stack_offset));
+                self.slot_bytes.insert(pseudo_id, 16);
                 self.int128_pseudos.insert(pseudo_id);
                 if int_arg_idx + 1 < int_arg_regs.len() {
                     self.free_regs.retain(|&r| {
@@ -2040,6 +2082,8 @@ impl RegAlloc {
 
                     self.locations
                         .insert(interval.pseudo, Loc::Stack(to_stack_offset));
+                    self.slot_bytes
+                        .insert(interval.pseudo, if is_quad { 16 } else { 8 });
                     self.free_xmm_regs.push(from_xmm);
                 }
             }
@@ -2093,6 +2137,7 @@ impl RegAlloc {
     ) {
         let int_arg_regs_set: &[Reg] = Reg::arg_regs();
         let spilled_args = &mut self.spilled_args;
+        let slot_bytes = &mut self.slot_bytes;
         let free_regs = &mut self.free_regs;
         crate::arch::regalloc::spill_gp_args_across(
             intervals,
@@ -2114,6 +2159,7 @@ impl RegAlloc {
                     from_reg,
                     to_stack_offset,
                 });
+                slot_bytes.insert(pseudo, 8);
             },
             |reg| free_regs.push(reg),
         );
@@ -2125,6 +2171,7 @@ impl RegAlloc {
             func,
             &mut self.stack_offset,
             &mut self.locations,
+            &mut self.slot_bytes,
             Loc::Stack,
         );
     }
@@ -2177,8 +2224,9 @@ impl RegAlloc {
             crate::arch::regalloc::place_locals(func, types, pos, intervals, set, |b, a| {
                 self.new_frame_slot(b, a)
             });
-        for (local, offset) in placed {
+        for (local, offset, bytes) in placed {
             self.locations.insert(local, Loc::Stack(offset));
+            self.slot_bytes.insert(local, bytes);
             if func.local_of(local).is_some_and(|l| types.is_float(l.typ)) {
                 self.fp_pseudos.insert(local);
             }
@@ -2197,6 +2245,7 @@ impl RegAlloc {
         if reusable {
             if let Some((reused, past)) = self.try_reuse_stack_slot(size, alignment, interval) {
                 self.locations.insert(interval.pseudo, Loc::Stack(reused));
+                self.slot_bytes.insert(interval.pseudo, size);
                 self.active_stack.push(crate::arch::regalloc::ActiveSlot {
                     current: interval.clone(),
                     past,
@@ -2208,6 +2257,7 @@ impl RegAlloc {
         }
         let offset = self.new_frame_slot(size, alignment);
         self.locations.insert(interval.pseudo, Loc::Stack(offset));
+        self.slot_bytes.insert(interval.pseudo, size);
         if reusable {
             self.active_stack.push(crate::arch::regalloc::ActiveSlot {
                 current: interval.clone(),
@@ -2798,6 +2848,158 @@ impl RegAlloc {
         } else {
             8
         }
+    }
+
+    /// Check the finished assignment against exact liveness; see
+    /// [`crate::arch::regalloc::verify_assignment`]. A debug build only.
+    ///
+    /// What this backend tells the verifier: where each location is; what
+    /// each instruction overwrites -- a call every caller-saved register and
+    /// every XMM register, a constraint point its clobbers, an asm the XMM
+    /// registers it names, a SIMD sequence [`SPARE_XMM`], the Mach-O TLV
+    /// getter every XMM register; which frame slots the frame reserves; and
+    /// that a general register or a frame slot may not hold a def and a
+    /// source of the same instruction -- the two-address lowerings write the
+    /// target before they read the second source -- while an XMM register
+    /// may, and an identity `Copy` is no instruction at all.
+    fn verify(
+        &self,
+        func: &Function,
+        constraint_points: &[ConstraintPoint<Reg>],
+        call_positions: &[usize],
+    ) {
+        use crate::arch::regalloc::{Assignment, Cell, Clobber, Spared};
+        let cells = |p: PseudoId, loc: &Loc| -> Vec<Cell<RegUnit>> {
+            match loc {
+                Loc::Reg(r) => vec![Cell::Reg(RegUnit::Gp(*r))],
+                Loc::Xmm(x) => {
+                    let span = self.arg_span.get(&p).copied().unwrap_or(1);
+                    let regs = XmmReg::arg_regs();
+                    match regs.iter().position(|r| r == x) {
+                        Some(first) if span > 1 => regs[first..first + span]
+                            .iter()
+                            .map(|&r| Cell::Reg(RegUnit::Xmm(r)))
+                            .collect(),
+                        _ => vec![Cell::Reg(RegUnit::Xmm(*x))],
+                    }
+                }
+                Loc::Stack(n) => {
+                    let bytes = self.slot_bytes.get(&p).copied().unwrap_or_else(|| {
+                        panic!(
+                            "internal compiler error: {p} of `{}` has frame slot {n} \
+                             but no recorded size",
+                            func.name
+                        )
+                    });
+                    let lo = -i64::from(*n);
+                    vec![Cell::Frame {
+                        lo,
+                        hi: lo + i64::from(bytes),
+                    }]
+                }
+                Loc::IncomingArg(o) => vec![Cell::Incoming(*o)],
+                Loc::Imm(_) | Loc::FImm(..) | Loc::Global(_) => Vec::new(),
+            }
+        };
+
+        let gp = |regs: &[Reg]| regs.iter().map(|&r| RegUnit::Gp(r)).collect::<Vec<_>>();
+        let every_xmm = || XmmReg::allocatable().iter().map(|&x| RegUnit::Xmm(x));
+        let mut clobbers: Vec<Clobber<RegUnit>> = constraint_points
+            .iter()
+            .map(|cp| Clobber {
+                position: cp.position,
+                regs: gp(&cp.clobbers),
+                spared: Spared::Ends(cp.involved_pseudos.clone()),
+                why: "the instruction",
+            })
+            .collect();
+        let caller_saved: Vec<RegUnit> = Reg::allocatable()
+            .iter()
+            .filter(|r| !r.is_callee_saved())
+            .map(|&r| RegUnit::Gp(r))
+            .chain(every_xmm())
+            .collect();
+        clobbers.extend(call_positions.iter().map(|&position| Clobber {
+            position,
+            regs: caller_saved.clone(),
+            spared: Spared::Operands,
+            why: "a call",
+        }));
+        let tlv = self.tls_access == crate::target::TlsAccess::MachOTlv;
+        for (position, insn) in func.blocks.iter().flat_map(|b| &b.insns).enumerate() {
+            if tlv && insn.op == Opcode::TlsAddr {
+                clobbers.push(Clobber {
+                    position,
+                    regs: every_xmm().collect(),
+                    spared: Spared::Operands,
+                    why: "the TLV getter",
+                });
+            }
+            let named: Vec<RegUnit> = asm_clobbered(insn, parse_xmm_clobber_name)
+                .into_iter()
+                .filter_map(|n| XmmReg::allocatable().get(usize::from(n)))
+                .map(|&x| RegUnit::Xmm(x))
+                .collect();
+            if !named.is_empty() {
+                clobbers.push(Clobber {
+                    position,
+                    regs: named,
+                    spared: Spared::Nothing,
+                    why: "the asm's clobber list",
+                });
+            }
+            if writes_spare_xmm(insn.op) {
+                clobbers.push(Clobber {
+                    position,
+                    regs: vec![RegUnit::Xmm(SPARE_XMM)],
+                    spared: Spared::Nothing,
+                    why: "the SIMD sequence",
+                });
+            }
+        }
+
+        let frame = |slot: i32, bytes: i32| {
+            let lo = -i64::from(slot);
+            Cell::Frame {
+                lo,
+                hi: lo + i64::from(bytes),
+            }
+        };
+        let mut reserved = Vec::new();
+        if let Some(slot) = self.guard_slot {
+            reserved.push(("the canary's slot", frame(slot, 8)));
+        }
+        if let Some(s) = self.x87_scratch {
+            reserved.push(("the x87 scratch slot", frame(s.slot(), X87Scratch::BYTES)));
+        }
+        if let Some(s) = self.x87_control_words {
+            reserved.push((
+                "the x87 control words' slot",
+                frame(s.slot(), X87ControlWords::BYTES),
+            ));
+        }
+        // The stack and frame pointers, the scratch pair, the frame base
+        // and the global register variables: every general register this
+        // function may not colour with, and the two scratch XMM registers.
+        let allocatable = self.allocatable_regs();
+        let held_back = EVERY_GP
+            .iter()
+            .filter(|r| !allocatable.contains(r))
+            .map(|&r| RegUnit::Gp(r))
+            .chain([RegUnit::Xmm(XmmReg::Xmm14), RegUnit::Xmm(XmmReg::Xmm15)]);
+        reserved.extend(held_back.map(|u| ("a register held back from allocation", Cell::Reg(u))));
+        let def_may_share_src = |insn: &Instruction, cell: &Cell<RegUnit>| {
+            insn.op == Opcode::Copy || matches!(cell, Cell::Reg(RegUnit::Xmm(_)))
+        };
+        crate::arch::regalloc::verify_assignment(&Assignment {
+            func,
+            live_out: &self.live_out,
+            locations: &self.locations,
+            cells: &cells,
+            clobbers,
+            reserved,
+            def_may_share_src: &def_may_share_src,
+        });
     }
 
     /// Compute live intervals, constraint points, and per-block liveness sets.

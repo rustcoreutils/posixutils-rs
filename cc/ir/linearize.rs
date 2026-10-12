@@ -3103,8 +3103,9 @@ impl<'a> Linearizer<'a> {
             // It writes the frame.
             ExprKind::UnwindInit => false,
 
-            // The counter reads differ, and `rdtscp` stores; a conversion
-            // or the thread pointer is a value.
+            // The counter reads differ, and `rdtscp` stores; so do reads
+            // and writes of aarch64's floating-point registers. A
+            // conversion or the thread pointer is a value.
             ExprKind::MachineBuiltin { op, args } => {
                 matches!(op, MachineOp::Cvtpd2ps | MachineOp::ThreadPointer)
                     && args.iter().all(|a| self.is_pure_expr(a, how))

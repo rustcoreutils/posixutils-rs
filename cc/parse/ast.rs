@@ -607,6 +607,34 @@ pub enum MachineOp {
     /// `__builtin_thread_pointer()`: the TLS ABI's thread pointer, `%fs:0`
     /// on x86-64 and `tpidr_el0` on aarch64.
     ThreadPointer,
+    /// `__builtin_aarch64_get_fpcr()` and its siblings: `mrs` of an aarch64
+    /// floating-point system register, as an `unsigned int`, or as an
+    /// `unsigned long long` for the `64` forms.
+    FpRegRead { reg: FpSysReg, wide: bool },
+    /// `__builtin_aarch64_set_fpcr(v)` and its siblings: `msr` of the
+    /// register, from an `unsigned int`, or an `unsigned long long` for the
+    /// `64` forms.
+    FpRegWrite { reg: FpSysReg, wide: bool },
+}
+
+/// An aarch64 floating-point system register a [`MachineOp`] reads or
+/// writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FpSysReg {
+    /// The control register: rounding mode, trap enables, flush-to-zero.
+    Fpcr,
+    /// The status register: the cumulative exception flags.
+    Fpsr,
+}
+
+impl FpSysReg {
+    /// The register's name in `mrs` and `msr`.
+    pub fn name(self) -> &'static str {
+        match self {
+            FpSysReg::Fpcr => "fpcr",
+            FpSysReg::Fpsr => "fpsr",
+        }
+    }
 }
 
 /// Which classification question a [`ExprKind::FpTest`] asks.

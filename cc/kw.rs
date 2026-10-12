@@ -892,6 +892,16 @@ define_keywords! {
     (BUILTIN_IA32_RDTSCP,   "__builtin_ia32_rdtscp",   BUILTIN | X86_64_ONLY),
     (BUILTIN_IA32_CVTPD2PS, "__builtin_ia32_cvtpd2ps", BUILTIN | X86_64_ONLY),
     (BUILTIN_THREAD_POINTER, "__builtin_thread_pointer", BUILTIN),
+    // aarch64's floating-point control and status registers, which glibc's
+    // <fpu_control.h> reads and writes through them.
+    (BUILTIN_AARCH64_GET_FPCR,   "__builtin_aarch64_get_fpcr",   BUILTIN | AARCH64_ONLY),
+    (BUILTIN_AARCH64_SET_FPCR,   "__builtin_aarch64_set_fpcr",   BUILTIN | AARCH64_ONLY),
+    (BUILTIN_AARCH64_GET_FPSR,   "__builtin_aarch64_get_fpsr",   BUILTIN | AARCH64_ONLY),
+    (BUILTIN_AARCH64_SET_FPSR,   "__builtin_aarch64_set_fpsr",   BUILTIN | AARCH64_ONLY),
+    (BUILTIN_AARCH64_GET_FPCR64, "__builtin_aarch64_get_fpcr64", BUILTIN | AARCH64_ONLY),
+    (BUILTIN_AARCH64_SET_FPCR64, "__builtin_aarch64_set_fpcr64", BUILTIN | AARCH64_ONLY),
+    (BUILTIN_AARCH64_GET_FPSR64, "__builtin_aarch64_get_fpsr64", BUILTIN | AARCH64_ONLY),
+    (BUILTIN_AARCH64_SET_FPSR64, "__builtin_aarch64_set_fpsr64", BUILTIN | AARCH64_ONLY),
     // <tgmath.h>'s: the call its arguments pick of its functions.
     (BUILTIN_TGMATH,        "__builtin_tgmath",        BUILTIN),
     (CPU_MODEL,            "__cpu_model",            0),

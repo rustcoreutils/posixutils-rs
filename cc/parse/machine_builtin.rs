@@ -11,7 +11,7 @@
 // The linearizer emits the instruction.
 //
 
-use super::ast::{Expr, ExprKind, MachineOp};
+use super::ast::{Expr, ExprKind, FpSysReg, MachineOp};
 use super::builtin_args::BuiltinArgs;
 use super::parser::{ParseResult, Parser};
 use crate::kw;
@@ -21,7 +21,8 @@ use crate::types::{Type, TypeId};
 
 impl Parser<'_> {
     /// `__builtin_ia32_rdtsc`, `__builtin_ia32_rdtscp`,
-    /// `__builtin_ia32_cvtpd2ps` and `__builtin_thread_pointer`.
+    /// `__builtin_ia32_cvtpd2ps`, `__builtin_thread_pointer` and aarch64's
+    /// `__builtin_aarch64_{get,set}_{fpcr,fpsr}{,64}`.
     pub(super) fn parse_machine_builtin(
         &mut self,
         name_id: StringId,
@@ -32,6 +33,14 @@ impl Parser<'_> {
             kw::BUILTIN_IA32_RDTSCP => MachineOp::Rdtscp,
             kw::BUILTIN_IA32_CVTPD2PS => MachineOp::Cvtpd2ps,
             kw::BUILTIN_THREAD_POINTER => MachineOp::ThreadPointer,
+            kw::BUILTIN_AARCH64_GET_FPCR => fp_read(FpSysReg::Fpcr, false),
+            kw::BUILTIN_AARCH64_GET_FPSR => fp_read(FpSysReg::Fpsr, false),
+            kw::BUILTIN_AARCH64_GET_FPCR64 => fp_read(FpSysReg::Fpcr, true),
+            kw::BUILTIN_AARCH64_GET_FPSR64 => fp_read(FpSysReg::Fpsr, true),
+            kw::BUILTIN_AARCH64_SET_FPCR => fp_write(FpSysReg::Fpcr, false),
+            kw::BUILTIN_AARCH64_SET_FPSR => fp_write(FpSysReg::Fpsr, false),
+            kw::BUILTIN_AARCH64_SET_FPCR64 => fp_write(FpSysReg::Fpcr, true),
+            kw::BUILTIN_AARCH64_SET_FPSR64 => fp_write(FpSysReg::Fpsr, true),
             _ => return None,
         };
         Some((|| {
@@ -58,6 +67,23 @@ impl Parser<'_> {
                 (t.vector_of(t.float_id, 4, None), vec![v2df])
             }
             MachineOp::ThreadPointer => (t.void_ptr_id, vec![]),
+            // gcc 13: `unsigned int` for the plain forms, `unsigned long
+            // long` for the `64` ones; a write returns nothing.
+            MachineOp::FpRegRead { wide, .. } => {
+                (if wide { t.ulonglong_id } else { t.uint_id }, vec![])
+            }
+            MachineOp::FpRegWrite { wide, .. } => {
+                let value = if wide { t.ulonglong_id } else { t.uint_id };
+                (t.void_id, vec![value])
+            }
         }
     }
+}
+
+fn fp_read(reg: FpSysReg, wide: bool) -> MachineOp {
+    MachineOp::FpRegRead { reg, wide }
+}
+
+fn fp_write(reg: FpSysReg, wide: bool) -> MachineOp {
+    MachineOp::FpRegWrite { reg, wide }
 }

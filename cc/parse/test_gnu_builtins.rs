@@ -182,3 +182,57 @@ fn test_machine_builtins_belong_to_their_target() {
         &x86_linux()
     ));
 }
+
+/// aarch64's floating-point register builtins parse to their reads and
+/// writes, typed as gcc 13 declares them, and exist on aarch64 alone.
+#[test]
+fn test_aarch64_fp_register_builtins() {
+    use super::ast::FpSysReg::{Fpcr, Fpsr};
+    let a64 = Target::new(Arch::Aarch64, Os::Linux);
+    for (src, op, ty) in [
+        (
+            "__builtin_aarch64_get_fpcr()",
+            MachineOp::FpRegRead {
+                reg: Fpcr,
+                wide: false,
+            },
+            "unsigned int",
+        ),
+        (
+            "__builtin_aarch64_get_fpsr64()",
+            MachineOp::FpRegRead {
+                reg: Fpsr,
+                wide: true,
+            },
+            "unsigned long long",
+        ),
+        (
+            "__builtin_aarch64_set_fpsr(1)",
+            MachineOp::FpRegWrite {
+                reg: Fpsr,
+                wide: false,
+            },
+            "void",
+        ),
+        (
+            "__builtin_aarch64_set_fpcr64(1)",
+            MachineOp::FpRegWrite {
+                reg: Fpcr,
+                wide: true,
+            },
+            "void",
+        ),
+    ] {
+        let (e, types, _, _) = parse_expr_for(src, &a64).unwrap();
+        assert!(
+            matches!(&e.kind, ExprKind::MachineBuiltin { op: o, .. } if *o == op),
+            "{src}: {:?}",
+            e.kind
+        );
+        assert_eq!(types.format_type(e.typ.unwrap(), None), ty, "{src}");
+    }
+    for name in ["__builtin_aarch64_get_fpcr", "__builtin_aarch64_set_fpsr64"] {
+        assert!(crate::builtins::available_on(name, &a64), "{name}");
+        assert!(!crate::builtins::available_on(name, &x86_linux()), "{name}");
+    }
+}

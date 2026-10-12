@@ -3435,10 +3435,10 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 
     /// A builtin that is one machine instruction ([`MachineOp`]), with the
-    /// value gcc 13 gives it. The time-stamp counter and the thread pointer
-    /// are an asm statement's outputs, as the instruction's own registers;
-    /// `cvtpd2ps` is a lane-by-lane conversion, which is what the
-    /// instruction computes.
+    /// value gcc 13 gives it. The time-stamp counter, the thread pointer and
+    /// aarch64's floating-point system registers are an asm statement's
+    /// operands, as the instruction's own registers; `cvtpd2ps` is a
+    /// lane-by-lane conversion, which is what the instruction computes.
     pub(crate) fn linearize_machine_builtin(
         &mut self,
         op: MachineOp,
@@ -3453,7 +3453,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     Some(_) => ("rdtscp", &[("=a", uint), ("=d", uint), ("=c", uint)][..]),
                     None => ("rdtsc", &[("=a", uint), ("=d", uint)][..]),
                 };
-                let regs = self.emit_machine_asm(template, outputs);
+                let regs = self.emit_machine_asm(template, outputs, &[]);
                 if let Some(aux) = aux {
                     self.emit(Instruction::store(regs[2], aux, 0, uint, Bits::new(32)));
                 }
@@ -3492,37 +3492,89 @@ impl<'a> super::linearize::Linearizer<'a> {
                     (Arch::X86_64, _) => "movq %%fs:0, %0",
                     (Arch::Aarch64, _) => "mrs %0, tpidr_el0",
                 };
-                self.emit_machine_asm(template, &[("=r", self.types.void_ptr_id)])[0]
+                self.emit_machine_asm(template, &[("=r", self.types.void_ptr_id)], &[])[0]
+            }
+            // `mrs` and `msr` move a whole X register, whatever the width
+            // of the value, so the plain forms widen and narrow around a
+            // 64-bit transfer as gcc's do. An asm statement is never moved
+            // past another, a call or a floating-point operation, nor
+            // deleted, nor merged with an identical one: each write and each
+            // read of the register happens where the program has it, which
+            // is what a change of rounding mode or a read of the exception
+            // flags needs.
+            MachineOp::FpRegRead { reg, wide } => {
+                let (uint, ulonglong) = (self.types.uint_id, self.types.ulonglong_id);
+                let template = format!("mrs %x0, {}", reg.name());
+                let value = self.emit_machine_asm(&template, &[("=r", ulonglong)], &[])[0];
+                if wide {
+                    value
+                } else {
+                    self.emit_convert(value, ulonglong, uint)
+                }
+            }
+            MachineOp::FpRegWrite { reg, wide } => {
+                let (uint, ulonglong) = (self.types.uint_id, self.types.ulonglong_id);
+                let value = self.linearize_expr(&args[0]);
+                let value = if wide {
+                    value
+                } else {
+                    self.emit_convert(value, uint, ulonglong)
+                };
+                let template = format!("msr {}, %x0", reg.name());
+                self.emit_machine_asm(&template, &[], &[(value, "r", ulonglong)]);
+                self.emit_const(0, self.types.int_id)
             }
         }
     }
 
-    /// An asm statement of `template` with only register `outputs`, each
-    /// a constraint and the type of its value: the pseudos it writes.
-    fn emit_machine_asm(&mut self, template: &str, outputs: &[(&str, TypeId)]) -> Vec<PseudoId> {
-        let arch = self.target.arch;
+    /// An asm statement of `template` with only register operands: each
+    /// output a constraint and the type of its value, each input the value,
+    /// its constraint and its type. Returns the pseudos it writes.
+    fn emit_machine_asm(
+        &mut self,
+        template: &str,
+        outputs: &[(&str, TypeId)],
+        inputs: &[(PseudoId, &str, TypeId)],
+    ) -> Vec<PseudoId> {
         let outputs: Vec<AsmConstraint> = outputs
             .iter()
-            .map(|&(constraint, typ)| AsmConstraint {
-                pseudo: self.alloc_pseudo(),
-                name: None,
-                matching_output: None,
-                constraint: constraint.to_string(),
-                class: AsmOperandClass::parse(constraint, arch)
-                    .expect("a builtin's constraint is a valid one"),
-                size: self.types.value_bits(typ),
-                offset: 0,
-                addr_space: crate::types::AddressSpace::Generic,
+            .map(|&(constraint, typ)| {
+                let pseudo = self.alloc_pseudo();
+                self.machine_asm_operand(pseudo, constraint, typ)
             })
+            .collect();
+        let inputs: Vec<AsmConstraint> = inputs
+            .iter()
+            .map(|&(pseudo, constraint, typ)| self.machine_asm_operand(pseudo, constraint, typ))
             .collect();
         let written = outputs.iter().map(|o| o.pseudo).collect();
         self.emit(Instruction::asm(AsmData {
             template: template.to_string(),
             outputs,
-            inputs: Vec::new(),
+            inputs,
             clobbers: Vec::new(),
             goto_labels: Vec::new(),
         }));
         written
+    }
+
+    /// One register operand of [`Self::emit_machine_asm`].
+    fn machine_asm_operand(
+        &self,
+        pseudo: PseudoId,
+        constraint: &str,
+        typ: TypeId,
+    ) -> AsmConstraint {
+        AsmConstraint {
+            pseudo,
+            name: None,
+            matching_output: None,
+            constraint: constraint.to_string(),
+            class: AsmOperandClass::parse(constraint, self.target.arch)
+                .expect("a builtin's constraint is a valid one"),
+            size: self.types.value_bits(typ),
+            offset: 0,
+            addr_space: crate::types::AddressSpace::Generic,
+        }
     }
 }

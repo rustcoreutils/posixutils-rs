@@ -797,7 +797,7 @@ impl VReg {
 ///
 /// Held as the negative displacement the backend expects, which
 /// [`LocalSlot::from_displacement`] checks. A distinct type, rather than a
-/// signed `i32`, keeps the callee's frame from being confused with the
+/// signed `i64`, keeps the callee's frame from being confused with the
 /// caller's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LocalSlot(i64);
@@ -1011,9 +1011,9 @@ pub enum Loc {
     /// alloca, addressed below the frame pointer -- or below the aligned base
     /// when the frame has one.
     ///
-    /// Carries a [`LocalSlot`] rather than a bare `i32` so it cannot be
+    /// Carries a [`LocalSlot`] rather than a bare `i64` so it cannot be
     /// confused with [`Loc::IncomingArg`]: both frame spaces are perfectly
-    /// valid `i32`s, and only the type tells them apart.
+    /// valid `i64`s, and only the type tells them apart.
     Stack(LocalSlot),
     /// An incoming stack argument, in the **caller's** frame: at +16 past the
     /// saved FP and LR, growing upwards.

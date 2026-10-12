@@ -9,7 +9,6 @@ keeping one here reads as a backlog item nobody is picking up.
 ## Table of Contents
 
 - [Technical Debt](#technical-debt)
-- [Future Features](#future-features)
 - [Optimization Passes](#optimization-passes)
 - [Assembly Peephole Optimizations](#assembly-peephole-optimizations)
 
@@ -29,41 +28,6 @@ from one instruction to the next.
 Done is R10 and R11 in `Reg::allocatable()`, with each of those emitters
 either confined to one instruction's lowering or declaring its scratch as a
 constraint.
-
----
-
-## Future Features
-
-### 64-bit stack frames
-
-An automatic object past `TypeTable::MAX_STACK_OBJECT_BYTES` (just under
-2 GiB) is refused with a diagnostic, and so is a frame whose total passes it,
-because a frame displacement is an `i32`. gcc compiles both: x86-64 reaches the
-frame through `movabsq`-materialised displacements, and aarch64 through
-`movz`/`movk` into a scratch register. The diagnostic exists so that c17 never
-emits a wrapped frame.
-
-The torture tests that need it (`compile/20031023-1..4`,
-`compile/stack-check-1`) fail with that diagnostic.
-
-What it takes:
-
-- Widen every frame quantity to `i64`: `MemAddr` displacements on both targets,
-  `Loc::Stack`/`Loc::IncomingArg`, `RegAlloc::stack_offset`,
-  `callee_saved_offset`, `stack_alloc_size`, `reg_save_area_offset`, the
-  outgoing-argument layout, `IncomingOff`, and the CFI directive offsets.
-  `crate::abi::slot_bytes` (the only place an object
-  size becomes a slot size) and `arch::regalloc::grow_frame` (the only place a
-  frame total grows) then bound at `max_object_bytes` instead, less the
-  prologue headroom (`FRAME_HEADROOM_BYTES`) and the frame's final alignment
-  rounding, which `grow_frame` reserves for the same reason.
-- A displacement outside the target's encodable range goes through a scratch
-  register: `movabsq` plus an indexed or `addq` form on x86-64. On aarch64
-  `legalize.rs` already expands any offset through X15; only the width of the
-  offsets it is given changes.
-- The prologue's `subq $N, %rsp` becomes `movabsq $N, %r11; subq %r11, %rsp`.
-- Stack probing: a frame larger than the guard gap touches each page on the
-  way down, as gcc and clang do. No target probes.
 
 ---
 

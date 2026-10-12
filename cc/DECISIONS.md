@@ -189,6 +189,36 @@ three deliberate differences.
   that chain while its probes run. clang stores the record before calling
   `___chkstk_darwin` for the same reason.
 
+### Frames past two gigabytes
+
+Frame quantities are `i64` in both back ends, and a frame may span up to
+`TypeTable::MAX_FRAME_BYTES`, `PTRDIFF_MAX` less the prologue's headroom --
+gcc's bound too, give or take its 511 bytes. A displacement or immediate
+past 32 bits goes through a register, one rule in each back end's
+`legalize.rs`: aarch64's X15, which every function has, and on x86-64 a
+*far scratch*.
+
+- **The far scratch is a callee-saved register held back for the whole
+  function**, `R15` unless the frame base, a global register variable or the
+  function's inline asm has it (then `R14`, `R13`, `R12`, `RBX`). gcc instead
+  picks a free register at each use. The register is decided before
+  allocation from `arch::regalloc::frame_reach`, an upper bound on every
+  displacement the frame can need, so allocation runs once, and a function
+  under two gigabytes -- every frame there was before -- gives up nothing and
+  is compiled as it was. One held back is never in use where the legalizer
+  needs it, so the rewrite is two instructions with no save, and `movabsq`
+  leaves the flags alone. R10 and R11 could not serve: emitters keep values
+  in them from one instruction to the next. Saving a register around each
+  far access with `push`/`pop` would move `%rsp`, which the outgoing argument
+  stores and `%rsp`-based probes address from.
+- **x86-64 passes a by-value argument past two gigabytes.** gcc refuses one
+  ("sorry, unimplemented: passing too large argument on stack"); C sets no
+  such limit, and the outgoing area is reserved and copied like any other.
+- **An inline-asm operand in a frame slot past 32 bits** is given its address
+  in a register when it is the object itself (an `m` operand of a local),
+  as a global's is; a spilled value's slot that far away is refused, since
+  its template text could only spell a displacement no instruction holds.
+
 ## GNU extensions: what c17 will and will not grow
 
 This is a **decision table, not a backlog**. Frequency in real source is the

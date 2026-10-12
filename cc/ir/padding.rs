@@ -33,7 +33,7 @@ use crate::ir::Access;
 use crate::parse::ast::Expr;
 use crate::strings::StringId;
 use crate::types::{TypeId, TypeKind, TypeTable};
-use crate::units::Bits;
+use crate::units::{Bits, ByteSize};
 
 /// Which bits of each byte of an object of type `typ` belong to a member:
 /// one mask per byte, a bit set where some member keeps a value. Every other
@@ -41,7 +41,7 @@ use crate::units::Bits;
 ///
 /// `Err` names the flexible array member that leaves the padding undefined.
 pub(crate) fn value_bits(types: &TypeTable, typ: TypeId) -> Result<Vec<u8>, StringId> {
-    let mut bits = vec![0u8; types.size_bytes(typ)];
+    let mut bits = vec![0u8; types.byte_size(typ).to_usize()];
     mark(types, typ, 0, &mut bits)?;
     Ok(bits)
 }
@@ -54,7 +54,7 @@ fn mark(types: &TypeTable, typ: TypeId, at: usize, bits: &mut [u8]) -> Result<()
         // Ahead of the real kinds: a complex type has its halves' kind.
         _ if types.is_complex(typ) => {
             let half = types.complex_base(typ);
-            let step = types.size_bytes(half);
+            let step = types.byte_size(half).to_usize();
             mark(types, half, at, bits)?;
             mark(types, half, at + step, bits)
         }
@@ -63,7 +63,7 @@ fn mark(types: &TypeTable, typ: TypeId, at: usize, bits: &mut [u8]) -> Result<()
             Ok(())
         }
         _ => {
-            set_bytes(bits, at, types.size_bytes(typ));
+            set_bytes(bits, at, types.byte_size(typ).to_usize());
             Ok(())
         }
     }
@@ -120,7 +120,7 @@ fn mark_array(types: &TypeTable, typ: TypeId, at: usize, bits: &mut [u8]) -> Res
     let (Some(count), Some(elem)) = (types.array_extent(typ).known(), types.base_type(typ)) else {
         return Ok(());
     };
-    let size = types.size_bytes(elem);
+    let size = types.byte_size(elem).to_usize();
     if count == 0 || size == 0 {
         return Ok(());
     }
@@ -334,7 +334,7 @@ impl Linearizer<'_> {
         for op in ops {
             match *op {
                 PaddingOp::Zero { at, len } => {
-                    self.emit_block_zero(base, at as i64, len as i64, access);
+                    self.emit_block_zero(base, at as i64, ByteSize::from_usize(len), access);
                 }
                 PaddingOp::Mask { at, keep } => {
                     let at = at as i64;
@@ -371,7 +371,7 @@ mod tests {
         StructMember {
             name: StringId(1),
             typ,
-            offset: crate::units::ByteSize::from_usize(offset),
+            offset: ByteSize::from_usize(offset),
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
@@ -397,7 +397,7 @@ mod tests {
     ) -> TypeId {
         let mut c = CompositeType::incomplete(None);
         c.members = members;
-        c.size = crate::units::ByteSize::from_usize(size);
+        c.size = ByteSize::from_usize(size);
         c.align = crate::units::Align::of_bytes(align as u64);
         c.member_align = crate::units::Align::of_bytes(align as u64);
         c.is_complete = true;

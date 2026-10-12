@@ -27,7 +27,7 @@ use crate::strings::StringId;
 use crate::symbol::SymbolId;
 use crate::types::Bitfield;
 use crate::types::{MemberInfo, TypeId, TypeKind, TypeTable};
-use crate::units::Bits;
+use crate::units::{Bits, ByteSize};
 
 /// A read-modify-write target whose address has been computed **once**.
 ///
@@ -447,7 +447,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// 6.7.9p19 asks for before an initializer list is applied: every member
     /// the list does not reach is initialized as a static object would be.
     pub(crate) fn emit_aggregate_zero(&mut self, base_sym: PseudoId, typ: TypeId) {
-        let total_bytes = self.types.size_bytes(typ) as i64;
+        let total_bytes = self.types.byte_size(typ);
         let access = Access::of(self.types, typ);
         self.emit_block_zero(base_sym, 0, total_bytes, access);
     }
@@ -460,7 +460,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         &mut self,
         dst: PseudoId,
         offset: i64,
-        size_bytes: i64,
+        size_bytes: ByteSize,
         typ: TypeId,
     ) {
         let byte = match self.auto_var_init {
@@ -534,7 +534,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         &mut self,
         dst: PseudoId,
         dst_base_offset: i64,
-        size_bytes: i64,
+        size_bytes: ByteSize,
         access: Access,
     ) {
         self.emit_block_fill(dst, dst_base_offset, size_bytes, 0, access);
@@ -545,17 +545,17 @@ impl<'a> super::linearize::Linearizer<'a> {
         &mut self,
         dst: PseudoId,
         dst_base_offset: i64,
-        size_bytes: i64,
+        size_bytes: ByteSize,
         byte: u8,
         access: Access,
     ) {
-        if size_bytes <= 0 {
+        if size_bytes.is_zero() {
             return;
         }
         // An object in a segment has no address `memset` could take, so it
         // is filled here at any size.
         if access.in_segment() || (access.volatile && size_bytes <= memexpand::INLINE_LIMIT_BYTES) {
-            for (offset, chunk) in memexpand::block_chunks(size_bytes) {
+            for (offset, chunk) in memexpand::block_chunks(size_bytes.to_i64()) {
                 let (typ, bits) = (chunk.typ(self.types), chunk.bits());
                 // Every byte the same: the chunk's value, sign-extended.
                 let pattern = i128::from(i64::from_ne_bytes([byte; 8]) >> (64 - bits.get()));
@@ -569,7 +569,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
         let dst_ptr = self.block_dest_addr(dst, dst_base_offset);
         let byte = self.emit_const(i128::from(byte), self.types.int_id);
-        let n = self.emit_const(size_bytes as i128, self.types.ulong_id);
+        let n = self.emit_const(i128::from(size_bytes.get()), self.types.ulong_id);
         let result = self.alloc_pseudo();
         self.emit(
             Instruction::new(BlockOp::Set.opcode())
@@ -585,7 +585,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         &mut self,
         dst: PseudoId,
         src: PseudoId,
-        size_bytes: i64,
+        size_bytes: ByteSize,
         vol: BlockVolatility,
     ) {
         self.emit_block_copy_at_offset(dst, 0, src, size_bytes, vol);
@@ -608,7 +608,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         dst: PseudoId,
         dst_base_offset: i64,
         src: PseudoId,
-        size_bytes: i64,
+        size_bytes: ByteSize,
         vol: BlockVolatility,
     ) {
         // An object in a segment has no address `memcpy` could take, so it
@@ -660,11 +660,11 @@ impl<'a> super::linearize::Linearizer<'a> {
         dst: PseudoId,
         dst_base_offset: i64,
         src: PseudoId,
-        size_bytes: i64,
+        size_bytes: ByteSize,
     ) {
         let dst_ptr = self.block_dest_addr(dst, dst_base_offset);
         let src = self.rvalue_addr(src, self.types.void_ptr_id);
-        let n = self.emit_const(size_bytes as i128, self.types.ulong_id);
+        let n = self.emit_const(i128::from(size_bytes.get()), self.types.ulong_id);
         let result = self.alloc_pseudo();
         self.emit(
             Instruction::new(BlockOp::Copy.opcode())
@@ -896,7 +896,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 Instruction::load(
                     byte,
                     base,
-                    (byte_offset.to_usize() + i as usize) as i64,
+                    byte_offset.to_i64() + i64::from(i),
                     byte_type,
                     Bits::new(8),
                 )
@@ -1118,19 +1118,13 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // 6. Store back, in the unit's own order.
         if self.bitfield_unit_reversed(bf, typ) {
-            self.emit_reversed_store(
-                combined,
-                base,
-                byte_offset.get() as i64,
-                storage_type,
-                access,
-            );
+            self.emit_reversed_store(combined, base, byte_offset.to_i64(), storage_type, access);
         } else {
             self.emit(
                 Instruction::store(
                     combined,
                     base,
-                    byte_offset.get() as i64,
+                    byte_offset.to_i64(),
                     storage_type,
                     storage_bits,
                 )
@@ -1150,7 +1144,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         access: Access,
     ) {
         let storage_type = self.bitfield_storage_type(bf.access_bytes as usize);
-        let offset = bf.offset.get() as i64;
+        let offset = bf.offset.to_i64();
         if self.bitfield_unit_reversed(bf, typ) {
             self.emit_reversed_load(target, base, offset, storage_type, access);
         } else {
@@ -1288,7 +1282,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 out
             };
 
-            let addr_off = (byte_offset.to_usize() + i as usize) as i64;
+            let addr_off = byte_offset.to_i64() + i64::from(i);
             let to_store = if byte_mask == 0xff {
                 // The field owns every bit of this byte, so nothing has to be
                 // preserved and the read can be skipped.
@@ -3077,7 +3071,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             Some(bf) => PlaceAt::Bitfield(base, bf, target_typ),
             // Not a bit-field: fold the member offset into the base so the
             // load and the store share one address.
-            _ => PlaceAt::Object(self.offset_address(base, info.offset.get() as i64)),
+            _ => PlaceAt::Object(self.offset_address(base, info.offset.to_i64())),
         };
         RmwPlace { at, ident: None }
     }
@@ -3344,7 +3338,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         // address. A zero-sized one copies nothing; through the scalar path
         // below its "nothing" was stored as a byte, over the next member.
         let target_kind = self.types.kind(target_typ);
-        let target_size_bytes = self.types.size_bytes(target_typ);
+        let target_size_bytes = self.types.byte_size(target_typ);
         if (target_kind == TypeKind::Struct || target_kind == TypeKind::Union)
             && op == AssignOp::Assign
         {
@@ -3352,7 +3346,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             let value_addr = self.linearize_lvalue(value);
 
             let vol = self.block_volatility(target_typ, self.expr_type(value));
-            self.emit_block_copy(target_addr, value_addr, target_size_bytes as i64, vol);
+            self.emit_block_copy(target_addr, value_addr, target_size_bytes, vol);
 
             // The assignment's value is the target's new value, in the IR's
             // convention for an aggregate: its value when it fits in a

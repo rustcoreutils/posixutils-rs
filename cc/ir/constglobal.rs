@@ -47,6 +47,7 @@ use super::strdata::ConstBytes;
 use super::{ConstValue, Function, Initializer, Instruction, Module, Opcode};
 use crate::types::{TypeId, TypeKind, TypeTable};
 use crate::units::Bits;
+use crate::units::ByteSize;
 use std::collections::HashMap;
 
 /// A global whose value is known for the whole run.
@@ -228,12 +229,11 @@ fn element_load(
     if !(types.is_integer(typ) || types.kind(typ) == TypeKind::Pointer) {
         return None;
     }
-    let width = insn.size.whole_bytes()?;
+    let width = insn.size.byte_size()?;
     let MemBase::Global(name) = &loc.base else {
         return None;
     };
-    let offset = usize::try_from(loc.offset?).ok()?;
-    let width = usize::try_from(width).ok()?;
+    let offset = ByteSize::new(u64::try_from(loc.offset?).ok()?);
     let v = int_at(aggregates.get(name.as_str())?, offset, width)?;
     let v = at_width(v, insn.size.get(), !types.is_unsigned(typ));
     if types.kind(typ) == TypeKind::Bool && !(0..=1).contains(&v) {
@@ -244,11 +244,13 @@ fn element_load(
 
 /// The integer `init` holds in the `width` bytes at `offset`, when they are
 /// exactly one `Int` of it or bytes it does not initialize at all (zero).
-fn int_at(init: &Initializer, offset: usize, width: usize) -> Option<i128> {
+fn int_at(init: &Initializer, offset: ByteSize, width: ByteSize) -> Option<i128> {
     let end = offset.checked_add(width)?;
+    // Whether the part at `at`, `size` bytes long, overlaps the bytes asked for.
+    let overlaps = |at: ByteSize, size: ByteSize| at < end && offset < at.offset_by(size);
     // The parts of `init` overlapping the bytes asked for, as (start, size,
     // initializer).
-    let parts: Vec<(usize, usize, &Initializer)> = match init {
+    let parts: Vec<(ByteSize, ByteSize, &Initializer)> = match init {
         Initializer::Array {
             elem_size,
             total_size,
@@ -260,7 +262,7 @@ fn int_at(init: &Initializer, offset: usize, width: usize) -> Option<i128> {
             elements
                 .iter()
                 .map(|(at, e)| (*at, *elem_size, e))
-                .filter(|&(at, size, _)| at < end && offset < at + size)
+                .filter(|&(at, size, _)| overlaps(at, size))
                 .collect()
         }
         Initializer::Struct { total_size, fields } => {
@@ -270,21 +272,21 @@ fn int_at(init: &Initializer, offset: usize, width: usize) -> Option<i128> {
             fields
                 .iter()
                 .map(|(at, size, f)| (*at, *size, f))
-                .filter(|&(at, size, _)| at < end && offset < at + size)
+                .filter(|&(at, size, _)| overlaps(at, size))
                 .collect()
         }
-        Initializer::Int(v) => return (offset == 0).then_some(*v),
+        Initializer::Int(v) => return offset.is_zero().then_some(*v),
         Initializer::None => return Some(0),
         _ => return None,
     };
     match parts.as_slice() {
         [] => Some(0),
-        [(at, size, part)] if *at <= offset && end <= at + size => {
+        [(at, size, part)] if *at <= offset && end <= at.offset_by(*size) => {
             // Wholly inside one element or member: an `Int` must be exactly
             // the bytes asked for; anything else is looked into.
             match part {
                 Initializer::Int(_) if (*at, *size) != (offset, width) => None,
-                _ => int_at(part, offset - at, width),
+                _ => int_at(part, offset.checked_sub(*at)?, width),
             }
         }
         _ => None,
@@ -615,20 +617,24 @@ mod tests {
     /// elements, each a struct of two 4-byte members and a byte.
     fn cpuid_table() -> Initializer {
         let entry = |function: i128, index: i128, reg: i128| Initializer::Struct {
-            total_size: 12,
+            total_size: ByteSize::new(12),
             fields: vec![
-                (0, 4, Initializer::Int(function)),
-                (4, 4, Initializer::Int(index)),
-                (8, 1, Initializer::Int(reg)),
+                (
+                    ByteSize::new(0),
+                    ByteSize::new(4),
+                    Initializer::Int(function),
+                ),
+                (ByteSize::new(4), ByteSize::new(4), Initializer::Int(index)),
+                (ByteSize::new(8), ByteSize::new(1), Initializer::Int(reg)),
             ],
         };
         Initializer::Array {
-            elem_size: 12,
-            total_size: 48,
+            elem_size: ByteSize::new(12),
+            total_size: ByteSize::new(48),
             elements: vec![
-                (0, entry(1, 0, 3)),
-                (12, entry(0x8000_0001, 0, -2)),
-                (36, entry(9, 2, 0)),
+                (ByteSize::new(0), entry(1, 0, 3)),
+                (ByteSize::new(12), entry(0x8000_0001, 0, -2)),
+                (ByteSize::new(36), entry(9, 2, 0)),
             ],
         }
     }

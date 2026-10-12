@@ -147,6 +147,20 @@ impl ByteSize {
         }
     }
 
+    /// The size or offset as a signed byte count: what an instruction's
+    /// displacement and pointer arithmetic count in. No object is larger than
+    /// `PTRDIFF_MAX`, which an `i64` holds on every target, so a size that
+    /// does not fit is an internal compiler error.
+    pub fn to_i64(self) -> i64 {
+        match i64::try_from(self.0) {
+            Ok(b) => b,
+            Err(_) => panic!(
+                "internal compiler error: a size of {} bytes does not fit an i64; no object is that large",
+                self.0
+            ),
+        }
+    }
+
     /// Whether the size is zero.
     pub const fn is_zero(self) -> bool {
         self.0 == 0
@@ -155,6 +169,12 @@ impl ByteSize {
     /// The sum of two sizes, or `None` when it does not fit.
     pub fn checked_add(self, other: ByteSize) -> Option<ByteSize> {
         self.0.checked_add(other.0).map(ByteSize)
+    }
+
+    /// The size less `other`, or `None` when `other` is the larger: how far
+    /// into an object one offset is past another.
+    pub fn checked_sub(self, other: ByteSize) -> Option<ByteSize> {
+        self.0.checked_sub(other.0).map(ByteSize)
     }
 
     /// The offset `delta` bytes on from this one, for two offsets inside one
@@ -298,6 +318,11 @@ mod tests {
         );
         assert_eq!(max.checked_add(ByteSize::new(1)), None);
         assert_eq!(
+            ByteSize::new(7).checked_sub(ByteSize::new(3)),
+            Some(ByteSize::new(4))
+        );
+        assert_eq!(ByteSize::new(3).checked_sub(ByteSize::new(7)), None);
+        assert_eq!(
             ByteSize::new(8).offset_by(ByteSize::new(4)),
             ByteSize::new(12)
         );
@@ -307,6 +332,14 @@ mod tests {
         assert!(ByteSize::ZERO.is_zero());
         assert_eq!(ByteSize::from_usize(12).get(), 12);
         assert_eq!(ByteSize::new(12).to_usize(), 12);
+        assert_eq!(ByteSize::new(12).to_i64(), 12);
+        assert_eq!(ByteSize::new(i64::MAX as u64).to_i64(), i64::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "internal compiler error: a size of 9223372036854775808 bytes")]
+    fn byte_size_to_i64_refuses_past_ptrdiff_max() {
+        ByteSize::new(1 << 63).to_i64();
     }
 
     #[test]

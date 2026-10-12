@@ -16,6 +16,7 @@ use crate::ir::{Function, Instruction, Module, Opcode, PseudoKind};
 use crate::target::{Arch, Os, Target};
 use crate::types::{TypeKind, TypeTable};
 use crate::units::Bits;
+use crate::units::ByteSize;
 
 fn x86() -> Target {
     Target::new(Arch::X86_64, Os::Linux)
@@ -467,8 +468,8 @@ fn test_darwin_returns_small_integer_vectors_in_v0() {
         assert_eq!(types.is_float(ret("r2")), darwin, "{os:?} r2");
         assert_eq!(types.is_float(ret("r1")), darwin, "{os:?} r1");
         if darwin {
-            assert_eq!(types.size_bytes(ret("r2")), 8);
-            assert_eq!(types.size_bytes(ret("r1")), 4);
+            assert_eq!(types.byte_size(ret("r2")), ByteSize::new(8));
+            assert_eq!(types.byte_size(ret("r1")), ByteSize::new(4));
         }
         // The call's result is taken at the width it was returned.
         let call = insns_of(&module, "c2")

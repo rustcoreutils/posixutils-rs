@@ -20,6 +20,7 @@ use crate::symbol::Symbol;
 use crate::target::Target;
 use crate::types::{CompositeType, MemberAlign, StructMember, Type, TypeModifiers, TypeTable};
 use crate::units::Bits;
+use crate::units::ByteSize;
 
 // Compound assignment lvalue tests
 
@@ -388,14 +389,14 @@ fn test_atomic_aggregate_assign_uses_atomic_store() {
         members: vec![StructMember {
             name: a_name,
             typ: int_id,
-            offset: crate::units::ByteSize::ZERO,
+            offset: ByteSize::ZERO,
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
             align: MemberAlign::NATURAL,
         }],
         enum_constants: vec![],
-        size: crate::units::ByteSize::new(4),
+        size: ByteSize::new(4),
         align: crate::units::Align::of_bytes(4),
         member_align: crate::units::Align::of_bytes(4),
         is_complete: true,

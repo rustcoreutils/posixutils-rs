@@ -62,7 +62,7 @@ use crate::diag::Position;
 use crate::float::{FloatVal, IntegerRounding, IntegralRounding};
 use crate::target::Target;
 use crate::types::{AddressSpace, TypeId, TypeTable};
-use crate::units::Bits;
+use crate::units::{Bits, ByteSize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -3210,7 +3210,7 @@ pub struct ImplicitParamCopy {
     /// Callee's local Sym pseudo that receives the data
     pub local_sym: PseudoId,
     /// Struct size in bytes
-    pub size_bytes: usize,
+    pub size_bytes: ByteSize,
     /// Type for the 8-byte load/store operations (typically `long`)
     pub qword_type: TypeId,
     /// Whether the caller's argument pseudo holds an *address* of the value
@@ -3921,16 +3921,16 @@ pub enum Initializer {
     /// Array initializer: element size in bytes, list of (offset, initializer) pairs
     /// Elements not listed are zero-initialized
     Array {
-        elem_size: usize,
-        total_size: usize,
-        elements: Vec<(usize, Initializer)>,
+        elem_size: ByteSize,
+        total_size: ByteSize,
+        elements: Vec<(ByteSize, Initializer)>,
     },
     /// Struct initializer: list of (offset, size, initializer) tuples
     /// Fields not listed are zero-initialized
     Struct {
-        total_size: usize,
+        total_size: ByteSize,
         /// Each tuple is (offset, field_size, initializer)
-        fields: Vec<(usize, usize, Initializer)>,
+        fields: Vec<(ByteSize, ByteSize, Initializer)>,
     },
     /// Address of a symbol (for pointer initializers like `int *p = &x;`)
     SymAddr(String),
@@ -3968,7 +3968,11 @@ impl Initializer {
     /// designator naming one of its elements -- `{ .s = "abc", .s[1] = 'z' }`
     /// -- has nothing to replace until the literal is seen as the elements
     /// it is. Units past the array are cut, as the literal itself is.
-    pub fn string_as_array(&self, elem_size: usize, total_size: usize) -> Option<Initializer> {
+    pub fn string_as_array(
+        &self,
+        elem_size: ByteSize,
+        total_size: ByteSize,
+    ) -> Option<Initializer> {
         let units: Vec<i128> = match self {
             Initializer::String(s) => crate::token::lexer::payload_bytes(s)
                 .map(i128::from)
@@ -3977,15 +3981,18 @@ impl Initializer {
             Initializer::Utf32String(u) => u.iter().map(|&c| i128::from(c)).collect(),
             _ => return None,
         };
-        let fits = total_size.checked_div(elem_size).unwrap_or(0);
+        let fits = total_size.get().checked_div(elem_size.get()).unwrap_or(0);
         Some(Initializer::Array {
             elem_size,
             total_size,
-            elements: units
-                .into_iter()
-                .take(fits)
-                .enumerate()
-                .map(|(i, u)| (i * elem_size, Initializer::Int(u)))
+            elements: (0..fits)
+                .zip(units)
+                .map(|(i, u)| {
+                    let at = elem_size
+                        .checked_mul(i)
+                        .expect("an element that fits the array is inside it");
+                    (at, Initializer::Int(u))
+                })
                 .collect(),
         })
     }
@@ -4961,15 +4968,23 @@ mod tests {
         }
         .holds_address());
         let array = |elements| Initializer::Array {
-            elem_size: 8,
-            total_size: 16,
+            elem_size: ByteSize::new(8),
+            total_size: ByteSize::new(16),
             elements,
         };
-        assert!(array(vec![(0, Initializer::Int(0)), (8, addr.clone())]).holds_address());
-        assert!(!array(vec![(0, Initializer::Int(1))]).holds_address());
+        assert!(array(vec![
+            (ByteSize::new(0), Initializer::Int(0)),
+            (ByteSize::new(8), addr.clone())
+        ])
+        .holds_address());
+        assert!(!array(vec![(ByteSize::new(0), Initializer::Int(1))]).holds_address());
         let nested = Initializer::Struct {
-            total_size: 16,
-            fields: vec![(0, 16, array(vec![(8, addr)]))],
+            total_size: ByteSize::new(16),
+            fields: vec![(
+                ByteSize::new(0),
+                ByteSize::new(16),
+                array(vec![(ByteSize::new(8), addr)]),
+            )],
         };
         assert!(nested.holds_address());
         assert!(!Initializer::None.holds_address());
@@ -5683,7 +5698,7 @@ mod tests {
     #[test]
     fn test_string_initializer_as_its_elements() {
         let s = Initializer::String("ab\u{e9}".into())
-            .string_as_array(1, 6)
+            .string_as_array(ByteSize::new(1), ByteSize::new(6))
             .unwrap();
         let Initializer::Array { elements, .. } = s else {
             panic!("an array");
@@ -5691,23 +5706,28 @@ mod tests {
         assert_eq!(
             elements,
             vec![
-                (0, Initializer::Int(97)),
-                (1, Initializer::Int(98)),
-                (2, Initializer::Int(0xe9))
+                (ByteSize::new(0), Initializer::Int(97)),
+                (ByteSize::new(1), Initializer::Int(98)),
+                (ByteSize::new(2), Initializer::Int(0xe9))
             ]
         );
         // Cut to the array, not the array stretched to the string.
         let w = Initializer::Utf16String(vec![1, 2, 3])
-            .string_as_array(2, 4)
+            .string_as_array(ByteSize::new(2), ByteSize::new(4))
             .unwrap();
         let Initializer::Array { elements, .. } = w else {
             panic!("an array");
         };
         assert_eq!(
             elements,
-            vec![(0, Initializer::Int(1)), (2, Initializer::Int(2))]
+            vec![
+                (ByteSize::new(0), Initializer::Int(1)),
+                (ByteSize::new(2), Initializer::Int(2))
+            ]
         );
-        assert!(Initializer::Int(1).string_as_array(1, 1).is_none());
+        assert!(Initializer::Int(1)
+            .string_as_array(ByteSize::new(1), ByteSize::new(1))
+            .is_none());
     }
 
     /// Every instruction pays for every field it has, so the ones only a few

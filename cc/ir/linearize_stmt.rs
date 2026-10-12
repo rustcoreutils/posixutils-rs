@@ -28,7 +28,7 @@ use crate::parse::expr_check::register_address_refusal;
 use crate::symbol::SymbolId;
 use crate::token::lexer::payload_bytes;
 use crate::types::TypeTable;
-use crate::units::Bits;
+use crate::units::{Bits, ByteSize};
 use gettextrs::gettext;
 
 use crate::types::{TypeId, TypeKind, TypeModifiers};
@@ -444,7 +444,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         name.clone(),
                         declarator
                             .explicit_align
-                            .unwrap_or(self.types.alignment(typ) as u32),
+                            .unwrap_or(self.types.align(typ).bytes() as u32),
                     );
                     if declarator
                         .storage_class
@@ -509,7 +509,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             self.record_pointee_extents(declarator.symbol, declarator.typ, &declarator.vla_sizes);
 
             if declarator.init.is_none() && !declarator.symbol_attrs.uninitialized {
-                self.auto_var_init(sym_id, 0, self.types.size_bytes(typ) as i64, typ);
+                self.auto_var_init(sym_id, 0, self.types.byte_size(typ), typ);
             }
 
             // If there's an initializer, emit Store(s)
@@ -567,10 +567,10 @@ impl<'a> super::linearize::Linearizer<'a> {
                         && !self.aggregate_travels_by_value(typ)
                     {
                         let value_addr = self.linearize_expr(init);
-                        let type_size_bytes = self.types.size_bytes(typ);
+                        let type_size_bytes = self.types.byte_size(typ);
 
                         let vol = self.block_volatility(typ, self.expr_type(init));
-                        self.emit_block_copy(sym_id, value_addr, type_size_bytes as i64, vol);
+                        self.emit_block_copy(sym_id, value_addr, type_size_bytes, vol);
                     } else {
                         // Simple scalar initializer, converted as if by
                         // assignment (C17 6.7.9p11).
@@ -648,7 +648,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let decl_name = self.symbol_name(declarator.symbol);
         let (dims, elem_type) = self.record_vm_extents(typ, &declarator.vla_sizes, &decl_name);
 
-        let elem_size = self.types.size_bytes(elem_type) as i64;
+        let elem_size = self.types.byte_size(elem_type).to_i64();
 
         // Total element count is the product of every extent. An array
         // declarator always has at least one level, so the empty product this
@@ -934,7 +934,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     }
                 }
 
-                let elem_size = self.types.size_bytes(elem_type);
+                let elem_size = self.types.byte_size(elem_type).to_usize();
                 let elem_is_aggregate = matches!(
                     self.types.kind(elem_type),
                     TypeKind::Array | TypeKind::Struct | TypeKind::Union
@@ -1008,16 +1008,16 @@ impl<'a> super::linearize::Linearizer<'a> {
                     let expr_type = self.expr_type(&elements[0].value);
                     let expr_kind = self.types.kind(expr_type);
                     if (expr_kind == TypeKind::Struct || expr_kind == TypeKind::Union)
-                        && self.types.size_bytes(expr_type) == self.types.size_bytes(typ)
+                        && self.types.byte_size(expr_type) == self.types.byte_size(typ)
                     {
                         let src_addr = self.linearize_lvalue(&elements[0].value);
-                        let target_size_bytes = self.types.size_bytes(typ);
+                        let target_size_bytes = self.types.byte_size(typ);
                         let vol = self.block_volatility(typ, expr_type);
                         self.emit_block_copy_at_offset(
                             base_sym,
                             base_offset,
                             src_addr,
-                            target_size_bytes as i64,
+                            target_size_bytes,
                             vol,
                         );
                         return;
@@ -1048,7 +1048,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                             self.emit_block_zero(
                                 base_sym,
                                 base_offset + reset.start as i64,
-                                (reset.end - reset.start) as i64,
+                                ByteSize::from_usize(reset.end - reset.start),
                                 access,
                             );
                         }
@@ -1058,7 +1058,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         // Placed in the object being initialized, not in the
                         // aggregate the visit walked.
                         let bitfield = visit.bitfield().map(|bf| crate::types::Bitfield {
-                            offset: crate::units::ByteSize::new(offset as u64),
+                            offset: ByteSize::new(offset as u64),
                             ..bf
                         });
                         // The member as a subobject of this object: a store
@@ -1157,7 +1157,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             // Only the bytes the field's own bits reach; its access span is
             // wider and covers bytes other members own.
             (Some(bit_offset), Some(bit_width)) => crate::types::own_bit_bytes(
-                crate::units::ByteSize::from_usize(visit.offset),
+                ByteSize::from_usize(visit.offset),
                 bit_offset,
                 bit_width,
             ),
@@ -1185,7 +1185,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
             }
 
-            let entry_end = entry.origin + self.types.size_bytes(entry.typ);
+            let entry_end = entry.origin + self.types.byte_size(entry.typ).to_usize();
             let inner = span
                 .start
                 .checked_sub(entry.origin)
@@ -1272,7 +1272,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     ) {
         if self.types.is_vector(typ) {
             let value_addr = self.vector_addr(init);
-            let bytes = self.types.size_bytes(typ) as i64;
+            let bytes = self.types.byte_size(typ);
             let vol = self.block_volatility(typ, self.expr_type(init));
             self.emit_block_copy_at_offset(base_sym, offset, value_addr, bytes, vol);
             return;
@@ -2234,7 +2234,11 @@ impl<'a> super::linearize::Linearizer<'a> {
         // every other block operation uses.
         if matches!(tail, StringTail::Zero) {
             let start = base_offset + (written as i64) * elem_bytes;
-            let bytes = (capacity - written) as i64 * elem_bytes;
+            let bytes = self
+                .types
+                .byte_size(elem_type)
+                .checked_mul((capacity - written) as u64)
+                .expect("the rest of an array is no larger than the array");
             let access = Access::of(self.types, arr_typ);
             self.emit_block_zero(base_sym, start, bytes, access);
         }
@@ -2370,22 +2374,22 @@ impl<'a> super::linearize::Linearizer<'a> {
             .globals
             .iter()
             .find(|g| g.name == global_name && g.is_const)?;
-        let size = self.types.size_bytes(expr.typ?);
-        let whole = self.types.size_bytes(global.typ);
+        let size = self.types.byte_size(expr.typ?);
+        let whole = self.types.byte_size(global.typ);
         initializer_leaf(&global.init, offset, size, whole)
     }
 
     /// The object `expr` designates a subobject of, and the subobject's byte
     /// offset in it. Only a path of constant subscripts into arrays and of
     /// members that are not bit-fields qualifies.
-    fn const_subobject_place(&self, expr: &Expr) -> Option<(crate::symbol::SymbolId, usize)> {
+    fn const_subobject_place(&self, expr: &Expr) -> Option<(crate::symbol::SymbolId, ByteSize)> {
         match &expr.kind {
-            ExprKind::Ident(symbol_id) => Some((*symbol_id, 0)),
+            ExprKind::Ident(symbol_id) => Some((*symbol_id, ByteSize::ZERO)),
             ExprKind::Index { array, index } if self.types.kind(array.typ?) == TypeKind::Array => {
                 let (symbol_id, base) = self.const_subobject_place(array)?;
                 let i = crate::constexpr::eval(self, ConstScope::StaticInitializer, index)?;
-                let step = self.types.size_bytes(expr.typ?);
-                let at = usize::try_from(i).ok()?.checked_mul(step)?;
+                let step = self.types.byte_size(expr.typ?);
+                let at = step.checked_mul(u64::try_from(i).ok()?)?;
                 Some((symbol_id, base.checked_add(at)?))
             }
             ExprKind::Member {
@@ -2397,7 +2401,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     return None;
                 }
                 let (symbol_id, base) = self.const_subobject_place(inner)?;
-                Some((symbol_id, base + info.offset.to_usize()))
+                Some((symbol_id, base.offset_by(info.offset)))
             }
             _ => None,
         }
@@ -2446,7 +2450,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn index_byte_offset(&self, array: &Expr, index: &Expr) -> Option<i64> {
         let idx = self.eval_const_init_expr(index)?;
         let elem_type = self.types.base_type(array.typ?)?;
-        Some(idx as i64 * self.types.size_bytes(elem_type) as i64)
+        Some(idx as i64 * self.types.byte_size(elem_type).to_i64())
     }
 
     /// Evaluate a static address expression (for initializers like `&symbol.field`)
@@ -2609,7 +2613,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 let pointee_size = ptr_expr
                     .typ
                     .and_then(|t| self.types.arithmetic_pointee(t))
-                    .map(|t| self.types.size_bytes(t) as i64)
+                    .map(|t| self.types.byte_size(t).to_i64())
                     .unwrap_or(1);
                 let byte_offset = if is_sub {
                     base_offset - int_val as i64 * pointee_size
@@ -3383,7 +3387,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         if is_memory || !self.types.is_vector(typ) {
             return typ;
         }
-        let bytes = self.types.size_bytes(typ);
+        let bytes = self.types.byte_size(typ).to_usize();
         if bytes <= 4 {
             return crate::abi::small_vector_bits(bytes, self.types);
         }
@@ -4744,14 +4748,14 @@ mod asm_operand_tests {
 /// initializer leaves out is zero, but has no entry to answer with.
 fn initializer_leaf(
     init: &crate::ir::Initializer,
-    offset: usize,
-    size: usize,
-    span: usize,
+    offset: ByteSize,
+    size: ByteSize,
+    span: ByteSize,
 ) -> Option<&crate::ir::Initializer> {
     use crate::ir::Initializer;
     match init {
         Initializer::Int(_) | Initializer::Float(_) => {
-            (offset == 0 && size == span).then_some(init)
+            (offset.is_zero() && size == span).then_some(init)
         }
         Initializer::Array {
             elem_size,
@@ -4760,14 +4764,14 @@ fn initializer_leaf(
         } => {
             let (start, element) = elements
                 .iter()
-                .find(|(start, _)| (*start..*start + *elem_size).contains(&offset))?;
-            initializer_leaf(element, offset - start, size, *elem_size)
+                .find(|(start, _)| (*start..start.offset_by(*elem_size)).contains(&offset))?;
+            initializer_leaf(element, offset.checked_sub(*start)?, size, *elem_size)
         }
         Initializer::Struct { fields, .. } => {
             let (start, field_size, field) = fields
                 .iter()
-                .find(|(start, len, _)| (*start..*start + *len).contains(&offset))?;
-            initializer_leaf(field, offset - start, size, *field_size)
+                .find(|(start, len, _)| (*start..start.offset_by(*len)).contains(&offset))?;
+            initializer_leaf(field, offset.checked_sub(*start)?, size, *field_size)
         }
         _ => None,
     }

@@ -29,7 +29,7 @@ use std::collections::HashSet;
 /// [`Aarch64CodeGen::emit_block_copy_loop`]. It is the bound the IR puts on an
 /// expanded `memcpy`, for the same reason: the instruction count of an unrolled
 /// copy is linear in the object.
-pub(super) const UNROLL_LIMIT_BYTES: i64 = crate::ir::memexpand::INLINE_LIMIT_BYTES;
+pub(super) const UNROLL_LIMIT_BYTES: i64 = crate::ir::memexpand::INLINE_LIMIT_BYTES.get() as i64;
 
 /// Where a frame's areas lie, as displacements up from x29, which points at
 /// the frame record at the bottom of the frame.

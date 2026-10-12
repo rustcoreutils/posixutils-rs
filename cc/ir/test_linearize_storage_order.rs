@@ -148,7 +148,7 @@ fn test_a_static_image_is_in_the_struct_order() {
     let at = |offset: usize| {
         fields
             .iter()
-            .find(|(o, _, _)| *o == offset)
+            .find(|(o, _, _)| o.to_usize() == offset)
             .map(|(_, _, init)| init.clone())
     };
     assert_eq!(at(0), Some(Initializer::Int(0x04030201)));

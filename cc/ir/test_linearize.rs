@@ -21,6 +21,7 @@ use crate::strings::StringTable;
 use crate::symbol::Symbol;
 use crate::target::Target;
 use crate::types::{CompositeType, MemberAlign, StructMember, Type, TypeTable};
+use crate::units::ByteSize;
 
 /// Create a default position for test code
 pub(super) fn test_pos() -> Position {
@@ -1277,8 +1278,8 @@ fn test_incomplete_struct_type_resolution() {
         .intern(Type::struct_type(CompositeType::incomplete(Some(foo_tag))));
     let f_sym = ctx.var("f", incomplete_struct_type);
     assert_eq!(
-        ctx.types.size_bytes(incomplete_struct_type),
-        0,
+        ctx.types.byte_size(incomplete_struct_type),
+        ByteSize::ZERO,
         "Incomplete struct should have size 0"
     );
 
@@ -1294,12 +1295,9 @@ fn test_incomplete_struct_type_resolution() {
     };
     let complete_composite = CompositeType {
         tag: Some(foo_tag),
-        members: vec![
-            member(x_id, crate::units::ByteSize::ZERO),
-            member(y_id, crate::units::ByteSize::new(4)),
-        ],
+        members: vec![member(x_id, ByteSize::ZERO), member(y_id, ByteSize::new(4))],
         enum_constants: vec![],
-        size: crate::units::ByteSize::new(8),
+        size: ByteSize::new(8),
         align: crate::units::Align::of_bytes(4),
         member_align: crate::units::Align::of_bytes(4),
         is_complete: true,
@@ -1310,7 +1308,10 @@ fn test_incomplete_struct_type_resolution() {
     };
     ctx.types
         .complete_struct(incomplete_struct_type, complete_composite);
-    assert_eq!(ctx.types.size_bytes(incomplete_struct_type), 8);
+    assert_eq!(
+        ctx.types.byte_size(incomplete_struct_type),
+        ByteSize::new(8)
+    );
 
     // Create an initializer list: {1, 2}
     let init_list = Expr::typed_unpositioned(
@@ -2042,7 +2043,7 @@ fn test_label_difference_initializers() {
         else {
             panic!("{arch}: `t` is an array");
         };
-        assert_eq!(*elem_size, 4);
+        assert_eq!(*elem_size, ByteSize::new(4));
         assert!(
             matches!(elements[0].1, Initializer::Int(0)),
             "{arch}: &&a - &&a"

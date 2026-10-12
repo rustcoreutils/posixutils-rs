@@ -39,6 +39,7 @@ use super::{Function, GlobalDef, Initializer, Module, Opcode, PseudoId};
 use crate::token::lexer::payload_bytes;
 use crate::types::{TypeKind, TypeTable};
 use crate::units::Bits;
+use crate::units::ByteSize;
 use std::collections::{HashMap, HashSet};
 
 /// How many definitions `string_len` follows before it gives up.
@@ -106,10 +107,10 @@ fn const_char_array(g: &GlobalDef, types: &TypeTable) -> Option<Vec<u8>> {
     }
     let elem = types.base_type(g.typ)?;
     // `qualifies` asks the array; a `volatile` element is as volatile.
-    if types.size_bytes(elem) != 1 || types.contains_volatile(elem) {
+    if types.byte_size(elem) != ByteSize::new(1) || types.contains_volatile(elem) {
         return None;
     }
-    let mut bytes = vec![0u8; types.size_bytes(g.typ)];
+    let mut bytes = vec![0u8; types.byte_size(g.typ).to_usize()];
     match &g.init {
         // `char s[3] = "abc"` keeps no terminator: the string is cut to the
         // array, never the array stretched to the string.
@@ -119,16 +120,16 @@ fn const_char_array(g: &GlobalDef, types: &TypeTable) -> Option<Vec<u8>> {
             }
         }
         Initializer::Array {
-            elem_size: 1,
+            elem_size,
             elements,
             ..
-        } => {
+        } if *elem_size == ByteSize::new(1) => {
             for (at, init) in elements {
                 let Initializer::Int(v) = init else {
                     return None;
                 };
                 // The byte of the value, whichever `char` it initializes.
-                *bytes.get_mut(*at)? = *v as u8;
+                *bytes.get_mut(at.to_usize())? = *v as u8;
             }
         }
         _ => return None,
@@ -327,7 +328,10 @@ impl<'a> StrReader<'a> {
         let MemBase::Local(sym) = at.base else {
             return None;
         };
-        let size = locals.types.size_bytes(self.func.local_of(sym)?.typ);
+        let size = locals
+            .types
+            .byte_size(self.func.local_of(sym)?.typ)
+            .to_usize();
         let start = usize::try_from(at.offset?).ok()?;
         let end = size.min(start.saturating_add(MAX_LOCAL_STRING));
         for (len, offset) in (start..end).enumerate() {
@@ -613,15 +617,15 @@ mod tests {
         fx.const_array("padded", 8, Initializer::String("ab".into()), |_| {});
         fx.const_array("cut", 3, Initializer::String("abc".into()), |_| {});
         let elements = vec![
-            (0, Initializer::Int(b'x'.into())),
-            (1, Initializer::Int(-1)),
+            (ByteSize::new(0), Initializer::Int(b'x'.into())),
+            (ByteSize::new(1), Initializer::Int(-1)),
         ];
         fx.const_array(
             "listed",
             4,
             Initializer::Array {
-                elem_size: 1,
-                total_size: 4,
+                elem_size: ByteSize::new(1),
+                total_size: ByteSize::new(4),
                 elements,
             },
             |_| {},

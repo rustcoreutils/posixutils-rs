@@ -1293,42 +1293,46 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 elements,
             } => {
                 // Emit array elements with gaps filled by zeros
+                let (elem_size, total_size) = (elem_size.to_usize(), total_size.to_usize());
                 let mut current_offset = 0usize;
 
                 for (offset, elem_init) in elements {
+                    let offset = offset.to_usize();
                     // Zero-fill gap before this element
-                    if *offset > current_offset {
-                        self.push_directive(Directive::Zero(*offset - current_offset));
+                    if offset > current_offset {
+                        self.push_directive(Directive::Zero(offset - current_offset));
                     }
 
                     // Emit element
-                    self.emit_initializer_data(elem_init, *elem_size);
+                    self.emit_initializer_data(elem_init, elem_size);
                     current_offset = offset + elem_size;
                 }
 
                 // Zero-fill remaining space
-                if *total_size > current_offset {
-                    self.push_directive(Directive::Zero(*total_size - current_offset));
+                if total_size > current_offset {
+                    self.push_directive(Directive::Zero(total_size - current_offset));
                 }
             }
             Initializer::Struct { total_size, fields } => {
                 // Emit struct fields with gaps filled by zeros
+                let total_size = total_size.to_usize();
                 let mut current_offset = 0usize;
 
                 for (offset, field_size, field_init) in fields {
+                    let (offset, field_size) = (offset.to_usize(), field_size.to_usize());
                     // Zero-fill gap before this field
-                    if *offset > current_offset {
-                        self.push_directive(Directive::Zero(*offset - current_offset));
+                    if offset > current_offset {
+                        self.push_directive(Directive::Zero(offset - current_offset));
                     }
 
                     // Emit field
-                    self.emit_initializer_data(field_init, *field_size);
+                    self.emit_initializer_data(field_init, field_size);
                     current_offset = offset + field_size;
                 }
 
                 // Zero-fill remaining space
-                if *total_size > current_offset {
-                    self.push_directive(Directive::Zero(*total_size - current_offset));
+                if total_size > current_offset {
+                    self.push_directive(Directive::Zero(total_size - current_offset));
                 }
             }
             Initializer::SymAddr(name) => {

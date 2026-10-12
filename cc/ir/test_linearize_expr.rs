@@ -22,6 +22,7 @@ use crate::strings::StringTable;
 use crate::target::{Arch, Os, Target};
 use crate::types::{CompositeType, MemberAlign, StructMember, Type, TypeTable};
 use crate::units::Bits;
+use crate::units::ByteSize;
 
 // Unary operation tests
 
@@ -630,14 +631,14 @@ fn test_struct_deref_returns_address() {
         members: vec![StructMember {
             name: ctx.str("x"),
             typ: ctx.types.int_id,
-            offset: crate::units::ByteSize::ZERO,
+            offset: ByteSize::ZERO,
             bit_width: None,
             bit_offset: None,
             access_bytes: None,
             align: MemberAlign::NATURAL,
         }],
         enum_constants: vec![],
-        size: crate::units::ByteSize::new(4),
+        size: ByteSize::new(4),
         align: crate::units::Align::of_bytes(4),
         member_align: crate::units::Align::of_bytes(4),
         is_complete: true,

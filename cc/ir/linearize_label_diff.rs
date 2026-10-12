@@ -106,7 +106,7 @@ impl Linearizer<'_> {
         if !self.mentions_label_address(expr) {
             return None;
         }
-        let width = self.types.size_bytes(typ);
+        let width = self.types.byte_size(typ).to_usize();
         let sum = self.label_sum(expr, width)?;
         let shape = sum.as_difference()?;
         // A difference is an integer, and only an integer the assembler has
@@ -197,7 +197,7 @@ impl Linearizer<'_> {
                 let keeps_bytes = kind == TypeKind::Pointer
                     || (self.types.is_integer(*cast_type)
                         && kind != TypeKind::Bool
-                        && self.types.size_bytes(*cast_type) >= width);
+                        && self.types.byte_size(*cast_type).to_usize() >= width);
                 if !keeps_bytes {
                     return None;
                 }
@@ -236,7 +236,7 @@ impl Linearizer<'_> {
                 return None;
             }
             let pointee = this.types.arithmetic_pointee(t)?;
-            Some((this.types.size_bytes(pointee) as i64).max(1))
+            Some(this.types.byte_size(pointee).to_i64().max(1))
         };
         let (lelem, relem) = (elem(self, left), elem(self, right));
         let l = self.label_sum(left, width)?;

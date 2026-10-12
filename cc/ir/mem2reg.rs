@@ -90,6 +90,7 @@ mod tests {
     use crate::target::Target;
     use crate::types::TypeTable;
     use crate::units::Bits;
+    use crate::units::ByteSize;
 
     /// A local named only by an inline-asm memory operand is still storage
     /// the program uses. Dropping it left the operand with no stack slot and
@@ -139,7 +140,7 @@ mod tests {
                 .push(crate::ir::ImplicitParamCopy {
                     arg_index: id,
                     local_sym: PseudoId(id),
-                    size_bytes: 16,
+                    size_bytes: ByteSize::new(16),
                     qword_type: types.long_id,
                     arg_is_address: true,
                 });

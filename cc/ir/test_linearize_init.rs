@@ -23,6 +23,7 @@ use crate::strings::StringTable;
 use crate::target::{Arch, Os, Target};
 use crate::types::{CompositeType, MemberAlign, StructMember, Type, TypeModifiers, TypeTable};
 use crate::units::Bits;
+use crate::units::ByteSize;
 
 // C99 6.7.8p14: a scalar initializes the first array element.
 
@@ -544,7 +545,7 @@ fn test_mixed_designated_positional_struct_init() {
             StructMember {
                 name: a_id,
                 typ: int_type,
-                offset: crate::units::ByteSize::ZERO,
+                offset: ByteSize::ZERO,
                 bit_offset: None,
                 bit_width: None,
                 access_bytes: None,
@@ -553,7 +554,7 @@ fn test_mixed_designated_positional_struct_init() {
             StructMember {
                 name: b_id,
                 typ: int_type,
-                offset: crate::units::ByteSize::new(4),
+                offset: ByteSize::new(4),
                 bit_offset: None,
                 bit_width: None,
                 access_bytes: None,
@@ -562,7 +563,7 @@ fn test_mixed_designated_positional_struct_init() {
             StructMember {
                 name: c_id,
                 typ: int_type,
-                offset: crate::units::ByteSize::new(8),
+                offset: ByteSize::new(8),
                 bit_offset: None,
                 bit_width: None,
                 access_bytes: None,
@@ -571,7 +572,7 @@ fn test_mixed_designated_positional_struct_init() {
             StructMember {
                 name: d_id,
                 typ: int_type,
-                offset: crate::units::ByteSize::new(12),
+                offset: ByteSize::new(12),
                 bit_offset: None,
                 bit_width: None,
                 access_bytes: None,
@@ -579,7 +580,7 @@ fn test_mixed_designated_positional_struct_init() {
             },
         ],
         enum_constants: vec![],
-        size: crate::units::ByteSize::new(16),
+        size: ByteSize::new(16),
         align: crate::units::Align::of_bytes(4),
         member_align: crate::units::Align::of_bytes(4),
         is_complete: true,
@@ -789,7 +790,7 @@ fn test_designator_chain_nested_struct_init() {
         StructMember {
             name: x_id,
             typ: ctx.int_type(),
-            offset: crate::units::ByteSize::ZERO,
+            offset: ByteSize::ZERO,
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
@@ -798,7 +799,7 @@ fn test_designator_chain_nested_struct_init() {
         StructMember {
             name: y_id,
             typ: ctx.int_type(),
-            offset: crate::units::ByteSize::new(4),
+            offset: ByteSize::new(4),
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
@@ -809,7 +810,7 @@ fn test_designator_chain_nested_struct_init() {
         tag: None,
         members: pt_members,
         enum_constants: vec![],
-        size: crate::units::ByteSize::new(8),
+        size: ByteSize::new(8),
         align: crate::units::Align::of_bytes(4),
         member_align: crate::units::Align::of_bytes(4),
         is_complete: true,
@@ -825,7 +826,7 @@ fn test_designator_chain_nested_struct_init() {
         StructMember {
             name: pt_id,
             typ: pt_type,
-            offset: crate::units::ByteSize::ZERO,
+            offset: ByteSize::ZERO,
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
@@ -834,7 +835,7 @@ fn test_designator_chain_nested_struct_init() {
         StructMember {
             name: z_id,
             typ: ctx.int_type(),
-            offset: crate::units::ByteSize::new(8),
+            offset: ByteSize::new(8),
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
@@ -845,7 +846,7 @@ fn test_designator_chain_nested_struct_init() {
         tag: None,
         members: outer_members,
         enum_constants: vec![],
-        size: crate::units::ByteSize::new(12),
+        size: ByteSize::new(12),
         align: crate::units::Align::of_bytes(4),
         member_align: crate::units::Align::of_bytes(4),
         is_complete: true,
@@ -930,7 +931,7 @@ fn test_designator_chain_array_member_init() {
     let members = vec![StructMember {
         name: arr_id,
         typ: arr_type,
-        offset: crate::units::ByteSize::ZERO,
+        offset: ByteSize::ZERO,
         bit_offset: None,
         bit_width: None,
         access_bytes: None,
@@ -940,7 +941,7 @@ fn test_designator_chain_array_member_init() {
         tag: None,
         members,
         enum_constants: vec![],
-        size: crate::units::ByteSize::new(12),
+        size: ByteSize::new(12),
         align: crate::units::Align::of_bytes(4),
         member_align: crate::units::Align::of_bytes(4),
         is_complete: true,
@@ -1083,7 +1084,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
         StructMember {
             name: a_id,
             typ: int_type,
-            offset: crate::units::ByteSize::ZERO,
+            offset: ByteSize::ZERO,
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
@@ -1092,7 +1093,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
         StructMember {
             name: StringId::EMPTY,
             typ: int_type,
-            offset: crate::units::ByteSize::new(4),
+            offset: ByteSize::new(4),
             bit_offset: Some(0),
             bit_width: Some(8),
             access_bytes: Some(4),
@@ -1101,7 +1102,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
         StructMember {
             name: b_id,
             typ: int_type,
-            offset: crate::units::ByteSize::new(8),
+            offset: ByteSize::new(8),
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
@@ -1112,7 +1113,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
         tag: None,
         members,
         enum_constants: vec![],
-        size: crate::units::ByteSize::new(12),
+        size: ByteSize::new(12),
         align: crate::units::Align::of_bytes(4),
         member_align: crate::units::Align::of_bytes(4),
         is_complete: true,
@@ -1192,7 +1193,7 @@ fn test_union_first_named_member_positional_init() {
         StructMember {
             name: StringId::EMPTY,
             typ: int_type,
-            offset: crate::units::ByteSize::ZERO,
+            offset: ByteSize::ZERO,
             bit_offset: Some(0),
             bit_width: Some(16),
             access_bytes: Some(4),
@@ -1201,7 +1202,7 @@ fn test_union_first_named_member_positional_init() {
         StructMember {
             name: a_id,
             typ: int_type,
-            offset: crate::units::ByteSize::ZERO,
+            offset: ByteSize::ZERO,
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
@@ -1212,7 +1213,7 @@ fn test_union_first_named_member_positional_init() {
         tag: None,
         members,
         enum_constants: vec![],
-        size: crate::units::ByteSize::new(4),
+        size: ByteSize::new(4),
         align: crate::units::Align::of_bytes(4),
         member_align: crate::units::Align::of_bytes(4),
         is_complete: true,
@@ -1295,7 +1296,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
         StructMember {
             name: kind_id,
             typ: int_type,
-            offset: crate::units::ByteSize::ZERO,
+            offset: ByteSize::ZERO,
             bit_offset: Some(0),
             bit_width: Some(3),
             access_bytes: Some(1),
@@ -1304,7 +1305,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
         StructMember {
             name: compact_id,
             typ: int_type,
-            offset: crate::units::ByteSize::ZERO,
+            offset: ByteSize::ZERO,
             bit_offset: Some(3),
             bit_width: Some(1),
             access_bytes: Some(1),
@@ -1313,7 +1314,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
         StructMember {
             name: ascii_id,
             typ: int_type,
-            offset: crate::units::ByteSize::ZERO,
+            offset: ByteSize::ZERO,
             bit_offset: Some(4),
             bit_width: Some(1),
             access_bytes: Some(1),
@@ -1322,7 +1323,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
         StructMember {
             name: static_alloc_id,
             typ: int_type,
-            offset: crate::units::ByteSize::ZERO,
+            offset: ByteSize::ZERO,
             bit_offset: Some(5),
             bit_width: Some(1),
             access_bytes: Some(1),
@@ -1337,7 +1338,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
             tag: None,
             members,
             enum_constants: vec![],
-            size: crate::units::ByteSize::new(1),
+            size: ByteSize::new(1),
             align: crate::units::Align::of_bytes(1),
             member_align: crate::units::Align::of_bytes(1),
             is_complete: true,
@@ -1428,8 +1429,16 @@ fn test_bitfield_designated_init_multiple_same_offset() {
         // Should have one field (the packed bitfield value)
         assert_eq!(fields.len(), 1, "Should pack all bitfields into one field");
         let (offset, size, init) = &fields[0];
-        assert_eq!(*offset, 0, "Packed field should be at offset 0");
-        assert_eq!(*size, 1, "Storage unit size should be 1 byte");
+        assert_eq!(
+            *offset,
+            ByteSize::new(0),
+            "Packed field should be at offset 0"
+        );
+        assert_eq!(
+            *size,
+            ByteSize::new(1),
+            "Storage unit size should be 1 byte"
+        );
         if let crate::ir::Initializer::Int(val) = init {
             // All four bitfields set to 1 should give: 1 + 8 + 16 + 32 = 57
             assert_eq!(
@@ -1461,7 +1470,7 @@ fn test_bitfield_designated_init_local_var() {
         StructMember {
             name: a_id,
             typ: int_type,
-            offset: crate::units::ByteSize::ZERO,
+            offset: ByteSize::ZERO,
             bit_offset: Some(0),
             bit_width: Some(4),
             access_bytes: Some(1),
@@ -1470,7 +1479,7 @@ fn test_bitfield_designated_init_local_var() {
         StructMember {
             name: b_id,
             typ: int_type,
-            offset: crate::units::ByteSize::ZERO,
+            offset: ByteSize::ZERO,
             bit_offset: Some(4),
             bit_width: Some(4),
             access_bytes: Some(1),
@@ -1479,7 +1488,7 @@ fn test_bitfield_designated_init_local_var() {
         StructMember {
             name: c_id,
             typ: int_type,
-            offset: crate::units::ByteSize::new(1),
+            offset: ByteSize::new(1),
             bit_offset: Some(0),
             bit_width: Some(8),
             access_bytes: Some(1),
@@ -1491,7 +1500,7 @@ fn test_bitfield_designated_init_local_var() {
         tag: None,
         members,
         enum_constants: vec![],
-        size: crate::units::ByteSize::new(2),
+        size: ByteSize::new(2),
         align: crate::units::Align::of_bytes(1),
         member_align: crate::units::Align::of_bytes(1),
         is_complete: true,
@@ -1616,7 +1625,7 @@ fn test_compound_literal_zero_init_lvalue() {
         StructMember {
             name: a_id,
             typ: ptr_type,
-            offset: crate::units::ByteSize::ZERO,
+            offset: ByteSize::ZERO,
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
@@ -1625,7 +1634,7 @@ fn test_compound_literal_zero_init_lvalue() {
         StructMember {
             name: b_id,
             typ: ptr_type,
-            offset: crate::units::ByteSize::new(8),
+            offset: ByteSize::new(8),
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
@@ -1634,7 +1643,7 @@ fn test_compound_literal_zero_init_lvalue() {
         StructMember {
             name: c_id,
             typ: ptr_type,
-            offset: crate::units::ByteSize::new(16),
+            offset: ByteSize::new(16),
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
@@ -1648,7 +1657,7 @@ fn test_compound_literal_zero_init_lvalue() {
             tag: None,
             members,
             enum_constants: vec![],
-            size: crate::units::ByteSize::new(24),
+            size: ByteSize::new(24),
             align: crate::units::Align::of_bytes(8),
             member_align: crate::units::Align::of_bytes(8),
             is_complete: true,
@@ -1801,14 +1810,14 @@ fn test_complex_struct_member_init_stores_both_halves() {
         members: vec![StructMember {
             name: ctx.str("z"),
             typ: complex_double,
-            offset: crate::units::ByteSize::ZERO,
+            offset: ByteSize::ZERO,
             bit_width: None,
             bit_offset: None,
             access_bytes: None,
             align: MemberAlign::NATURAL,
         }],
         enum_constants: vec![],
-        size: crate::units::ByteSize::new(16),
+        size: ByteSize::new(16),
         align: crate::units::Align::of_bytes(8),
         member_align: crate::units::Align::of_bytes(8),
         is_complete: true,

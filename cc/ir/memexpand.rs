@@ -33,7 +33,7 @@ use super::build::Builder;
 use super::facts::ConstMap;
 use super::{Function, Instruction, Opcode, PseudoId};
 use crate::types::{TypeId, TypeTable};
-use crate::units::Bits;
+use crate::units::{Bits, ByteSize};
 
 /// The most bytes a `memcpy` or `memset` of a constant length is expanded
 /// into, and the most an aggregate copy the linearizer emits is.
@@ -48,7 +48,7 @@ use crate::units::Bits;
 /// 256 KB struct passed by value -- `struct big { int i[0x10000]; }`, which
 /// gcc.c-torture's pr28982b does -- once produced 65,536 IR instructions and
 /// a 65-second compile against gcc's one `call memcpy`.
-pub(crate) const INLINE_LIMIT_BYTES: i64 = 128;
+pub(crate) const INLINE_LIMIT_BYTES: ByteSize = ByteSize::new(128);
 
 /// The most bytes a `memmove` of a constant length is expanded into.
 ///
@@ -58,7 +58,7 @@ pub(crate) const INLINE_LIMIT_BYTES: i64 = 128;
 /// registers either target has free without spilling. gcc stops at a single
 /// move (16 bytes); c17 has no 16-byte move, and its eight are still cheaper
 /// than the call.
-const MOVE_LIMIT_BYTES: i64 = 64;
+const MOVE_LIMIT_BYTES: ByteSize = ByteSize::new(64);
 
 /// One of the widths a block is moved in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,12 +123,12 @@ pub(crate) fn chunk_copy(
     src: PseudoId,
     dst: PseudoId,
     dst_offset: i64,
-    bytes: i64,
+    bytes: ByteSize,
     typ: impl Fn(Chunk) -> TypeId,
     mut alloc: impl FnMut() -> PseudoId,
 ) -> Vec<Instruction> {
     let mut out = Vec::new();
-    for (at, chunk) in block_chunks(bytes) {
+    for (at, chunk) in block_chunks(bytes.to_i64()) {
         let (t, bits) = (typ(chunk), chunk.bits());
         let v = alloc();
         out.push(Instruction::load(v, src, at, t, bits));
@@ -200,7 +200,7 @@ impl BlockOp {
         }
     }
 
-    fn limit(self) -> i64 {
+    fn limit(self) -> ByteSize {
         match self {
             BlockOp::Copy | BlockOp::Set => INLINE_LIMIT_BYTES,
             BlockOp::Move => MOVE_LIMIT_BYTES,
@@ -237,13 +237,17 @@ pub fn run(func: &mut Function, types: &TypeTable) -> bool {
 }
 
 /// The operation `insn` is and its length, when it is one to expand.
-fn expandable(insn: &Instruction, consts: &ConstMap, size_t_bits: u32) -> Option<(BlockOp, i64)> {
+fn expandable(
+    insn: &Instruction,
+    consts: &ConstMap,
+    size_t_bits: u32,
+) -> Option<(BlockOp, ByteSize)> {
     let op = BlockOp::of(insn.op)?;
     let &[_, _, n] = insn.src.as_slice() else {
         return None;
     };
-    let n = i64::try_from(consts.get_at(n, size_t_bits, false)?).ok()?;
-    (0..=op.limit()).contains(&n).then_some((op, n))
+    let n = ByteSize::new(u64::try_from(consts.get_at(n, size_t_bits, false)?).ok()?);
+    (n <= op.limit()).then_some((op, n))
 }
 
 /// The instructions that replace one block memory operation.
@@ -255,7 +259,7 @@ struct Expander<'a> {
 }
 
 impl Expander<'_> {
-    fn expand(mut self, op: BlockOp, n: i64) {
+    fn expand(mut self, op: BlockOp, n: ByteSize) {
         let (dest, second) = (self.model.src[0], self.model.src[1]);
         match op {
             BlockOp::Copy => {
@@ -267,7 +271,7 @@ impl Expander<'_> {
                 }
             }
             BlockOp::Move => {
-                let loaded: Vec<_> = block_chunks(n)
+                let loaded: Vec<_> = block_chunks(n.to_i64())
                     .map(|(at, chunk)| (self.load(second, at, chunk), at, chunk))
                     .collect();
                 for (v, at, chunk) in loaded {
@@ -276,7 +280,7 @@ impl Expander<'_> {
             }
             BlockOp::Set => {
                 let mut fill = Fill::new(second, self.consts);
-                for (at, chunk) in block_chunks(n) {
+                for (at, chunk) in block_chunks(n.to_i64()) {
                     let v = fill.at(&mut self.b, chunk);
                     self.store(v, dest, at, chunk);
                 }
@@ -378,7 +382,7 @@ mod tests {
         let width_type = |c: Chunk| TypeId(c.bytes() as u32 + 100);
         for n in 0..=24 {
             let mut next = 50;
-            let insns = chunk_copy(src, dst, 1000, n, width_type, || {
+            let insns = chunk_copy(src, dst, 1000, ByteSize::new(n as u64), width_type, || {
                 next += 1;
                 PseudoId(next)
             });
@@ -415,7 +419,7 @@ mod tests {
             assert_eq!(next, 50 + pieces.len() as u32, "one temporary per piece");
         }
         let widths = |n| {
-            chunk_copy(src, dst, 0, n, width_type, || PseudoId(0))
+            chunk_copy(src, dst, 0, ByteSize::new(n), width_type, || PseudoId(0))
                 .iter()
                 .step_by(2)
                 .map(|i| (i.offset, i.size.bytes_exact()))

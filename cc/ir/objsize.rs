@@ -107,7 +107,7 @@ impl ObjectSizes {
             if g.symbol_attrs.weak || types.has_unbounded_tail(g.typ) {
                 continue;
             }
-            let size = types.size_bytes(g.typ) as u64;
+            let size = types.byte_size(g.typ).get();
             if size > 0 {
                 named.insert(g.name.clone(), size);
             }
@@ -528,7 +528,7 @@ impl<'w, 'a, 's> Walker<'w, 'a, 's> {
             return None;
         };
         let size = match func.local_of(p) {
-            Some(local) => self.ctx.types.size_bytes(local.typ) as u64,
+            Some(local) => self.ctx.types.byte_size(local.typ).get(),
             None => self.ctx.sizes.named(name)?,
         };
         (size > 0).then_some(size)
@@ -750,7 +750,7 @@ impl<'w, 'a, 's> Walker<'w, 'a, 's> {
         let types = self.ctx.types;
         let elem = types
             .base_type(func.params[param].1)
-            .map(|t| match types.size_bytes(t) {
+            .map(|t| match types.byte_size(t).to_usize() {
                 // `void`: bytes.
                 0 if types.kind(t) == TypeKind::Void => 1,
                 n => n as u64,

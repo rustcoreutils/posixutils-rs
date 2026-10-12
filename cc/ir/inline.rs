@@ -17,7 +17,7 @@ use super::{
 };
 use crate::opt::Optimization;
 use crate::types::TypeId;
-use crate::units::Bits;
+use crate::units::{Bits, ByteSize};
 use std::collections::{HashMap, HashSet};
 
 // Inlining Constants
@@ -1094,7 +1094,7 @@ fn clone_ret(
                     src_addr,
                     target,
                     0,
-                    i64::from(insn.size.bytes_exact()),
+                    ByteSize::new(u64::from(insn.size.bytes_exact())),
                     |_| typ,
                     || {
                         let temp = ctx.alloc_pseudo_id();
@@ -1394,14 +1394,17 @@ fn implicit_param_copy(
     // even though a same-sized struct does not -- keying on size stored the
     // pointer into the local and the inlined body read it as a pair of
     // floats.
-    if !copy.arg_is_address && matches!(copy.size_bytes, 1 | 2 | 4 | 8) {
-        let bits = (copy.size_bytes * 8) as u32;
+    if !copy.arg_is_address && matches!(copy.size_bytes.get(), 1 | 2 | 4 | 8) {
+        let bits = copy
+            .size_bytes
+            .bits()
+            .expect("eight bytes or fewer have a value width");
         return vec![Instruction::store(
             call_arg,
             local,
             0,
             copy.qword_type,
-            Bits::new(bits),
+            bits,
         )];
     }
 
@@ -1421,7 +1424,7 @@ fn implicit_param_copy(
         call_arg,
         local,
         0,
-        copy.size_bytes as i64,
+        copy.size_bytes,
         |_| copy.qword_type,
         || {
             let temp = ctx.alloc_pseudo_id();
@@ -3017,8 +3020,12 @@ mod tests {
             "table",
             types.void_ptr_id,
             Initializer::Struct {
-                total_size: 8,
-                fields: vec![(0, 8, Initializer::SymAddr("my_handler".to_string()))],
+                total_size: ByteSize::new(8),
+                fields: vec![(
+                    ByteSize::new(0),
+                    ByteSize::new(8),
+                    Initializer::SymAddr("my_handler".to_string()),
+                )],
             },
         ));
 
@@ -3070,9 +3077,12 @@ mod tests {
             "handlers",
             types.void_ptr_id,
             Initializer::Array {
-                elem_size: 8,
-                total_size: 8,
-                elements: vec![(0, Initializer::SymAddr("arr_func".to_string()))],
+                elem_size: ByteSize::new(8),
+                total_size: ByteSize::new(8),
+                elements: vec![(
+                    ByteSize::new(0),
+                    Initializer::SymAddr("arr_func".to_string()),
+                )],
             },
         ));
 
@@ -3311,7 +3321,7 @@ mod tests {
             .push(crate::ir::ImplicitParamCopy {
                 arg_index: 0,
                 local_sym: PseudoId(0),
-                size_bytes: 12,
+                size_bytes: ByteSize::new(12),
                 qword_type: types.long_id,
                 arg_is_address: true,
             });

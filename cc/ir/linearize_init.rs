@@ -23,6 +23,7 @@ use crate::target::ByteOrder;
 use crate::token::lexer::Position;
 use crate::types::{MemberInfo, Type, TypeId, TypeKind, TypeModifiers, TypeTable};
 use crate::units::Bits;
+use crate::units::ByteSize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Determine whether a declared object type is `const`-qualified for the
@@ -121,17 +122,17 @@ fn bitfield_byte_span(member: &crate::types::StructMember) -> Option<std::ops::R
 /// for an ordinary member covering it, or something other than an integer --
 /// which leaves the caller to discard the earlier initializer whole.
 fn replace_carrier_bits(
-    fields: &mut Vec<(usize, usize, Initializer)>,
-    offset: usize,
+    fields: &mut Vec<(ByteSize, ByteSize, Initializer)>,
+    offset: ByteSize,
     bits: u8,
     mask: u8,
 ) -> bool {
     match fields
         .iter()
-        .position(|(off, size, _)| *off <= offset && offset < *off + *size)
+        .position(|(off, size, _)| *off <= offset && offset < off.offset_by(*size))
     {
         Some(index) => {
-            if (fields[index].0, fields[index].1) != (offset, 1) {
+            if (fields[index].0, fields[index].1) != (offset, ByteSize::new(1)) {
                 return false;
             }
             let Initializer::Int(held) = fields[index].2 else {
@@ -143,7 +144,7 @@ fn replace_carrier_bits(
         None => {
             // The byte holds no bit-field the earlier initializer gave a
             // value to, so the bits around this field's are zero.
-            fields.push((offset, 1, Initializer::Int(i128::from(bits))));
+            fields.push((offset, ByteSize::new(1), Initializer::Int(i128::from(bits))));
             fields.sort_by_key(|(off, _, _)| *off);
             true
         }
@@ -278,7 +279,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         name.clone(),
                         declarator
                             .explicit_align
-                            .unwrap_or(self.types.alignment(declarator.typ) as u32),
+                            .unwrap_or(self.types.align(declarator.typ).bytes() as u32),
                     );
                     // Track extern thread-local symbols separately for TLS access
                     if storage_class.contains(TypeModifiers::THREAD_LOCAL) {
@@ -749,7 +750,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         let pointee_size = ptr_expr
                             .typ
                             .and_then(|t| self.types.arithmetic_pointee(t))
-                            .map(|t| self.types.size_bytes(t) as i64)
+                            .map(|t| self.types.byte_size(t).to_i64())
                             .unwrap_or(1);
                         let byte_offset = if is_sub {
                             base_off - int_val as i64 * pointee_size
@@ -892,7 +893,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let elem = left
             .typ
             .and_then(|t| self.types.arithmetic_pointee(t))
-            .map(|t| self.types.size_bytes(t) as i64)
+            .map(|t| self.types.byte_size(t).to_i64())
             .unwrap_or(1)
             .max(1);
         Some((bytes / elem) as i128)
@@ -952,7 +953,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let (re, im) =
             constexpr::eval_complex_as(self, ConstScope::StaticInitializer, value, base)?;
 
-        let base_bytes = self.types.size_bytes(base);
+        let base_bytes = self.types.byte_size(base);
         // A GNU complex integer's halves are integers. Emitting them as
         // floats laid an eight-byte floating image over a four-byte half, so
         // `_Complex int b = 8;` wrote past its own object and zeroed whatever
@@ -967,8 +968,13 @@ impl<'a> super::linearize::Linearizer<'a> {
         };
         let (re_init, im_init) = (half(re)?, half(im)?);
         Some(Initializer::Struct {
-            total_size: base_bytes * 2,
-            fields: vec![(0, base_bytes, re_init), (base_bytes, base_bytes, im_init)],
+            total_size: base_bytes
+                .checked_mul(2)
+                .expect("a complex type's size is twice its base's"),
+            fields: vec![
+                (ByteSize::ZERO, base_bytes, re_init),
+                (base_bytes, base_bytes, im_init),
+            ],
         })
     }
 
@@ -1461,7 +1467,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     elem_idx += 1;
                     continue;
                 };
-                let field_size = self.types.size_bytes(member.typ);
+                let field_size = self.types.byte_size(member.typ).to_usize();
 
                 // Brace elision: scalar for aggregate member
                 let kind = if self.is_brace_elision_candidate(element, member.typ) {
@@ -1526,7 +1532,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     }
                 }
             }
-            let field_size = self.types.size_bytes(field_type);
+            let field_size = self.types.byte_size(field_type).to_usize();
             // `.m = v, w` elides braces into `m` as a positional `v, w` would.
             let kind = if self.is_brace_elision_candidate(element, field_type) {
                 let sub_elements = self.consume_brace_elision(elements, &mut elem_idx, field_type);
@@ -1699,7 +1705,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 let Some(elem_type) = self.types.base_type(typ) else {
                     return;
                 };
-                let elem_size = self.types.size_bytes(elem_type);
+                let elem_size = self.types.byte_size(elem_type).to_usize();
                 let groups = self.group_array_init_elements(elements, typ);
                 for index in groups.indices {
                     let Some(list) = groups.element_lists.get(&index) else {
@@ -1743,7 +1749,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// [`Held::Value`].
     fn record_value_unions(&self, typ: TypeId, base: usize, held: &mut UnionMembers) {
         if self.type_holds_union(typ) {
-            held.record_value(base..base + self.types.size_bytes(typ));
+            held.record_value(base..base + self.types.byte_size(typ).to_usize());
         }
     }
 
@@ -1802,7 +1808,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let mut unions = unions;
 
         loop {
-            let type_size = self.types.size_bytes(typ);
+            let type_size = self.types.byte_size(typ).to_usize();
             if !bitfield && offset == base && size == type_size {
                 return SubobjectPlace::Member;
             }
@@ -1838,7 +1844,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                     let found = composite.members.iter().find(|member| {
                         member.bit_width.is_none() && {
                             let member_start = base + member.offset.to_usize();
-                            let member_end = member_start + self.types.size_bytes(member.typ);
+                            let member_end =
+                                member_start + self.types.byte_size(member.typ).to_usize();
                             offset >= member_start && offset + size <= member_end
                         }
                     });
@@ -1868,7 +1875,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     let Some(elem_type) = self.types.base_type(typ) else {
                         return SubobjectPlace::NotASubobject;
                     };
-                    let elem_size = self.types.size_bytes(elem_type);
+                    let elem_size = self.types.byte_size(elem_type).to_usize();
                     if elem_size == 0 {
                         return SubobjectPlace::NotASubobject;
                     }
@@ -1920,8 +1927,8 @@ impl<'a> super::linearize::Linearizer<'a> {
             .members
             .get(index)
             .filter(|member| member.bit_width.is_none())?;
-        let span =
-            member.offset.to_usize()..member.offset.to_usize() + self.types.size_bytes(member.typ);
+        let span = member.offset.to_usize()
+            ..member.offset.to_usize() + self.types.byte_size(member.typ).to_usize();
         self.holds(base, &span, offset, size)
             .then_some((member.offset.to_usize(), member.typ))
     }
@@ -1931,14 +1938,14 @@ impl<'a> super::linearize::Linearizer<'a> {
     fn empty_aggregate_init(&self, typ: TypeId) -> Option<Initializer> {
         match self.types.kind(typ) {
             TypeKind::Struct | TypeKind::Union => Some(Initializer::Struct {
-                total_size: self.types.size_bytes(typ),
+                total_size: self.types.byte_size(typ),
                 fields: Vec::new(),
             }),
             TypeKind::Array => {
                 let elem_type = self.types.base_type(typ)?;
                 Some(Initializer::Array {
-                    elem_size: self.types.size_bytes(elem_type),
-                    total_size: self.types.size_bytes(typ),
+                    elem_size: self.types.byte_size(elem_type),
+                    total_size: self.types.byte_size(typ),
                     elements: Vec::new(),
                 })
             }
@@ -1995,7 +2002,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         size: usize,
         unions: UnionFold<'_>,
     ) -> Option<&'i mut Initializer> {
-        if offset == 0 && size == self.types.size_bytes(typ) {
+        if offset == 0 && size == self.types.byte_size(typ).to_usize() {
             return Some(init);
         }
 
@@ -2016,19 +2023,23 @@ impl<'a> super::linearize::Linearizer<'a> {
                         .find(|member| {
                             member.bit_width.is_none() && {
                                 let span = member.offset.to_usize()
-                                    ..member.offset.to_usize() + self.types.size_bytes(member.typ);
+                                    ..member.offset.to_usize()
+                                        + self.types.byte_size(member.typ).to_usize();
                                 self.holds(0, &span, offset, size)
                             }
                         })
                         .map(|member| (member.offset.to_usize(), member.typ))?
                 };
-                let slot_size = self.types.size_bytes(slot_type);
+                let slot_size = self.types.byte_size(slot_type).to_usize();
                 let Initializer::Struct { fields, .. } = init else {
                     return None;
                 };
-                let slot = Self::entry_init_mut(fields, slot_offset, slot_size, || {
-                    self.empty_aggregate_init(slot_type)
-                })?;
+                let (at, len) = (
+                    ByteSize::from_usize(slot_offset),
+                    ByteSize::from_usize(slot_size),
+                );
+                let slot =
+                    Self::entry_init_mut(fields, at, len, || self.empty_aggregate_init(slot_type))?;
                 self.subobject_init_mut(
                     slot_type,
                     slot,
@@ -2039,7 +2050,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
             TypeKind::Array => {
                 let elem_type = self.types.base_type(typ)?;
-                let elem_size = self.types.size_bytes(elem_type);
+                let elem_size = self.types.byte_size(elem_type).to_usize();
                 if elem_size == 0 {
                     return None;
                 }
@@ -2047,7 +2058,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                 if offset + size > elem_offset + elem_size {
                     return None;
                 }
-                if let Some(exploded) = init.string_as_array(elem_size, self.types.size_bytes(typ))
+                let whole = self.types.byte_size(typ);
+                if let Some(exploded) = init.string_as_array(ByteSize::from_usize(elem_size), whole)
                 {
                     *init = exploded;
                 }
@@ -2057,9 +2069,9 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // An array's entries carry no width, so give each one the
                 // element width it implicitly has and borrow the struct
                 // path's bookkeeping.
-                let slot = Self::element_init_mut(elements, elem_offset, || {
-                    self.empty_aggregate_init(elem_type)
-                })?;
+                let at = ByteSize::from_usize(elem_offset);
+                let slot =
+                    Self::element_init_mut(elements, at, || self.empty_aggregate_init(elem_type))?;
                 self.subobject_init_mut(
                     elem_type,
                     slot,
@@ -2080,15 +2092,15 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// bit-field carrier byte, or an entry spanning several members -- which
     /// is not something a subobject can be placed into.
     fn entry_init_mut(
-        fields: &mut Vec<(usize, usize, Initializer)>,
-        slot_offset: usize,
-        slot_size: usize,
+        fields: &mut Vec<(ByteSize, ByteSize, Initializer)>,
+        slot_offset: ByteSize,
+        slot_size: ByteSize,
         empty: impl FnOnce() -> Option<Initializer>,
     ) -> Option<&mut Initializer> {
-        let slot_end = slot_offset + slot_size;
+        let slot_end = slot_offset.offset_by(slot_size);
         let index = match fields
             .iter()
-            .position(|(off, sz, _)| *off < slot_end && slot_offset < *off + *sz)
+            .position(|(off, sz, _)| *off < slot_end && slot_offset < off.offset_by(*sz))
         {
             Some(index) => {
                 if (fields[index].0, fields[index].1) != (slot_offset, slot_size) {
@@ -2111,8 +2123,8 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// The same for an array initializer's element list, whose entries are
     /// one element wide by construction.
     fn element_init_mut(
-        elements: &mut Vec<(usize, Initializer)>,
-        elem_offset: usize,
+        elements: &mut Vec<(ByteSize, Initializer)>,
+        elem_offset: ByteSize,
         empty: impl FnOnce() -> Option<Initializer>,
     ) -> Option<&mut Initializer> {
         let index = match elements.iter().position(|(off, _)| *off == elem_offset) {
@@ -2232,7 +2244,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     return false;
                 };
                 let replacement = Initializer::Struct {
-                    total_size: size,
+                    total_size: ByteSize::from_usize(size),
                     fields,
                 };
                 let replaced = self.overlay_subobject(
@@ -2269,11 +2281,15 @@ impl<'a> super::linearize::Linearizer<'a> {
         earlier: &RawFieldInit,
         later: &RawFieldInit,
         offset: usize,
-    ) -> Option<Vec<(usize, usize, Initializer)>> {
+    ) -> Option<Vec<(ByteSize, ByteSize, Initializer)>> {
         let union_start = earlier.offset + offset;
         let (Some(bit_offset), Some(bit_width)) = (later.bit_offset, later.bit_width) else {
             let inner = later.offset.checked_sub(union_start)?;
-            return Some(vec![(inner, later.field_size, later.init.clone())]);
+            return Some(vec![(
+                ByteSize::from_usize(inner),
+                ByteSize::from_usize(later.field_size),
+                later.init.clone(),
+            )]);
         };
         let Initializer::Int(value) = later.init else {
             return None;
@@ -2282,7 +2298,11 @@ impl<'a> super::linearize::Linearizer<'a> {
             .into_iter()
             .map(|(byte, bits, _)| {
                 let inner = (later.offset + byte).checked_sub(union_start)?;
-                Some((inner, 1, Initializer::Int(i128::from(bits))))
+                Some((
+                    ByteSize::from_usize(inner),
+                    ByteSize::new(1),
+                    Initializer::Int(i128::from(bits)),
+                ))
             })
             .collect()
     }
@@ -2323,7 +2343,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         };
         let order = self.bit_order(later.typ);
         for (byte, bits, mask) in bitfield_carrier_bytes(bit_offset, bit_width, value, order) {
-            if !replace_carrier_bits(fields, base + byte, bits, mask) {
+            if !replace_carrier_bits(fields, ByteSize::from_usize(base + byte), bits, mask) {
                 return false;
             }
         }
@@ -2362,7 +2382,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         typ: TypeId,
     ) -> Initializer {
         let type_kind = self.types.kind(typ);
-        let total_size = self.types.size_bytes(typ);
+        let total_size = self.types.byte_size(typ);
 
         match type_kind {
             TypeKind::Array => {
@@ -2391,7 +2411,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     }
                 }
 
-                let elem_size = self.types.size_bytes(elem_type);
+                let elem_size = self.types.byte_size(elem_type);
                 let elem_is_aggregate = matches!(
                     self.types.kind(elem_type),
                     TypeKind::Array | TypeKind::Struct | TypeKind::Union
@@ -2404,7 +2424,9 @@ impl<'a> super::linearize::Linearizer<'a> {
                     let Some(list) = groups.element_lists.get(&element_index) else {
                         continue;
                     };
-                    let offset = (element_index as usize) * elem_size;
+                    let offset = elem_size
+                        .checked_mul(element_index as u64)
+                        .expect("an element of the array is inside it");
                     // When a string literal initializes a char/wchar_t array element
                     // (e.g., char names[3][4] = {"Sun", "Mon", "Tue"}), handle it
                     // directly with the ARRAY type. Otherwise ast_init_list_to_ir
@@ -2443,7 +2465,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
 
             TypeKind::Struct | TypeKind::Union => {
-                let struct_size = self.types.size_bytes(typ);
+                let struct_size = self.types.byte_size(typ);
                 if let Some(composite) = self.types.get(typ).composite.as_ref() {
                     let members: Vec<_> = composite.members.clone();
                     let is_union = self.types.kind(typ) == TypeKind::Union;
@@ -2511,12 +2533,16 @@ impl<'a> super::linearize::Linearizer<'a> {
                     // also be different sizes at the same byte offset, leaving
                     // no single width to emit.
                     let mut bitfield_bytes: BTreeMap<usize, u8> = BTreeMap::new();
-                    let mut init_fields: Vec<(usize, usize, Initializer)> = Vec::new();
+                    let mut init_fields: Vec<(ByteSize, ByteSize, Initializer)> = Vec::new();
 
                     for field in &raw_fields {
                         let (Some(bit_off), Some(bit_width)) = (field.bit_offset, field.bit_width)
                         else {
-                            init_fields.push((field.offset, field.field_size, field.init.clone()));
+                            init_fields.push((
+                                ByteSize::from_usize(field.offset),
+                                ByteSize::from_usize(field.field_size),
+                                field.init.clone(),
+                            ));
                             continue;
                         };
                         let Initializer::Int(value) = field.init else {
@@ -2530,11 +2556,10 @@ impl<'a> super::linearize::Linearizer<'a> {
                         }
                     }
 
-                    init_fields.extend(
-                        bitfield_bytes
-                            .into_iter()
-                            .map(|(offset, bits)| (offset, 1, Initializer::Int(bits as i128))),
-                    );
+                    init_fields.extend(bitfield_bytes.into_iter().map(|(offset, bits)| {
+                        let at = ByteSize::from_usize(offset);
+                        (at, ByteSize::new(1), Initializer::Int(bits as i128))
+                    }));
                     init_fields.sort_by_key(|(offset, _, _)| *offset);
 
                     Initializer::Struct {
@@ -2637,7 +2662,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         return None;
                     }
                     let elem_type = self.types.base_type(typ)?;
-                    let elem_size = self.types.size_bytes(elem_type);
+                    let elem_size = self.types.byte_size(elem_type).to_usize();
                     offset += (*index as usize) * elem_size;
                     typ = elem_type;
                     bit_offset = None;
@@ -2798,9 +2823,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     q | (self.types.qualifiers(l.anon_type) & Type::MEMBER_QUALIFIERS)
                 });
                 return Some(MemberInfo {
-                    offset: crate::units::ByteSize::from_usize(
-                        base_offset + inner.offset.to_usize(),
-                    ),
+                    offset: ByteSize::from_usize(base_offset + inner.offset.to_usize()),
                     typ: inner.typ,
                     bit_offset: inner.bit_offset,
                     bit_width: inner.bit_width,
@@ -3417,14 +3440,17 @@ mod tests {
         else {
             panic!("an array initializer lowers to Initializer::Array, got {init:?}");
         };
-        assert_eq!(elem_size, 4);
-        assert_eq!(total_size, 8);
+        assert_eq!(elem_size, ByteSize::new(4));
+        assert_eq!(total_size, ByteSize::new(8));
         assert_eq!(
             elements
                 .iter()
                 .map(|(offset, init)| (*offset, init.clone()))
                 .collect::<Vec<_>>(),
-            vec![(0, Initializer::Int(1)), (4, Initializer::Int(2))],
+            vec![
+                (ByteSize::new(0), Initializer::Int(1)),
+                (ByteSize::new(4), Initializer::Int(2))
+            ],
         );
     }
 
@@ -3488,7 +3514,9 @@ mod tests {
         let symbols = SymbolTable::new();
         let mut lin = Linearizer::new(&symbols, &types, &strings, &target);
         let offsets = |init: &Initializer| match init {
-            Initializer::Struct { fields, .. } => fields.iter().map(|f| f.0).collect::<Vec<_>>(),
+            Initializer::Struct { fields, .. } => {
+                fields.iter().map(|f| f.0.get()).collect::<Vec<_>>()
+            }
             other => panic!("a struct initializer lowers to Initializer::Struct, got {other:?}"),
         };
 
@@ -3540,7 +3568,7 @@ mod tests {
         crate::types::StructMember {
             name,
             typ,
-            offset: crate::units::ByteSize::from_usize(offset),
+            offset: ByteSize::from_usize(offset),
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
@@ -3559,7 +3587,7 @@ mod tests {
         crate::types::StructMember {
             name,
             typ,
-            offset: crate::units::ByteSize::ZERO,
+            offset: ByteSize::ZERO,
             bit_offset: Some(bit_offset),
             bit_width: Some(width),
             access_bytes: Some(4),
@@ -3574,7 +3602,7 @@ mod tests {
     ) -> crate::types::CompositeType {
         crate::types::CompositeType {
             members,
-            size: crate::units::ByteSize::from_usize(size),
+            size: ByteSize::from_usize(size),
             align: crate::units::Align::of_bytes(align as u64),
             member_align: crate::units::Align::of_bytes(align as u64),
             is_complete: true,
@@ -3742,12 +3770,18 @@ mod tests {
         members
     }
 
-    fn struct_init(total_size: usize, fields: &[(usize, usize, i128)]) -> Initializer {
+    fn struct_init(total_size: u64, fields: &[(u64, u64, i128)]) -> Initializer {
         Initializer::Struct {
-            total_size,
+            total_size: ByteSize::new(total_size),
             fields: fields
                 .iter()
-                .map(|(off, size, value)| (*off, *size, Initializer::Int(*value)))
+                .map(|&(off, size, value)| {
+                    (
+                        ByteSize::new(off),
+                        ByteSize::new(size),
+                        Initializer::Int(value),
+                    )
+                })
                 .collect(),
         }
     }
@@ -3867,12 +3901,12 @@ mod tests {
         let int = fixture.types.int_id;
 
         let array = Initializer::Array {
-            elem_size: 4,
-            total_size: 12,
+            elem_size: ByteSize::new(4),
+            total_size: ByteSize::new(12),
             elements: vec![
-                (0, Initializer::Int(1)),
-                (4, Initializer::Int(2)),
-                (8, Initializer::Int(3)),
+                (ByteSize::new(0), Initializer::Int(1)),
+                (ByteSize::new(4), Initializer::Int(2)),
+                (ByteSize::new(8), Initializer::Int(3)),
             ],
         };
         let merged = lin.merge_raw_field_inits(vec![
@@ -3886,12 +3920,12 @@ mod tests {
                 0,
                 12,
                 Initializer::Array {
-                    elem_size: 4,
-                    total_size: 12,
+                    elem_size: ByteSize::new(4),
+                    total_size: ByteSize::new(12),
                     elements: vec![
-                        (0, Initializer::Int(1)),
-                        (4, Initializer::Int(9)),
-                        (8, Initializer::Int(3)),
+                        (ByteSize::new(0), Initializer::Int(1)),
+                        (ByteSize::new(4), Initializer::Int(9)),
+                        (ByteSize::new(8), Initializer::Int(3)),
                     ],
                 }
             )]
@@ -3984,10 +4018,14 @@ mod tests {
                 0,
                 8,
                 Initializer::Struct {
-                    total_size: 8,
+                    total_size: ByteSize::new(8),
                     fields: vec![
-                        (0, 4, Initializer::Int(5)),
-                        (4, 4, struct_init(4, &[(1, 1, 9)])),
+                        (ByteSize::new(0), ByteSize::new(4), Initializer::Int(5)),
+                        (
+                            ByteSize::new(4),
+                            ByteSize::new(4),
+                            struct_init(4, &[(1, 1, 9)])
+                        ),
                     ],
                 }
             )]
@@ -4154,8 +4192,12 @@ mod tests {
                     fixture.n_union,
                     8,
                     Initializer::Struct {
-                        total_size: 8,
-                        fields: vec![(0, 8, struct_init(8, &[(0, 4, 1), (4, 4, 2)]))],
+                        total_size: ByteSize::new(8),
+                        fields: vec![(
+                            ByteSize::new(0),
+                            ByteSize::new(8),
+                            struct_init(8, &[(0, 4, 1), (4, 4, 2)]),
+                        )],
                     },
                 )
             },
@@ -4171,8 +4213,12 @@ mod tests {
                 0,
                 8,
                 Initializer::Struct {
-                    total_size: 8,
-                    fields: vec![(0, 8, struct_init(8, &[(0, 4, 1), (4, 4, 9)]))],
+                    total_size: ByteSize::new(8),
+                    fields: vec![(
+                        ByteSize::new(0),
+                        ByteSize::new(8),
+                        struct_init(8, &[(0, 4, 1), (4, 4, 9)])
+                    )],
                 }
             )]
         );
@@ -4194,8 +4240,12 @@ mod tests {
                     fixture.n_union,
                     8,
                     Initializer::Struct {
-                        total_size: 8,
-                        fields: vec![(0, 8, struct_init(8, &[(0, 4, 1), (4, 4, 2)]))],
+                        total_size: ByteSize::new(8),
+                        fields: vec![(
+                            ByteSize::new(0),
+                            ByteSize::new(8),
+                            struct_init(8, &[(0, 4, 1), (4, 4, 2)]),
+                        )],
                     },
                 )
             },
@@ -4224,8 +4274,12 @@ mod tests {
                 fixture.n_union,
                 8,
                 Initializer::Struct {
-                    total_size: 8,
-                    fields: vec![(0, 8, struct_init(8, &[(0, 4, 1), (4, 4, 2)]))],
+                    total_size: ByteSize::new(8),
+                    fields: vec![(
+                        ByteSize::new(0),
+                        ByteSize::new(8),
+                        struct_init(8, &[(0, 4, 1), (4, 4, 2)]),
+                    )],
                 },
             ),
             raw(4, int, 4, Initializer::Int(9)),

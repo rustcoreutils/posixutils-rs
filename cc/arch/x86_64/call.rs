@@ -60,7 +60,7 @@ pub(super) struct CallArgInfo {
 /// `rep movsq`. It is the bound the IR puts on an expanded `memcpy`, for the
 /// same reason: one load/store pair per eightbyte made a 600 MB argument 75
 /// million instructions and tens of gigabytes of compiler memory.
-pub(super) const UNROLL_LIMIT_BYTES: i64 = crate::ir::memexpand::INLINE_LIMIT_BYTES;
+pub(super) const UNROLL_LIMIT_BYTES: i64 = crate::ir::memexpand::INLINE_LIMIT_BYTES.get() as i64;
 
 /// Where [`X86_64CodeGen::emit_rep_movsq`] writes.
 ///

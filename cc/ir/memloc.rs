@@ -662,6 +662,7 @@ mod tests {
     use super::*;
     use crate::ir::{BasicBlock, BasicBlockId, Pseudo};
     use crate::target::Target;
+    use crate::units::ByteSize;
 
     /// The extent every same-base comparison reads: a width ending part
     /// way into a byte still touches that byte, and an extent that cannot be
@@ -886,7 +887,7 @@ mod tests {
         let member = |typ| crate::types::StructMember {
             name: crate::strings::StringId::EMPTY,
             typ,
-            offset: crate::units::ByteSize::ZERO,
+            offset: ByteSize::ZERO,
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
@@ -896,7 +897,7 @@ mod tests {
             tag: None,
             members,
             enum_constants: Vec::new(),
-            size: crate::units::ByteSize::new(4),
+            size: ByteSize::new(4),
             align: crate::units::Align::of_bytes(4),
             member_align: crate::units::Align::of_bytes(4),
             is_complete: true,

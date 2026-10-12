@@ -249,7 +249,7 @@ impl Linearizer<'_> {
     /// substituting here is enough; nothing downstream has to know.
     fn atomic_access_type(&self, typ: TypeId) -> TypeId {
         if matches!(self.types.kind(typ), TypeKind::Struct | TypeKind::Union) {
-            self.bitfield_storage_type((self.types.size_bytes(typ)).max(1))
+            self.bitfield_storage_type(self.types.byte_size(typ).to_usize().max(1))
         } else {
             typ
         }
@@ -312,7 +312,7 @@ impl Linearizer<'_> {
                  lock-free atomics only at 1, 2, 4 and 8 bytes",
                 &[
                     &self.types.get(typ).to_string(),
-                    &self.types.size_bytes(typ).to_string(),
+                    &self.types.byte_size(typ).to_string(),
                 ],
             );
             return None;
@@ -654,8 +654,8 @@ impl Linearizer<'_> {
         rhs: PseudoId,
     ) -> PseudoId {
         let elem_type = self.types.base_type(ptr_typ).unwrap_or(self.types.char_id);
-        let elem_size = self.types.size_bytes(elem_type);
-        let scale = self.emit_const(elem_size as i128, self.types.long_id);
+        let elem_size = self.types.byte_size(elem_type);
+        let scale = self.emit_const(i128::from(elem_size.get()), self.types.long_id);
         let extended = self.emit_convert(rhs, value_typ, self.types.long_id);
         let scaled = self.alloc_reg_pseudo();
         self.emit(Instruction::binop(
@@ -724,7 +724,7 @@ impl Linearizer<'_> {
     pub(crate) fn incdec_delta(&mut self, typ: TypeId) -> PseudoId {
         if self.types.kind(typ) == TypeKind::Pointer {
             let elem = self.types.base_type(typ).unwrap_or(self.types.char_id);
-            let bytes = (self.types.size_bytes(elem)).max(1);
+            let bytes = self.types.byte_size(elem).to_usize().max(1);
             return self.emit_const(bytes as i128, self.types.long_id);
         }
         if self.types.is_float(typ) {

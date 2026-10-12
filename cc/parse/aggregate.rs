@@ -21,6 +21,7 @@ use crate::token::preprocess::StorageOrderPragma;
 use crate::types::{
     CompositeType, EnumConstant, MemberAlign, StructMember, Type, TypeId, TypeKind, TypeModifiers,
 };
+use crate::units::{Align, ByteSize};
 use gettextrs::{gettext, gettext_args};
 
 const DEFAULT_MEMBER_CAPACITY: usize = 16;
@@ -269,13 +270,15 @@ impl Parser<'_> {
                 self.symbols.get_mut(sym_id).typ = self.enumerator_type(value, underlying, size);
             }
 
+            // The enum is as wide, and as aligned, as the integer type chosen.
+            let align = Align::of_bytes(size as u64);
             let composite = CompositeType {
                 tag,
                 members: Vec::new(),
                 enum_constants: constants,
-                size,
-                align: size,
-                member_align: size,
+                size: ByteSize::new(size as u64),
+                align,
+                member_align: align,
                 is_complete: true,
                 transparent: false,
                 reverse_order: false,
@@ -579,7 +582,7 @@ impl Parser<'_> {
                 }
             }
             let pack_cap = self.current_pack();
-            let (size, mut align) = if is_union {
+            let layout = if is_union {
                 self.types.compute_union_layout(&mut members, pack_cap)
             } else {
                 self.types.compute_struct_layout(&mut members, pack_cap)
@@ -590,24 +593,22 @@ impl Parser<'_> {
             // overwrites it. AAPCS64 derives an argument's alignment from the
             // members and ignores the type's own attribute, and a `#pragma
             // pack` cap folded in here is recorded nowhere else.
-            let member_align = align;
+            let member_align = layout.map_or(Align::ONE, |(_, align)| align);
 
             // Apply struct-level aligned attribute (raises alignment, never lowers)
-            if let Some(sa) = struct_align {
-                if sa as usize > align {
-                    align = sa as usize;
-                }
-            }
+            let align = struct_align.map_or(member_align, |sa| {
+                member_align.max(Align::of_bytes(u64::from(sa)))
+            });
 
-            // Re-pad size to new alignment. Saturating: the layout answers
-            // `usize::MAX` for a member list too large to describe, and
-            // rounding that must not wrap it small before the check below.
-            let size = size.checked_next_multiple_of(align).unwrap_or(usize::MAX);
+            // Re-pad size to new alignment. The layout answers `None` for a
+            // member list too large to describe, and so does a rounding that
+            // overflows: both are refused below.
+            let size = layout.and_then(|(size, _)| size.align_up(align));
 
             // The same bound `derive_array_type` enforces: a member list can
             // reach it even when no single member does.
             let max = self.types.max_object_bytes();
-            if size > max {
+            let Some(size) = size.filter(|&size| size <= max) else {
                 let keyword = if is_union { "union" } else { "struct" };
                 let name = tag
                     .and_then(|t| self.idents.get_opt(t))
@@ -619,7 +620,7 @@ impl Parser<'_> {
                     ),
                     specifier_pos,
                 ));
-            }
+            };
 
             if is_transparent && !is_union {
                 self.warn_transparent_union_ignored(specifier_pos);
@@ -841,7 +842,7 @@ impl Parser<'_> {
                 members.push(StructMember {
                     name: StringId::EMPTY,
                     typ: member_base_type_id,
-                    offset: 0,
+                    offset: ByteSize::ZERO,
                     bit_offset: None,
                     bit_width: None,
                     access_bytes: None,
@@ -876,7 +877,7 @@ impl Parser<'_> {
                     members.push(StructMember {
                         name: StringId::EMPTY,
                         typ,
-                        offset: 0,
+                        offset: ByteSize::ZERO,
                         bit_offset: None,
                         bit_width: Some(width),
                         access_bytes: None,
@@ -949,8 +950,8 @@ impl Parser<'_> {
                 // C11 6.7.5p5: the `_Alignas` keyword may not weaken a
                 // member's alignment either; the `aligned` attribute may.
                 if let (Some(written), Some(_)) = (member_align.written, self.pending_alignas_kw) {
-                    let natural = self.types.natural_alignment(typ) as u32;
-                    if written < natural {
+                    let natural = self.types.natural_align(typ);
+                    if Align::of_bytes(u64::from(written)) < natural {
                         let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
                         diag::error_args(
                             self.current_pos(),
@@ -987,7 +988,7 @@ impl Parser<'_> {
                 members.push(StructMember {
                     name,
                     typ,
-                    offset: 0, // Computed later
+                    offset: ByteSize::ZERO, // Computed later
                     bit_offset: None,
                     bit_width,
                     access_bytes: None,
@@ -1276,7 +1277,7 @@ impl Parser<'_> {
         let max_width = if self.types.kind(typ_id) == TypeKind::Bool {
             1
         } else {
-            self.types.size_bits(typ_id)
+            self.types.value_bits(typ_id).get()
         };
         if width > max_width {
             return Err(ParseError::new(
@@ -1324,7 +1325,7 @@ mod tests {
             .lookup_typedef(strings.lookup("E").unwrap())
             .unwrap();
         assert_eq!(e, tag.typ);
-        assert_eq!(types.size_bits(e), 32);
+        assert_eq!(types.value_bits(e).get(), 32);
         assert!(types.is_unsigned(e));
     }
 
@@ -1345,14 +1346,14 @@ mod tests {
                 .unwrap()
         };
         let (cb, vp, cs) = (typedef("CB"), typedef("VP"), typedef("CS"));
-        assert_eq!(types.size_bits(cb), 64);
+        assert_eq!(types.value_bits(cb).get(), 64);
         assert!(!types.is_unsigned(cb));
         assert_eq!(types.qualifiers(cb), TypeModifiers::CONST);
-        assert_eq!(types.size_bits(vp), 32);
+        assert_eq!(types.value_bits(vp).get(), 32);
         assert!(types.is_unsigned(vp));
         assert_eq!(types.qualifiers(vp), TypeModifiers::VOLATILE);
         assert!(types.is_composite_complete(cs));
-        assert_eq!(types.size_bytes(cs), 16);
+        assert_eq!(types.byte_size(cs).get(), 16);
         assert_eq!(types.qualifiers(cs), TypeModifiers::CONST);
     }
 
@@ -1369,7 +1370,7 @@ mod tests {
         let cs = symbols
             .lookup_typedef(strings.lookup("CS").unwrap())
             .unwrap();
-        assert_eq!(types.size_bytes(cs), 16);
+        assert_eq!(types.byte_size(cs).get(), 16);
     }
 
     /// The types of the variables declared at the top of function `func`'s
@@ -1419,9 +1420,9 @@ mod tests {
         let locals = locals_of(&tu, &strings, &symbols, "f");
         let typ = |name: &str| locals.iter().find(|(n, _)| n == name).unwrap().1;
         assert_eq!(typ("x"), outer);
-        assert_eq!(types.size_bytes(typ("y")), 4);
+        assert_eq!(types.byte_size(typ("y")).get(), 4);
         assert_eq!(types.qualifiers(typ("y")), TypeModifiers::CONST);
-        assert_eq!(types.size_bytes(typ("z")), 50);
+        assert_eq!(types.byte_size(typ("z")).get(), 50);
     }
 
     /// `struct S;` by itself declares a new tag in its block, which the
@@ -1446,7 +1447,7 @@ mod tests {
         };
         assert_ne!(pointee("f", "p"), outer);
         assert_eq!(pointee("f", "p"), pointee("f", "q"));
-        assert_eq!(types.size_bytes(pointee("f", "p")), 50);
+        assert_eq!(types.byte_size(pointee("f", "p")).get(), 50);
         assert_eq!(pointee("g", "p"), outer);
     }
 }

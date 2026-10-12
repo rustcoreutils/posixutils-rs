@@ -1294,11 +1294,14 @@ fn test_incomplete_struct_type_resolution() {
     };
     let complete_composite = CompositeType {
         tag: Some(foo_tag),
-        members: vec![member(x_id, 0), member(y_id, 4)],
+        members: vec![
+            member(x_id, crate::units::ByteSize::ZERO),
+            member(y_id, crate::units::ByteSize::new(4)),
+        ],
         enum_constants: vec![],
-        size: 8,
-        align: 4,
-        member_align: 4,
+        size: crate::units::ByteSize::new(8),
+        align: crate::units::Align::of_bytes(4),
+        member_align: crate::units::Align::of_bytes(4),
         is_complete: true,
         transparent: false,
         reverse_order: false,

@@ -143,7 +143,7 @@ fn normalize(types: &TypeTable, typ: Option<TypeId>, value: i128) -> i128 {
     if types.kind(t) == TypeKind::Bool {
         return (value != 0) as i128;
     }
-    reduce_to_width(value, types.size_bits(t), types.is_unsigned(t))
+    reduce_to_width(value, types.value_bits(t).get(), types.is_unsigned(t))
 }
 
 /// `value` converted to the integer type of `bits` bits and the signedness
@@ -388,7 +388,7 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
             if crate::parse::ast::sizeof_type_is_runtime(env.types(), *type_id, dims) {
                 return None;
             }
-            Some(env.types().size_bytes(*type_id) as i128)
+            Some(i128::from(env.types().byte_size(*type_id).get()))
         }
 
         ExprKind::SizeofExpr(inner) => {
@@ -401,12 +401,16 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
             if env.types().variable_array_levels(typ) > 0 {
                 return None;
             }
-            Some(env.types().size_bytes(typ) as i128)
+            Some(i128::from(env.types().byte_size(typ).get()))
         }
 
-        ExprKind::AlignofType(type_id) => Some(env.types().alignof_value(*type_id) as i128),
+        ExprKind::AlignofType(type_id) => {
+            Some(i128::from(env.types().alignof_value(*type_id).bytes()))
+        }
 
-        ExprKind::AlignofExpr(inner) => inner.typ.map(|typ| env.types().alignof_value(typ) as i128),
+        ExprKind::AlignofExpr(inner) => inner
+            .typ
+            .map(|typ| i128::from(env.types().alignof_value(typ).bytes())),
 
         ExprKind::Cast {
             expr: inner,
@@ -484,7 +488,7 @@ fn eval_overflow_p(
         CheckedOp::Mul => a.mul(b),
     };
     // A magnitude past u128 fits no type.
-    let fits = exact.is_some_and(|v| v.fits(types.size_bits(dst), types.is_unsigned(dst)));
+    let fits = exact.is_some_and(|v| v.fits(types.value_bits(dst).get(), types.is_unsigned(dst)));
     Some(i128::from(!fits))
 }
 
@@ -571,7 +575,7 @@ impl Exact {
 /// expression in every context. The argument is already converted to the
 /// builtin's parameter type, whose width the operation reads.
 fn eval_bit_builtin(env: &impl ConstEnv, scope: ConstScope, op: BitOp, arg: &Expr) -> Option<i128> {
-    let width = env.types().size_bits(arg.typ?);
+    let width = env.types().value_bits(arg.typ?).get();
     Some(eval_bit_op(op, width, eval(env, scope, arg)?))
 }
 
@@ -614,7 +618,7 @@ pub(crate) fn offset_of(env: &impl ConstEnv, typ: TypeId, path: &[OffsetOfPath])
             }
             OffsetOfPath::Index(index) => {
                 let elem = env.types().base_type(current)?;
-                offset += *index as i128 * env.types().size_bytes(elem) as i128;
+                offset += *index as i128 * i128::from(env.types().byte_size(elem).get());
                 current = elem;
             }
         }
@@ -633,7 +637,7 @@ pub(crate) fn member_at(
     member: StringId,
 ) -> Option<(i128, TypeId)> {
     let info = env.types().find_member(aggregate, member)?;
-    Some((info.offset as i128, info.typ))
+    Some((i128::from(info.offset.get()), info.typ))
 }
 
 fn eval_binary(
@@ -766,7 +770,7 @@ fn eval_binary(
             }
             let width = left
                 .typ
-                .map(|t| env.types().size_bits(t))
+                .map(|t| env.types().value_bits(t).get())
                 .unwrap_or(32)
                 .max(32);
             let mask: i128 = if width > 64 {
@@ -953,7 +957,10 @@ fn integer_shape(types: &TypeTable, to: TypeId) -> Option<(u32, bool)> {
     if types.kind(to) == TypeKind::Bool {
         return None;
     }
-    Some((types.size_bits(to).clamp(1, 128), !types.is_unsigned(to)))
+    Some((
+        types.value_bits(to).get().clamp(1, 128),
+        !types.is_unsigned(to),
+    ))
 }
 
 /// C's conversion of the constant `val` to the integer type `to` (6.3.1.2,
@@ -1404,7 +1411,7 @@ pub(crate) fn eval_pointer(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) 
             // which the scope mechanism exists to accept.
             let idx = eval(env, scope, index)?;
             let elem_type = env.types().base_type(array.typ?)?;
-            Some(base_offset + idx * env.types().size_bytes(elem_type) as i128)
+            Some(base_offset + idx * i128::from(env.types().byte_size(elem_type).get()))
         }
 
         _ => None,

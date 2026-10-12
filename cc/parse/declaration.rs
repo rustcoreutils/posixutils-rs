@@ -20,6 +20,7 @@ use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId, SymbolKind};
 use crate::token::lexer::Position;
 use crate::types::{ArrayExtent, FloatClass, Type, TypeId, TypeKind, TypeModifiers, TypeTable};
+use crate::units::ByteSize;
 use gettextrs::gettext;
 
 /// C17 6.7.2p2: the type specifiers must together name one of a
@@ -786,9 +787,9 @@ impl Parser<'_> {
         pos: Position,
     ) -> Result<TypeId, ParseError> {
         if let ArrayExtent::Known(count) = extent {
-            let total = (count as u128) * (self.types.size_bytes(elem) as u128);
+            let total = self.types.byte_size(elem).checked_mul(count as u64);
             let max = self.types.max_object_bytes();
-            if total > max as u128 {
+            if total.is_none_or(|total| total > max) {
                 return Err(ParseError::new(
                     format!(
                         "size of array is too large: it exceeds the maximum \
@@ -828,8 +829,8 @@ impl Parser<'_> {
         pos: Position,
         what: &str,
     ) -> Result<(), ParseError> {
-        let bytes = self.types.size_bytes(typ);
-        if bytes <= TypeTable::MAX_STACK_OBJECT_BYTES {
+        let bytes = self.types.byte_size(typ);
+        if bytes <= ByteSize::from_usize(TypeTable::MAX_STACK_OBJECT_BYTES) {
             return Ok(());
         }
         Err(ParseError::new(
@@ -1701,7 +1702,7 @@ impl Parser<'_> {
         self.advance();
         self.expect_special(b'(')?;
         let align = if let Some(type_id) = self.try_parse_type_name() {
-            self.types.alignment(type_id) as i128
+            i128::from(self.types.align(type_id).bytes())
         } else {
             let expr = self.parse_expression()?;
             match self.eval_const_expr(&expr) {

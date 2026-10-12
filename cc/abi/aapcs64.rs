@@ -53,7 +53,7 @@ pub(crate) fn argument_alignment(types: &TypeTable, ty: TypeId) -> usize {
         // `composite.align` would carry the struct's own attribute; the
         // member-derived value is recorded separately for exactly this.
         TypeKind::Struct | TypeKind::Union => {
-            types.composite(ty).map(|c| c.member_align).unwrap_or(1)
+            types.composite(ty).map_or(1, |c| c.member_align.to_usize())
         }
         // An array is passed as its element type repeated, so it aligns as
         // one element does.
@@ -820,7 +820,7 @@ mod tests {
             StructMember {
                 name: crate::strings::StringId::default(),
                 typ,
-                offset: 0,
+                offset: crate::units::ByteSize::ZERO,
                 bit_width: None,
                 bit_offset: None,
                 access_bytes: None,
@@ -844,9 +844,9 @@ mod tests {
                 tag: None,
                 members,
                 enum_constants: vec![],
-                size,
-                align,
-                member_align,
+                size: crate::units::ByteSize::from_usize(size),
+                align: crate::units::Align::of_bytes(align as u64),
+                member_align: crate::units::Align::of_bytes(member_align as u64),
                 is_complete: true,
                 transparent: false,
                 reverse_order: false,
@@ -916,7 +916,7 @@ mod tests {
         let member = |t| StructMember {
             name: crate::strings::StringId::default(),
             typ: t,
-            offset: 0,
+            offset: crate::units::ByteSize::ZERO,
             bit_width: None,
             bit_offset: None,
             access_bytes: None,
@@ -928,9 +928,9 @@ mod tests {
             tag: None,
             members: vec![m0, m1],
             enum_constants: vec![],
-            size: 8,
-            align: 8,
-            member_align: 8,
+            size: crate::units::ByteSize::new(8),
+            align: crate::units::Align::of_bytes(8),
+            member_align: crate::units::Align::of_bytes(8),
             is_complete: true,
             transparent: false,
             reverse_order: false,
@@ -949,14 +949,14 @@ mod tests {
         // A *struct* of two doubles really is two elements.
         let s0 = member(d);
         let mut s1 = member(d);
-        s1.offset = 8;
+        s1.offset = crate::units::ByteSize::new(8);
         let st = types.intern(Type::struct_type(CompositeType {
             tag: None,
             members: vec![s0, s1],
             enum_constants: vec![],
-            size: 16,
-            align: 8,
-            member_align: 8,
+            size: crate::units::ByteSize::new(16),
+            align: crate::units::Align::of_bytes(8),
+            member_align: crate::units::Align::of_bytes(8),
             is_complete: true,
             transparent: false,
             reverse_order: false,
@@ -988,7 +988,7 @@ mod tests {
                 .map(|&(typ, offset)| StructMember {
                     name: crate::strings::StringId::default(),
                     typ,
-                    offset,
+                    offset: crate::units::ByteSize::from_usize(offset),
                     bit_width: None,
                     bit_offset: None,
                     access_bytes: None,
@@ -996,9 +996,9 @@ mod tests {
                 })
                 .collect(),
             enum_constants: vec![],
-            size,
-            align,
-            member_align: align,
+            size: crate::units::ByteSize::from_usize(size),
+            align: crate::units::Align::of_bytes(align as u64),
+            member_align: crate::units::Align::of_bytes(align as u64),
             is_complete: true,
             transparent: false,
             reverse_order: false,

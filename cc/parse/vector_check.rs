@@ -71,7 +71,7 @@ impl Parser<'_> {
         }
         let fault = match lanes {
             (Some((le, ln)), Some((re, rn))) => {
-                let same_width = ln == rn && self.types.size_bits(le) == self.types.size_bits(re);
+                let same_width = ln == rn && self.types.value_bits(le) == self.types.value_bits(re);
                 let both_integer = self.types.is_integer(le) && self.types.is_integer(re);
                 if same_width && (both_integer || self.types.types_compatible(le, re)) {
                     return true;
@@ -147,7 +147,7 @@ impl Parser<'_> {
             if scalar_float {
                 return Some(SplatFault::FloatToInteger);
             }
-            let bits = types.size_bits(lane);
+            let bits = types.value_bits(lane).get();
             let fits = match self.eval_const_expr(e) {
                 // Either reading of the lane's bits will do: gcc spreads
                 // `-1` across unsigned lanes. A 128-bit lane holds every
@@ -159,7 +159,7 @@ impl Parser<'_> {
                         (lo..=hi).contains(&c)
                     }
                 }
-                None => types.size_bits(typ) <= bits,
+                None => types.value_bits(typ).get() <= bits,
             };
             return (!fits).then_some(SplatFault::Truncation);
         };
@@ -181,7 +181,7 @@ impl Parser<'_> {
                     let rounded = v.round_to_format(lane_format);
                     rounded.cmp_value(v) == Some(std::cmp::Ordering::Equal)
                 }
-                None => types.size_bits(typ) <= precision,
+                None => types.value_bits(typ).get() <= precision,
             }
         };
         (!fits).then_some(SplatFault::Truncation)
@@ -192,7 +192,9 @@ impl Parser<'_> {
     /// size, and converts nothing else. Answers whether it is valid.
     pub(super) fn check_vector_cast(&mut self, from: TypeId, to: TypeId, pos: Position) -> bool {
         let types = &*self.types;
-        let same_size = types.size_bits(from) == types.size_bits(to);
+        // Either type may be an aggregate with no value width; two of them
+        // compare equal here, as the saturated widths always did.
+        let same_size = types.checked_value_bits(from) == types.checked_value_bits(to);
         let (vector, other) = if types.is_vector(to) {
             (to, from)
         } else {

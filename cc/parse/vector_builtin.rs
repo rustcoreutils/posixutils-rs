@@ -76,7 +76,7 @@ impl Parser<'_> {
                      the mask vector should be the same"
                         .to_string(),
                 )
-            } else if self.types.size_bits(lane) != self.types.size_bits(mlane) {
+            } else if self.types.value_bits(lane) != self.types.value_bits(mlane) {
                 Some(
                     "'__builtin_shuffle' argument vector(s) inner type must have the same \
                      size as inner type of the mask"

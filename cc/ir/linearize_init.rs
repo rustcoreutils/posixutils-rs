@@ -1472,7 +1472,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     StructFieldVisitKind::Expr(element.value.clone())
                 };
                 visits.push(StructFieldVisit {
-                    offset: member.offset,
+                    offset: member.offset.to_usize(),
                     typ: member.typ,
                     field_size,
                     kind,
@@ -1836,7 +1836,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     // range inside its carrier is not a subobject.
                     let found = composite.members.iter().find(|member| {
                         member.bit_width.is_none() && {
-                            let member_start = base + member.offset;
+                            let member_start = base + member.offset.to_usize();
                             let member_end = member_start + self.types.size_bytes(member.typ);
                             offset >= member_start && offset + size <= member_end
                         }
@@ -1859,8 +1859,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                             SubobjectPlace::NotASubobject
                         };
                     };
-                    base += member.offset;
-                    unions = unions.inside(member.offset);
+                    base += member.offset.to_usize();
+                    unions = unions.inside(member.offset.to_usize());
                     typ = member.typ;
                 }
                 TypeKind::Array => {
@@ -1919,9 +1919,10 @@ impl<'a> super::linearize::Linearizer<'a> {
             .members
             .get(index)
             .filter(|member| member.bit_width.is_none())?;
-        let span = member.offset..member.offset + self.types.size_bytes(member.typ);
+        let span =
+            member.offset.to_usize()..member.offset.to_usize() + self.types.size_bytes(member.typ);
         self.holds(base, &span, offset, size)
-            .then_some((member.offset, member.typ))
+            .then_some((member.offset.to_usize(), member.typ))
     }
 
     /// An initializer that writes nothing, shaped for `typ` so that
@@ -2013,12 +2014,12 @@ impl<'a> super::linearize::Linearizer<'a> {
                         .iter()
                         .find(|member| {
                             member.bit_width.is_none() && {
-                                let span = member.offset
-                                    ..member.offset + self.types.size_bytes(member.typ);
+                                let span = member.offset.to_usize()
+                                    ..member.offset.to_usize() + self.types.size_bytes(member.typ);
                                 self.holds(0, &span, offset, size)
                             }
                         })
-                        .map(|member| (member.offset, member.typ))?
+                        .map(|member| (member.offset.to_usize(), member.typ))?
                 };
                 let slot_size = self.types.size_bytes(slot_type);
                 let Initializer::Struct { fields, .. } = init else {
@@ -2590,7 +2591,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         quals |= self.types.qualifiers(typ);
                     }
                     quals |= member.quals;
-                    offset += member.offset;
+                    offset += member.offset.to_usize();
                     typ = member.typ;
                     if idx + 1 == designators.len() {
                         bit_offset = member.bit_offset;
@@ -2617,7 +2618,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     if idx > 0 {
                         quals |= self.types.qualifiers(typ);
                     }
-                    offset += member.offset;
+                    offset += member.offset.to_usize();
                     typ = member.typ;
                     bit_offset = None;
                     bit_width = None;
@@ -2777,7 +2778,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
                 // Nested anonymous aggregate — descend into it
                 if self.types.is_anonymous_aggregate(inner) {
-                    descend_into = Some((inner.typ, base_offset + inner.offset, idx + 1));
+                    descend_into =
+                        Some((inner.typ, base_offset + inner.offset.to_usize(), idx + 1));
                     break;
                 }
                 // Found a valid named member
@@ -2795,7 +2797,9 @@ impl<'a> super::linearize::Linearizer<'a> {
                     q | (self.types.qualifiers(l.anon_type) & Type::MEMBER_QUALIFIERS)
                 });
                 return Some(MemberInfo {
-                    offset: base_offset + inner.offset,
+                    offset: crate::units::ByteSize::from_usize(
+                        base_offset + inner.offset.to_usize(),
+                    ),
                     typ: inner.typ,
                     bit_offset: inner.bit_offset,
                     bit_width: inner.bit_width,
@@ -2832,7 +2836,8 @@ impl<'a> super::linearize::Linearizer<'a> {
             if self.types.is_anonymous_aggregate(member) {
                 // Recursively search for the field, building the nesting path
                 let mut path = Vec::new();
-                if self.find_anon_field_path(member.typ, member.offset, name, &mut path) {
+                if self.find_anon_field_path(member.typ, member.offset.to_usize(), name, &mut path)
+                {
                     return Some(MemberDesignatorResult::Anonymous {
                         outer_idx: idx,
                         levels: path,
@@ -2880,7 +2885,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 });
                 if self.find_anon_field_path(
                     inner_member.typ,
-                    base_offset + inner_member.offset,
+                    base_offset + inner_member.offset.to_usize(),
                     name,
                     path,
                 ) {
@@ -3534,7 +3539,7 @@ mod tests {
         crate::types::StructMember {
             name,
             typ,
-            offset,
+            offset: crate::units::ByteSize::from_usize(offset),
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
@@ -3553,7 +3558,7 @@ mod tests {
         crate::types::StructMember {
             name,
             typ,
-            offset: 0,
+            offset: crate::units::ByteSize::ZERO,
             bit_offset: Some(bit_offset),
             bit_width: Some(width),
             access_bytes: Some(4),
@@ -3568,9 +3573,9 @@ mod tests {
     ) -> crate::types::CompositeType {
         crate::types::CompositeType {
             members,
-            size,
-            align,
-            member_align: align,
+            size: crate::units::ByteSize::from_usize(size),
+            align: crate::units::Align::of_bytes(align as u64),
+            member_align: crate::units::Align::of_bytes(align as u64),
             is_complete: true,
             ..crate::types::CompositeType::incomplete(None)
         }

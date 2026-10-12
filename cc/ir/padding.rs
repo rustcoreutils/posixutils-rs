@@ -95,16 +95,20 @@ fn mark_members(
             if is_union {
                 set_bytes(
                     bits,
-                    at + m.offset,
+                    at + m.offset.to_usize(),
                     (bit_offset + width as usize).div_ceil(8),
                 );
             } else {
-                set_bits(bits, (at + m.offset) * 8 + bit_offset, width as usize);
+                set_bits(
+                    bits,
+                    (at + m.offset.to_usize()) * 8 + bit_offset,
+                    width as usize,
+                );
             }
         } else if types.is_flexible_array_member(m) {
             return Err(m.name);
         } else {
-            mark(types, m.typ, at + m.offset, bits)?;
+            mark(types, m.typ, at + m.offset.to_usize(), bits)?;
         }
     }
     Ok(())
@@ -355,7 +359,7 @@ mod tests {
         StructMember {
             name: StringId(1),
             typ,
-            offset,
+            offset: crate::units::ByteSize::from_usize(offset),
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
@@ -381,9 +385,9 @@ mod tests {
     ) -> TypeId {
         let mut c = CompositeType::incomplete(None);
         c.members = members;
-        c.size = size;
-        c.align = align;
-        c.member_align = align;
+        c.size = crate::units::ByteSize::from_usize(size);
+        c.align = crate::units::Align::of_bytes(align as u64);
+        c.member_align = crate::units::Align::of_bytes(align as u64);
         c.is_complete = true;
         let mut t = Type::basic(kind);
         t.composite = Some(Box::new(c));

@@ -67,7 +67,7 @@ fn test_attributes_follow_an_unnamed_bitfield() {
         ]
     );
     // The written alignment places the field at 8 on every target.
-    assert_eq!(composite.members[1].offset, 8);
+    assert_eq!(composite.members[1].offset, crate::units::ByteSize::new(8));
 }
 
 #[test]

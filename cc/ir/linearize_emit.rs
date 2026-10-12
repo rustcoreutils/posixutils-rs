@@ -886,8 +886,14 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
             let byte = self.alloc_pseudo();
             self.emit(
-                Instruction::load(byte, base, (byte_offset + i as usize) as i64, byte_type, 8)
-                    .with_access(access),
+                Instruction::load(
+                    byte,
+                    base,
+                    (byte_offset.to_usize() + i as usize) as i64,
+                    byte_type,
+                    8,
+                )
+                .with_access(access),
             );
             // Widen before shifting, or the shift is done at eight bits and
             // drops everything it moves. `uchar` is unsigned, so this is a
@@ -1105,13 +1111,19 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // 6. Store back, in the unit's own order.
         if self.bitfield_unit_reversed(bf, typ) {
-            self.emit_reversed_store(combined, base, byte_offset as i64, storage_type, access);
+            self.emit_reversed_store(
+                combined,
+                base,
+                byte_offset.get() as i64,
+                storage_type,
+                access,
+            );
         } else {
             self.emit(
                 Instruction::store(
                     combined,
                     base,
-                    byte_offset as i64,
+                    byte_offset.get() as i64,
                     storage_type,
                     storage_bits,
                 )
@@ -1131,7 +1143,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         access: Access,
     ) {
         let storage_type = self.bitfield_storage_type(bf.access_bytes as usize);
-        let offset = bf.offset as i64;
+        let offset = bf.offset.get() as i64;
         if self.bitfield_unit_reversed(bf, typ) {
             self.emit_reversed_load(target, base, offset, storage_type, access);
         } else {
@@ -1269,7 +1281,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 out
             };
 
-            let addr_off = (byte_offset + i as usize) as i64;
+            let addr_off = (byte_offset.to_usize() + i as usize) as i64;
             let to_store = if byte_mask == 0xff {
                 // The field owns every bit of this byte, so nothing has to be
                 // preserved and the read can be skipped.
@@ -3032,7 +3044,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             Some(bf) => PlaceAt::Bitfield(base, bf, target_typ),
             // Not a bit-field: fold the member offset into the base so the
             // load and the store share one address.
-            _ => PlaceAt::Object(self.offset_address(base, info.offset as i64)),
+            _ => PlaceAt::Object(self.offset_address(base, info.offset.get() as i64)),
         };
         RmwPlace { at, ident: None }
     }

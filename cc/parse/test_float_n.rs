@@ -39,7 +39,10 @@ fn test_float_n_types_are_distinct_but_share_a_format() {
     ] {
         assert!(!types.types_compatible(named, standard));
         assert_eq!(types.fp_format(named), types.fp_format(standard));
-        assert_eq!(types.size_bits(named), types.size_bits(standard));
+        assert_eq!(
+            types.value_bits(named).get(),
+            types.value_bits(standard).get()
+        );
     }
     assert!(!types.types_compatible(f64_, f32x));
     assert_eq!(types.format_type(f32x, None), "_Float32x");

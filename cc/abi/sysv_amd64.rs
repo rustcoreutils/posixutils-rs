@@ -357,11 +357,11 @@ impl SysVAmd64Abi {
                 let (field_start, field_end) = match (member.bit_width, member.bit_offset) {
                     (Some(0), _) => continue,
                     (Some(width), Some(bit_offset)) => {
-                        let start = member.offset as u32 * 8 + bit_offset;
+                        let start = member.offset.get() as u32 * 8 + bit_offset;
                         (start, start + width)
                     }
                     _ => {
-                        let start = member.offset as u32 * 8;
+                        let start = member.offset.get() as u32 * 8;
                         (start, start + types.size_bits(field_ty))
                     }
                 };
@@ -705,16 +705,16 @@ mod tests {
             members: vec![StructMember {
                 name: crate::strings::StringId::default(),
                 typ: member,
-                offset: 0,
+                offset: crate::units::ByteSize::ZERO,
                 bit_width: None,
                 bit_offset: None,
                 access_bytes: None,
                 align: MemberAlign::NATURAL,
             }],
             enum_constants: vec![],
-            size,
-            align,
-            member_align: align,
+            size: crate::units::ByteSize::from_usize(size),
+            align: crate::units::Align::of_bytes(align as u64),
+            member_align: crate::units::Align::of_bytes(align as u64),
             is_complete: true,
             transparent: false,
             reverse_order: false,
@@ -855,7 +855,7 @@ mod tests {
                 StructMember {
                     name: crate::strings::StringId::default(),
                     typ: q,
-                    offset: 0,
+                    offset: crate::units::ByteSize::ZERO,
                     bit_width: None,
                     bit_offset: None,
                     access_bytes: None,
@@ -864,7 +864,7 @@ mod tests {
                 StructMember {
                     name: crate::strings::StringId::default(),
                     typ: arr2,
-                    offset: 0,
+                    offset: crate::units::ByteSize::ZERO,
                     bit_width: None,
                     bit_offset: None,
                     access_bytes: None,
@@ -872,9 +872,9 @@ mod tests {
                 },
             ],
             enum_constants: vec![],
-            size: 16,
-            align: 16,
-            member_align: 16,
+            size: crate::units::ByteSize::new(16),
+            align: crate::units::Align::of_bytes(16),
+            member_align: crate::units::Align::of_bytes(16),
             is_complete: true,
             transparent: false,
             reverse_order: false,

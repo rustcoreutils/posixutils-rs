@@ -1057,7 +1057,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         // Placed in the object being initialized, not in the
                         // aggregate the visit walked.
                         let bitfield = visit.bitfield().map(|bf| crate::types::Bitfield {
-                            offset: offset as usize,
+                            offset: crate::units::ByteSize::new(offset as u64),
                             ..bf
                         });
                         // The member as a subobject of this object: a store
@@ -1155,9 +1155,11 @@ impl<'a> super::linearize::Linearizer<'a> {
         let span = match (visit.bit_offset, visit.bit_width) {
             // Only the bytes the field's own bits reach; its access span is
             // wider and covers bytes other members own.
-            (Some(bit_offset), Some(bit_width)) => {
-                crate::types::own_bit_bytes(visit.offset, bit_offset, bit_width)
-            }
+            (Some(bit_offset), Some(bit_width)) => crate::types::own_bit_bytes(
+                crate::units::ByteSize::from_usize(visit.offset),
+                bit_offset,
+                bit_width,
+            ),
             _ => visit.offset..visit.offset + visit.field_size,
         };
         let mut reset: Option<std::ops::Range<usize>> = None;
@@ -2394,7 +2396,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     return None;
                 }
                 let (symbol_id, base) = self.const_subobject_place(inner)?;
-                Some((symbol_id, base + info.offset))
+                Some((symbol_id, base + info.offset.to_usize()))
             }
             _ => None,
         }

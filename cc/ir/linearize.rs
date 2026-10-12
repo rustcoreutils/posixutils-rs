@@ -395,9 +395,11 @@ impl RawFieldInit {
     /// `char` member owns, while the field itself does not.
     pub(crate) fn byte_span(&self) -> std::ops::Range<usize> {
         match (self.bit_offset, self.bit_width) {
-            (Some(bit_offset), Some(bit_width)) => {
-                crate::types::own_bit_bytes(self.offset, bit_offset, bit_width)
-            }
+            (Some(bit_offset), Some(bit_width)) => crate::types::own_bit_bytes(
+                crate::units::ByteSize::from_usize(self.offset),
+                bit_offset,
+                bit_width,
+            ),
             _ => self.offset..self.offset + self.field_size,
         }
     }
@@ -536,7 +538,7 @@ impl StructFieldVisit {
     /// This field's placement, if it is a bit-field of non-zero width.
     pub(crate) fn bitfield(&self) -> Option<crate::types::Bitfield> {
         crate::types::Bitfield::from_parts(
-            self.offset,
+            crate::units::ByteSize::from_usize(self.offset),
             self.bit_offset,
             self.bit_width,
             self.access_bytes,
@@ -3426,7 +3428,7 @@ impl<'a> Linearizer<'a> {
                     .find_member(struct_type, *member)
                     .unwrap_or_else(|| MemberInfo::standing_in(self.expr_type(expr)));
 
-                self.offset_address(base, member_info.offset as i64)
+                self.offset_address(base, member_info.offset.get() as i64)
             }
             ExprKind::Arrow {
                 expr: inner,
@@ -3444,7 +3446,7 @@ impl<'a> Linearizer<'a> {
                     .find_member(struct_type, *member)
                     .unwrap_or_else(|| MemberInfo::standing_in(self.expr_type(expr)));
 
-                self.offset_address(ptr, member_info.offset as i64)
+                self.offset_address(ptr, member_info.offset.get() as i64)
             }
             ExprKind::Index { array, index } => {
                 // arr[idx] as lvalue = arr + idx * sizeof(elem)
@@ -3726,7 +3728,10 @@ impl<'a> Linearizer<'a> {
         if let Some(bf) = member_info.bitfield() {
             return self.emit_bitfield_load(base, bf, access_typ);
         }
-        self.read_object(ObjectPlace::At(base, member_info.offset as i64), access_typ)
+        self.read_object(
+            ObjectPlace::At(base, member_info.offset.get() as i64),
+            access_typ,
+        )
     }
 
     /// Bytes that one step of `ptr_expr` spans, as a run-time value.
@@ -7449,7 +7454,7 @@ impl<'a> Linearizer<'a> {
                 let align = self.types.alignof_value(*typ);
                 // _Alignof returns size_t
                 let result_typ = self.types.ulong_id;
-                self.emit_const(align as i128, result_typ)
+                self.emit_const(i128::from(align.bytes()), result_typ)
             }
 
             ExprKind::AlignofExpr(inner_expr) => {
@@ -7457,7 +7462,7 @@ impl<'a> Linearizer<'a> {
                 let align = self.types.alignof_value(inner_typ);
                 // _Alignof returns size_t
                 let result_typ = self.types.ulong_id;
-                self.emit_const(align as i128, result_typ)
+                self.emit_const(i128::from(align.bytes()), result_typ)
             }
 
             ExprKind::Comma(exprs) => {

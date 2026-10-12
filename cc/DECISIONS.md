@@ -75,6 +75,15 @@ default namespace: glibc's `<features.h>` turns on `_DEFAULT_SOURCE` (POSIX
 `#define _GNU_SOURCE` or `_XOPEN_SOURCE`, exactly as under gcc. `-pthread`
 defines `_REENTRANT`, as gcc's does.
 
+### `-E` passes plain assembler and preprocessed input over
+
+**Settled (user decision, 2026-10-12): c17 matches gcc.** Under `-E`, `-M`
+and `-MM`, an input that is not preprocessed -- plain assembler (`.s`,
+`-x assembler`) or C already preprocessed (`.i`, `-x cpp-output`) -- is
+passed over: nothing is written, `-o` creates no file, and the operand is not
+opened, as gcc 13 does. `.S` is preprocessed as before, and `-x c` makes any
+file C source to preprocess.
+
 ### Float constant folding stops where an operation raises
 
 Arithmetic, negation, comparison and conversion fold over float constants, at

@@ -208,3 +208,52 @@ int main(void) {
 "#;
     crate::common::compile_and_run_everywhere("binary128_ld_args", src);
 }
+
+/// `_Float16` to and from binary128 (`long double` on aarch64, `_Float128`)
+/// and `__int128`, by libgcc's `hf` routines. On aarch64 the binary128
+/// conversions came out as an `fcvt` between an `h` and a `q` register, an
+/// instruction A64 does not have, and `__int128` from `_Float16` was wrong.
+///
+/// Not on macOS: Apple's targets have no `_Float128`, as with clang.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn binary128_half_conversions() {
+    let src = r#"
+_Float16 h = 1.5f16;
+volatile long double vld = 2.5L;
+volatile _Float128 vq = 3.5f128;
+volatile __int128 vi = 1000;
+volatile unsigned __int128 vu = 2000;
+volatile _Float16 vh = 1500.0f16;
+__attribute__((noinline)) long double a(void) { return h; }
+__attribute__((noinline)) _Float128 b(void) { return h; }
+__attribute__((noinline)) _Float16 c(long double x) { return x; }
+__attribute__((noinline)) _Float16 d(_Float128 x) { return x; }
+__attribute__((noinline)) double use(_Float128 q) { return (double)q; }
+__attribute__((noinline)) double e(void) { return use(h); }
+__attribute__((noinline)) _Float128 f(_Float16 x) { return (_Float128)x * 2; }
+__attribute__((noinline)) long double g(_Float16 x) { return (long double)x * 2; }
+int main(void) {
+    if (a() != 1.5L) return 1;
+    if (b() != 1.5f128) return 2;
+    if (c(vld) != 2.5f16) return 3;
+    if (d(vq) != 3.5f16) return 4;
+    if (e() != 1.5) return 5;
+    if (f(h) != 3.0f128) return 6;
+    if (g(h) != 3.0L) return 7;
+    _Float16 k = vld;
+    if (k != 2.5f16) return 8;
+    _Float16 m = vq;
+    if (m != 3.5f16) return 9;
+    if ((_Float128)h + vq != 5.0f128) return 10;
+    if (h + vld != 4.0L) return 11;
+    _Float16 i1 = vi, u1 = vu;
+    __int128 i2 = vh;
+    unsigned __int128 u2 = vh;
+    if (i1 != 1000.0f16 || u1 != 2000.0f16) return 12;
+    if (i2 != 1500 || u2 != 1500) return 13;
+    return 0;
+}
+"#;
+    crate::common::compile_and_run_everywhere("binary128_half", src);
+}

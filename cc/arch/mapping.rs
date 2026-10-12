@@ -217,7 +217,8 @@ pub(crate) fn float_suffix(types: &TypeTable, typ: TypeId) -> &'static str {
         Some(FpFormat::Binary64) => "df",
         Some(FpFormat::X87Extended) => "xf",
         Some(FpFormat::Binary128) => "tf",
-        Some(FpFormat::Binary16) | None => "",
+        Some(FpFormat::Binary16) => "hf",
+        None => "",
     }
 }
 
@@ -1827,10 +1828,12 @@ pub(crate) fn map_int128_float_convert(
                 (false, "df") => "__floattidf",
                 (false, "xf") => "__floattixf",
                 (false, "tf") => "__floattitf",
+                (false, "hf") => "__floattihf",
                 (true, "sf") => "__floatuntisf",
                 (true, "df") => "__floatuntidf",
                 (true, "xf") => "__floatuntixf",
                 (true, "tf") => "__floatuntitf",
+                (true, "hf") => "__floatuntihf",
                 _ => return None,
             };
             let call = build_convert_rtlib_call(insn, func_name, types, target);
@@ -1856,10 +1859,12 @@ pub(crate) fn map_int128_float_convert(
                 (false, "df") => "__fixdfti",
                 (false, "xf") => "__fixxfti",
                 (false, "tf") => "__fixtfti",
+                (false, "hf") => "__fixhfti",
                 (true, "sf") => "__fixunssfti",
                 (true, "df") => "__fixunsdfti",
                 (true, "xf") => "__fixunsxfti",
                 (true, "tf") => "__fixunstfti",
+                (true, "hf") => "__fixunshfti",
                 _ => return None,
             };
             let call = build_convert_rtlib_call(insn, func_name, types, target);
@@ -2048,9 +2053,11 @@ fn map_binary128(insn: &Instruction, ctx: &mut MappingCtx<'_>) -> Option<MappedI
                 (true, "sf") => "__trunctfsf2",
                 (true, "df") => "__trunctfdf2",
                 (true, "xf") => "__trunctfxf2",
+                (true, "hf") => "__trunctfhf2",
                 (false, "sf") => "__extendsftf2",
                 (false, "df") => "__extenddftf2",
                 (false, "xf") => "__extendxftf2",
+                (false, "hf") => "__extendhftf2",
                 _ => return None,
             };
             let call = build_convert_rtlib_call(insn, name, ctx.types, ctx.target);

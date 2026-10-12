@@ -415,4 +415,78 @@ mod tests {
         };
         assert_libcall(&mapper.map_insn(&insn, &mut ctx), "__floattitf");
     }
+
+    /// `_Float16` to and from binary128 and `__int128`: libgcc's `hf`
+    /// routines, as gcc calls. The binary128 arms named no `hf` mode, so
+    /// the conversion reached the back end as an `fcvt` between `h` and `q`
+    /// registers, which A64 has not, and the assembler refused it; the
+    /// `__int128` arms left it unconverted.
+    #[test]
+    fn test_aarch64_float16_binary128_and_int128() {
+        let target = Target::new(Arch::Aarch64, Os::Linux);
+        let types = TypeTable::new(&target);
+        let mapper = Aarch64Mapper;
+        let cases = [
+            (
+                Opcode::FCvtF,
+                types.longdouble_id,
+                types.float16_id,
+                "__extendhftf2",
+            ),
+            (
+                Opcode::FCvtF,
+                types.float16_id,
+                types.longdouble_id,
+                "__trunctfhf2",
+            ),
+            (
+                Opcode::FCvtF,
+                types.float128_id,
+                types.float16_id,
+                "__extendhftf2",
+            ),
+            (
+                Opcode::SCvtF,
+                types.float16_id,
+                types.int128_id,
+                "__floattihf",
+            ),
+            (
+                Opcode::UCvtF,
+                types.float16_id,
+                types.uint128_id,
+                "__floatuntihf",
+            ),
+            (
+                Opcode::FCvtS,
+                types.int128_id,
+                types.float16_id,
+                "__fixhfti",
+            ),
+            (
+                Opcode::FCvtU,
+                types.uint128_id,
+                types.float16_id,
+                "__fixunshfti",
+            ),
+        ];
+        for (op, to, from, name) in cases {
+            let insn =
+                make_convert_insn(op, to, types.value_bits(to), from, types.value_bits(from));
+            let mut func = make_minimal_func(&types);
+            let mut ctx = MappingCtx {
+                func: &mut func,
+                types: &types,
+                target: &target,
+            };
+            // A float-to-float conversion is legal to map and becomes its
+            // call in the library-call pass; an `__int128` one is mapped.
+            if op == Opcode::FCvtF {
+                assert_legal(&mapper.map_insn(&insn, &mut ctx));
+                assert_libcall(&library_call(&insn, &mut ctx, &mapper), name);
+            } else {
+                assert_libcall(&mapper.map_insn(&insn, &mut ctx), name);
+            }
+        }
+    }
 }

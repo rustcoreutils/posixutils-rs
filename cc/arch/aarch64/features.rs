@@ -18,6 +18,7 @@ use crate::arch::codegen::BswapSize;
 use crate::arch::lir::{CallTarget, CondCode, Directive, FpSize, OperandSize, Symbol};
 use crate::ir::Instruction;
 use crate::types::TypeTable;
+use crate::units::ByteSize;
 
 /// Bytes of the variadic register save area holding x0-x7.
 pub(super) const VA_GR_SAVE_BYTES: i32 = 8 * 8;
@@ -86,8 +87,11 @@ impl VaAggKind {
         if !types.is_aggregate_or_complex(typ) {
             return VaAggKind::Scalar;
         }
-        let bytes =
-            crate::abi::slot_bytes(types.size_bytes(typ).max(1), pos, "a variadic argument");
+        let bytes = crate::abi::slot_bytes(
+            types.byte_size(typ).max(ByteSize::new(1)),
+            pos,
+            "a variadic argument",
+        );
         let abi = crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, target);
         match abi.classify_param(typ, types) {
             crate::abi::ArgClass::Hfa { base, count } => VaAggKind::Hfa(HfaElem::of(base), count),
@@ -255,8 +259,8 @@ impl Aarch64CodeGen {
         let dst_loc = self.get_location(target);
 
         if self.base.target.os == crate::target::Os::MacOS {
-            let (_, align) =
-                crate::abi::aapcs64::darwin_va_slot(pos, types, arg_type, &self.base.target);
+            let slot = crate::abi::aapcs64::darwin_va_slot(pos, types, arg_type, &self.base.target);
+            let align = crate::abi::slot_align(slot.align);
             self.emit_va_arg_darwin(&ap_loc, &dst_loc, type_bits, is_fp, agg, align);
         } else {
             self.emit_va_arg_aapcs64(
@@ -265,7 +269,7 @@ impl Aarch64CodeGen {
                 type_bits,
                 is_fp,
                 agg,
-                crate::abi::aapcs64::argument_alignment(types, arg_type) as i32,
+                crate::abi::slot_align(crate::abi::aapcs64::argument_alignment(types, arg_type)),
             );
         }
     }

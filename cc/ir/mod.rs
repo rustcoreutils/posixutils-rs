@@ -5442,16 +5442,16 @@ mod tests {
             vec![
                 ArgClass::Direct {
                     classes: vec![RegClass::Integer],
-                    size_bits: 64,
+                    size_bits: crate::units::Bits::new(64),
                 },
                 ArgClass::Direct {
                     classes: vec![RegClass::Integer],
-                    size_bits: 32,
+                    size_bits: crate::units::Bits::new(32),
                 },
             ],
             ArgClass::Direct {
                 classes: vec![RegClass::Integer],
-                size_bits: 32,
+                size_bits: crate::units::Bits::new(32),
             },
         )));
         assert_eq!(call.op, Opcode::Call);
@@ -6246,15 +6246,15 @@ mod tests {
             vec![],
             ArgClass::Direct {
                 classes: vec![RegClass::Integer],
-                size_bits: 64,
+                size_bits: crate::units::Bits::new(64),
             },
         )));
         assert!(!insn.returns_via_sret());
         insn.extra_mut().abi_info = Some(Box::new(CallAbiInfo::new(
             vec![],
             ArgClass::Indirect {
-                align: 8,
-                size_bytes: 32,
+                align: crate::units::Align::of_bytes(8),
+                size_bytes: crate::units::ByteSize::new(32),
             },
         )));
         assert!(insn.returns_via_sret());
@@ -6268,7 +6268,7 @@ mod tests {
             vec![],
             ArgClass::Direct {
                 classes: vec![RegClass::Integer],
-                size_bits: 64,
+                size_bits: crate::units::Bits::new(64),
             },
         )));
         assert!(!insn.returns_two_regs());
@@ -6276,7 +6276,7 @@ mod tests {
             vec![],
             ArgClass::Direct {
                 classes: vec![RegClass::Integer, RegClass::Integer],
-                size_bits: 128,
+                size_bits: crate::units::Bits::new(128),
             },
         )));
         assert!(insn.returns_two_regs());
@@ -6295,7 +6295,7 @@ mod tests {
     fn test_aggregate_ret_is_address() {
         let sse = |n: usize, bits: u32| ArgClass::Direct {
             classes: vec![RegClass::Sse; n],
-            size_bits: bits,
+            size_bits: crate::units::Bits::new(bits),
         };
         assert!(
             aggregate_ret_is_address(&sse(1, 128), Bits::new(128)),
@@ -6313,14 +6313,16 @@ mod tests {
             !aggregate_ret_is_address(
                 &ArgClass::Direct {
                     classes: vec![RegClass::Integer, RegClass::Integer],
-                    size_bits: 128,
+                    size_bits: crate::units::Bits::new(128),
                 },
                 Bits::new(128)
             ),
             "__int128 comes back in RAX/RDX"
         );
         assert!(aggregate_ret_is_address(
-            &ArgClass::X87 { size_bits: 80 },
+            &ArgClass::X87 {
+                size_bits: crate::units::Bits::new(80)
+            },
             Bits::new(128)
         ));
         assert!(aggregate_ret_is_address(
@@ -6333,8 +6335,8 @@ mod tests {
         assert!(
             !aggregate_ret_is_address(
                 &ArgClass::Indirect {
-                    align: 8,
-                    size_bytes: 64,
+                    align: crate::units::Align::of_bytes(8),
+                    size_bytes: crate::units::ByteSize::new(64),
                 },
                 Bits::new(512)
             ),

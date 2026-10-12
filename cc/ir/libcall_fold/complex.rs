@@ -212,8 +212,8 @@ mod tests {
             Bits::new(64),
         );
         let indirect = ArgClass::Indirect {
-            align: 16,
-            size_bytes: 16,
+            align: crate::units::Align::of_bytes(16),
+            size_bytes: crate::units::ByteSize::new(16),
         };
         insn.extra_mut().abi_info = Some(Box::new(CallAbiInfo::new(vec![], indirect)));
         insn.extra_mut().known = Some(LibFn::MulComplex);

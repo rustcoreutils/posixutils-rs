@@ -1151,7 +1151,7 @@ impl Aarch64CodeGen {
                             // case does; without this the parameter was
                             // left uninitialized.
                             let bytes = crate::abi::slot_bytes(
-                                types.size_bytes(*typ),
+                                types.byte_size(*typ),
                                 crate::arch::func_pos(func),
                                 "a stacked parameter",
                             );

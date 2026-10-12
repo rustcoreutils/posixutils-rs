@@ -639,7 +639,9 @@ impl X86_64CodeGen {
     ) {
         use crate::abi::{ArgClass, RegClass};
         let size_bytes = crate::abi::slot_bytes(
-            types.size_bytes(arg_type).max(1),
+            types
+                .byte_size(arg_type)
+                .max(crate::units::ByteSize::new(1)),
             self.base.func_pos,
             "a variadic argument",
         );

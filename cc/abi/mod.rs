@@ -31,6 +31,7 @@ pub use win64::{Win64Abi, WIN64_POSITION_BYTES, WIN64_REG_POSITIONS, WIN64_SHADO
 
 use crate::target::{Arch, Target};
 use crate::types::{TypeId, TypeKind, TypeTable};
+use crate::units::{Align, Bits, ByteSize};
 
 /// An object's byte count as the backends' frame arithmetic needs it.
 ///
@@ -60,20 +61,37 @@ use crate::types::{TypeId, TypeKind, TypeTable};
 /// The placeholder is one eightbyte: non-zero, so the `& !(align - 1)`
 /// roundings and the `while done < bytes` copy loops that consume it still
 /// terminate, and small enough that nothing it feeds overflows in turn.
-pub fn slot_bytes(bytes: usize, pos: crate::diag::Position, what: &str) -> i32 {
-    if bytes > TypeTable::MAX_STACK_OBJECT_BYTES {
-        crate::diag::error_args(
-            pos,
-            "size of {0} is {1} bytes, past the {2} bytes a stack frame slot can address",
-            &[
-                what,
-                &bytes.to_string(),
-                &TypeTable::MAX_STACK_OBJECT_BYTES.to_string(),
-            ],
-        );
-        return 8;
+pub fn slot_bytes(bytes: ByteSize, pos: crate::diag::Position, what: &str) -> i32 {
+    let bytes = checked_slot_size(bytes, pos, what);
+    match i32::try_from(bytes.get()) {
+        Ok(slot) => slot,
+        Err(_) => unreachable!("MAX_STACK_OBJECT_BYTES is below i32::MAX"),
     }
-    bytes as i32
+}
+
+/// [`slot_bytes`] kept as a size: `bytes` itself when a frame slot can hold
+/// it, and otherwise the one-eightbyte placeholder, after the diagnostic.
+pub fn checked_slot_size(bytes: ByteSize, pos: crate::diag::Position, what: &str) -> ByteSize {
+    let max = ByteSize::from_usize(TypeTable::MAX_STACK_OBJECT_BYTES);
+    if bytes <= max {
+        return bytes;
+    }
+    crate::diag::error_args(
+        pos,
+        "size of {0} is {1} bytes, past the {2} bytes a stack frame slot can address",
+        &[what, &bytes.to_string(), &max.to_string()],
+    );
+    ByteSize::new(8)
+}
+
+/// An alignment as the backends' frame arithmetic needs it: an `i32`, like
+/// every displacement [`slot_bytes`] feeds. No alignment c17 accepts is past
+/// 2^28, so one that does not fit is an internal compiler error.
+pub fn slot_align(align: Align) -> i32 {
+    match i32::try_from(align.bytes()) {
+        Ok(bytes) => bytes,
+        Err(_) => panic!("internal compiler error: an alignment of {align} does not fit a frame"),
+    }
 }
 
 // Register Classification
@@ -146,14 +164,14 @@ pub enum HfaBase {
 }
 
 impl HfaBase {
-    /// The width of one element, in bytes.
-    pub fn bytes(self) -> usize {
-        match self {
+    /// The size of one element.
+    pub fn bytes(self) -> ByteSize {
+        ByteSize::new(match self {
             HfaBase::Float16 => 2,
             HfaBase::Float32 => 4,
             HfaBase::Float64 | HfaBase::ShortVector64 => 8,
             HfaBase::Float128 | HfaBase::ShortVector128 => 16,
-        }
+        })
     }
 }
 
@@ -169,8 +187,8 @@ pub enum ArgClass {
     Direct {
         /// Classification per eightbyte/slot (usually 1-2 elements)
         classes: Vec<RegClass>,
-        /// Size in bits of the value
-        size_bits: u32,
+        /// The value's width
+        size_bits: Bits,
     },
     /// The argument travels in memory rather than in registers.
     ///
@@ -178,13 +196,11 @@ pub enum ArgClass {
     /// MEMORY class means the caller pushes the object *by value*, so the
     /// payload below is the object's own size.
     Indirect {
-        /// Alignment requirement in bytes
-        align: u32,
-        /// Size in **bytes**: an object size, not a value width. Deriving it
-        /// from [`crate::types::TypeTable::size_bits`] answered 536870911 for
-        /// any aggregate past `u32::MAX` bits, which sized the stacked
-        /// argument short.
-        size_bytes: usize,
+        /// Alignment requirement
+        align: Align,
+        /// The object's size: not a value width, since an object passed this
+        /// way can be larger than any value is wide.
+        size_bytes: ByteSize,
     },
     /// Homogeneous Floating-Point Aggregate (AAPCS64 specific).
     /// Struct with 1-4 identical float/double members passed in FP registers.
@@ -199,8 +215,8 @@ pub enum ArgClass {
     Extend {
         /// True for signed extension, false for zero extension
         signed: bool,
-        /// Original size in bits
-        size_bits: u32,
+        /// The value's own width, before extension
+        size_bits: Bits,
     },
     /// On the stack by value, in the next stacked-argument slot, whatever
     /// registers remain -- and with it every later argument that would have
@@ -212,14 +228,15 @@ pub enum ArgClass {
     /// gcc gives such a vector neither register class and lays it on the
     /// stack, like no C type.
     Stacked {
-        /// Size in bytes of the value.
-        size_bytes: usize,
+        /// The value's size.
+        size_bytes: ByteSize,
     },
     /// x87 FPU return (long double returned in ST(0)).
     /// Only used for return values on x86-64.
     X87 {
-        /// Size in bits (80 for long double, stored in 128-bit slot)
-        size_bits: u32,
+        /// The value's width: 128 for `long double`, whose 80 bits are
+        /// stored in a 128-bit slot
+        size_bits: Bits,
     },
     /// Zero-sized type, ignored in parameter passing.
     Ignore,
@@ -344,19 +361,20 @@ pub trait Abi {
 /// ([`TypeTable::is_small_float_vector`]), so each convention answers for
 /// those before it asks this.
 pub(crate) fn native_vector_carrier(vec: TypeId, types: &TypeTable) -> TypeId {
-    match types.size_bytes(vec) {
+    let bytes = types.byte_size(vec);
+    match bytes.get() {
         17.. => types.vector_memory_carrier(vec),
         16 => types.float128_id,
         8 => types.double_id,
-        bytes => small_vector_bits(bytes, types),
+        _ => small_vector_bits(bytes, types),
     }
 }
 
 /// The unsigned integer a vector of `bytes`, four or fewer, travels as: a
 /// lane count that is a power of two makes the width one, two or four.
-pub(crate) fn small_vector_bits(bytes: usize, types: &TypeTable) -> TypeId {
+pub(crate) fn small_vector_bits(bytes: ByteSize, types: &TypeTable) -> TypeId {
     types
-        .unsigned_of_size(bytes)
+        .unsigned_of_size(bytes.to_usize())
         .expect("a vector's size is a power of two")
 }
 
@@ -523,13 +541,10 @@ mod tests {
                     "{base:?}: {got:?}"
                 ),
                 None => assert!(
-                    matches!(
-                        got,
-                        ArgClass::Indirect {
-                            align: 16,
-                            size_bytes: 32
-                        }
-                    ),
+                    got == ArgClass::Indirect {
+                        align: Align::of_bytes(16),
+                        size_bytes: ByteSize::new(32)
+                    },
                     "{base:?}: {got:?}"
                 ),
             }
@@ -545,13 +560,15 @@ mod tests {
 
         // char (8 bits) needs extension
         let char_class = abi.classify_param(types.char_id, &types);
-        assert!(matches!(char_class, ArgClass::Extend { size_bits: 8, .. }));
+        assert!(
+            matches!(char_class, ArgClass::Extend { size_bits, .. } if size_bits == Bits::new(8))
+        );
 
         // short (16 bits) needs extension
         let short_class = abi.classify_param(types.short_id, &types);
         assert!(matches!(
             short_class,
-            ArgClass::Extend { size_bits: 16, .. }
+            ArgClass::Extend { size_bits, .. } if size_bits == Bits::new(16)
         ));
     }
 
@@ -627,7 +644,7 @@ mod tests {
         use RegClass::*;
         let direct = |classes: Vec<RegClass>| ArgClass::Direct {
             classes,
-            size_bits: 128,
+            size_bits: Bits::new(128),
         };
         assert!(direct(vec![Sse]).is_register_aggregate());
         assert!(direct(vec![Sse, Sse]).is_register_aggregate());
@@ -641,8 +658,8 @@ mod tests {
         assert!(!direct(vec![]).is_register_aggregate());
         assert!(!direct(vec![Integer]).is_register_aggregate());
         assert!(!ArgClass::Indirect {
-            align: 8,
-            size_bytes: 16
+            align: Align::of_bytes(8),
+            size_bytes: ByteSize::new(16)
         }
         .is_register_aggregate());
         assert!(!ArgClass::Ignore.is_register_aggregate());
@@ -692,13 +709,13 @@ mod tests {
             }
             let carrier = types.vector_memory_carrier(v8si);
             assert_eq!(abi.vector_carrier(v8si, &types), carrier);
-            assert_eq!(types.size_bytes(carrier), 32);
-            assert_eq!(types.alignment(carrier), types.alignment(v8si));
+            assert_eq!(types.byte_size(carrier), ByteSize::new(32));
+            assert_eq!(types.align(carrier), types.align(v8si));
             // A written alignment, raised or lowered, moves no argument: gcc
             // passes the main variant.
             for align in [16, 64] {
                 let written = types.vector_of(types.int_id, 8, Some(align));
-                assert_eq!(types.alignment(written), align as usize);
+                assert_eq!(types.align(written), Align::of_bytes(u64::from(align)));
                 assert_eq!(abi.vector_carrier(written, &types), carrier);
                 let one = types.vector_of(types.float_id, 1, Some(align));
                 assert_eq!(
@@ -748,7 +765,7 @@ mod tests {
                     class,
                     ArgClass::Direct {
                         classes: vec![RegClass::Sse],
-                        size_bits: 128
+                        size_bits: Bits::new(128)
                     }
                 ),
                 Arch::Aarch64 => assert_eq!(
@@ -788,7 +805,9 @@ mod tests {
                 // of its own size.
                 let want = match os {
                     Os::MacOS => types.uint_id,
-                    _ => types.unsigned_of_size(types.size_bytes(v)).unwrap(),
+                    _ => types
+                        .unsigned_of_size(types.byte_size(v).to_usize())
+                        .unwrap(),
                 };
                 assert_eq!(param, want, "{os:?}");
                 let ret = abi.vector_return_carrier(v, &types);
@@ -804,7 +823,7 @@ mod tests {
                     let w = widened(v).expect("widened");
                     let (lane, count) = types.vector_lanes(w).unwrap();
                     assert_eq!(count, types.vector_lanes(v).unwrap().1);
-                    assert_eq!(types.size_bytes(lane), lane_bytes);
+                    assert_eq!(types.byte_size(lane), ByteSize::new(lane_bytes));
                     assert_eq!(abi.vector_return_carrier(v, &types), types.double_id);
                 }
                 assert_eq!(widened(v1si), None);
@@ -838,7 +857,7 @@ mod tests {
             let abi = get_abi(&target);
             for v in [v1sf, v2hf, v1hf] {
                 assert!(types.is_small_float_vector(v));
-                let bytes = types.size_bytes(v);
+                let bytes = types.byte_size(v);
                 let param = abi.vector_carrier(v, &types);
                 let ret = abi.vector_return_carrier(v, &types);
                 match (arch, os) {
@@ -849,11 +868,11 @@ mod tests {
                             abi.classify_param(v, &types),
                             ArgClass::Stacked { size_bytes: bytes }
                         );
-                        assert_eq!(Some(ret), types.unsigned_of_size(bytes));
+                        assert_eq!(Some(ret), types.unsigned_of_size(bytes.to_usize()));
                     }
                     (Arch::Aarch64, _) => {
                         assert_eq!(param, types.uint_id);
-                        let want = if bytes == 2 {
+                        let want = if bytes == ByteSize::new(2) {
                             types.float16_id
                         } else {
                             types.float_id
@@ -901,7 +920,7 @@ mod tests {
             abi.classify_return(v4si, &types),
             ArgClass::Direct {
                 classes: vec![RegClass::Sse],
-                size_bits: 128
+                size_bits: Bits::new(128)
             }
         );
         // gcc passes a one-lane floating vector by reference whatever its
@@ -909,7 +928,7 @@ mod tests {
         // hidden pointer at sixteen.
         let integer = |bits| ArgClass::Direct {
             classes: vec![RegClass::Integer],
-            size_bits: bits,
+            size_bits: Bits::new(bits),
         };
         for (lane, bits) in [
             (types.float16_id, 16),
@@ -918,14 +937,14 @@ mod tests {
             (types.float128_id, 128),
         ] {
             let v = types.vector_of(lane, 1, None);
-            let bytes = bits as usize / 8;
+            let bytes = Bits::new(bits).byte_size().unwrap();
             let by_reference = ArgClass::Indirect {
-                align: bytes as u32,
+                align: Align::of_bytes(bytes.get()),
                 size_bytes: bytes,
             };
             assert_eq!(abi.classify_param(v, &types), by_reference, "{bits}");
             let ret = abi.classify_return(v, &types);
-            match types.unsigned_of_size(bytes) {
+            match types.unsigned_of_size(bytes.to_usize()) {
                 Some(bits_of) => {
                     assert_eq!(ret, abi.classify_return(bits_of, &types), "{bits}");
                 }

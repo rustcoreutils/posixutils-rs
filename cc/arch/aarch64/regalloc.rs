@@ -2105,7 +2105,7 @@ impl RegAlloc {
             let multi_reg_return_typ = multi_reg_returns.get(&interval.pseudo).copied();
             if let Some(typ) = multi_reg_return_typ {
                 let size = crate::abi::slot_bytes(
-                    types.size_bytes(typ),
+                    types.byte_size(typ),
                     self.func_pos,
                     "an aggregate returned by a call",
                 );
@@ -2669,7 +2669,10 @@ mod tests {
     /// that stays true.
     #[test]
     fn incoming_args_are_laid_out_from_the_area_base() {
-        let slot = |bytes: usize, align: usize| StackSlot { bytes, align };
+        let slot = |bytes: u64, align: u64| StackSlot {
+            bytes: crate::units::ByteSize::new(bytes),
+            align: crate::units::Align::of_bytes(align),
+        };
         let first = IncomingOff::FIRST.0;
 
         // Alignment up to the base's own: unchanged, and packed at 8.
@@ -2700,7 +2703,7 @@ mod tests {
 
         // Past the base's alignment is where the bases diverge. Arriving
         // first, an over-aligned argument must start *at* the base.
-        for align in [32usize, 64] {
+        for align in [32u64, 64] {
             let mut next = IncomingOff::FIRST;
             assert_eq!(
                 IncomingOff::take(&mut next, slot(align, align)).displacement(),
@@ -2711,7 +2714,7 @@ mod tests {
 
         // And after an 8-byte argument it rounds to the next multiple of its
         // alignment measured from the base, not from the displacement.
-        for align in [32usize, 64] {
+        for align in [32u64, 64] {
             let mut next = IncomingOff::FIRST;
             assert_eq!(
                 IncomingOff::take(&mut next, slot(8, 8)).displacement(),

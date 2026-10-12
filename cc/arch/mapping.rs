@@ -373,7 +373,7 @@ pub(crate) fn build_f16_convert_call(
     let param_class = if f16_abi == Float16Abi::Integer && src_kind == TypeKind::Float16 {
         ArgClass::Extend {
             signed: false,
-            size_bits: 16,
+            size_bits: Bits::new(16),
         }
     } else {
         let abi = get_abi_for_conv(CallingConv::C, target);
@@ -384,7 +384,7 @@ pub(crate) fn build_f16_convert_call(
     let ret_class = if f16_abi == Float16Abi::Integer && dst_kind == TypeKind::Float16 {
         ArgClass::Extend {
             signed: false,
-            size_bits: 16,
+            size_bits: Bits::new(16),
         }
     } else {
         let abi = get_abi_for_conv(CallingConv::C, target);
@@ -430,7 +430,7 @@ fn build_f16_extend_call(
     let param_class = if f16_abi == Float16Abi::Integer {
         ArgClass::Extend {
             signed: false,
-            size_bits: 16,
+            size_bits: Bits::new(16),
         }
     } else {
         let abi = get_abi_for_conv(CallingConv::C, target);
@@ -478,7 +478,7 @@ fn build_f16_truncate_call(
     let ret_class = if f16_abi == Float16Abi::Integer {
         ArgClass::Extend {
             signed: false,
-            size_bits: 16,
+            size_bits: Bits::new(16),
         }
     } else {
         abi.classify_return(float16_type, types)

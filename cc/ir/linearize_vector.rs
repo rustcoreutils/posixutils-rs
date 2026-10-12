@@ -150,9 +150,8 @@ impl Linearizer<'_> {
         vec: TypeId,
         carrier: TypeId,
     ) -> PseudoId {
-        let bytes = self.types.byte_size(vec).to_usize();
-        let narrow =
-            bytes < self.types.byte_size(carrier).to_usize() && self.types.is_integer(carrier);
+        let bytes = self.types.byte_size(vec);
+        let narrow = bytes < self.types.byte_size(carrier) && self.types.is_integer(carrier);
         let typ = if narrow {
             crate::abi::small_vector_bits(bytes, self.types)
         } else {

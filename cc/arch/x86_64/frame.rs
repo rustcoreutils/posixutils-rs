@@ -1362,7 +1362,7 @@ impl X86_64CodeGen {
                                 // own type answers `Double` whatever it holds,
                                 // which is two bytes too wide for a `_Float16`
                                 // and half as wide as a binary128 needs.
-                                let fp_size = FpSize::for_sse_aggregate(size_bits);
+                                let fp_size = FpSize::for_sse_aggregate(size_bits.get());
                                 match src_loc {
                                     Loc::Stack(offset) => {
                                         self.push_lir(X86Inst::MovFp {

@@ -18,6 +18,7 @@ use crate::arch::eh::CallArgsArea;
 use crate::arch::lir::{complex_fp_info, CallTarget, FpSize, OperandSize, Symbol};
 use crate::ir::{Instruction, PseudoId};
 use crate::types::{TypeId, TypeKind, TypeTable};
+use crate::units::{Align, Bits, ByteSize};
 
 /// What a stacked argument is made of, which decides both how many
 /// bytes it reserves and how its bytes are produced.
@@ -60,8 +61,8 @@ impl StackArg {
         match self.typ {
             Some(t) => stacked.slot(types, t),
             None => StackSlot {
-                bytes: if self.size == 128 { 16 } else { 8 },
-                align: 8,
+                bytes: ByteSize::new(if self.size == 128 { 16 } else { 8 }),
+                align: Align::EIGHT,
             },
         }
     }
@@ -158,7 +159,7 @@ impl Aarch64CodeGen {
         let mut at = crate::abi::aapcs64::darwin_va_area_start(end);
         let mut max_align = 16;
         for arg in variadic {
-            let (bytes, align) = arg.typ.map_or((8, 8), |t| {
+            let slot = arg.typ.map_or(StackSlot::POINTER, |t| {
                 crate::abi::aapcs64::darwin_va_slot(
                     insn.pos.unwrap_or_default(),
                     types,
@@ -166,17 +167,14 @@ impl Aarch64CodeGen {
                     &self.base.target,
                 )
             });
-            at = (at + align - 1) & !(align - 1);
-            max_align = max_align.max(align);
+            let (start, end) = slot.place(i64::from(at));
+            max_align = max_align.max(crate::abi::slot_align(slot.align));
             placed.push(PlacedArg {
                 arg,
-                slot: StackSlot {
-                    bytes: bytes as usize,
-                    align: align as usize,
-                },
-                offset: at,
+                slot,
+                offset: i32::try_from(start).unwrap_or(i32::MAX),
             });
-            at += bytes;
+            at = i32::try_from(end).unwrap_or(i32::MAX);
         }
         if placed.is_empty() {
             return 0;
@@ -309,7 +307,7 @@ impl Aarch64CodeGen {
     pub(super) fn stacked_arg_bytes(&self, typ: TypeId, types: &TypeTable) -> Option<i32> {
         let abi = crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, &self.base.target);
         match abi.classify_param(typ, types) {
-            ArgClass::Stacked { size_bytes } => i32::try_from(size_bytes).ok(),
+            ArgClass::Stacked { size_bytes } => i32::try_from(size_bytes.get()).ok(),
             _ => None,
         }
     }
@@ -487,7 +485,7 @@ impl Aarch64CodeGen {
                         typ: arg_type,
                         kind: StackKind::Composite {
                             bytes: crate::abi::slot_bytes(
-                                types.size_bytes(arg_type.unwrap()),
+                                types.byte_size(arg_type.unwrap()),
                                 insn.pos.unwrap_or_default(),
                                 "a by-value argument",
                             ),
@@ -534,7 +532,7 @@ impl Aarch64CodeGen {
                         kind: StackKind::Composite {
                             bytes: arg_type.map_or(16, |t| {
                                 crate::abi::slot_bytes(
-                                    types.size_bytes(t),
+                                    types.byte_size(t),
                                     insn.pos.unwrap_or_default(),
                                     "a by-value argument",
                                 )
@@ -861,7 +859,13 @@ impl Aarch64CodeGen {
                 // the value's own size on Apple, where a `char` is one byte
                 // and the next argument begins right after it.
                 self.push_lir(Aarch64Inst::Str {
-                    size: OperandSize::from_bits((slot.bytes.min(8) * 8) as u32),
+                    size: OperandSize::from_bits(
+                        slot.bytes
+                            .min(ByteSize::new(8))
+                            .bits()
+                            .expect("eight bytes have a width")
+                            .get(),
+                    ),
                     src: Reg::X9,
                     addr: MemAddr::BaseOffset {
                         base: Reg::SP,
@@ -1163,7 +1167,7 @@ impl Aarch64CodeGen {
         match &abi_info.ret {
             ArgClass::Direct { classes, size_bits } => {
                 // Two-register return (9-16 bytes)
-                if *size_bits > 64 && classes.len() == 2 {
+                if *size_bits > Bits::new(64) && classes.len() == 2 {
                     if classes.iter().all(|c| *c == RegClass::Integer) {
                         self.handle_two_reg_return(&dst_loc);
                         return;
@@ -1387,7 +1391,7 @@ impl HfaElem {
         };
         HfaElem {
             size,
-            bytes: base.bytes() as i32,
+            bytes: i32::try_from(base.bytes().get()).expect("an element is at most sixteen bytes"),
         }
     }
 }

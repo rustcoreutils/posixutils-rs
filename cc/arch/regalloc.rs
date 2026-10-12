@@ -936,7 +936,7 @@ pub fn local_slot(
     types: &TypeTable,
     pos: crate::diag::Position,
 ) -> (i32, i32) {
-    let bytes = crate::abi::slot_bytes(types.size_bytes(local.typ), pos, "an automatic object");
+    let bytes = crate::abi::slot_bytes(types.byte_size(local.typ), pos, "an automatic object");
     let align = local
         .explicit_align
         .map(|a| a as i32)

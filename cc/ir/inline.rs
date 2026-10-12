@@ -3419,7 +3419,7 @@ mod tests {
                 "struct { __float128 a; }: one SSE register, sixteen bytes",
                 crate::abi::ArgClass::Direct {
                     classes: vec![crate::abi::RegClass::Sse],
-                    size_bits: 128,
+                    size_bits: crate::units::Bits::new(128),
                 },
                 128u32,
                 vec![

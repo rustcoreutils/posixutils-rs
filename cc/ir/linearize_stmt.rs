@@ -3396,8 +3396,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         if is_memory || !self.types.is_vector(typ) {
             return typ;
         }
-        let bytes = self.types.byte_size(typ).to_usize();
-        if bytes <= 4 {
+        let bytes = self.types.byte_size(typ);
+        if bytes <= crate::units::ByteSize::new(4) {
             return crate::abi::small_vector_bits(bytes, self.types);
         }
         self.vector_carrier(typ, crate::abi::CallingConv::C)

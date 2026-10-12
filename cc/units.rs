@@ -239,6 +239,9 @@ impl Align {
     /// Byte alignment: no requirement at all.
     pub const ONE: Align = Align(0);
 
+    /// Eightbyte alignment: a pointer's, on every target.
+    pub const EIGHT: Align = Align(3);
+
     /// The alignment of `bytes` bytes, or `None` when `bytes` is not a power
     /// of two (zero included).
     pub const fn from_bytes(bytes: u64) -> Option<Align> {
@@ -393,6 +396,7 @@ mod tests {
         assert_eq!(Align::from_bytes(0), None);
         assert_eq!(Align::from_bytes(12), None);
         assert_eq!(Align::from_bytes(1), Some(Align::ONE));
+        assert_eq!(Align::from_bytes(8), Some(Align::EIGHT));
         let sixteen = Align::of_bytes(16);
         assert_eq!(sixteen.bytes(), 16);
         assert_eq!(sixteen.log2(), 4);

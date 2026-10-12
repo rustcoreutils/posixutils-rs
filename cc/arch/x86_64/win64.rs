@@ -444,15 +444,15 @@ mod tests {
     fn each_position_takes_one_register_of_its_class() {
         let int = ArgClass::Direct {
             classes: vec![RegClass::Integer],
-            size_bits: 64,
+            size_bits: crate::units::Bits::new(64),
         };
         let sse = ArgClass::Direct {
             classes: vec![RegClass::Sse],
-            size_bits: 64,
+            size_bits: crate::units::Bits::new(64),
         };
         let by_ref = ArgClass::Indirect {
-            align: 8,
-            size_bytes: 24,
+            align: crate::units::Align::EIGHT,
+            size_bytes: crate::units::ByteSize::new(24),
         };
         assert_eq!(position_reg(0, &int), Some(PositionReg::Gp(Reg::Rcx)));
         assert_eq!(position_reg(1, &sse), Some(PositionReg::Xmm(XmmReg::Xmm1)));

@@ -17,6 +17,7 @@ use crate::arch::eh::CallArgsArea;
 use crate::arch::lir::{complex_fp_info, CallTarget, FpSize, OperandSize, Symbol};
 use crate::ir::{Instruction, PseudoId};
 use crate::types::{TypeKind, TypeTable};
+use crate::units::{Align, Bits, ByteSize};
 use std::collections::HashMap;
 
 /// The alignment a stacked argument must start on: its type's, at least 8.
@@ -188,7 +189,7 @@ impl X86_64CodeGen {
         let mut at: i64 = 0;
         // Reserve `bytes` for the argument at `i`, starting it on `align`.
         let place = |i: usize,
-                     bytes: usize,
+                     bytes: ByteSize,
                      align: i32,
                      indices: &mut Vec<usize>,
                      offsets: &mut Vec<i64>,
@@ -197,7 +198,10 @@ impl X86_64CodeGen {
             *at = (*at + align - 1) & !(align - 1);
             indices.push(i);
             offsets.push(*at);
-            *at += (bytes as i64 + 7) & !7;
+            let slot = bytes
+                .align_up(Align::EIGHT)
+                .expect("no argument's size is within an eightbyte of overflowing");
+            *at += slot.to_i64();
         };
 
         let abi_info = insn
@@ -221,7 +225,7 @@ impl X86_64CodeGen {
                 // Long double is always passed on the stack by value (16 bytes = 2 qwords)
                 place(
                     i,
-                    16,
+                    ByteSize::new(16),
                     16,
                     &mut stack_arg_indices,
                     &mut stack_offsets,
@@ -244,7 +248,7 @@ impl X86_64CodeGen {
                         // Every eightbyte lands on the stack, so a mixed pair
                         // takes two qwords -- `max` counted it as one and left
                         // the outgoing area a qword short.
-                        let bytes = classes.len().max(1) * 8;
+                        let bytes = ByteSize::from_usize(classes.len().max(1) * 8);
                         let align = arg_align(insn, types, i);
                         place(
                             i,
@@ -290,7 +294,14 @@ impl X86_64CodeGen {
                     // Advancing anyway made this side count a register the
                     // setup side had not.
                     if temp_int_idx >= int_arg_regs.len() {
-                        place(i, 8, 8, &mut stack_arg_indices, &mut stack_offsets, &mut at);
+                        place(
+                            i,
+                            ByteSize::new(8),
+                            8,
+                            &mut stack_arg_indices,
+                            &mut stack_offsets,
+                            &mut at,
+                        );
                     } else {
                         temp_int_idx += 1;
                     }
@@ -300,7 +311,14 @@ impl X86_64CodeGen {
                     if temp_fp_idx + (*count as usize) > fp_arg_regs.len() {
                         // §3.2.3 step 5 again: to memory whole, consuming none
                         // of the registers it did not fit in.
-                        place(i, 8, 8, &mut stack_arg_indices, &mut stack_offsets, &mut at);
+                        place(
+                            i,
+                            ByteSize::new(8),
+                            8,
+                            &mut stack_arg_indices,
+                            &mut stack_offsets,
+                            &mut at,
+                        );
                     } else {
                         temp_fp_idx += *count as usize;
                     }
@@ -1042,7 +1060,7 @@ impl X86_64CodeGen {
         match &abi_info.ret {
             ArgClass::Direct { classes, size_bits } => {
                 // Check for two-register struct return (9-16 bytes)
-                if *size_bits > 64 && classes.len() == 2 {
+                if *size_bits > Bits::new(64) && classes.len() == 2 {
                     // Check if it's two INTEGER (struct) vs two SSE (complex) vs mixed
                     if classes.iter().all(|c| *c == RegClass::Integer) {
                         self.handle_two_reg_return(&dst_loc);
@@ -1089,7 +1107,7 @@ impl X86_64CodeGen {
                     let fmt = if insn.typ.is_some_and(|t| {
                         matches!(types.kind(t), TypeKind::Struct | TypeKind::Union)
                     }) {
-                        FpSize::for_sse_aggregate(*size_bits)
+                        FpSize::for_sse_aggregate(size_bits.get())
                     } else {
                         ret_fmt
                     };

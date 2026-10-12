@@ -21,10 +21,11 @@
 
 use super::{is_aggregate, is_float, is_integer, is_pointer, Abi, ArgClass, HfaBase, RegClass};
 use crate::types::{TypeId, TypeKind, TypeTable};
+use crate::units::{Align, Bits, ByteSize};
 
 /// The alignment AAPCS64 gives an argument of this type.
 ///
-/// **Not `TypeTable::alignment`.** AAPCS64 has no notion of over-alignment: a
+/// **Not `TypeTable::align`.** AAPCS64 has no notion of over-alignment: a
 /// type's own `__attribute__((aligned(N)))` does not change how it is passed,
 /// while alignment contributed by a *field* does. Measured against gcc, which
 /// implements the same rule in `aarch64_function_arg_alignment`:
@@ -42,30 +43,30 @@ use crate::types::{TypeId, TypeKind, TypeTable};
 ///
 /// This governs both the stacked-argument offset (stage C.12-C.14) and the
 /// even-register pairing (stage C.10), so every aarch64 site that lays out an
-/// argument asks *this* and not `alignment()`.
+/// argument asks *this* and not `align()`.
 ///
 /// The clamp to 16 is unobservable through natural alignment alone -- gcc
 /// reports `_Alignof <= 16` for every non-attributed type on this target,
 /// including a 32-byte vector -- but it is what gcc's own code does, so it is
 /// written as a clamp rather than left implicit.
-pub(crate) fn argument_alignment(types: &TypeTable, ty: TypeId) -> usize {
+pub(crate) fn argument_alignment(types: &TypeTable, ty: TypeId) -> Align {
     let raw = match types.kind(ty) {
         // `composite.align` would carry the struct's own attribute; the
         // member-derived value is recorded separately for exactly this.
         TypeKind::Struct | TypeKind::Union => {
-            types.composite(ty).map_or(1, |c| c.member_align.to_usize())
+            types.composite(ty).map_or(Align::ONE, |c| c.member_align)
         }
         // An array is passed as its element type repeated, so it aligns as
         // one element does.
         TypeKind::Array => types
             .base_type(ty)
             .map(|elem| argument_alignment(types, elem))
-            .unwrap_or(1),
-        // `natural_alignment` already ignores `explicit_align`, which is where
+            .unwrap_or(Align::ONE),
+        // `natural_align` already ignores `explicit_align`, which is where
         // an attributed *typedef* records itself.
-        _ => types.natural_alignment(ty),
+        _ => types.natural_align(ty),
     };
-    raw.clamp(8, 16)
+    raw.clamp(Align::of_bytes(8), Align::of_bytes(16))
 }
 
 /// The alignment of the stack slot an argument of type `ty` occupies.
@@ -77,9 +78,9 @@ pub(crate) fn argument_alignment(types: &TypeTable, ty: TypeId) -> usize {
 /// instead, so a `struct { long a; long double b; }` argument's pointer was
 /// placed on a sixteen-byte boundary where gcc puts it on eight: a gcc caller
 /// crashed a c17 callee, and a gcc callee read a c17 caller's wrong slot.
-pub(crate) fn stacked_argument_alignment(types: &TypeTable, ty: TypeId) -> usize {
+pub(crate) fn stacked_argument_alignment(types: &TypeTable, ty: TypeId) -> Align {
     match Aapcs64Abi::new().classify_param(ty, types) {
-        ArgClass::Indirect { .. } => 8,
+        ArgClass::Indirect { .. } => Align::of_bytes(8),
         _ => argument_alignment(types, ty),
     }
 }
@@ -103,7 +104,7 @@ pub(crate) fn gr_run_start(
     n: usize,
     num_regs: usize,
 ) -> Option<usize> {
-    let start = if argument_alignment(types, ty) == 16 {
+    let start = if argument_alignment(types, ty) == Align::of_bytes(16) {
         (ngrn + 1) & !1
     } else {
         ngrn
@@ -113,7 +114,7 @@ pub(crate) fn gr_run_start(
 
 /// The stack slot a variadic argument of type `ty` occupies on Apple targets.
 ///
-/// Returns `(bytes, align)`. Apple's arm64 convention puts *every* variadic
+/// Apple's arm64 convention puts *every* variadic
 /// argument on the stack, one eight-byte granule at a time, and a type whose
 /// alignment is 16 starts on a sixteen-byte boundary. The size is rounded up
 /// to the granule, so a `__int128` occupies sixteen bytes rather than the one
@@ -135,14 +136,20 @@ pub(crate) fn darwin_va_slot(
     types: &TypeTable,
     ty: TypeId,
     target: &crate::target::Target,
-) -> (i32, i32) {
+) -> StackSlot {
     let abi = crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, target);
     if matches!(abi.classify_param(ty, types), ArgClass::Indirect { .. }) {
-        return (8, 8);
+        return StackSlot::POINTER;
     }
-    let bytes =
-        (crate::abi::slot_bytes(types.size_bytes(ty).max(1), pos, "a variadic argument") + 7) & !7;
-    (bytes, (types.alignment(ty) as i32).max(8))
+    let eight = Align::of_bytes(8);
+    let size = types.byte_size(ty).max(ByteSize::new(1));
+    let size = crate::abi::checked_slot_size(size, pos, "a variadic argument");
+    StackSlot {
+        bytes: size
+            .align_up(eight)
+            .expect("a frame slot rounded to an eightbyte still fits"),
+        align: types.align(ty).max(eight),
+    }
 }
 
 /// Where the first variadic argument of a Darwin call sits, given where the
@@ -199,27 +206,32 @@ impl StackedArgs {
         let class = Aapcs64Abi::new().classify_param(ty, types);
         // An argument replaced by a pointer to a copy (stage C.4) is that
         // pointer on the stack, whatever the object is.
+        let eight = Align::of_bytes(8);
         if matches!(class, ArgClass::Indirect { .. }) {
-            return StackSlot { bytes: 8, align: 8 };
+            return StackSlot::POINTER;
         }
+        // An HFA is at most four elements of at most sixteen bytes, and any
+        // other class that reaches the stack by value at most sixteen bytes.
         let bytes = match class {
-            ArgClass::Hfa { base, count } => base.bytes() * count as usize,
-            _ => types.size_bytes(ty),
+            ArgClass::Hfa { base, count } => ByteSize::new(base.bytes().get() * u64::from(count)),
+            _ => types.byte_size(ty),
         };
         match self {
             StackedArgs::Natural => match class {
                 ArgClass::Hfa { base, .. } => StackSlot {
                     bytes,
-                    align: base.bytes(),
+                    align: Align::of_bytes(base.bytes().get()),
                 },
                 _ if types.is_aggregate_or_complex(ty) => StackedArgs::Granules.slot(types, ty),
                 _ => StackSlot {
                     bytes,
-                    align: types.natural_alignment(ty).max(1),
+                    align: types.natural_align(ty),
                 },
             },
             StackedArgs::Granules => StackSlot {
-                bytes: (bytes + 7) & !7,
+                bytes: bytes
+                    .align_up(eight)
+                    .expect("a stacked argument passed by value is at most sixteen bytes"),
                 align: stacked_argument_alignment(types, ty),
             },
         }
@@ -230,11 +242,18 @@ impl StackedArgs {
 /// both relative to the base of the argument area.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StackSlot {
-    pub bytes: usize,
-    pub align: usize,
+    pub bytes: ByteSize,
+    pub align: Align,
 }
 
 impl StackSlot {
+    /// One pointer's slot: what an argument replaced by a pointer to a copy
+    /// occupies, however large the copy is.
+    pub const POINTER: StackSlot = StackSlot {
+        bytes: ByteSize::new(8),
+        align: Align::EIGHT,
+    };
+
     /// Place this slot at the first suitably aligned offset at or after `at`,
     /// returning where it starts and where the next argument may begin.
     ///
@@ -242,15 +261,18 @@ impl StackSlot {
     /// NSAA of stage C -- not to any frame displacement the area happens to
     /// sit at.
     pub fn place(self, at: i64) -> (i64, i64) {
-        let align = self.align as i64;
+        let align = ByteSize::new(self.align.bytes()).to_i64();
         let start = (at + align - 1) & !(align - 1);
-        (start, start + self.bytes as i64)
+        (start, start + self.bytes.to_i64())
     }
 }
 
-/// Maximum aggregate size (in bits) that can be passed in registers.
-/// Structs larger than 128 bits (16 bytes) must use sret (unless HFA).
-const MAX_AGGREGATE_BITS: u32 = 128;
+/// Maximum aggregate size that can be passed in registers.
+/// Structs larger than 16 bytes must use sret (unless HFA).
+const MAX_AGGREGATE_BYTES: ByteSize = ByteSize::new(16);
+
+/// The size one X register carries.
+const EIGHTBYTE: ByteSize = ByteSize::new(8);
 
 /// Maximum number of HFA/HVA elements.
 const MAX_HFA_ELEMENTS: u8 = 4;
@@ -268,7 +290,7 @@ const MAX_HFA_ELEMENTS: u8 = 4;
 /// register -- so `long double _Complex` is a two-element HVA in q0/q1, the
 /// same shape as the narrower complex types, not an indirect return.
 fn complex_hfa_base(ty: TypeId, types: &TypeTable) -> Option<HfaBase> {
-    match types.size_bits(types.complex_base(ty)) {
+    match types.value_bits(types.complex_base(ty)).get() {
         16 => Some(HfaBase::Float16),
         32 => Some(HfaBase::Float32),
         64 => Some(HfaBase::Float64),
@@ -295,16 +317,17 @@ pub struct Aapcs64Abi {
 /// Asked before every integer path, because a complex type carries its base's
 /// kind: `_Complex long` satisfied `is_integer` and was handed a single X
 /// register for a sixteen-byte value.
-fn classify_complex_integer(types: &TypeTable, ty: TypeId, size_bits: u32) -> ArgClass {
-    let size_bytes = types.size_bytes(ty);
-    if size_bits > MAX_AGGREGATE_BITS {
+fn classify_complex_integer(types: &TypeTable, ty: TypeId) -> ArgClass {
+    let size_bytes = types.byte_size(ty);
+    if size_bytes > MAX_AGGREGATE_BYTES {
         return ArgClass::Indirect {
-            align: types.alignment(ty) as u32,
+            align: types.align(ty),
             size_bytes,
         };
     }
+    let size_bits = types.value_bits(ty);
     ArgClass::Direct {
-        classes: vec![RegClass::Integer; size_bits.div_ceil(64) as usize],
+        classes: vec![RegClass::Integer; size_bits.get().div_ceil(64) as usize],
         size_bits,
     }
 }
@@ -333,7 +356,7 @@ impl Aapcs64Abi {
             TypeKind::Float => Some(HfaBase::Float32),
             TypeKind::Double => Some(HfaBase::Float64),
             TypeKind::Float128 => Some(HfaBase::Float128),
-            TypeKind::LongDouble => match types.size_bits(typ) {
+            TypeKind::LongDouble => match types.value_bits(typ).get() {
                 64 => Some(HfaBase::Float64),
                 128 => Some(HfaBase::Float128),
                 _ => None,
@@ -354,7 +377,7 @@ impl Aapcs64Abi {
         // lanes: an aggregate of up to four of one size is a Homogeneous
         // Short-Vector Aggregate, passed as an HFA is.
         if types.is_vector(ty) {
-            return match types.size_bytes(ty) {
+            return match types.byte_size(ty).get() {
                 8 => Some((HfaBase::ShortVector64, 1)),
                 16 => Some((HfaBase::ShortVector128, 1)),
                 _ => None,
@@ -470,11 +493,10 @@ impl Aapcs64Abi {
 
     /// Classify an aggregate type.
     fn classify_aggregate(&self, ty: TypeId, types: &TypeTable) -> ArgClass {
-        let size_bits = types.size_bits(ty);
-        let size_bytes = types.size_bytes(ty);
+        let size_bytes = types.byte_size(ty);
 
         // Empty struct
-        if size_bits == 0 {
+        if size_bytes.is_zero() {
             return ArgClass::Ignore;
         }
 
@@ -484,16 +506,17 @@ impl Aapcs64Abi {
         }
 
         // Non-HFA aggregates: check size
-        if size_bits > MAX_AGGREGATE_BITS {
+        if size_bytes > MAX_AGGREGATE_BYTES {
             // Large aggregate - pass by reference
             return ArgClass::Indirect {
-                align: types.alignment(ty) as u32,
+                align: types.align(ty),
                 size_bytes,
             };
         }
 
         // Small aggregate (≤16 bytes) - pass in X registers
-        if size_bits <= 64 {
+        let size_bits = types.value_bits(ty);
+        if size_bytes <= EIGHTBYTE {
             ArgClass::Direct {
                 classes: vec![RegClass::Integer],
                 size_bits,
@@ -530,7 +553,7 @@ impl Abi for Aapcs64Abi {
     ///   type of its own, classed [`ArgClass::Stacked`]. An integer one is
     ///   the unsigned integer of its size.
     fn vector_carrier(&self, vec: TypeId, types: &TypeTable) -> TypeId {
-        if self.darwin && types.size_bytes(vec) <= 4 {
+        if self.darwin && types.byte_size(vec) <= ByteSize::new(4) {
             return types.uint_id;
         }
         if types.is_small_float_vector(vec) {
@@ -555,10 +578,10 @@ impl Abi for Aapcs64Abi {
         if let Some(widened) = self.vector_return_widened(vec, types) {
             return self.vector_carrier(widened, types);
         }
-        let bytes = types.size_bytes(vec);
-        let small = types.vector_lanes(vec).is_some() && bytes <= 4;
+        let bytes = types.byte_size(vec);
+        let small = types.vector_lanes(vec).is_some() && bytes <= ByteSize::new(4);
         if self.darwin && small {
-            return if types.is_small_float_vector(vec) && bytes == 2 {
+            return if types.is_small_float_vector(vec) && bytes == ByteSize::new(2) {
                 types.float16_id
             } else {
                 types.float_id
@@ -583,12 +606,10 @@ impl Abi for Aapcs64Abi {
         }
         if types.is_vector_stack_carrier(ty) {
             return ArgClass::Stacked {
-                size_bytes: types.size_bytes(ty),
+                size_bytes: types.byte_size(ty),
             };
         }
         let kind = types.kind(ty);
-        let size_bits = types.size_bits(ty);
-        let size_bytes = types.size_bytes(ty);
 
         // `__attribute__((transparent_union))` passes the union exactly as its
         // first member would be passed. Substituted here rather than on the
@@ -610,21 +631,24 @@ impl Abi for Aapcs64Abi {
         // sign-extended `_Complex short` as a scalar, overwriting the
         // imaginary half.
         if types.is_complex_integer(ty) {
-            return classify_complex_integer(types, ty, size_bits);
+            return classify_complex_integer(types, ty);
         }
 
         // Integer types smaller than 32 bits need extension
         // AAPCS64: "the size of the argument is rounded up to 4 bytes"
-        if is_integer(kind) && size_bits < 32 {
+        if is_integer(kind) && types.value_bits(ty) < Bits::new(32) {
             let signed = !types.is_unsigned(ty);
-            return ArgClass::Extend { signed, size_bits };
+            return ArgClass::Extend {
+                signed,
+                size_bits: types.value_bits(ty),
+            };
         }
 
         // 128-bit integer types: two consecutive GP registers, 16-byte aligned
         if kind == TypeKind::Int128 {
             return ArgClass::Direct {
                 classes: vec![RegClass::Integer, RegClass::Integer],
-                size_bits,
+                size_bits: types.value_bits(ty),
             };
         }
 
@@ -632,7 +656,7 @@ impl Abi for Aapcs64Abi {
         if is_integer(kind) || is_pointer(kind) {
             return ArgClass::Direct {
                 classes: vec![RegClass::Integer],
-                size_bits,
+                size_bits: types.value_bits(ty),
             };
         }
 
@@ -649,8 +673,8 @@ impl Abi for Aapcs64Abi {
                 return ArgClass::Hfa { base, count: 2 };
             }
             return ArgClass::Indirect {
-                align: 16,
-                size_bytes,
+                align: Align::of_bytes(16),
+                size_bytes: types.byte_size(ty),
             };
         }
 
@@ -658,7 +682,7 @@ impl Abi for Aapcs64Abi {
         if is_float(kind) {
             return ArgClass::Direct {
                 classes: vec![RegClass::Sse], // Using Sse for FP registers
-                size_bits,
+                size_bits: types.value_bits(ty),
             };
         }
 
@@ -677,24 +701,25 @@ impl Abi for Aapcs64Abi {
         if kind == TypeKind::Function {
             return ArgClass::Direct {
                 classes: vec![RegClass::Integer],
-                size_bits: 64,
+                size_bits: Bits::new(64),
             };
         }
 
         // Default: small values in registers, large by reference
-        if size_bits <= 64 {
+        let size_bytes = types.byte_size(ty);
+        if size_bytes <= EIGHTBYTE {
             ArgClass::Direct {
                 classes: vec![RegClass::Integer],
-                size_bits,
+                size_bits: types.value_bits(ty),
             }
-        } else if size_bits <= MAX_AGGREGATE_BITS {
+        } else if size_bytes <= MAX_AGGREGATE_BYTES {
             ArgClass::Direct {
                 classes: vec![RegClass::Integer, RegClass::Integer],
-                size_bits,
+                size_bits: types.value_bits(ty),
             }
         } else {
             ArgClass::Indirect {
-                align: types.alignment(ty) as u32,
+                align: types.align(ty),
                 size_bytes,
             }
         }
@@ -705,8 +730,6 @@ impl Abi for Aapcs64Abi {
             return self.classify_return(self.vector_return_carrier(ty, types), types);
         }
         let kind = types.kind(ty);
-        let size_bits = types.size_bits(ty);
-        let size_bytes = types.size_bytes(ty);
 
         // Void return
         if kind == TypeKind::Void {
@@ -716,14 +739,14 @@ impl Abi for Aapcs64Abi {
         // Complex integers, before any integer path: see
         // `classify_complex_integer`.
         if types.is_complex_integer(ty) {
-            return classify_complex_integer(types, ty, size_bits);
+            return classify_complex_integer(types, ty);
         }
 
         // 128-bit integer types: return in X0+X1
         if kind == TypeKind::Int128 {
             return ArgClass::Direct {
                 classes: vec![RegClass::Integer, RegClass::Integer],
-                size_bits,
+                size_bits: types.value_bits(ty),
             };
         }
 
@@ -731,7 +754,7 @@ impl Abi for Aapcs64Abi {
         if is_integer(kind) || is_pointer(kind) {
             return ArgClass::Direct {
                 classes: vec![RegClass::Integer],
-                size_bits,
+                size_bits: types.value_bits(ty),
             };
         }
 
@@ -742,8 +765,8 @@ impl Abi for Aapcs64Abi {
                 return ArgClass::Hfa { base, count: 2 };
             }
             return ArgClass::Indirect {
-                align: 16,
-                size_bytes,
+                align: Align::of_bytes(16),
+                size_bytes: types.byte_size(ty),
             };
         }
 
@@ -751,9 +774,11 @@ impl Abi for Aapcs64Abi {
         if is_float(kind) {
             return ArgClass::Direct {
                 classes: vec![RegClass::Sse],
-                size_bits,
+                size_bits: types.value_bits(ty),
             };
         }
+
+        let size_bytes = types.byte_size(ty);
 
         // Aggregate types
         if is_aggregate(kind) {
@@ -763,38 +788,38 @@ impl Abi for Aapcs64Abi {
             }
 
             // Non-HFA: check size
-            if size_bits > MAX_AGGREGATE_BITS {
+            if size_bytes > MAX_AGGREGATE_BYTES {
                 // Large aggregate - return via X8 (sret)
                 return ArgClass::Indirect {
-                    align: types.alignment(ty) as u32,
+                    align: types.align(ty),
                     size_bytes,
                 };
             }
 
             // Small aggregate
-            if size_bits <= 64 {
+            if size_bytes <= EIGHTBYTE {
                 return ArgClass::Direct {
                     classes: vec![RegClass::Integer],
-                    size_bits,
+                    size_bits: types.value_bits(ty),
                 };
             } else {
                 // 9-16 bytes: X0+X1
                 return ArgClass::Direct {
                     classes: vec![RegClass::Integer, RegClass::Integer],
-                    size_bits,
+                    size_bits: types.value_bits(ty),
                 };
             }
         }
 
         // Default
-        if size_bits <= 64 {
+        if size_bytes <= EIGHTBYTE {
             ArgClass::Direct {
                 classes: vec![RegClass::Integer],
-                size_bits,
+                size_bits: types.value_bits(ty),
             }
         } else {
             ArgClass::Indirect {
-                align: types.alignment(ty) as u32,
+                align: types.align(ty),
                 size_bytes,
             }
         }
@@ -883,19 +908,20 @@ mod tests {
         attributed.explicit_align = Some(32);
         let attributed = types.intern(attributed);
 
-        assert_eq!(argument_alignment(&types, plain), 8);
+        let a = |bytes| Align::of_bytes(bytes);
+        assert_eq!(argument_alignment(&types, plain), a(8));
         assert_eq!(
             argument_alignment(&types, over),
-            8,
+            a(8),
             "a struct's own aligned(32) must not reach the argument area"
         );
-        assert_eq!(argument_alignment(&types, member_aligned), 16);
-        assert_eq!(argument_alignment(&types, packed), 8);
-        assert_eq!(argument_alignment(&types, nat16), 16);
-        assert_eq!(argument_alignment(&types, i128), 16);
+        assert_eq!(argument_alignment(&types, member_aligned), a(16));
+        assert_eq!(argument_alignment(&types, packed), a(8));
+        assert_eq!(argument_alignment(&types, nat16), a(16));
+        assert_eq!(argument_alignment(&types, i128), a(16));
         assert_eq!(
             argument_alignment(&types, attributed),
-            8,
+            a(8),
             "an attributed typedef must not reach the argument area either"
         );
     }
@@ -978,9 +1004,9 @@ mod tests {
     fn record(types: &mut TypeTable, members: &[(TypeId, usize)], size: usize) -> TypeId {
         let align = members
             .iter()
-            .map(|(t, _)| types.alignment(*t))
+            .map(|(t, _)| types.align(*t))
             .max()
-            .unwrap_or(1);
+            .unwrap_or(Align::ONE);
         types.intern(Type::struct_type(CompositeType {
             tag: None,
             members: members
@@ -997,8 +1023,8 @@ mod tests {
                 .collect(),
             enum_constants: vec![],
             size: crate::units::ByteSize::from_usize(size),
-            align: crate::units::Align::of_bytes(align as u64),
-            member_align: crate::units::Align::of_bytes(align as u64),
+            align,
+            member_align: align,
             is_complete: true,
             transparent: false,
             reverse_order: false,
@@ -1038,7 +1064,10 @@ mod tests {
             let h3 = record(&mut types, &[(h, 0), (h, 2), (h, 4)], 6);
             let ptr = types.void_ptr_id;
 
-            let slot = |bytes, align| StackSlot { bytes, align };
+            let slot = |bytes, align| StackSlot {
+                bytes: ByteSize::new(bytes),
+                align: Align::of_bytes(align),
+            };
             let darwin = os == Os::MacOS;
             // (type, what, Apple's slot); AAPCS64 rounds each up to granules.
             let rows = [
@@ -1069,7 +1098,10 @@ mod tests {
                 let want = if darwin {
                     apple
                 } else {
-                    slot((apple.bytes + 7) & !7, apple.align.clamp(8, 16))
+                    StackSlot {
+                        bytes: apple.bytes.align_up(Align::of_bytes(8)).unwrap(),
+                        align: apple.align.clamp(Align::of_bytes(8), Align::of_bytes(16)),
+                    }
                 };
                 assert_eq!(stacked.slot(&types, ty), want, "{what} on {os:?}");
             }

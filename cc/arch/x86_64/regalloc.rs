@@ -1922,7 +1922,7 @@ impl RegAlloc {
                         Loc::IncomingArg(IncomingOff::take(
                             &mut stack_arg_offset,
                             crate::abi::slot_bytes(
-                                types.size_bytes(*typ),
+                                types.byte_size(*typ),
                                 self.func_pos,
                                 "a stacked parameter",
                             ),
@@ -1952,7 +1952,7 @@ impl RegAlloc {
                         Loc::IncomingArg(IncomingOff::take(
                             &mut stack_arg_offset,
                             crate::abi::slot_bytes(
-                                types.size_bytes(*typ),
+                                types.byte_size(*typ),
                                 self.func_pos,
                                 "a stacked parameter",
                             ),
@@ -1978,7 +1978,7 @@ impl RegAlloc {
                         Loc::IncomingArg(IncomingOff::take(
                             &mut stack_arg_offset,
                             crate::abi::slot_bytes(
-                                types.size_bytes(*typ),
+                                types.byte_size(*typ),
                                 self.func_pos,
                                 "a stacked parameter",
                             ),
@@ -2002,7 +2002,7 @@ impl RegAlloc {
                         Loc::IncomingArg(IncomingOff::take(
                             &mut stack_arg_offset,
                             crate::abi::slot_bytes(
-                                types.size_bytes(*typ),
+                                types.byte_size(*typ),
                                 self.func_pos,
                                 "a stacked parameter",
                             ),
@@ -2024,7 +2024,7 @@ impl RegAlloc {
                         Loc::IncomingArg(IncomingOff::take(
                             &mut stack_arg_offset,
                             crate::abi::slot_bytes(
-                                types.size_bytes(*typ),
+                                types.byte_size(*typ),
                                 self.func_pos,
                                 "a stacked parameter",
                             ),
@@ -2064,7 +2064,7 @@ impl RegAlloc {
                         Loc::IncomingArg(IncomingOff::take(
                             &mut stack_arg_offset,
                             crate::abi::slot_bytes(
-                                types.size_bytes(*typ),
+                                types.byte_size(*typ),
                                 self.func_pos,
                                 "a stacked parameter",
                             ),

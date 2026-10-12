@@ -150,11 +150,14 @@ impl Parser<'_> {
             let bits = types.size_bits(lane);
             let fits = match self.eval_const_expr(e) {
                 // Either reading of the lane's bits will do: gcc spreads
-                // `-1` across unsigned lanes.
+                // `-1` across unsigned lanes. A 128-bit lane holds every
+                // constant there is, and its bounds overflow `i128`.
                 Some(c) => {
-                    let lo = -(1i128 << (bits - 1));
-                    let hi = (1i128 << bits) - 1;
-                    (lo..=hi).contains(&c)
+                    bits >= 128 || {
+                        let lo = -(1i128 << (bits - 1));
+                        let hi = (1i128 << bits) - 1;
+                        (lo..=hi).contains(&c)
+                    }
                 }
                 None => types.size_bits(typ) <= bits,
             };

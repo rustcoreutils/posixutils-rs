@@ -1636,7 +1636,10 @@ impl<'a> Parser<'a> {
         let Some(typ) = expr.typ else {
             return;
         };
-        if self.types.kind(typ) != TypeKind::Void && self.type_name_is_incomplete(typ) {
+        if self.types.kind(typ) != TypeKind::Void
+            && self.type_name_is_incomplete(typ)
+            && !self.report_sve_use(typ, super::target_types::SveUse::Size, pos)
+        {
             let named = self.types.format_type(typ, Some(self.idents));
             diag::error_args(
                 pos,
@@ -1665,7 +1668,7 @@ impl<'a> Parser<'a> {
     fn check_sizeof_operand_is_complete(&self, typ: TypeId, pos: Position) {
         let incomplete =
             self.types.kind(typ) != TypeKind::Void && self.type_name_is_incomplete(typ);
-        if incomplete {
+        if incomplete && !self.report_sve_use(typ, super::target_types::SveUse::Size, pos) {
             crate::diag::error(
                 pos,
                 &format!(
@@ -1707,7 +1710,14 @@ impl<'a> Parser<'a> {
                 // `void`, as an extension, and so does c17. A variable length
                 // array's extents are its own size expressions, so `int[n]`
                 // is complete.
-                if self.types.kind(typ) != TypeKind::Void && self.type_name_is_incomplete(typ) {
+                if self.types.kind(typ) != TypeKind::Void
+                    && self.type_name_is_incomplete(typ)
+                    && !self.report_sve_use(
+                        typ,
+                        super::target_types::SveUse::Alignment,
+                        alignof_pos,
+                    )
+                {
                     let named = self.types.format_type(typ, Some(self.idents));
                     diag::error_args(
                         alignof_pos,
@@ -1993,6 +2003,7 @@ impl<'a> Parser<'a> {
         // value of it to make.
         if self.types.kind(return_type) != TypeKind::Void
             && self.type_name_is_incomplete(return_type)
+            && !self.report_sve_use(return_type, super::target_types::SveUse::Value, call_pos)
         {
             let named = self.types.format_type(return_type, Some(self.idents));
             diag::error_args(call_pos, "invalid use of undefined type '{0}'", &[&named]);

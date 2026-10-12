@@ -478,6 +478,9 @@ impl Parser<'_> {
         let Some(defect) = self.array_element_defect(elem) else {
             return;
         };
+        if self.report_sve_use(elem, super::target_types::SveUse::Element, site.name_pos) {
+            return;
+        }
         let msg = match defect {
             ElementDefect::Incomplete => format!(
                 "array type has incomplete element type '{}'",
@@ -570,6 +573,7 @@ impl Parser<'_> {
                     nothrow: decl_type.nothrow,
                     conv: decl_type.conv,
                     nocf_check: decl_type.nocf_check,
+                    vector_pcs: decl_type.vector_pcs,
                     ..Default::default()
                 };
                 func_type.base = Some(self.substitute_base_type(inner_base_id, actual_base_id));

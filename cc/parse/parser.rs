@@ -429,7 +429,7 @@ impl<'a> Parser<'a> {
         types: &'a mut TypeTable,
         layout_pragmas: Vec<(usize, LayoutPragma)>,
     ) -> Self {
-        Self {
+        let mut parser = Self {
             tokens,
             idents,
             symbols,
@@ -482,7 +482,9 @@ impl<'a> Parser<'a> {
             pack_stack: Vec::new(),
             storage_order_current: StorageOrderPragma::Default,
             visibility_stack: Vec::new(),
-        }
+        };
+        parser.declare_target_types();
+        parser
     }
 
     /// Evaluate library builtins as the command line says: whether the

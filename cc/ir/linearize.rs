@@ -3312,9 +3312,15 @@ impl<'a> Linearizer<'a> {
             TypeKind::Enum | TypeKind::Struct | TypeKind::Union
         ) && !self.types.is_composite_complete(typ);
         if incomplete {
-            let named = self.types.format_type(typ, Some(self.strings));
             let pos = self.current_pos.unwrap_or_default();
-            crate::diag::error_args(pos, "invalid use of incomplete type '{0}'", &[&named]);
+            // gcc's words for a value of an SVE builtin type, which only
+            // SVE code could load or store.
+            if self.types.sve_name(typ).is_some() {
+                crate::diag::error(pos, "this operation requires the SVE ISA extension");
+            } else {
+                let named = self.types.format_type(typ, Some(self.strings));
+                crate::diag::error_args(pos, "invalid use of incomplete type '{0}'", &[&named]);
+            }
         }
         incomplete
     }

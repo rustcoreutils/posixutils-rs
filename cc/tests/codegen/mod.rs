@@ -11,6 +11,7 @@
 // Tests for register allocation, inline assembly, PIC, optimization, and debug info.
 //
 
+mod aarch64_builtin_types;
 mod aarch64_offsets;
 mod aarch64_runtime;
 mod aggregate_abi;

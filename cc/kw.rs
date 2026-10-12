@@ -19,7 +19,7 @@
 
 use crate::strings::StringId;
 
-// Tag bit constants (u32, 15 of 32 used)
+// Tag bit constants (u32, 17 of 32 used)
 
 pub const TYPE_SPEC: u32 = 1 << 0;
 pub const STORAGE: u32 = 1 << 1;
@@ -50,6 +50,9 @@ pub const RESERVED_NAME: u32 = 1 << 14;
 /// `__seg_fs`/`__seg_gs` address spaces. Anywhere else gcc has never heard
 /// of the name, so neither has c17 -- see [`exists_on`].
 pub const X86_64_ONLY: u32 = 1 << 15;
+/// An attribute gcc knows only on aarch64: `aarch64_vector_pcs`. The mirror
+/// of [`X86_64_ONLY`].
+pub const AARCH64_ONLY: u32 = 1 << 16;
 
 /// Composite: all tags that start a declaration
 pub const DECL_START: u32 =
@@ -1614,6 +1617,47 @@ define_keywords! {
     (_, "__no_address_safety_analysis__", SUPPORTED_ATTR),
     // `__builtin_has_attribute(T-or-E, attr)`. Appended, as above.
     (BUILTIN_HAS_ATTRIBUTE, "__builtin_has_attribute", BUILTIN),
+    // The AAPCS64 vector procedure call standard, a function-type
+    // attribute; glibc's `<math.h>` declares its AdvSIMD functions with it.
+    (_, "aarch64_vector_pcs",        SUPPORTED_ATTR | AARCH64_ONLY),
+    (_, "__aarch64_vector_pcs__",    SUPPORTED_ATTR | AARCH64_ONLY),
+    // gcc's aarch64 builtin type names, which the parser declares as
+    // typedefs on aarch64 (`parse::target_types`). Interned here only so
+    // that the parser, whose identifier table is read-only, has their ids;
+    // they carry no tag and are ordinary identifiers everywhere else.
+    (_, "__Int8x8_t",     0),
+    (_, "__Int8x16_t",    0),
+    (_, "__Int16x4_t",    0),
+    (_, "__Int16x8_t",    0),
+    (_, "__Int32x2_t",    0),
+    (_, "__Int32x4_t",    0),
+    (_, "__Int64x1_t",    0),
+    (_, "__Int64x2_t",    0),
+    (_, "__Uint8x8_t",    0),
+    (_, "__Uint8x16_t",   0),
+    (_, "__Uint16x4_t",   0),
+    (_, "__Uint16x8_t",   0),
+    (_, "__Uint32x2_t",   0),
+    (_, "__Uint32x4_t",   0),
+    (_, "__Uint64x1_t",   0),
+    (_, "__Uint64x2_t",   0),
+    (_, "__Float32x2_t",  0),
+    (_, "__Float32x4_t",  0),
+    (_, "__Float64x1_t",  0),
+    (_, "__Float64x2_t",  0),
+    (_, "__SVInt8_t",     0),
+    (_, "__SVInt16_t",    0),
+    (_, "__SVInt32_t",    0),
+    (_, "__SVInt64_t",    0),
+    (_, "__SVUint8_t",    0),
+    (_, "__SVUint16_t",   0),
+    (_, "__SVUint32_t",   0),
+    (_, "__SVUint64_t",   0),
+    (_, "__SVFloat16_t",  0),
+    (_, "__SVFloat32_t",  0),
+    (_, "__SVFloat64_t",  0),
+    (_, "__SVBfloat16_t", 0),
+    (_, "__SVBool_t",     0),
 }
 
 // Tag query API
@@ -1627,21 +1671,31 @@ pub fn has_tag(id: StringId, mask: u32) -> bool {
 
 /// Does keyword `id` exist on a target of architecture `arch`?
 ///
-/// Every keyword does, except an [`X86_64_ONLY`] one off x86-64: there it is
-/// an ordinary identifier, so an attribute of that name warns as unknown and
-/// `__has_attribute` answers 0, exactly as gcc for aarch64 does.
+/// Every keyword does, except an [`X86_64_ONLY`] one off x86-64 and an
+/// [`AARCH64_ONLY`] one off aarch64: there it is an ordinary identifier, so
+/// an attribute of that name warns as unknown and `__has_attribute` answers
+/// 0, exactly as gcc for the other architecture does.
 pub fn exists_on(id: StringId, arch: crate::target::Arch) -> bool {
-    arch == crate::target::Arch::X86_64 || !has_tag(id, X86_64_ONLY)
+    let idx = id.0 as usize;
+    idx == 0 || idx > KEYWORD_COUNT || tag_exists_on(KEYWORD_TAGS[idx - 1], arch)
 }
 
 /// [`exists_on`] for a spelling rather than an interned id: `__has_builtin`
 /// is asked about a name.
 pub fn spelling_exists_on(name: &str, arch: crate::target::Arch) -> bool {
-    arch == crate::target::Arch::X86_64
-        || !KEYWORD_STRINGS
-            .iter()
-            .zip(KEYWORD_TAGS.iter())
-            .any(|(s, &t)| *s == name && t & X86_64_ONLY != 0)
+    KEYWORD_STRINGS
+        .iter()
+        .zip(KEYWORD_TAGS.iter())
+        .all(|(s, &t)| *s != name || tag_exists_on(t, arch))
+}
+
+/// Whether a keyword tagged `tags` exists on `arch`.
+fn tag_exists_on(tags: u32, arch: crate::target::Arch) -> bool {
+    let only = match arch {
+        crate::target::Arch::X86_64 => AARCH64_ONLY,
+        crate::target::Arch::Aarch64 => X86_64_ONLY,
+    };
+    tags & only == 0
 }
 
 /// What `__has_attribute(id)` answers on a target of architecture `arch`,
@@ -2084,6 +2138,7 @@ mod tests {
             ("unused", 1, 1), ("used", 1, 1), ("vector_size", 1, 1),
             ("visibility", 1, 1), ("warning", 1, 1), ("warn_unused_result", 1, 1),
             ("weak", 1, 1), ("weakref", 1, 1), ("zero_call_used_regs", 1, 0),
+            ("aarch64_vector_pcs", 0, 1),
             ("abi_tag", 0, 0), ("nonnull_if_nonzero", 0, 0),
             ("no_sanitize_memory", 0, 0), ("counted_by", 0, 0),
         ];

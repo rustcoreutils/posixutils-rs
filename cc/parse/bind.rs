@@ -475,6 +475,16 @@ impl Parser<'_> {
                          with the 'no_caller_saved_registers' attribute",
                     );
                 }
+                // A function of the vector procedure call standard preserves
+                // all of q8-q23, which c17's frames do not save; a call to
+                // one is fine (see `merge_vector_pcs`).
+                if self.types.get(typ).vector_pcs {
+                    diag::error(
+                        pos,
+                        "sorry, unimplemented: a definition of a function with the \
+                         'aarch64_vector_pcs' attribute",
+                    );
+                }
                 self.record_written_attrs(super::has_attribute::WrittenOn::Linked(name));
                 let def = self.define_function(specs, name, pos, typ, params, attrs.clone())?;
                 return Ok(Bound::FuncDef(Box::new(def)));
@@ -543,7 +553,22 @@ impl Parser<'_> {
             };
             // An initialized `extern` declaration is a definition (6.9.2p1),
             // so its object needs a size like any other.
-            if !is_fn && (!specs.is_extern() || init.is_some()) {
+            if !is_fn && self.types.sve_name(typ).is_some() {
+                // gcc refuses an SVE object of static storage duration, or
+                // an `extern` one, for its size, and makes no other without
+                // SVE code; neither does c17.
+                let what = if scope == DeclScope::File
+                    || specs.is_extern()
+                    || specs
+                        .storage_class
+                        .contains(crate::types::TypeModifiers::STATIC)
+                {
+                    super::target_types::SveUse::StaticObject
+                } else {
+                    super::target_types::SveUse::Value
+                };
+                self.report_sve_use(typ, what, pos);
+            } else if !is_fn && (!specs.is_extern() || init.is_some()) {
                 self.check_object_complete(scope, name, typ, pos);
             }
             // A tentative definition of an array without its extent, which a

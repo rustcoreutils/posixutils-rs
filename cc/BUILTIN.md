@@ -471,6 +471,18 @@ gcc does, so `(-9 + 38i) / (5 + 6i)` is `6 + 1i`. `_Complex __int128` is
 All three are lowered lane by lane in `ir/linearize_vector.rs`, and their
 constraints are gcc's, in gcc's words (`parse/vector_builtin.rs`).
 
+### aarch64 builtin types
+
+On aarch64, Linux and Darwin, c17 declares gcc's builtin vector type names
+at file scope before the first token, as gcc does (`parse/target_types.rs`);
+glibc's `<math.h>` names five of them for gcc 9 and 10 onwards. Elsewhere
+they are ordinary identifiers.
+
+| Types | Notes |
+|-------|-------|
+| `__Int8x8_t` .. `__Int64x2_t`, `__Uint8x8_t` .. `__Uint64x2_t`, `__Float32x2_t`, `__Float32x4_t`, `__Float64x1_t`, `__Float64x2_t` | The AdvSIMD vectors: laid out, passed and operated on as the GNU vector of their lanes -- `signed char`, `short`, `int`, `long`, their unsigned counterparts, `float`, `double` -- but each a type of its own (`TypeModifiers::ADVSIMD`), as in gcc: `__builtin_types_compatible_p(__Float32x4_t, float __attribute__((vector_size(16))))` is 0, `_Generic` tells them apart and a pointer to one does not convert to a pointer to the other, while a value converts between two vectors of as many lanes of compatible types. gcc's `__Poly*`, `__Float16x*` and `__Bfloat16x*` vectors are not provided: c17 has no poly, `__fp16` or `__bf16` lane type to give them |
+| `__SVInt8_t` .. `__SVInt64_t`, `__SVUint8_t` .. `__SVUint64_t`, `__SVFloat16_t`, `__SVFloat32_t`, `__SVFloat64_t`, `__SVBfloat16_t`, `__SVBool_t` | The SVE vectors, gcc 13's whole list. An SVE vector's size is a run-time quantity and c17 generates no SVE code, so each is an incomplete type no definition completes (`TypeTable::sve_type`): a typedef, a pointer and a function declaration may name one, and everything needing its size or a value of it is refused, in gcc's words without SVE -- "SVE type '__SVFloat32_t' does not have a fixed size" for a static or `extern` object and `sizeof`, "does not have a defined alignment", "fields cannot have SVE type", "array elements cannot have SVE type", "arithmetic on pointer to SVE type", "this operation requires the SVE ISA extension" for a call, an automatic object, a load or a store, and "'f' requires the SVE ISA extension" for a definition taking or returning one |
+
 ## Checked Arithmetic
 
 C23 spells the generic three `ckd_add`, `ckd_sub`, `ckd_mul`. Each computes

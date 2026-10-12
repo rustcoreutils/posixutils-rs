@@ -23,6 +23,7 @@
 // translation units, files on disk -- stays in `tests/diagnostics`.
 //
 
+mod aarch64_builtin_types;
 mod arrays_and_initializers;
 mod asm_constraints;
 mod asm_flag_outputs;

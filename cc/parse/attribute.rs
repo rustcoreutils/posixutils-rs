@@ -1896,10 +1896,14 @@ impl Parser<'_> {
 
     /// Hold the function-type attributes `attrs` names for the declarator
     /// being parsed: a calling convention, refusing a second one that
-    /// disagrees with it -- in the same list or another -- as gcc does; and
+    /// disagrees with it -- in the same list or another -- as gcc does;
     /// `nocf_check`, which only branch protection gives a meaning, gcc
-    /// warning that it is ignored otherwise.
+    /// warning that it is ignored otherwise; and aarch64's
+    /// `aarch64_vector_pcs`.
     fn merge_fn_type_attrs(&mut self, attrs: &AttributeList, pos: Position) {
+        if self.types.target().arch == crate::target::Arch::Aarch64 {
+            self.merge_vector_pcs(attrs, pos);
+        }
         if attrs.has_attr("nocf_check") {
             if self.cf_branch {
                 self.pending_fn_type.nocf_check = Some(pos);
@@ -1928,6 +1932,35 @@ impl Parser<'_> {
         }
     }
 
+    /// Hold `aarch64_vector_pcs` for the declarator being parsed, refusing
+    /// an argument as gcc does.
+    ///
+    /// The AAPCS64 vector procedure call standard differs from the base one
+    /// only in what a callee preserves: all 128 bits of v8-v23, where the
+    /// base standard preserves the low 64 bits of v8-v15 alone. Arguments
+    /// and results travel in the same registers and the same stack slots,
+    /// and a caller written for the base standard already assumes every
+    /// register the vector one lets a callee change -- v0-v7 and v24-v31 --
+    /// changed, and more besides. So a call to such a function is compiled
+    /// with the base convention and is correct, merely saving what it need
+    /// not; gcc's own calls keep values in v16-v23 across one, which c17's
+    /// do not. A *definition* is the side that would have to keep the
+    /// stronger promise, and `bind` refuses one.
+    fn merge_vector_pcs(&mut self, attrs: &AttributeList, pos: Position) {
+        let Some(attr) = attrs.find("aarch64_vector_pcs") else {
+            return;
+        };
+        if !attr.args.is_empty() {
+            diag::error_args(
+                pos,
+                "wrong number of arguments specified for '{0}' attribute",
+                &["aarch64_vector_pcs"],
+            );
+            return;
+        }
+        self.pending_fn_type.vector_pcs = Some(pos);
+    }
+
     /// Give the declared type the function-type attributes its declaration
     /// names.
     ///
@@ -1939,7 +1972,7 @@ impl Parser<'_> {
     /// so it changes nothing but is placed by the same rule.
     fn apply_pending_fn_type_attrs(&mut self, typ: TypeId) -> TypeId {
         let pending = std::mem::take(&mut self.pending_fn_type);
-        if pending.conv.is_none() && pending.nocf_check.is_none() {
+        if pending.conv.is_none() && pending.nocf_check.is_none() && pending.vector_pcs.is_none() {
             return typ;
         }
         let func = match self.types.kind(typ) {
@@ -1959,7 +1992,8 @@ impl Parser<'_> {
                 (name, pos)
             });
             let nocf = pending.nocf_check.map(|pos| ("nocf_check", pos));
-            for (name, pos) in conv.into_iter().chain(nocf) {
+            let vpcs = pending.vector_pcs.map(|pos| ("aarch64_vector_pcs", pos));
+            for (name, pos) in conv.into_iter().chain(nocf).chain(vpcs) {
                 diag::group_warning_args(
                     ATTRIBUTE_WARNING,
                     pos,
@@ -1974,6 +2008,7 @@ impl Parser<'_> {
             changed.conv = conv;
         }
         changed.nocf_check |= pending.nocf_check.is_some();
+        changed.vector_pcs |= pending.vector_pcs.is_some();
         let changed = self.types.intern(changed);
         if func == typ {
             return changed;
@@ -2310,6 +2345,8 @@ pub(super) struct FnTypeAttrs {
     conv: Option<(crate::abi::CallingConv, Position)>,
     /// `nocf_check`, under branch protection.
     nocf_check: Option<Position>,
+    /// `aarch64_vector_pcs` (aarch64 only).
+    vector_pcs: Option<Position>,
 }
 
 /// Every slot an attribute list writes for the declaration being parsed.

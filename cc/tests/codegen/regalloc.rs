@@ -716,3 +716,70 @@ __attribute__((noinline)) int many_fcmp(double a, double b) {
         assert_eq!(rc, 0, "aarch64");
     }
 }
+
+/// Multiplies with every argument register still live across them: the
+/// plain 32- and 64-bit `imul` touches only its operands, so values may sit
+/// in %rax and %rdx across it, while the one-operand `mulq` behind a 128-bit
+/// product's high half writes both. Signed and unsigned, 32, 64 and 128
+/// bits; the answers are gcc 13's. Exit codes 1..=6.
+#[test]
+fn multiplies_keep_the_values_live_across_them() {
+    let src = r#"
+typedef unsigned long u64;
+typedef long i64;
+typedef unsigned __int128 u128;
+typedef __int128 i128;
+__attribute__((noinline)) i64 s64(i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
+    i64 p = a * b;
+    i64 q = c * d;
+    i64 r = e * f;
+    return p ^ (q + a) ^ (r - b) ^ c ^ (d << 1) ^ (e << 2) ^ (f << 3);
+}
+__attribute__((noinline)) u64 u64m(u64 a, u64 b, u64 c, u64 d, u64 e, u64 f) {
+    u64 p = a * b;
+    u64 q = p * c;
+    u64 r = q * d;
+    return p + q + r + a + b + c + d + e * f + e + f;
+}
+__attribute__((noinline)) int s32(int a, int b, int c, int d, int e, int f) {
+    int p = a * b, q = c * d, r = e * f;
+    return p - q + r + a - b + c - d + e - f;
+}
+__attribute__((noinline)) u128 u128m(u64 a, u64 b, u64 c, u64 d) {
+    u128 x = (u128)a * b;
+    u128 y = (u128)c * d;
+    return x + y + a + (b ^ c) + d;
+}
+__attribute__((noinline)) i128 i128m(i128 a, i128 b, i64 c, i64 d) {
+    i128 x = a * b;
+    i128 y = (i128)c * d;
+    return x - y + c + d + (a >> 3) + (b << 1);
+}
+__attribute__((noinline)) u64 hi64(u64 a, u64 b, u64 c, u64 d) {
+    u64 h1 = (u64)(((u128)a * b) >> 64);
+    u64 h2 = (u64)(((u128)c * d) >> 64);
+    return h1 * 3 + h2 + a + b + c + d;
+}
+int main(void) {
+    if ((u64)s64(0x1234567, -0x7654321, 0x13579bd, -0x2468ace, 0x1111111, 0x7fffffff)
+        != 0xff7ddd529bc26f9dUL)
+        return 1;
+    if (u64m(0xfedcba9876543210UL, 0x123456789abcdefUL, 0x1000003UL,
+             0x7fffffffffffffffUL, 0x55aa55aa55aa55aaUL, 0x3UL) != 0xf8e02f393d0ae39cUL)
+        return 2;
+    if ((unsigned)s32(12345, -6789, 4321, 98765, -31, 77) != 0xe1901349u)
+        return 3;
+    u128 r = u128m(0xfedcba9876543210UL, 0x123456789abcdefUL, ~0UL, ~0UL - 7);
+    if ((u64)(r >> 64) != 0x121fa00ad77d73cUL || (u64)r != 0x1ff04dc0d209f110UL)
+        return 4;
+    i128 s = i128m(-((i128)0x123456789abcdefL << 40) + 77, (i128)0x7654321 << 20,
+                   -0x7fffffffffffL, 0x1234567890L);
+    if ((u64)((u128)s >> 64) != 0x368acf1333bb0badUL || (u64)s != 0x16f2461b72f0000aUL)
+        return 5;
+    if (hi64(0xfedcba9876543210UL, 0x123456789abcdefUL, ~0UL, ~0UL - 7) != 0x365ee02086785b3UL)
+        return 6;
+    return 0;
+}
+"#;
+    crate::common::compile_and_run_everywhere("mul_live_across", src);
+}

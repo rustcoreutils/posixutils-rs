@@ -197,6 +197,15 @@ impl X86_64CodeGen {
             .typ
             .map_or(insn.size, |t| types.value_bits(t))
             .max(Bits::new(32));
+        // The register allocator declares no fixed-register clobber for a
+        // `Mul` (`opcode_constraints`), which holds because this is only
+        // ever the two-operand `imul`: a 128-bit product is expanded by the
+        // mapping pass, its high half into `UMulHi`.
+        debug_assert!(
+            size <= Bits::new(64),
+            "a {}-bit Mul reached the x86-64 backend unexpanded",
+            size.get()
+        );
         let op_size = OperandSize::from_bits(size);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
@@ -1303,8 +1312,14 @@ impl X86_64CodeGen {
     /// Uses mul instruction which puts result in RDX:RAX.
     pub(super) fn emit_umulhi(&mut self, insn: &Instruction) {
         let target = insn.target.expect("UMulHi must have target");
-        let src1 = insn.src[0];
-        let src2 = insn.src[1];
+        // An operand that dies here may sit in RAX (`operand_survives`), and
+        // moving the other one into RAX first would destroy it. The product
+        // commutes, so the one already in RAX stays there.
+        let (src1, src2) = if matches!(self.get_location(insn.src[1]), Loc::Reg(Reg::Rax)) {
+            (insn.src[1], insn.src[0])
+        } else {
+            (insn.src[0], insn.src[1])
+        };
         let dst_loc = self.get_location(target);
 
         // mul uses RAX as implicit first operand, result in RDX:RAX

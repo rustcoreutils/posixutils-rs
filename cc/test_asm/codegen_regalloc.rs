@@ -245,3 +245,29 @@ fn binary128_across_calls_takes_no_callee_saved_v_register() {
         );
     }
 }
+
+/// A plain multiply is the two-operand `imul`, which reads and writes only
+/// its own operands: a value live across it may sit in %rax or %rdx. Every
+/// `Mul` used to be declared to clobber both, as the one-operand `mulq` of a
+/// 128-bit product's high half does, so `c` -- arriving in %rdx and read
+/// after `a * b` -- was stored to the frame at entry and loaded back. gcc
+/// keeps it in %rdx: `imulq %rsi, %rdi; leaq (%rdi,%rdx), %rax`.
+#[test]
+fn a_value_in_rdx_survives_a_plain_multiply_in_place() {
+    let src = "long f(long a, long b, long c) { return a * b + c; }\n\
+               unsigned long g(unsigned long a, unsigned long b, unsigned long c,\n\
+                               unsigned long d) { return a * b * c + d; }\n\
+               int h(int a, int b, int c) { return a * b - c; }\n";
+    for opt in ["-O1", "-O2"] {
+        let asm = asm_for_with("mul_keeps_rdx", X86_64_LINUX, src, &[opt]);
+        for func in ["f", "g", "h"] {
+            assert_body_contains(&asm, func, "imul", "the multiply");
+            assert_body_lacks(
+                &asm,
+                func,
+                "(%rbp)",
+                "nothing is stored to the frame around a plain multiply",
+            );
+        }
+    }
+}

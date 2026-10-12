@@ -294,17 +294,19 @@ pub fn opcode_constraints(op: Opcode) -> RegConstraints {
         Opcode::DivS | Opcode::DivU | Opcode::ModS | Opcode::ModU => RegConstraints {
             clobbers: &[Reg::Rax, Reg::Rdx],
         },
-        // Int128 mul uses `mulq` which clobbers RAX:RDX. Regular mul uses IMul2
-        // which doesn't depend on these, so marking them as clobbers is safe for both.
+        // `UMulHi` is the one-operand `mulq`, which reads RAX and writes
+        // RDX:RAX. The 128-bit product expansion reads `a_lo` twice -- once
+        // for `umulhi(a_lo, b_lo)` and again for the cross term
+        // `a_lo * b_hi` -- so an `a_lo` parked in RAX was destroyed by the
+        // multiply and the cross term computed from the low product instead.
         //
-        // `UMulHi` is the *other* half of that same `mulq`, and it was missing
-        // here. The 128-bit product expansion reads `a_lo` twice -- once for
-        // `umulhi(a_lo, b_lo)` and again for the cross term `a_lo * b_hi` --
-        // so an `a_lo` parked in RAX was destroyed by the multiply and the
-        // cross term computed from the low product instead. The fault only
-        // showed when `b_hi` was non-zero, because otherwise that term is
-        // multiplied by zero.
-        Opcode::Mul | Opcode::UMulHi => RegConstraints {
+        // `Mul` is not here: a 128-bit `Mul` never reaches the backend (the
+        // mapping pass expands it into 64-bit `Mul`s and this `UMulHi`), and
+        // every other width is the two-operand `imul`, which touches only
+        // its own operands (`emit_mul`). Declaring RAX:RDX clobbered by it
+        // kept every value live across a multiply out of both, and spilled
+        // an argument arriving in RDX.
+        Opcode::UMulHi => RegConstraints {
             clobbers: &[Reg::Rax, Reg::Rdx],
         },
         // The TLS descriptor sequence hard-uses %rax: the `@TLSCALL`

@@ -47,6 +47,7 @@ mod conversion_overflow;
 mod declarations;
 mod declarators_and_shifts;
 mod default_pedwarns;
+mod diagnostic_pragmas;
 mod empty_declarations;
 mod expressions;
 mod frame_larger_than;

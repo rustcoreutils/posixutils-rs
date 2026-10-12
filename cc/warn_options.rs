@@ -101,6 +101,7 @@ const PLAIN: &[(&str, Effect)] = &[
     ("float-equal", Accepted),
     ("format", Accepted),
     ("format-contains-nul", Accepted),
+    ("format-diag", Accepted),
     ("format-extra-args", Accepted),
     ("format-nonliteral", Accepted),
     ("format-overflow", Accepted),
@@ -486,6 +487,181 @@ fn check_value(stem: &str, kind: Value, value: &str) -> Verdict {
     }
 }
 
+/// What gcc makes of the option a `#pragma GCC diagnostic` kind names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PragmaOption {
+    /// A warning option for C: the pragma applies to it.
+    Warning,
+    /// An option that is no warning (`-Werror`, `-fstack-protector`,
+    /// `-O2`), or a string that is no option name.
+    NotAWarning,
+    /// A warning only C++ has: [`CXX_ONLY`].
+    CxxOnly,
+    /// No option gcc knows -- among them a `-Wno-` form, which gcc's pragma
+    /// does not take.
+    Unknown,
+}
+
+/// The C++ warnings a C header shared with C++ code may name, which gcc
+/// knows and refuses for C. Not gcc's roster: the names such headers use.
+const CXX_ONLY: &[&str] = &[
+    "c++11-compat",
+    "c++20-compat",
+    "catch-value",
+    "class-conversion",
+    "class-memaccess",
+    "comma-subscript",
+    "conversion-null",
+    "ctor-dtor-privacy",
+    "dangling-reference",
+    "delete-non-virtual-dtor",
+    "deprecated-copy",
+    "deprecated-copy-dtor",
+    "deprecated-enum-enum-conversion",
+    "deprecated-enum-float-conversion",
+    "effc++",
+    "extra-semi",
+    "inaccessible-base",
+    "init-list-lifetime",
+    "invalid-offsetof",
+    "literal-suffix",
+    "mismatched-new-delete",
+    "missing-template-keyword",
+    "noexcept",
+    "non-virtual-dtor",
+    "old-style-cast",
+    "overloaded-virtual",
+    "pessimizing-move",
+    "pmf-conversions",
+    "range-loop-construct",
+    "redundant-move",
+    "register",
+    "reorder",
+    "sign-promo",
+    "subobject-linkage",
+    "suggest-override",
+    "terminate",
+    "useless-cast",
+    "virtual-move-assign",
+    "volatile",
+    "zero-as-null-pointer-constant",
+];
+
+/// Classify the option `text` of `#pragma GCC diagnostic error`, `warning`
+/// or `ignored`, as gcc does. A value after a warning's `=` is not checked
+/// there, as it is on the command line.
+pub fn pragma_option(text: &str) -> PragmaOption {
+    let Some(name) = text.strip_prefix("-W") else {
+        return match text.strip_prefix("-f") {
+            Some(f)
+                if !matches!(
+                    crate::f_options::classify(f),
+                    crate::f_options::Verdict::Known(_)
+                ) =>
+            {
+                PragmaOption::Unknown
+            }
+            _ if text.is_empty() => PragmaOption::Unknown,
+            _ => PragmaOption::NotAWarning,
+        };
+    };
+    if name == "error"
+        || name.starts_with("error=")
+        || ["l,", "a,", "p,"].iter().any(|p| name.starts_with(p))
+    {
+        return PragmaOption::NotAWarning;
+    }
+    if name.is_empty() || plain(name).is_some() {
+        return PragmaOption::Warning;
+    }
+    if CXX_ONLY.contains(&name) {
+        return PragmaOption::CxxOnly;
+    }
+    match name.split_once('=') {
+        Some((stem, _)) if joined(stem).is_some() => PragmaOption::Warning,
+        _ => PragmaOption::Unknown,
+    }
+}
+
+/// The warning option gcc would suggest for the unknown `text` (`-Wunusedx`
+/// is "did you mean '-Wunused'?"), by gcc's spelling rule
+/// (`spellcheck.cc`): the closest name by edit distance -- insertions,
+/// deletions, substitutions and adjacent transpositions, a change of case
+/// alone costing half -- within a cutoff of about a third of the longer
+/// length. The names are this table's.
+pub fn suggest(text: &str) -> Option<String> {
+    let goal = text.strip_prefix('-')?;
+    // gcc's candidates include each warning's negative form, so an exact
+    // `-Wno-<name>` suggests nothing.
+    let candidates = PLAIN
+        .iter()
+        .flat_map(|(n, _)| [format!("W{n}"), format!("Wno-{n}")])
+        .chain(JOINED.iter().map(|(s, _)| format!("W{s}=")));
+    let mut best: Option<(u32, String)> = None;
+    for candidate in candidates {
+        let d = edit_distance(goal, &candidate);
+        if d == 0 {
+            return None;
+        }
+        if d > edit_distance_cutoff(goal.len(), candidate.len()) {
+            continue;
+        }
+        if best.as_ref().is_none_or(|(b, _)| d < *b) {
+            best = Some((d, candidate));
+        }
+    }
+    best.map(|(_, c)| format!("-{c}"))
+}
+
+/// gcc's edit distance unit: a change of case alone costs 1.
+const BASE_COST: u32 = 2;
+
+/// gcc's `get_edit_distance`: optimal string alignment distance, each edit
+/// [`BASE_COST`], a substitution that changes only case 1.
+fn edit_distance(s: &str, t: &str) -> u32 {
+    let (s, t): (Vec<char>, Vec<char>) = (s.chars().collect(), t.chars().collect());
+    let (n, m) = (s.len(), t.len());
+    let mut d = vec![vec![0u32; m + 1]; n + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i as u32 * BASE_COST;
+    }
+    for (j, cell) in d[0].iter_mut().enumerate() {
+        *cell = j as u32 * BASE_COST;
+    }
+    for i in 1..=n {
+        for j in 1..=m {
+            let sub = if s[i - 1] == t[j - 1] {
+                0
+            } else if s[i - 1].eq_ignore_ascii_case(&t[j - 1]) {
+                1
+            } else {
+                BASE_COST
+            };
+            let mut best = (d[i - 1][j] + BASE_COST)
+                .min(d[i][j - 1] + BASE_COST)
+                .min(d[i - 1][j - 1] + sub);
+            if i > 1 && j > 1 && s[i - 1] == t[j - 2] && s[i - 2] == t[j - 1] {
+                best = best.min(d[i - 2][j - 2] + BASE_COST);
+            }
+            d[i][j] = best;
+        }
+    }
+    d[n][m]
+}
+
+/// gcc's `get_edit_distance_cutoff`.
+fn edit_distance_cutoff(goal_len: usize, candidate_len: usize) -> u32 {
+    let max_len = goal_len.max(candidate_len) as u32;
+    let min_len = goal_len.min(candidate_len) as u32;
+    if max_len <= 1 {
+        return 0;
+    }
+    if max_len - min_len <= 1 {
+        return BASE_COST * (max_len / 3).max(1);
+    }
+    BASE_COST * (max_len + 2) / 3
+}
+
 /// The note gcc gives, once a translation unit has had a diagnostic, for
 /// each `-Wno-<name>` it did not know.
 pub fn unknown_negation_note(name: &str) -> String {
@@ -510,6 +686,46 @@ mod tests {
     fn tables_are_sorted_and_unique() {
         assert!(PLAIN.windows(2).all(|w| w[0].0 < w[1].0));
         assert!(JOINED.windows(2).all(|w| w[0].0 < w[1].0));
+        assert!(CXX_ONLY.windows(2).all(|w| w[0] < w[1]));
+        // A C++ warning is no C one.
+        assert!(CXX_ONLY.iter().all(|n| plain(n).is_none()));
+    }
+
+    /// `#pragma GCC diagnostic`'s option, as gcc 13 classifies it.
+    #[test]
+    fn pragma_options_as_gcc_classifies_them() {
+        use PragmaOption::*;
+        for (text, want) in [
+            ("-Wunused", Warning),
+            ("-W", Warning),
+            ("-Wformat=9", Warning),
+            ("-Wbogus", Unknown),
+            ("-Wno-unused", Unknown),
+            ("-Wbogus=3", Unknown),
+            ("", Unknown),
+            ("-fbogus", Unknown),
+            ("-Werror", NotAWarning),
+            ("-Werror=unused", NotAWarning),
+            ("-Wl,x", NotAWarning),
+            ("-fstack-protector", NotAWarning),
+            ("-O2", NotAWarning),
+            ("Wunused", NotAWarning),
+            ("-Wold-style-cast", CxxOnly),
+        ] {
+            assert_eq!(pragma_option(text), want, "{text}");
+        }
+    }
+
+    /// gcc's spelling suggestions: within the cutoff, none for an exact
+    /// name, a negative form included.
+    #[test]
+    fn suggestions_follow_gccs_cutoff() {
+        assert_eq!(suggest("-Wunusedjunk").as_deref(), Some("-Wunused"));
+        assert_eq!(suggest("-Wunsued").as_deref(), Some("-Wunused"));
+        assert_eq!(suggest("-Wno-unused"), None);
+        assert_eq!(suggest("-Wbogus"), None);
+        assert_eq!(edit_distance("ab", "ba"), BASE_COST);
+        assert_eq!(edit_distance("A", "a"), 1);
     }
 
     /// Every name the warning-emitting code asks about is one the table

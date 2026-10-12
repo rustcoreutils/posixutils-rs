@@ -28,6 +28,7 @@ mod asm_pinned_operands;
 pub mod asm_probe;
 mod asm_register_vars;
 mod asm_template_syntax;
+mod backend_labels;
 mod binary128;
 mod bitfield_layout;
 mod block_moves;

@@ -71,6 +71,10 @@ The compiler supports C input via `-` for stdin, and can output intermediate rep
 - `--dump-ast` — Parse and dump AST to stdout
 - `--dump-tokens` — Dump preprocessed token stream
 - `-E` — Run the preprocessor only
+- `-fstack-usage` — Each function's stack use in a `.su` file, counted as gcc counts it.
+  `scripts/c17_frames.sh` compares c17's against gcc's function by function over CPython
+  and a torture sample; `scripts/c17_frames.sh -i BASE_C17` checks instead that two c17
+  builds emit identical assembly over the same files, both targets, `-O0` and `-O2`
 
 Examples:
 

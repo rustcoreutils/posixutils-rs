@@ -14,9 +14,10 @@
 // these run here.
 //
 
+use crate::arch::stack_usage::StackUsage;
 use crate::diag;
 use crate::opt::Optimization;
-use crate::pipeline::{self, CodegenOptions, Quiet};
+use crate::pipeline::{self, CodegenOptions, Observer};
 use crate::prefix_map::{MapOption, PrefixMaps};
 use crate::strings::StringTable;
 use crate::target::{self, Target};
@@ -39,6 +40,22 @@ pub struct Compiled {
     pub stderr: String,
     /// The assembly, if it compiled.
     pub asm: Option<String>,
+    /// Each function's stack use, as `-fstack-usage` records it.
+    pub stack_usage: Vec<StackUsage>,
+}
+
+/// The observer of a test compile: it keeps the stack use the back end
+/// reports, which `c17 -fstack-usage` would write to a `.su` file.
+#[derive(Default)]
+struct Recorder {
+    stack_usage: Vec<StackUsage>,
+}
+
+impl Observer for Recorder {
+    fn generated(&mut self, stack_usage: &[StackUsage]) -> std::io::Result<()> {
+        self.stack_usage = stack_usage.to_vec();
+        Ok(())
+    }
 }
 
 /// The command-line options a test may pass. Anything else is a test bug and
@@ -321,7 +338,8 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
         debug_prefix_map: &prefix_maps.debug,
         code,
     };
-    let result = pipeline::compile_tokens(preprocessed, &strings, &target, &opts, &mut Quiet);
+    let mut recorder = Recorder::default();
+    let result = pipeline::compile_tokens(preprocessed, &strings, &target, &opts, &mut recorder);
 
     diag::finish_unit();
     let mut diags = diag::take_captured_diagnostics();
@@ -343,6 +361,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
         success: asm.is_some(),
         stderr,
         asm,
+        stack_usage: recorder.stack_usage,
     }
 }
 

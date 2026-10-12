@@ -138,6 +138,32 @@ pub fn asm_symbol(name: &str) -> String {
     }
 }
 
+/// The stack each function of `src` uses, compiled for `triple` with
+/// `extra`, as `-fstack-usage` counts it (gcc's measure: on x86-64 every
+/// byte below the caller's `%rsp`, return address included; on aarch64 the
+/// frame the prologue allocates).
+#[track_caller]
+pub fn stack_use(
+    name: &str,
+    triple: &str,
+    src: &str,
+    extra: &[&str],
+) -> std::collections::HashMap<String, u64> {
+    let target = format!("--target={triple}");
+    let mut flags = vec![target.as_str()];
+    flags.extend_from_slice(extra);
+    let c = compile(name, src, &flags);
+    assert!(
+        c.success,
+        "c17 --target {triple} failed for {name}:\n{}",
+        c.stderr
+    );
+    c.stack_usage
+        .into_iter()
+        .map(|u| (u.name, u.bytes))
+        .collect()
+}
+
 /// Bytes of stack frame function `func` reserves in its prologue: the x86-64
 /// `subq $N, %rsp` or the aarch64 `sub sp, sp, #N`. `None` means the prologue
 /// reserves nothing this parser recognizes.
@@ -194,4 +220,20 @@ pub fn mentions(asm: &str, name: &str) -> bool {
             l.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
                 .any(|w| w == name || w.strip_prefix('_') == Some(name))
         })
+}
+
+#[test]
+fn stack_use_reads_each_functions_record() {
+    let src = "int leaf(int x) { return x + 1; }\n\
+               int g(int);\n\
+               int calls(int x) { return g(x) + g(x + 1); }\n";
+    let x86 = stack_use("stack_use_probe", X86_64_LINUX, src, &["-O2"]);
+    // A leaf at -O2: the return address and the saved %rbp.
+    assert_eq!(x86["leaf"], 16, "{x86:?}");
+    assert!(x86["calls"] >= 16, "{x86:?}");
+    let a64 = stack_use("stack_use_probe_a64", AARCH64_LINUX, src, &["-O2"]);
+    assert!(
+        a64.contains_key("leaf") && a64.contains_key("calls"),
+        "{a64:?}"
+    );
 }

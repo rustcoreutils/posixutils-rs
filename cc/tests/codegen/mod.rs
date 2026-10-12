@@ -100,4 +100,5 @@ mod unwind;
 mod varargs;
 mod vector_abi;
 mod vector_native;
+mod vector_pcs;
 mod vectors;

@@ -723,6 +723,23 @@ impl VReg {
         }
     }
 
+    /// Does a function of the vector procedure call standard preserve this
+    /// register for its caller? It keeps all 128 bits of each of v8-v23.
+    pub fn is_vector_pcs_preserved(&self) -> bool {
+        self.is_callee_saved()
+            || matches!(
+                self,
+                VReg::V16
+                    | VReg::V17
+                    | VReg::V18
+                    | VReg::V19
+                    | VReg::V20
+                    | VReg::V21
+                    | VReg::V22
+                    | VReg::V23
+            )
+    }
+
     /// Is this a callee-saved FP register?
     /// AAPCS64: v8-v15 (lower 64 bits) are callee-saved
     pub fn is_callee_saved(&self) -> bool {
@@ -1731,6 +1748,9 @@ impl RegAlloc {
         self.place_locals(func, types, &intervals, rest);
         self.run_chordal_color(func, types, intervals, &clobbering);
         self.place_stack_slots(func);
+        if func.vector_pcs {
+            self.add_vector_pcs_saves(func, !call_positions.is_empty());
+        }
         // In register order, so the prologue saves them in pairs as gcc
         // does: `stp d8, d9`.
         self.used_callee_saved_fp.sort();
@@ -1739,6 +1759,53 @@ impl RegAlloc {
         }
 
         crate::arch::regalloc::LocationMap::from(self.locations.clone())
+    }
+
+    /// The registers of v8-v23 a function of the vector procedure call
+    /// standard may change, all of which it saves whole
+    /// ([`VReg::is_vector_pcs_preserved`]): v16-v18, the code generator's
+    /// scratch, which nearly every floating-point or vector operation
+    /// passes through; every one a value is given; every one an asm
+    /// statement clobbers; and, in a function that calls anything -- each
+    /// call is a base-standard one, free to change v16-v23 and the top half
+    /// of v8-v15 -- or that `setjmp` returns to, all of them, as gcc saves
+    /// them. Its calls are unchanged: what crosses one still needs a
+    /// register the base standard keeps.
+    fn add_vector_pcs_saves(&mut self, func: &Function, calls: bool) {
+        let all = VReg::allocatable()
+            .iter()
+            .chain(&[VReg::V16, VReg::V17, VReg::V18])
+            .copied()
+            .filter(VReg::is_vector_pcs_preserved);
+        let changed: Vec<VReg> = if calls || func.receives_nonlocal_goto() {
+            all.collect()
+        } else {
+            let assigned: HashSet<VReg> = self
+                .locations
+                .values()
+                .filter_map(|loc| match loc {
+                    Loc::VReg(v) => Some(*v),
+                    _ => None,
+                })
+                .collect();
+            let clobbered: HashSet<VReg> = func
+                .blocks
+                .iter()
+                .flat_map(|block| &block.insns)
+                .flat_map(|insn| asm_clobbered(insn, parse_fp_clobber_name))
+                .collect();
+            all.filter(|v| {
+                [VReg::V16, VReg::V17, VReg::V18].contains(v)
+                    || assigned.contains(v)
+                    || clobbered.contains(v)
+            })
+            .collect()
+        };
+        for v in changed {
+            if !self.used_callee_saved_fp.contains(&v) {
+                self.used_callee_saved_fp.push(v);
+            }
+        }
     }
 
     /// Reset allocator state for a new function
@@ -2425,12 +2492,18 @@ impl RegAlloc {
                 forbidden.entry(p).or_default().extend(VReg::arg_regs());
             }
         }
+        // Cheapest first: a register nothing has to save, then -- in a
+        // vector-PCS function, which saves them whole -- v19-v23, then
+        // v8-v15. A stable sort, so each group keeps its order.
         let caller_first: Vec<VReg> = {
-            let (callee, mut caller): (Vec<VReg>, Vec<VReg>) = VReg::allocatable()
-                .iter()
-                .partition(|v| v.is_callee_saved());
-            caller.extend(callee);
-            caller
+            let mut order = VReg::allocatable().to_vec();
+            order.sort_by_key(|v| {
+                (
+                    v.is_callee_saved(),
+                    func.vector_pcs && v.is_vector_pcs_preserved(),
+                )
+            });
+            order
         };
         let order = mcs_ordering(&graph);
         let result = greedy_color(

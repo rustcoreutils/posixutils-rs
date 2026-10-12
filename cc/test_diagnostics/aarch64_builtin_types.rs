@@ -263,23 +263,18 @@ fn vector_pcs_is_part_of_the_function_type() {
     );
 }
 
-/// A definition would have to preserve all of q8-q23, which c17's frames do
-/// not; it is refused rather than miscompiled. Calls are fine -- see
-/// `merge_vector_pcs`.
+/// A definition is compiled, as gcc compiles one, with nothing to say:
+/// its frame preserves all of q8-q23 (`test_asm/codegen_vector_pcs.rs`).
 #[test]
-fn vector_pcs_definition_is_refused() {
-    let stderr = compile_rejected_with(
+fn vector_pcs_definition_is_accepted() {
+    let stderr = compile_accepted(
         "vpcs_def",
-        "__attribute__((aarch64_vector_pcs)) int f(int x) { return x; }\n",
+        "__attribute__((aarch64_vector_pcs)) int f(int x) { return x; }\n\
+         static __attribute__((aarch64_vector_pcs)) int g(int x) { return f(x); }\n\
+         int (__attribute__((aarch64_vector_pcs)) *p)(int) = g;\n",
         LINUX,
     );
-    assert!(
-        stderr.contains(
-            "sorry, unimplemented: a definition of a function with the 'aarch64_vector_pcs' \
-             attribute"
-        ),
-        "{stderr}"
-    );
+    assert!(stderr.is_empty(), "{stderr}");
 }
 
 /// On x86-64 gcc knows no such attribute: it warns that the directive is

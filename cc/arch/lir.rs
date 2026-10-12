@@ -1052,6 +1052,13 @@ pub enum Directive {
     /// .type symbol, @function/@object (ELF only)
     Type { sym: Symbol, kind: SymbolType },
 
+    /// `.variant_pcs symbol` (aarch64 ELF only): the function follows a
+    /// variant of the procedure call standard -- `aarch64_vector_pcs`'s,
+    /// which preserves more registers -- so neither the linker nor the
+    /// dynamic loader may send a call to it through code that keeps only
+    /// the base standard's, as a lazily bound PLT entry does.
+    VariantPcs(Symbol),
+
     /// .size symbol, size (ELF only)
     Size { sym: Symbol, size: ByteSize },
 
@@ -1607,6 +1614,12 @@ impl EmitAsm for Directive {
                         sym.format_for_target(target),
                         kind.as_str()
                     );
+                }
+            }
+            Directive::VariantPcs(sym) => {
+                // ELF only: Mach-O marks no such thing.
+                if !matches!(target.os, Os::MacOS) {
+                    let _ = writeln!(out, ".variant_pcs {}", sym.format_for_target(target));
                 }
             }
             Directive::Size { sym, size } => {

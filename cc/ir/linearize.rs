@@ -2192,10 +2192,12 @@ impl<'a> Linearizer<'a> {
         ir_func.is_noipa = func.attrs.noipa;
         ir_func.saves_all_registers = func.attrs.saves_all_registers;
         ir_func.no_instrument = func.attrs.no_instrument;
-        ir_func.nocf_check = self
+        let fn_type = self
             .symbols
             .lookup(func.name, crate::symbol::Namespace::Ordinary)
-            .is_some_and(|s| self.types.get(s.typ).nocf_check);
+            .map(|s| self.types.get(s.typ));
+        ir_func.nocf_check = fn_type.is_some_and(|t| t.nocf_check);
+        ir_func.vector_pcs = fn_type.is_some_and(|t| t.vector_pcs);
 
         let ret_kind = self.types.kind(func.return_type);
         // A vector is returned as its carrier, which is what the function

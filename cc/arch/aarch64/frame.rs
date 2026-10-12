@@ -135,6 +135,13 @@ impl Aarch64CodeGen {
         self.frame_base = alloc.frame_base();
         let mut callee_saved = alloc.callee_saved_used().to_vec();
         let callee_saved_fp = alloc.callee_saved_fp_used().to_vec();
+        // A vector-PCS function keeps all 128 bits of each of v8-v23; the
+        // allocator has listed every one it may change.
+        self.fp_save_size = if func.vector_pcs {
+            FpSize::Quad
+        } else {
+            FpSize::Double
+        };
 
         // When using aligned base, x19 must be callee-saved
         if let Some(base) = self.frame_base.reg() {
@@ -159,11 +166,12 @@ impl Aarch64CodeGen {
         // Calculate total frame size
         // Need space for: fp/lr (16 bytes) + GP callee-saved + FP callee-saved + local vars + reg save area
         // Round up callee-saved counts to even for 16-byte alignment
-        // Note: AAPCS64 only requires the lower 64 bits of V8-V15 to be preserved (d8-d15)
+        // Note: AAPCS64 only requires the lower 64 bits of V8-V15 to be
+        // preserved (d8-d15); the vector standard all of V8-V23 (q8-q23).
         let callee_saved_gp_pairs = callee_saved.len().div_ceil(2);
         let callee_saved_gp_size = callee_saved_gp_pairs as i64 * 16;
         let callee_saved_fp_pairs = callee_saved_fp.len().div_ceil(2);
-        let callee_saved_fp_size = callee_saved_fp_pairs as i64 * 16; // 8 bytes per d-reg, 16 per pair
+        let callee_saved_fp_size = callee_saved_fp_pairs as i64 * self.fp_save_pair_bytes();
         let callee_saved_size = callee_saved_gp_size + callee_saved_fp_size;
 
         let (layout, save_area_base, total_frame) = FrameLayout::of(
@@ -400,6 +408,13 @@ impl Aarch64CodeGen {
             self.push_lir(Aarch64Inst::Directive(Directive::Visibility(
                 Symbol::global(name),
                 how.clone(),
+            )));
+        }
+
+        // A vector-PCS function says so, as gcc's does (ELF only).
+        if func.vector_pcs {
+            self.push_lir(Aarch64Inst::Directive(Directive::VariantPcs(
+                Symbol::global(name),
             )));
         }
 
@@ -785,19 +800,33 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Save callee-saved FP registers (d8-d15) in pairs
+    /// The bytes a pair of callee-saved V registers takes in the frame:
+    /// two `d` halves, or two whole `q` registers in a vector-PCS function.
+    pub(super) fn fp_save_pair_bytes(&self) -> i64 {
+        2 * if self.fp_save_size == FpSize::Quad {
+            16
+        } else {
+            8
+        }
+    }
+
+    /// Save callee-saved FP registers in pairs: d8-d15, or in a vector-PCS
+    /// function those of q8-q23 it changes. The CFI names the D view, which
+    /// is the register's low half and where its slot starts either way.
     fn save_callee_saved_fp_regs(
         &mut self,
         total_frame: i64,
         callee_saved_fp: &[VReg],
         start_offset: i64,
     ) {
+        let size = self.fp_save_size;
+        let reg_bytes = self.fp_save_pair_bytes() / 2;
         let mut offset = start_offset;
         let mut i = 0;
         while i < callee_saved_fp.len() {
             if i + 1 < callee_saved_fp.len() {
                 self.push_lir(Aarch64Inst::StpFp {
-                    size: FpSize::Double,
+                    size,
                     src1: callee_saved_fp[i],
                     src2: callee_saved_fp[i + 1],
                     addr: MemAddr::BaseOffset {
@@ -811,12 +840,12 @@ impl Aarch64CodeGen {
                 ));
                 self.push_cfi(Directive::cfi_offset(
                     callee_saved_fp[i + 1].name_d(),
-                    -(total_frame - offset - 8),
+                    -(total_frame - offset - reg_bytes),
                 ));
                 i += 2;
             } else {
                 self.push_lir(Aarch64Inst::StrFp {
-                    size: FpSize::Double,
+                    size,
                     src: callee_saved_fp[i],
                     addr: MemAddr::BaseOffset {
                         base: Reg::X29, // fp
@@ -829,7 +858,7 @@ impl Aarch64CodeGen {
                 ));
                 i += 1;
             }
-            offset += 16;
+            offset += 2 * reg_bytes;
         }
     }
 
@@ -1759,12 +1788,15 @@ impl Aarch64CodeGen {
                 offset += 16;
             }
 
-            // Restore FP callee-saved registers (d8-d15)
+            // Restore FP callee-saved registers: d8-d15, or in a
+            // vector-PCS function the q registers it saved.
+            let size = self.fp_save_size;
+            let pair_bytes = self.fp_save_pair_bytes();
             let mut i = 0;
             while i < callee_saved_fp.len() {
                 if i + 1 < callee_saved_fp.len() {
                     self.push_lir(Aarch64Inst::LdpFp {
-                        size: FpSize::Double,
+                        size,
                         addr: MemAddr::BaseOffset {
                             base: Reg::sp(),
                             offset,
@@ -1777,7 +1809,7 @@ impl Aarch64CodeGen {
                     i += 2;
                 } else {
                     self.push_lir(Aarch64Inst::LdrFp {
-                        size: FpSize::Double,
+                        size,
                         addr: MemAddr::BaseOffset {
                             base: Reg::sp(),
                             offset,
@@ -1787,7 +1819,7 @@ impl Aarch64CodeGen {
                     self.push_cfi(Directive::cfi_restore(callee_saved_fp[i].name_d()));
                     i += 1;
                 }
-                offset += 16;
+                offset += pair_bytes;
             }
         }
 

@@ -89,5 +89,6 @@ mod codegen_unwind;
 mod codegen_varargs;
 mod codegen_vector_abi;
 mod codegen_vector_native;
+mod codegen_vector_pcs;
 mod misc_statement_attributes;
 mod preprocessor_std_dialect;

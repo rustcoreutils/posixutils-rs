@@ -49,6 +49,10 @@ pub struct Aarch64CodeGen {
     pub(super) frame_size: i64,
     /// Where the current function's frame areas lie.
     pub(super) layout: crate::arch::aarch64::frame::FrameLayout,
+    /// How much of each callee-saved V register the current function saves:
+    /// the low half (`d8`) under the base standard, all of it (`q8`) in a
+    /// function of the vector procedure call standard.
+    pub(super) fp_save_size: FpSize,
     /// Offset from FP to register save area (for variadic functions)
     pub(super) reg_save_area_offset: i64,
     /// Number of fixed GP parameters (for variadic functions)
@@ -98,6 +102,7 @@ impl Aarch64CodeGen {
             pseudos: Default::default(),
             frame_size: 0,
             layout: Default::default(),
+            fp_save_size: FpSize::Double,
             reg_save_area_offset: 0,
             num_fixed_gp_params: 0,
             num_fixed_fp_params: 0,

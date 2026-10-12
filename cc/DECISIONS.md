@@ -198,6 +198,24 @@ three deliberate differences.
   that chain while its probes run. clang stores the record before calling
   `___chkstk_darwin` for the same reason.
 
+### Vector-PCS definitions save c17's scratch V registers
+
+A function of the AAPCS64 vector procedure call standard
+(`aarch64_vector_pcs`) preserves all of q8-q23 for its caller. c17 saves
+whole each of them its body may change: every one the allocator gives a
+value, every one an asm statement clobbers, all sixteen in a function that
+makes a call (as gcc saves them) -- and always v16-v18, the code generator's
+fixed floating-point scratch registers, where gcc saves only what it
+writes. Nearly every floating-point or vector operation passes through
+them, and which ones a function uses is known only once its code is
+emitted, after its frame is laid out; saving them costs a leaf function
+48 bytes of frame and three stores and loads. Calls the function makes are
+the base standard's, so what is live across one still takes a register
+that standard preserves; the allocator prefers v24-v31 to v19-v23, which
+would need saving. `.variant_pcs` marks a definition, as gcc's does; gcc
+also marks a vector-PCS function a unit only calls, which c17 does not:
+c17 calls it by the base standard, which a lazily bound PLT entry keeps.
+
 ### Frames past two gigabytes
 
 Frame quantities are `i64` in both back ends, and a frame may span up to

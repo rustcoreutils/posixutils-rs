@@ -475,16 +475,6 @@ impl Parser<'_> {
                          with the 'no_caller_saved_registers' attribute",
                     );
                 }
-                // A function of the vector procedure call standard preserves
-                // all of q8-q23, which c17's frames do not save; a call to
-                // one is fine (see `merge_vector_pcs`).
-                if self.types.get(typ).vector_pcs {
-                    diag::error(
-                        pos,
-                        "sorry, unimplemented: a definition of a function with the \
-                         'aarch64_vector_pcs' attribute",
-                    );
-                }
                 self.record_written_attrs(super::has_attribute::WrittenOn::Linked(name));
                 let def = self.define_function(specs, name, pos, typ, params, attrs.clone())?;
                 return Ok(Bound::FuncDef(Box::new(def)));

@@ -23,6 +23,7 @@ use crate::arch::x86_64::x87::{is_x87_float_to_int, is_x87_fp_cvt, is_x87_int_to
 use crate::ir::{Instruction, Module, NanCompare, Opcode, PseudoId, PseudoKind};
 use crate::target::{Os, Target};
 use crate::types::TypeTable;
+use crate::units::Bits;
 use std::collections::{HashMap, HashSet};
 
 // x86-64 Code Generator
@@ -235,8 +236,8 @@ impl X86_64CodeGen {
     /// The one statement of that rule; three emitters checked it themselves
     /// and the x87 conversion did not, storing `$9223372036854775807` to
     /// memory, which the assembler rejects.
-    pub(super) fn imm_operand(v: i128, size: u32) -> Option<GpOperand> {
-        let fits = if size <= 32 {
+    pub(super) fn imm_operand(v: i128, size: Bits) -> Option<GpOperand> {
+        let fits = if size <= Bits::new(32) {
             i32::try_from(v).is_ok() || u32::try_from(v).is_ok()
         } else {
             i32::try_from(v).is_ok()
@@ -251,7 +252,7 @@ impl X86_64CodeGen {
         &mut self,
         src: PseudoId,
         loc: &Loc,
-        size: u32,
+        size: Bits,
         scratch: Reg,
     ) -> GpOperand {
         match loc {
@@ -266,8 +267,8 @@ impl X86_64CodeGen {
     /// Store the constant `v`, `size` bits wide, to `addr` -- through
     /// `scratch` when no immediate encoding holds it. `scratch` must not be a
     /// register `addr` is formed from.
-    pub(super) fn store_imm(&mut self, v: i128, size: u32, addr: MemAddr, scratch: Reg) {
-        let op_size = OperandSize::from_bits(crate::units::Bits::new(size.max(32)));
+    pub(super) fn store_imm(&mut self, v: i128, size: Bits, addr: MemAddr, scratch: Reg) {
+        let op_size = OperandSize::from_bits(size.max(Bits::new(32)));
         let src = match Self::imm_operand(v, size) {
             Some(imm) => imm,
             None => {
@@ -646,8 +647,12 @@ impl X86_64CodeGen {
     /// `scratch` where it is neither in a register nor in the frame. The one
     /// test `Cbr` and `Select` both make.
     fn emit_condition_test(&mut self, cond: PseudoId, scratch: Reg) {
-        let bits = self.base.value_widths.bits(cond).get().clamp(8, 64);
-        let size = OperandSize::from_bits(crate::units::Bits::new(bits));
+        let bits = self
+            .base
+            .value_widths
+            .bits(cond)
+            .clamp(Bits::new(8), Bits::new(64));
+        let size = OperandSize::from_bits(bits);
         match self.get_location(cond) {
             Loc::Reg(r) => self.push_lir(X86Inst::Test {
                 size,
@@ -684,7 +689,7 @@ impl X86_64CodeGen {
         };
 
         let loc = self.get_location(cond);
-        let size = self.base.value_widths.bits(cond).get();
+        let size = self.base.value_widths.bits(cond);
 
         // Handle 128-bit integer stack values: OR both halves together and test
         if self.int128_pseudos.contains(&insn.src[0]) {
@@ -731,7 +736,7 @@ impl X86_64CodeGen {
                 return true;
             }
             Loc::Xmm(x) => {
-                let fp_size = if size <= 32 {
+                let fp_size = if size <= Bits::new(32) {
                     FpSize::Single
                 } else {
                     FpSize::Double
@@ -784,10 +789,10 @@ impl X86_64CodeGen {
         // Derive comparison size from type to handle long/pointer switches
         let switch_size = insn
             .typ
-            .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.get().max(32));
+            .map_or(insn.size, |t| types.value_bits(t))
+            .max(Bits::new(32));
         self.emit_move(val, Reg::R10, switch_size);
-        let op_size = if switch_size > 32 {
+        let op_size = if switch_size > Bits::new(32) {
             OperandSize::B64
         } else {
             OperandSize::B32
@@ -850,7 +855,7 @@ impl X86_64CodeGen {
     fn emit_switch_range(
         &mut self,
         val: PseudoId,
-        switch_size: u32,
+        switch_size: Bits,
         op_size: OperandSize,
         lo: i64,
         hi: i64,
@@ -935,7 +940,7 @@ impl X86_64CodeGen {
                         // Only emit code if the target is in an XMM register
                         // FImm locations are materialized inline at use sites
                         if let Some(Loc::Xmm(_)) = target_loc {
-                            let fmt = self.fp_format(insn.typ, insn.size.get(), types);
+                            let fmt = self.fp_format(insn.typ, insn.size, types);
                             self.emit_fp_const_load(target, *v, fmt);
                         }
                         // For FImm locations, do nothing - the value will be
@@ -1018,7 +1023,7 @@ impl X86_64CodeGen {
             }
             // Move to final destination if needed
             if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-                self.emit_move_to_loc(dst_reg, &dst_loc, 64);
+                self.emit_move_to_loc(dst_reg, &dst_loc, Bits::new(64));
             }
         }
     }
@@ -1035,7 +1040,7 @@ impl X86_64CodeGen {
             if let Loc::Global(name) = self.get_location(src) {
                 self.emit_tls_addr(&name, dst_reg);
                 if !matches!(dst_loc, Loc::Reg(_)) {
-                    self.emit_move_to_loc(dst_reg, &dst_loc, 64);
+                    self.emit_move_to_loc(dst_reg, &dst_loc, Bits::new(64));
                 }
             }
         }
@@ -1077,7 +1082,7 @@ impl X86_64CodeGen {
             // block, so liveness and DCE already see the real successors.
             Opcode::IndirectBr => {
                 if let Some(&val) = insn.src.first() {
-                    self.emit_move(val, Reg::R10, 64);
+                    self.emit_move(val, Reg::R10, Bits::new(64));
                     self.push_lir(X86Inst::JmpIndirect { reg: Reg::R10 });
                 }
             }
@@ -1157,7 +1162,7 @@ impl X86_64CodeGen {
 
             // The operand's format is its `src_typ`: `typ` is the `int`.
             Opcode::Signbit => {
-                if self.fp_format(insn.src_typ, insn.src_size.get(), types) == FpSize::Extended {
+                if self.fp_format(insn.src_typ, insn.src_size, types) == FpSize::Extended {
                     self.emit_x87_signbit(insn);
                 } else {
                     self.emit_fp_signbit(insn, types);
@@ -1228,7 +1233,7 @@ impl X86_64CodeGen {
             Opcode::Copy => {
                 if let (Some(target), Some(&src)) = (insn.target, insn.src.first()) {
                     // Pass the type to emit_copy for proper sign/zero extension
-                    self.emit_copy_with_type(src, target, insn.size.get(), insn.typ, types);
+                    self.emit_copy_with_type(src, target, insn.size, insn.typ, types);
                 }
             }
 
@@ -1430,7 +1435,7 @@ impl X86_64CodeGen {
         // so a target parked there before the setup was overwritten, and the
         // `call *%r11` jumped into whatever the last argument had addressed.
         if let Some(func_addr) = insn.extra().indirect_target {
-            self.emit_move(func_addr, Reg::R11, 64);
+            self.emit_move(func_addr, Reg::R11, Bits::new(64));
         }
 
         // Emit the call instruction
@@ -1457,7 +1462,7 @@ impl X86_64CodeGen {
             || matches!(self.get_location(else_val), Loc::Xmm(_) | Loc::FImm(..));
 
         if is_fp {
-            let fmt = self.fp_format(insn.typ, size.get(), types);
+            let fmt = self.fp_format(insn.typ, size, types);
             if fmt == FpSize::Extended {
                 self.emit_x87_select(ops);
             } else {
@@ -1577,7 +1582,7 @@ impl X86_64CodeGen {
             target,
             width: size,
         } = ops;
-        let op_size = OperandSize::from_bits(crate::units::Bits::new(size.get()));
+        let op_size = OperandSize::from_bits(size);
         let dst_loc = self.get_location(target);
         let dst_reg = match &dst_loc {
             Loc::Reg(r) => *r,
@@ -1585,21 +1590,21 @@ impl X86_64CodeGen {
         };
 
         // Move else value into destination first (default if condition is false)
-        self.emit_move(else_val, dst_reg, size.get());
+        self.emit_move(else_val, dst_reg, size);
 
         // Test condition
         let cond_loc = self.get_location(cond);
         match &cond_loc {
             Loc::Imm(v) => {
                 if *v != 0 {
-                    self.emit_move(then_val, dst_reg, size.get());
+                    self.emit_move(then_val, dst_reg, size);
                     if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-                        self.emit_move_to_loc(dst_reg, &dst_loc, size.get());
+                        self.emit_move_to_loc(dst_reg, &dst_loc, size);
                     }
                     return;
                 }
                 if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-                    self.emit_move_to_loc(dst_reg, &dst_loc, size.get());
+                    self.emit_move_to_loc(dst_reg, &dst_loc, size);
                 }
                 return;
             }
@@ -1611,7 +1616,7 @@ impl X86_64CodeGen {
         } else {
             Reg::R10
         };
-        self.emit_move(then_val, then_reg, size.get());
+        self.emit_move(then_val, then_reg, size);
         self.push_lir(X86Inst::CMov {
             cc: CondCode::Ne,
             size: op_size,
@@ -1620,7 +1625,7 @@ impl X86_64CodeGen {
         });
 
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, size.get());
+            self.emit_move_to_loc(dst_reg, &dst_loc, size);
         }
     }
 
@@ -1662,7 +1667,7 @@ impl crate::arch::AsmOperandFormatter for X86_64CodeGen {
             },
             (Some('P' | 'p'), V::Int(v)) => v.to_string(),
             (Some('P' | 'p'), V::Symbol(sym)) => sym.clone(),
-            (Some('z'), _) => match slot.size {
+            (Some('z'), _) => match slot.size.get() {
                 8 => "b",
                 16 => "w",
                 32 => "l",
@@ -1711,8 +1716,8 @@ impl crate::arch::AsmOperandFormatter for X86_64CodeGen {
 
 impl X86_64CodeGen {
     /// A general register at the operand's width, without the `%`.
-    fn asm_default_reg(&self, reg: Reg, size_bits: u32) -> String {
-        let size_mod = match size_bits {
+    fn asm_default_reg(&self, reg: Reg, size_bits: Bits) -> String {
+        let size_mod = match size_bits.get() {
             8 => 'b',
             16 => 'w',
             64 => 'q',

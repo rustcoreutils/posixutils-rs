@@ -224,7 +224,7 @@ impl Aarch64CodeGen {
             Loc::FImm(f, imm_size) => {
                 // Use the size from the FImm, not the passed-in size
                 // This ensures float constants are loaded correctly for their type
-                let bits = f.to_bits_at_width(imm_size);
+                let bits = f.to_bits_at_width(crate::units::Bits::new(imm_size));
                 self.emit_mov_imm(dst, bits, imm_size);
             }
         }
@@ -556,7 +556,7 @@ impl Aarch64CodeGen {
                 });
             }
             _ => match (
-                crate::ir::memexpand::overlapping_halves(mem_size),
+                crate::ir::memexpand::overlapping_halves(crate::units::Bits::new(mem_size)),
                 &mem_addr,
             ) {
                 (Some((width, high)), MemAddr::BaseOffset { base, offset }) => {
@@ -578,7 +578,7 @@ impl Aarch64CodeGen {
                 emit_load_lir(self, mem_addr);
             }
             ComputedAddr::Global(name) => {
-                match crate::ir::memexpand::overlapping_halves(mem_size) {
+                match crate::ir::memexpand::overlapping_halves(crate::units::Bits::new(mem_size)) {
                     // A ragged global is read through its own address, so
                     // that the two halves can be addressed separately.
                     Some((width, high)) => {

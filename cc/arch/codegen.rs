@@ -1179,8 +1179,8 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     /// keeps its sign and payload.
     fn emit_float_initializer(&mut self, val: FloatVal, size: ByteSize) {
         match size.get() {
-            2 => self.push_directive(Directive::Short(val.to_bits_at_width(16))),
-            4 => self.push_directive(Directive::Long(val.to_bits_at_width(32))),
+            2 => self.push_directive(Directive::Short(val.to_bits_at_width(Bits::new(16)))),
+            4 => self.push_directive(Directive::Long(val.to_bits_at_width(Bits::new(32)))),
             16 => {
                 let fmt = match self.target.arch {
                     crate::target::Arch::Aarch64 => FpFormat::Binary128,
@@ -1191,7 +1191,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 self.push_directive(Directive::Quad(bits as i64));
                 self.push_directive(Directive::Quad((bits >> 64) as i64));
             }
-            _ => self.push_directive(Directive::Quad(val.to_bits_at_width(64))),
+            _ => self.push_directive(Directive::Quad(val.to_bits_at_width(Bits::new(64)))),
         }
     }
 
@@ -1530,7 +1530,7 @@ pub enum AsmOperandValue<R> {
     /// [`crate::arch::asm_constraints::canonical_int`]).
     Int(i64),
     /// A floating constant, and its width in bits.
-    Float(FloatVal, u32),
+    Float(FloatVal, Bits),
     /// A symbolic address constant, `sym` or `sym+off`, decorated for the
     /// target.
     Symbol(String),
@@ -1560,9 +1560,8 @@ impl<R> AsmOperandValue<R> {
 #[derive(Debug, Clone)]
 pub struct AsmOperandSlot<R> {
     pub value: AsmOperandValue<R>,
-    /// Operand size in bits: the width a bare `%0` names a general register
-    /// at.
-    pub size: u32,
+    /// Operand width: the width a bare `%0` names a general register at.
+    pub size: Bits,
     /// GCC named-operand alias (e.g. the `[out]` in `%[out]`). `None`
     /// for positional `%0`/`%1`/... operands.
     pub name: Option<String>,
@@ -1803,7 +1802,7 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
                     .ok_or_else(|| format!("asm operand number {n} out of range"))?;
                 label_slot = AsmOperandSlot {
                     value: AsmOperandValue::Symbol(text.clone()),
-                    size: 64,
+                    size: Bits::new(64),
                     name: None,
                 };
                 &label_slot
@@ -2334,7 +2333,7 @@ mod tests {
         use super::{AsmOperandSlot, AsmOperandValue as V};
         let slot = |value, name: Option<&str>| AsmOperandSlot {
             value,
-            size: 64,
+            size: crate::units::Bits::new(64),
             name: name.map(String::from),
         };
         let slots = [

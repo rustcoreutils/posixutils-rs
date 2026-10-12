@@ -31,13 +31,20 @@ use crate::arch::simd::X86Shuffle;
 use crate::ir::{Instruction, Opcode, PseudoId, SimdOp};
 use crate::target::X86Simd;
 use crate::types::TypeTable;
-use crate::units::Bits;
+use crate::units::{Bits, ByteSize};
 
 /// The third temporary of the SSE2 sequences, beside the two reserved
 /// scratch registers. It is allocatable: the allocator keeps it free of
 /// every value live where [`writes_spare_xmm`] says an instruction may
 /// write it, operands included.
 pub(super) const SPARE_XMM: XmmReg = XmmReg::Xmm13;
+
+/// The width of a lane of `lane_bytes`, as a general register moves it.
+fn lane_width(lane_bytes: usize) -> Bits {
+    ByteSize::from_usize(lane_bytes)
+        .bits()
+        .expect("a lane is at most eight bytes")
+}
 
 /// Whether `op` may write [`SPARE_XMM`]: a multiply or an unsigned order,
 /// whatever its lanes and `-m` flags, so the answer errs toward keeping the
@@ -75,7 +82,8 @@ impl X86_64CodeGen {
         let (lane, _) = types
             .vector_lanes(vec)
             .expect("a vector operation's type is a vector");
-        let lane_bytes = types.size_bytes(lane);
+        // A lane is a scalar, so its size is its width's.
+        let lane_bytes = types.value_bits(lane).bytes_exact() as usize;
         // An eight-byte vector rides in the low half; integer lanes never
         // read across, and `arch::simd` keeps floating ones at sixteen.
         let size = if insn.size > Bits::new(64) {
@@ -183,11 +191,11 @@ impl X86_64CodeGen {
                     // zero-extended: the bits above an `int` argument are
                     // the caller's garbage, and a count over the lane width
                     // clears every lane.
-                    let bits = lane_bytes as u32 * 8;
+                    let bits = lane_width(lane_bytes);
                     self.emit_move(count, Reg::R11, bits);
-                    if bits < 32 {
+                    if bits < Bits::new(32) {
                         self.push_lir(X86Inst::Movzx {
-                            src_size: OperandSize::from_bits(crate::units::Bits::new(bits)),
+                            src_size: OperandSize::from_bits(bits),
                             dst_size: OperandSize::B32,
                             src: GpOperand::Reg(Reg::R11),
                             dst: Reg::R11,
@@ -409,10 +417,10 @@ impl X86_64CodeGen {
             }
             return;
         }
-        let bits = lane_bytes as u32 * 8;
+        let bits = lane_width(lane_bytes);
         self.emit_move(src, Reg::R11, bits);
         self.push_lir(X86Inst::MovGpXmm {
-            size: if bits > 32 {
+            size: if bits > Bits::new(32) {
                 OperandSize::B64
             } else {
                 OperandSize::B32

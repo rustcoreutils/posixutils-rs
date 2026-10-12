@@ -106,8 +106,11 @@ impl fmt::Display for OperandSize {
 ///
 /// Zero for an eightbyte past the end, which a class vector longer than the
 /// object cannot produce but a caller need not prove.
-pub fn eightbyte_bytes(total: i64, at: i64) -> i64 {
-    (total - at).clamp(0, 8)
+pub fn eightbyte_bytes(total: ByteSize, at: ByteSize) -> ByteSize {
+    let eight = ByteSize::new(8);
+    total
+        .checked_sub(at)
+        .map_or(ByteSize::ZERO, |rest| rest.min(eight))
 }
 
 // Floating-Point Size
@@ -186,8 +189,8 @@ impl FpSize {
     ///
     /// Rounding up instead is what wrote four bytes past the twelve-byte
     /// `struct { float x, y, z; }` whose second eightbyte holds only its `z`.
-    pub fn exact_sse_store(bytes: i64) -> Option<FpSize> {
-        match bytes {
+    pub fn exact_sse_store(bytes: ByteSize) -> Option<FpSize> {
+        match bytes.get() {
             2 => Some(FpSize::Half),
             4 => Some(FpSize::Single),
             8 => Some(FpSize::Double),
@@ -1994,22 +1997,24 @@ mod tests {
     /// four bytes past a twelve-byte local.
     #[test]
     fn test_eightbyte_bytes_stops_at_the_end_of_the_object() {
+        let at =
+            |total: u64, at: u64| eightbyte_bytes(ByteSize::new(total), ByteSize::new(at)).get();
         // A multiple of eight fills every register it takes.
-        assert_eq!(eightbyte_bytes(16, 0), 8);
-        assert_eq!(eightbyte_bytes(16, 8), 8);
+        assert_eq!(at(16, 0), 8);
+        assert_eq!(at(16, 8), 8);
         // Twelve and thirteen do not: the second register holds four and five.
-        assert_eq!(eightbyte_bytes(12, 0), 8);
-        assert_eq!(eightbyte_bytes(12, 8), 4);
-        assert_eq!(eightbyte_bytes(13, 8), 5);
+        assert_eq!(at(12, 0), 8);
+        assert_eq!(at(12, 8), 4);
+        assert_eq!(at(13, 8), 5);
         // Under a register's worth the one register holds the whole object.
-        assert_eq!(eightbyte_bytes(3, 0), 3);
+        assert_eq!(at(3, 0), 3);
         // Past the end is nothing at all, never a negative width.
-        assert_eq!(eightbyte_bytes(12, 16), 0);
-        assert_eq!(eightbyte_bytes(0, 0), 0);
+        assert_eq!(at(12, 16), 0);
+        assert_eq!(at(0, 0), 0);
 
         // The eightbytes of any size account for it exactly.
-        for total in 1..=64i64 {
-            let sum: i64 = (0..8).map(|i| eightbyte_bytes(total, i * 8)).sum();
+        for total in 1..=64u64 {
+            let sum: u64 = (0..8).map(|i| at(total, i * 8)).sum();
             assert_eq!(sum, total, "the eightbytes of {total} must cover it");
         }
     }
@@ -2018,19 +2023,16 @@ mod tests {
     /// floating-point store has is refused rather than rounded up to one.
     #[test]
     fn test_exact_sse_store_refuses_a_width_it_cannot_write() {
-        assert_eq!(FpSize::exact_sse_store(2), Some(FpSize::Half));
-        assert_eq!(FpSize::exact_sse_store(4), Some(FpSize::Single));
-        assert_eq!(FpSize::exact_sse_store(8), Some(FpSize::Double));
-        assert_eq!(FpSize::exact_sse_store(16), Some(FpSize::Quad));
+        let store = |bytes| FpSize::exact_sse_store(ByteSize::new(bytes));
+        assert_eq!(store(2), Some(FpSize::Half));
+        assert_eq!(store(4), Some(FpSize::Single));
+        assert_eq!(store(8), Some(FpSize::Double));
+        assert_eq!(store(16), Some(FpSize::Quad));
         // `for_sse_aggregate` answers every one of these with a *wider* store,
         // which is what wrote past the object; here they have no answer and
         // the caller moves the bytes through a general register instead.
         for ragged in [0, 1, 3, 5, 6, 7, 9, 12, 15, 17] {
-            assert_eq!(
-                FpSize::exact_sse_store(ragged),
-                None,
-                "{ragged} bytes is not one SSE store"
-            );
+            assert_eq!(store(ragged), None, "{ragged} bytes is not one SSE store");
         }
     }
 

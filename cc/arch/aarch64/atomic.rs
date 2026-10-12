@@ -423,7 +423,7 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::FImm(f, imm_size) => {
-                let bits = f.to_bits_at_width(imm_size);
+                let bits = f.to_bits_at_width(crate::units::Bits::new(imm_size));
                 self.emit_mov_imm(reg, bits, 64);
             }
         }

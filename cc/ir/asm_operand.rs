@@ -274,10 +274,10 @@ fn out_of_range(func: &Function, c: &AsmConstraint, found: &Immediate) -> Result
     let imm = c.class.imm;
     let int = match found {
         Immediate::Int(p) => match kind(*p) {
-            Some(PseudoKind::Val(v)) => canonical_int(*v, c.size.get()),
+            Some(PseudoKind::Val(v)) => canonical_int(*v, c.size),
             _ => return Ok(()),
         },
-        Immediate::Folded(v) => canonical_int((*v).into(), c.size.get()),
+        Immediate::Folded(v) => canonical_int((*v).into(), c.size),
         Immediate::Float(p) => {
             return match kind(*p) {
                 Some(PseudoKind::FVal(v)) if !imm.float.admits(*v) => {

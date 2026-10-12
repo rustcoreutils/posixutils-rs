@@ -1025,9 +1025,11 @@ impl Aarch64CodeGen {
 /// `hi` is zero for everything narrower than binary128.
 pub(super) fn fp_const_bits(f: crate::float::FloatVal, size: FpSize) -> (u64, u64) {
     match size {
-        FpSize::Half => (f.to_bits_at_width(16) as u64, 0),
-        FpSize::Single => (f.to_bits_at_width(32) as u64, 0),
+        FpSize::Half => (f.to_bits_at_width(crate::units::Bits::new(16)) as u64, 0),
+        FpSize::Single => (f.to_bits_at_width(crate::units::Bits::new(32)) as u64, 0),
         FpSize::Quad => f.to_f128_bits(),
-        FpSize::Double | FpSize::Extended => (f.to_bits_at_width(64) as u64, 0),
+        FpSize::Double | FpSize::Extended => {
+            (f.to_bits_at_width(crate::units::Bits::new(64)) as u64, 0)
+        }
     }
 }

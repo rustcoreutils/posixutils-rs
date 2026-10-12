@@ -22,8 +22,8 @@ impl X86_64CodeGen {
     pub(super) fn emit_binop(&mut self, insn: &Instruction, types: &TypeTable) {
         let size = insn
             .typ
-            .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.get().max(32));
+            .map_or(insn.size, |t| types.value_bits(t))
+            .max(Bits::new(32));
         // `kind` and not `is_plain_int128`: complex arithmetic is split into
         // per-half operations whose type is the base `__int128`, so no
         // instruction reaching here carries a complex type. Checked:
@@ -33,7 +33,7 @@ impl X86_64CodeGen {
             self.emit_int128_binop(insn);
             return;
         }
-        let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
+        let op_size = OperandSize::from_bits(size);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
             _ => return,
@@ -86,7 +86,7 @@ impl X86_64CodeGen {
                         work_reg
                     };
                     self.emit_move(src1, shift_reg, size);
-                    self.emit_move(src2, Reg::Rcx, 8);
+                    self.emit_move(src2, Reg::Rcx, Bits::new(8));
                     // LIR: shift by %cl
                     let shift_count = ShiftCount::Cl;
                     match insn.op {
@@ -160,9 +160,9 @@ impl X86_64CodeGen {
     pub(super) fn emit_unary_op(&mut self, insn: &Instruction, op: UnaryOp, types: &TypeTable) {
         let size = insn
             .typ
-            .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.get().max(32));
-        let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
+            .map_or(insn.size, |t| types.value_bits(t))
+            .max(Bits::new(32));
+        let op_size = OperandSize::from_bits(size);
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -195,9 +195,9 @@ impl X86_64CodeGen {
     pub(super) fn emit_mul(&mut self, insn: &Instruction, types: &TypeTable) {
         let size = insn
             .typ
-            .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.get().max(32));
-        let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
+            .map_or(insn.size, |t| types.value_bits(t))
+            .max(Bits::new(32));
+        let op_size = OperandSize::from_bits(size);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
             _ => return,
@@ -230,9 +230,9 @@ impl X86_64CodeGen {
     pub(super) fn emit_div(&mut self, insn: &Instruction, types: &TypeTable) {
         let size = insn
             .typ
-            .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.get().max(32));
-        let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
+            .map_or(insn.size, |t| types.value_bits(t))
+            .max(Bits::new(32));
+        let op_size = OperandSize::from_bits(size);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
             _ => return,
@@ -261,7 +261,7 @@ impl X86_64CodeGen {
         // Sign-extend or zero-extend for division (this clobbers RDX)
         match insn.op {
             Opcode::DivS | Opcode::ModS => {
-                if size == 64 {
+                if size == Bits::new(64) {
                     // LIR: sign-extend RAX to RDX:RAX
                     self.push_lir(X86Inst::Cqto);
                 } else {
@@ -307,9 +307,9 @@ impl X86_64CodeGen {
         // Compared at the operands' width; the result is an `int`.
         let size = insn
             .operand_type()
-            .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.operand_width().get().max(32));
-        let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
+            .map_or(insn.operand_width(), |t| types.value_bits(t))
+            .max(Bits::new(32));
+        let op_size = OperandSize::from_bits(size);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
             _ => return,
@@ -358,18 +358,17 @@ impl X86_64CodeGen {
         // whose slot held it zero-extended, as 65408.
         let narrow = insn
             .operand_type()
-            .map(|t| types.size_bits(t))
-            .unwrap_or(insn.operand_width().get());
-        if narrow < 32 {
+            .map_or(insn.operand_width(), |t| types.value_bits(t));
+        if narrow < Bits::new(32) {
             let signed = matches!(
                 cc,
                 CondCode::Slt | CondCode::Sle | CondCode::Sgt | CondCode::Sge
             );
-            let from = OperandSize::from_bits(crate::units::Bits::new(narrow));
+            let from = OperandSize::from_bits(narrow);
             // The second operand first, into a scratch no pseudo is
             // allocated to: the work register may be the one it is in.
             for (src, reg) in [(src2, scratch), (src1, work_reg)] {
-                self.emit_move(src, reg, 32);
+                self.emit_move(src, reg, Bits::new(32));
                 let src = GpOperand::Reg(reg);
                 let dst_size = OperandSize::B32;
                 self.push_lir(if signed {
@@ -425,7 +424,7 @@ impl X86_64CodeGen {
 
         // Move to final destination if not already there
         if !matches!(&dst_loc, Loc::Reg(r) if *r == work_reg) {
-            self.emit_move_to_loc(work_reg, &dst_loc, u32::BITS);
+            self.emit_move_to_loc(work_reg, &dst_loc, Bits::new(32));
         }
     }
 
@@ -462,7 +461,7 @@ impl X86_64CodeGen {
                 // The source may have been sign-extended by a prior load
                 // (e.g., load.8 of a 'char' produces movsbl), so we must
                 // mask to the actual source width to get the unsigned value.
-                self.emit_move(src, dst_reg, insn.src_size.get().max(32));
+                self.emit_move(src, dst_reg, insn.src_size.max(Bits::new(32)));
                 if insn.src_size < Bits::new(32) {
                     // Mask to source width: AND with (1 << src_size) - 1
                     let mask = (1i64 << insn.src_size.get()) - 1;
@@ -475,7 +474,7 @@ impl X86_64CodeGen {
             }
             Opcode::Sext => {
                 // Move source at its original size, then sign-extend
-                self.emit_move(src, dst_reg, insn.src_size.get().max(32));
+                self.emit_move(src, dst_reg, insn.src_size.max(Bits::new(32)));
                 match insn.src_size.get() {
                     8 => {
                         // LIR: sign-extend byte to qword
@@ -516,7 +515,7 @@ impl X86_64CodeGen {
                 // uses the value, but an optimized clang callee does not:
                 // `int take(signed char)` compiles to a bare `movl %edi, %eax`
                 // and reads whatever the caller left above the byte.
-                self.emit_move(src, dst_reg, 64);
+                self.emit_move(src, dst_reg, Bits::new(64));
                 let signed = insn.typ.is_some_and(|t| !types.is_unsigned(t));
                 match insn.size.get() {
                     8 | 16 if signed => {
@@ -564,7 +563,7 @@ impl X86_64CodeGen {
             _ => {}
         }
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, insn.size.get());
+            self.emit_move_to_loc(dst_reg, &dst_loc, insn.size);
         }
     }
 
@@ -826,7 +825,7 @@ impl X86_64CodeGen {
         }
 
         // Variable shift amount
-        self.emit_move(src2, Reg::Rcx, 64);
+        self.emit_move(src2, Reg::Rcx, Bits::new(64));
         self.int128_load_lo(src1, Reg::R10);
         self.int128_load_hi(src1, Reg::R11);
 
@@ -926,7 +925,7 @@ impl X86_64CodeGen {
         }
 
         // Variable shift
-        self.emit_move(src2, Reg::Rcx, 64);
+        self.emit_move(src2, Reg::Rcx, Bits::new(64));
         self.int128_load_lo(src1, Reg::R10);
         self.int128_load_hi(src1, Reg::R11);
 
@@ -1044,7 +1043,7 @@ impl X86_64CodeGen {
         }
 
         // Variable shift
-        self.emit_move(src2, Reg::Rcx, 64);
+        self.emit_move(src2, Reg::Rcx, Bits::new(64));
         self.int128_load_lo(src1, Reg::R10);
         self.int128_load_hi(src1, Reg::R11);
 
@@ -1155,7 +1154,7 @@ impl X86_64CodeGen {
             _ => {} // 64-bit: lo half is the result
         }
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, insn.size.get());
+            self.emit_move_to_loc(dst_reg, &dst_loc, insn.size);
         }
     }
 
@@ -1173,7 +1172,7 @@ impl X86_64CodeGen {
         };
         self.int128_load_lo(src, dst_reg);
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, 64);
+            self.emit_move_to_loc(dst_reg, &dst_loc, Bits::new(64));
         }
     }
 
@@ -1189,7 +1188,7 @@ impl X86_64CodeGen {
         };
         self.int128_load_hi(src, dst_reg);
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, 64);
+            self.emit_move_to_loc(dst_reg, &dst_loc, Bits::new(64));
         }
     }
 
@@ -1202,11 +1201,11 @@ impl X86_64CodeGen {
         let dst_loc = self.get_location(target);
 
         // Store lo half
-        self.emit_move(src_lo, Reg::R10, 64);
+        self.emit_move(src_lo, Reg::R10, Bits::new(64));
         self.int128_store_lo(Reg::R10, &dst_loc);
 
         // Store hi half
-        self.emit_move(src_hi, Reg::R10, 64);
+        self.emit_move(src_hi, Reg::R10, Bits::new(64));
         self.int128_store_hi(Reg::R10, &dst_loc);
     }
 
@@ -1223,7 +1222,7 @@ impl X86_64CodeGen {
             _ => Reg::R10,
         };
 
-        self.emit_move(src1, work_reg, 64);
+        self.emit_move(src1, work_reg, Bits::new(64));
         let src2_loc = self.get_location(src2);
         let src2_op = match &src2_loc {
             Loc::Reg(r) => GpOperand::Reg(*r),
@@ -1231,7 +1230,7 @@ impl X86_64CodeGen {
                 GpOperand::Imm(*v as i64)
             }
             _ => {
-                self.emit_move(src2, Reg::R11, 64);
+                self.emit_move(src2, Reg::R11, Bits::new(64));
                 GpOperand::Reg(Reg::R11)
             }
         };
@@ -1251,7 +1250,7 @@ impl X86_64CodeGen {
         }
 
         if !matches!(&dst_loc, Loc::Reg(r) if *r == work_reg) {
-            self.emit_move_to_loc(work_reg, &dst_loc, 64);
+            self.emit_move_to_loc(work_reg, &dst_loc, Bits::new(64));
         }
     }
 
@@ -1268,7 +1267,7 @@ impl X86_64CodeGen {
             _ => Reg::R10,
         };
 
-        self.emit_move(src1, work_reg, 64);
+        self.emit_move(src1, work_reg, Bits::new(64));
         let src2_loc = self.get_location(src2);
         let src2_op = match &src2_loc {
             Loc::Reg(r) => GpOperand::Reg(*r),
@@ -1276,7 +1275,7 @@ impl X86_64CodeGen {
                 GpOperand::Imm(*v as i64)
             }
             _ => {
-                self.emit_move(src2, Reg::R11, 64);
+                self.emit_move(src2, Reg::R11, Bits::new(64));
                 GpOperand::Reg(Reg::R11)
             }
         };
@@ -1296,7 +1295,7 @@ impl X86_64CodeGen {
         }
 
         if !matches!(&dst_loc, Loc::Reg(r) if *r == work_reg) {
-            self.emit_move_to_loc(work_reg, &dst_loc, 64);
+            self.emit_move_to_loc(work_reg, &dst_loc, Bits::new(64));
         }
     }
 
@@ -1309,12 +1308,12 @@ impl X86_64CodeGen {
         let dst_loc = self.get_location(target);
 
         // mul uses RAX as implicit first operand, result in RDX:RAX
-        self.emit_move(src1, Reg::Rax, 64);
+        self.emit_move(src1, Reg::Rax, Bits::new(64));
         let src2_loc = self.get_location(src2);
         let src2_op = match &src2_loc {
             Loc::Reg(r) => GpOperand::Reg(*r),
             _ => {
-                self.emit_move(src2, Reg::R11, 64);
+                self.emit_move(src2, Reg::R11, Bits::new(64));
                 GpOperand::Reg(Reg::R11)
             }
         };
@@ -1326,7 +1325,7 @@ impl X86_64CodeGen {
 
         // High result is in RDX
         if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::Rdx) {
-            self.emit_move_to_loc(Reg::Rdx, &dst_loc, 64);
+            self.emit_move_to_loc(Reg::Rdx, &dst_loc, Bits::new(64));
         }
     }
 }

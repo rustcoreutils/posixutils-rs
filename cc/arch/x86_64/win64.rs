@@ -35,6 +35,7 @@ use crate::abi::{
 use crate::arch::lir::{Directive, FpSize, OperandSize};
 use crate::ir::{Function, Instruction, PseudoId};
 use crate::types::{TypeId, TypeKind, TypeTable};
+use crate::units::{Bits, ByteSize};
 
 /// The integer register of each register position.
 pub(super) const GP_ARGS: [Reg; WIN64_REG_POSITIONS] = [Reg::Rcx, Reg::Rdx, Reg::R8, Reg::R9];
@@ -279,7 +280,7 @@ impl X86_64CodeGen {
             self.load_win64_position(n, class, typ, types);
         }
         if let Some(func_addr) = insn.extra().indirect_target {
-            self.emit_move(func_addr, Reg::R11, 64);
+            self.emit_move(func_addr, Reg::R11, Bits::new(64));
         }
         self.emit_call_instruction(insn, func_name, area as usize);
         self.cleanup_call_stack(area as usize);
@@ -305,7 +306,8 @@ impl X86_64CodeGen {
     ) {
         let slot = Self::win64_outgoing_slot(n);
         if is_sse(class) {
-            let fmt = self.fp_format(typ, typ.map_or(64, |t| types.size_bits(t)), types);
+            let size = typ.map_or(Bits::new(64), |t| types.value_bits(t));
+            let fmt = self.fp_format(typ, size, types);
             self.emit_fp_move(arg, XmmReg::Xmm15, fmt);
             self.push_lir(X86Inst::MovFp {
                 size: fmt,
@@ -335,10 +337,10 @@ impl X86_64CodeGen {
         types: &TypeTable,
     ) {
         if matches!(class, ArgClass::Indirect { .. }) {
-            self.emit_move(arg, dst, 64);
+            self.emit_move(arg, dst, Bits::new(64));
             return;
         }
-        let size = typ.map_or(64, |t| types.size_bits(t));
+        let size = typ.map_or(Bits::new(64), |t| types.value_bits(t));
         if typ.is_some_and(|t| types.is_float(t)) {
             let fmt = self.fp_format(typ, size, types);
             self.emit_fp_move(arg, XmmReg::Xmm15, fmt);
@@ -363,7 +365,8 @@ impl X86_64CodeGen {
     ) {
         let slot = Self::win64_outgoing_slot(n);
         if is_sse(class) {
-            let fmt = self.fp_format(typ, typ.map_or(64, |t| types.size_bits(t)), types);
+            let size = typ.map_or(Bits::new(64), |t| types.value_bits(t));
+            let fmt = self.fp_format(typ, size, types);
             self.push_lir(X86Inst::MovFp {
                 size: fmt,
                 src: XmmOperand::Mem(slot.clone()),
@@ -388,7 +391,6 @@ impl X86_64CodeGen {
         if types.kind(typ) == TypeKind::Void {
             return;
         }
-        let size = types.size_bits(typ);
         let class = Win64Abi::new().classify_return(typ, types);
         if types.is_plain_int128(typ) {
             let loc = self.get_location(src);
@@ -399,20 +401,21 @@ impl X86_64CodeGen {
                 dst: XmmOperand::Reg(XmmReg::Xmm0),
             });
         } else if is_sse(&class) {
-            let fmt = self.fp_format(Some(typ), size, types);
+            let fmt = self.fp_format(Some(typ), types.value_bits(typ), types);
             self.emit_fp_move(src, XmmReg::Xmm0, fmt);
         } else if types.is_complex(typ) {
             // A complex `Ret` carries the value's address; its bits go back.
             let addr = self.scalar_mem_operand(src, 0, Reg::R11);
-            self.load_bits(addr, types.size_bytes(typ), Reg::Rax);
+            self.load_bits(addr, types.byte_size(typ), Reg::Rax);
         } else {
             self.load_win64_gp_value(src, Some(typ), &class, Reg::Rax, types);
         }
     }
 
     /// Load the `bytes` (1, 2, 4 or 8) bytes at `addr` into `dst`.
-    fn load_bits(&mut self, addr: MemAddr, bytes: usize, dst: Reg) {
-        let size = OperandSize::from_bits(crate::units::Bits::new((bytes * 8) as u32));
+    fn load_bits(&mut self, addr: MemAddr, bytes: ByteSize, dst: Reg) {
+        let width = bytes.bits().expect("a value in RAX is at most eight bytes");
+        let size = OperandSize::from_bits(width);
         match size {
             OperandSize::B8 | OperandSize::B16 => self.push_lir(X86Inst::Movzx {
                 src_size: size,
@@ -444,15 +447,15 @@ mod tests {
     fn each_position_takes_one_register_of_its_class() {
         let int = ArgClass::Direct {
             classes: vec![RegClass::Integer],
-            size_bits: crate::units::Bits::new(64),
+            size_bits: Bits::new(64),
         };
         let sse = ArgClass::Direct {
             classes: vec![RegClass::Sse],
-            size_bits: crate::units::Bits::new(64),
+            size_bits: Bits::new(64),
         };
         let by_ref = ArgClass::Indirect {
             align: crate::units::Align::EIGHT,
-            size_bytes: crate::units::ByteSize::new(24),
+            size_bytes: ByteSize::new(24),
         };
         assert_eq!(position_reg(0, &int), Some(PositionReg::Gp(Reg::Rcx)));
         assert_eq!(position_reg(1, &sse), Some(PositionReg::Xmm(XmmReg::Xmm1)));

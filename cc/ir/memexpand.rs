@@ -158,9 +158,9 @@ pub(crate) fn chunk_copy(
 /// Rounding a ragged size up to the next width instead is what the back ends
 /// used to do, and it reads up to three bytes past the object -- which faults
 /// when the object ends a page.
-pub(crate) fn overlapping_halves(bits: u32) -> Option<(i64, i64)> {
-    let bytes = i64::from(bits / 8);
-    if !bits.is_multiple_of(8) || bytes == 0 || bytes > 8 || bytes.count_ones() == 1 {
+pub(crate) fn overlapping_halves(width: Bits) -> Option<(i64, i64)> {
+    let bytes = i64::from(width.whole_bytes()?);
+    if bytes == 0 || bytes > 8 || bytes.count_ones() == 1 {
         return None;
     }
     let width = 1i64 << (63 - bytes.leading_zeros() as i64);
@@ -643,7 +643,7 @@ mod tests {
     #[test]
     fn overlapping_halves_covers_a_ragged_size_without_passing_its_end() {
         for (bytes, want) in [(3i64, (2, 1)), (5, (4, 1)), (6, (4, 2)), (7, (4, 3))] {
-            let got = overlapping_halves(bytes as u32 * 8);
+            let got = overlapping_halves(Bits::new(bytes as u32 * 8));
             assert_eq!(
                 got,
                 Some(want),
@@ -672,7 +672,7 @@ mod tests {
     fn overlapping_halves_declines_a_size_that_is_already_one_access() {
         for bits in [0, 8, 16, 32, 64, 72, 96, 128, 40 + 4] {
             assert_eq!(
-                overlapping_halves(bits),
+                overlapping_halves(Bits::new(bits)),
                 None,
                 "{bits} bits was split, but it is not a ragged sub-register size"
             );

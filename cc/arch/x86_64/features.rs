@@ -17,6 +17,7 @@ use crate::arch::codegen::BswapSize;
 use crate::arch::lir::{CallTarget, CondCode, Directive, Label, OperandSize, Symbol};
 use crate::ir::{Instruction, PseudoId};
 use crate::types::TypeTable;
+use crate::units::{Align, Bits, ByteSize};
 
 /// Where an aggregate `va_arg` result is written.
 #[derive(Clone, Copy)]
@@ -179,7 +180,7 @@ impl X86_64CodeGen {
         ap_base: Reg,
         ap_base_offset: i32,
         dst_loc: &Loc,
-        arg_size: u32,
+        arg_size: Bits,
         arg_bytes: i32,
         label_suffix: u32,
     ) {
@@ -197,7 +198,7 @@ impl X86_64CodeGen {
         // from the pointer it had just destroyed.
         let overflow_label = Label::internal("va_overflow", label_suffix);
         let done_label = Label::internal("va_done", label_suffix);
-        let lir_arg_size = OperandSize::from_bits(crate::units::Bits::new(arg_size));
+        let lir_arg_size = OperandSize::from_bits(arg_size);
 
         // gp_offset -> R10d
         self.push_lir(X86Inst::Mov {
@@ -551,7 +552,7 @@ impl X86_64CodeGen {
         src_off: i32,
         dst: VaAggDst,
         dst_off: i32,
-        nbytes: i32,
+        nbytes: ByteSize,
     ) {
         // A register destination *is* the aggregate, so it takes one load of
         // the whole slot. Chunking into it wrote each piece over the last, so
@@ -571,8 +572,9 @@ impl X86_64CodeGen {
             return;
         }
         let mut at = 0;
-        if i64::from(nbytes) > UNROLL_LIMIT_BYTES {
-            let qwords = i64::from(nbytes) / 8;
+        let mut rest = nbytes;
+        if nbytes > UNROLL_LIMIT_BYTES {
+            let qwords = nbytes.to_i64() / 8;
             // Neither base is `%rsp`, so the helper's pushes leave both where
             // they are; a frame slot is not `%rsp`-relative either.
             let to = match dst {
@@ -592,10 +594,9 @@ impl X86_64CodeGen {
                 qwords,
             );
             at = (qwords * 8) as i32;
+            rest = ByteSize::new(nbytes.get() % 8);
         }
-        for (off, chunk) in crate::ir::memexpand::block_chunks(crate::units::ByteSize::new(
-            u64::try_from(i64::from(nbytes - at)).expect("a byte count is not negative"),
-        )) {
+        for (off, chunk) in crate::ir::memexpand::block_chunks(rest) {
             let size = OperandSize::from_bits(chunk.bits());
             let done = at + off as i32;
             self.push_lir(X86Inst::Mov {
@@ -640,16 +641,14 @@ impl X86_64CodeGen {
         label_suffix: u32,
     ) {
         use crate::abi::{ArgClass, RegClass};
-        let size_bytes = crate::abi::slot_bytes(
-            types
-                .byte_size(arg_type)
-                .max(crate::units::ByteSize::new(1)),
+        let size_bytes = crate::abi::checked_slot_size(
+            types.byte_size(arg_type).max(ByteSize::new(1)),
             self.base.func_pos,
             "a variadic argument",
         );
         // Resolved before anything is clobbered: `%rax` carries the save-area
         // pointer here and the result pseudo can be allocated to it.
-        let Some(dst) = self.va_agg_dst(dst_loc, size_bytes > 8) else {
+        let Some(dst) = self.va_agg_dst(dst_loc, size_bytes > ByteSize::new(8)) else {
             return;
         };
 
@@ -705,7 +704,7 @@ impl X86_64CodeGen {
             // copied half of the latter and left the rest of the destination
             // as it was.
             let sse_bytes = if classes.iter().all(|c| *c == RegClass::Sse)
-                && (classes.len() as i32) * 8 < size_bytes
+                && ByteSize::from_usize(classes.len() * 8) < size_bytes
             {
                 16
             } else {
@@ -776,7 +775,11 @@ impl X86_64CodeGen {
                     RegClass::Sse => sse_bytes,
                     _ => 8,
                 };
-                let bytes = (size_bytes - at).min(covers);
+                let bytes = size_bytes
+                    .checked_sub(ByteSize::new(at as u64))
+                    .map_or(ByteSize::ZERO, |rest| {
+                        rest.min(ByteSize::new(covers as u64))
+                    });
                 self.va_copy_bytes(Reg::Rax, 0, dst, at, bytes);
                 at += covers;
             }
@@ -799,7 +802,7 @@ impl X86_64CodeGen {
         // Rounding to a fixed 16 left a `__attribute__((aligned (32)))`
         // argument sixteen bytes low, because the caller had placed it at a
         // 32-byte boundary within an area whose base is 32-byte aligned.
-        let arg_align = (types.alignment(arg_type) as i64).max(8);
+        let arg_align = i64::from(crate::abi::slot_align(types.align(arg_type))).max(8);
         if arg_align > 8 {
             self.push_lir(X86Inst::Add {
                 size: OperandSize::B64,
@@ -820,7 +823,12 @@ impl X86_64CodeGen {
         });
         self.push_lir(X86Inst::Add {
             size: OperandSize::B64,
-            src: GpOperand::Imm(((size_bytes + 7) & !7) as i64),
+            src: GpOperand::Imm(
+                size_bytes
+                    .align_up(Align::EIGHT)
+                    .expect("a frame slot rounded to an eightbyte still fits")
+                    .to_i64(),
+            ),
             dst: Reg::Rcx,
         });
         self.push_lir(X86Inst::Mov {
@@ -866,9 +874,6 @@ impl X86_64CodeGen {
         if crate::abi::param_is_ignored(arg_type, types) {
             return;
         }
-
-        let arg_size = types.size_bits(arg_type).max(32);
-        let arg_bytes = (arg_size / 8).max(8) as i32;
 
         let dst_loc = self.get_location(target);
 
@@ -916,6 +921,8 @@ impl X86_64CodeGen {
                 types,
             );
         } else {
+            let arg_size = types.value_bits(arg_type).max(Bits::new(32));
+            let arg_bytes = arg_size.bytes_exact().max(8) as i32;
             self.emit_va_arg_int(
                 base_reg,
                 base_offset,
@@ -1009,7 +1016,7 @@ impl X86_64CodeGen {
             BswapSize::B32 => OperandSize::B32,
             BswapSize::B64 => OperandSize::B64,
         };
-        self.emit_move(src, Reg::R10, op_size.bits());
+        self.emit_move(src, Reg::R10, op_size.width());
 
         // Perform byte-swap: 16-bit uses ROR, 32/64-bit uses BSWAP
         match swap_size {
@@ -1037,7 +1044,7 @@ impl X86_64CodeGen {
         }
 
         let dst_loc = self.get_location(dst);
-        self.emit_move_to_loc(Reg::R10, &dst_loc, op_size.bits());
+        self.emit_move_to_loc(Reg::R10, &dst_loc, op_size.width());
     }
 
     /// Emit count trailing zeros: BSF gives the index of the least
@@ -1046,14 +1053,14 @@ impl X86_64CodeGen {
         let (Some(&src), Some(dst)) = (insn.src.first(), insn.target) else {
             return;
         };
-        self.emit_move(src, Reg::R10, src_size.bits());
+        self.emit_move(src, Reg::R10, src_size.width());
         self.push_lir(X86Inst::Bsf {
             size: src_size,
             src: GpOperand::Reg(Reg::R10),
             dst: Reg::R10,
         });
         let dst_loc = self.get_location(dst);
-        self.emit_move_to_loc(Reg::R10, &dst_loc, u32::BITS);
+        self.emit_move_to_loc(Reg::R10, &dst_loc, Bits::new(32));
     }
 
     /// Emit count leading zeros: CLZ(x) = operand_bits - 1 - BSR(x), which
@@ -1063,7 +1070,7 @@ impl X86_64CodeGen {
         let (Some(&src), Some(dst)) = (insn.src.first(), insn.target) else {
             return;
         };
-        self.emit_move(src, Reg::R10, src_size.bits());
+        self.emit_move(src, Reg::R10, src_size.width());
         self.push_lir(X86Inst::Bsr {
             size: src_size,
             src: GpOperand::Reg(Reg::R10),
@@ -1075,7 +1082,7 @@ impl X86_64CodeGen {
             dst: Reg::R10,
         });
         let dst_loc = self.get_location(dst);
-        self.emit_move_to_loc(Reg::R10, &dst_loc, u32::BITS);
+        self.emit_move_to_loc(Reg::R10, &dst_loc, Bits::new(32));
     }
 
     /// Emit population count with the baseline sequence of
@@ -1085,12 +1092,12 @@ impl X86_64CodeGen {
         let (Some(&src), Some(dst)) = (insn.src.first(), insn.target) else {
             return;
         };
-        self.emit_move(src, Reg::R10, src_size.bits());
+        self.emit_move(src, Reg::R10, src_size.width());
         for inst in popcount_sequence(src_size, Reg::R10, Reg::R11) {
             self.push_lir(inst);
         }
         let dst_loc = self.get_location(dst);
-        self.emit_move_to_loc(Reg::R10, &dst_loc, u32::BITS);
+        self.emit_move_to_loc(Reg::R10, &dst_loc, Bits::new(32));
     }
 
     // gcc's non-local goto
@@ -1138,7 +1145,7 @@ impl X86_64CodeGen {
             })
         };
 
-        self.emit_move(env, Reg::R10, 64);
+        self.emit_move(env, Reg::R10, Bits::new(64));
         self.push_lir(X86Inst::Mov {
             size: OperandSize::B64,
             src: GpOperand::Reg(Reg::Rbp),
@@ -1193,7 +1200,7 @@ impl X86_64CodeGen {
 
         self.push_lir(X86Inst::Directive(Directive::BlockLabel(done)));
         let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::R11, &dst_loc, u32::BITS);
+        self.emit_move_to_loc(Reg::R11, &dst_loc, Bits::new(32));
     }
 
     /// gcc's `__builtin_longjmp(buf, 1)`: put back the frame and stack
@@ -1230,7 +1237,7 @@ impl X86_64CodeGen {
                 offset,
             })
         };
-        self.emit_move(env, Reg::R11, 64);
+        self.emit_move(env, Reg::R11, Bits::new(64));
         self.push_lir(X86Inst::Mov {
             size: OperandSize::B64,
             src: word(SjljLayout::RESUME),
@@ -1336,7 +1343,7 @@ impl X86_64CodeGen {
         };
 
         // Load size into R10 (scratch register)
-        self.emit_move(size, Reg::R10, 64);
+        self.emit_move(size, Reg::R10, Bits::new(64));
 
         // Round up to 16-byte alignment: (size + 15) & ~15
         self.push_lir(X86Inst::Add {
@@ -1362,7 +1369,7 @@ impl X86_64CodeGen {
 
         // Store result
         let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::R10, &dst_loc, 64);
+        self.emit_move_to_loc(Reg::R10, &dst_loc, Bits::new(64));
     }
 
     /// Capture %rsp so a later restore can put it back.
@@ -1379,7 +1386,7 @@ impl X86_64CodeGen {
             dst: GpOperand::Reg(Reg::R10),
         });
         let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::R10, &dst_loc, 64);
+        self.emit_move_to_loc(Reg::R10, &dst_loc, Bits::new(64));
     }
 
     /// The start of a landing pad, where the unwinder jumps with the
@@ -1391,7 +1398,7 @@ impl X86_64CodeGen {
         }
         if let Some(target) = insn.target {
             let dst_loc = self.get_location(target);
-            self.emit_move_to_loc(Reg::Rax, &dst_loc, 64);
+            self.emit_move_to_loc(Reg::Rax, &dst_loc, Bits::new(64));
         }
     }
 
@@ -1400,7 +1407,7 @@ impl X86_64CodeGen {
         let Some(&src) = insn.src.first() else {
             return;
         };
-        self.emit_move(src, Reg::R10, 64);
+        self.emit_move(src, Reg::R10, Bits::new(64));
         self.push_lir(X86Inst::Mov {
             size: OperandSize::B64,
             src: GpOperand::Reg(Reg::R10),
@@ -1443,7 +1450,7 @@ impl X86_64CodeGen {
             });
             self.push_lir(insn);
         }
-        for (off, chunk) in crate::ir::memexpand::block_chunks(crate::units::ByteSize::new(
+        for (off, chunk) in crate::ir::memexpand::block_chunks(ByteSize::new(
             u64::try_from(bytes % 8).expect("a byte count is not negative"),
         )) {
             tail(self, off as i32, OperandSize::from_bits(chunk.bits()));
@@ -1476,9 +1483,9 @@ impl X86_64CodeGen {
         let target = insn.target;
 
         // Load arguments in reverse order to avoid clobbering
-        self.emit_move(n, Reg::Rdx, 64);
-        self.emit_move(c, Reg::Rsi, 32); // c is int (32-bit)
-        self.emit_move(dest, Reg::Rdi, 64);
+        self.emit_move(n, Reg::Rdx, Bits::new(64));
+        self.emit_move(c, Reg::Rsi, Bits::new(32)); // c is int (32-bit)
+        self.emit_move(dest, Reg::Rdi, Bits::new(64));
 
         if let Some(bytes) = self.rep_block_length(n) {
             // RAX = the byte, in every byte: its low eight bits times
@@ -1517,7 +1524,7 @@ impl X86_64CodeGen {
         // Store result from RAX to target (returns dest)
         if let Some(target) = target {
             let dst_loc = self.get_location(target);
-            self.emit_move_to_loc(Reg::Rax, &dst_loc, 64);
+            self.emit_move_to_loc(Reg::Rax, &dst_loc, Bits::new(64));
         }
     }
 
@@ -1540,9 +1547,9 @@ impl X86_64CodeGen {
         let target = insn.target;
 
         // Load arguments in reverse order to avoid clobbering
-        self.emit_move(n, Reg::Rdx, 64);
-        self.emit_move(src, Reg::Rsi, 64);
-        self.emit_move(dest, Reg::Rdi, 64);
+        self.emit_move(n, Reg::Rdx, Bits::new(64));
+        self.emit_move(src, Reg::Rsi, Bits::new(64));
+        self.emit_move(dest, Reg::Rdi, Bits::new(64));
 
         if let Some(bytes) = self.rep_block_length(n) {
             self.emit_rep_block(bytes, X86Inst::RepMovsq, |cg, off, size| {
@@ -1572,7 +1579,7 @@ impl X86_64CodeGen {
         // Store result from RAX to target (returns dest)
         if let Some(target) = target {
             let dst_loc = self.get_location(target);
-            self.emit_move_to_loc(Reg::Rax, &dst_loc, 64);
+            self.emit_move_to_loc(Reg::Rax, &dst_loc, Bits::new(64));
         }
     }
 
@@ -1594,9 +1601,9 @@ impl X86_64CodeGen {
         let target = insn.target;
 
         // Load arguments in reverse order to avoid clobbering
-        self.emit_move(n, Reg::Rdx, 64);
-        self.emit_move(src, Reg::Rsi, 64);
-        self.emit_move(dest, Reg::Rdi, 64);
+        self.emit_move(n, Reg::Rdx, Bits::new(64));
+        self.emit_move(src, Reg::Rsi, Bits::new(64));
+        self.emit_move(dest, Reg::Rdi, Bits::new(64));
 
         // Call memmove
         self.push_lir(X86Inst::Call {
@@ -1606,7 +1613,7 @@ impl X86_64CodeGen {
         // Store result from RAX to target (returns dest)
         if let Some(target) = target {
             let dst_loc = self.get_location(target);
-            self.emit_move_to_loc(Reg::Rax, &dst_loc, 64);
+            self.emit_move_to_loc(Reg::Rax, &dst_loc, Bits::new(64));
         }
     }
 
@@ -1641,7 +1648,7 @@ impl X86_64CodeGen {
         };
         self.emit_frame_walk(insn.frame_level());
         let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::R10, &dst_loc, 64);
+        self.emit_move_to_loc(Reg::R10, &dst_loc, Bits::new(64));
     }
 
     /// Emit __builtin_return_address(level) - return address at given level
@@ -1661,7 +1668,7 @@ impl X86_64CodeGen {
             dst: GpOperand::Reg(Reg::R10),
         });
         let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::R10, &dst_loc, 64);
+        self.emit_move_to_loc(Reg::R10, &dst_loc, Bits::new(64));
     }
 }
 

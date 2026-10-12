@@ -295,7 +295,7 @@ impl Aarch64CodeGen {
             let op_name = output.name.clone();
             let mk = |value: AsmOperandValue<Reg>| crate::arch::AsmOperandSlot {
                 value,
-                size: op_size,
+                size: crate::units::Bits::new(op_size),
                 name: op_name.clone(),
             };
             // A flag output takes no register: its value is read off the
@@ -487,7 +487,7 @@ impl Aarch64CodeGen {
             let op_name = input.name.clone();
             let mk = |value: AsmOperandValue<Reg>| crate::arch::AsmOperandSlot {
                 value,
-                size: op_size,
+                size: crate::units::Bits::new(op_size),
                 name: op_name.clone(),
             };
             if let Some(pin) = pins[num_outputs + input_idx] {
@@ -558,7 +558,11 @@ impl Aarch64CodeGen {
                 // `"rI"(5000)`. A class that offers no register at all takes
                 // the constant as written, if it fits.
                 Loc::Imm(v)
-                    if class.reg.is_some() && !class.imm.int.admits(canonical_int(v, op_size)) =>
+                    if class.reg.is_some()
+                        && !class
+                            .imm
+                            .int
+                            .admits(canonical_int(v, crate::units::Bits::new(op_size))) =>
                 {
                     let Some(reg) = addr_regs.take(&mut gp_scratch, true) else {
                         crate::arch::codegen::report_asm_registers_exhausted(insn.pos);
@@ -570,7 +574,10 @@ impl Aarch64CodeGen {
                 }
                 Loc::Imm(v)
                     if !class.imm.int.is_empty()
-                        && !class.imm.int.admits(canonical_int(v, op_size)) =>
+                        && !class
+                            .imm
+                            .int
+                            .admits(canonical_int(v, crate::units::Bits::new(op_size))) =>
                 {
                     crate::diag::error(
                         insn.pos.unwrap_or_default(),
@@ -580,7 +587,10 @@ impl Aarch64CodeGen {
                 }
                 Loc::Imm(v) => {
                     // Immediate value
-                    slots.push(mk(AsmOperandValue::Int(canonical_int(v, op_size))));
+                    slots.push(mk(AsmOperandValue::Int(canonical_int(
+                        v,
+                        crate::units::Bits::new(op_size),
+                    ))));
                 }
                 // A floating constant has no address, so a memory-class
                 // constraint cannot be satisfied. gcc says the same and stops.
@@ -595,7 +605,7 @@ impl Aarch64CodeGen {
                 // and a constant is never allocated one. Materialize it into
                 // a scratch: nothing else is live there across the asm.
                 Loc::FImm(v, imm_size) if class.reg.is_some() => {
-                    let bits = v.to_bits_at_width(imm_size);
+                    let bits = v.to_bits_at_width(crate::units::Bits::new(imm_size));
                     let Some(scratch) = gp_scratch.pop() else {
                         crate::diag::error(
                             insn.pos.unwrap_or_default(),
@@ -1222,12 +1232,14 @@ impl Aarch64CodeGen {
                 let (base, actual) = self.loc_addr_parts(loc).unwrap();
                 AsmOperandValue::Mem(format!("[{}, #{}]", asm_reg_name_64(base), actual))
             }
-            Loc::Imm(v) => AsmOperandValue::Int(canonical_int(*v, size_bits)),
+            Loc::Imm(v) => {
+                AsmOperandValue::Int(canonical_int(*v, crate::units::Bits::new(size_bits)))
+            }
             Loc::VReg(vreg) => AsmOperandValue::RegName(vreg.name_d().to_string()),
             // An immediate-class constraint takes the constant itself. The
             // register and memory classes never reach here; `emit_inline_asm`
             // materializes or diagnoses them first.
-            Loc::FImm(v, fp_size) => AsmOperandValue::Float(*v, *fp_size),
+            Loc::FImm(v, fp_size) => AsmOperandValue::Float(*v, crate::units::Bits::new(*fp_size)),
             Loc::Global(name) => AsmOperandValue::Mem(name.clone()),
         }
     }

@@ -446,8 +446,8 @@ impl FloatVal {
     /// a `long double` want [`to_bits`](Self::to_bits) at its format instead,
     /// and this answers with the `double` encoding rather than a wrong wide
     /// value.
-    pub fn to_bits_at_width(self, fp_size: u32) -> i64 {
-        let fmt = match fp_size {
+    pub fn to_bits_at_width(self, width: crate::units::Bits) -> i64 {
+        let fmt = match width.get() {
             16 => FpFormat::Binary16,
             32 => FpFormat::Binary32,
             _ => FpFormat::Binary64,
@@ -4349,8 +4349,8 @@ mod tests {
         ] {
             let got = v(x).round_to_integral(RoundEven, fmt).unwrap();
             assert_eq!(
-                got.to_bits_at_width(64),
-                v(even).to_bits_at_width(64),
+                got.to_bits_at_width(crate::units::Bits::new(64)),
+                v(even).to_bits_at_width(crate::units::Bits::new(64)),
                 "{x}"
             );
         }

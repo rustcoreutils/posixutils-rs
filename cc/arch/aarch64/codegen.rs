@@ -1213,7 +1213,7 @@ impl Aarch64CodeGen {
             target,
             width: size,
         } = ops;
-        let op_size = OperandSize::from_bits(crate::units::Bits::new(size.get()));
+        let op_size = OperandSize::from_bits(size);
         let dst_loc = self.get_location(target);
         // Use X16 as default scratch to avoid clobbering live values
         let dst_reg = match &dst_loc {
@@ -1302,7 +1302,9 @@ impl crate::arch::AsmOperandFormatter for Aarch64CodeGen {
             // names its width with a modifier, `%d0`.
             (None, V::RegName(name)) => format!("v{}", &name[1..]),
             (None | Some('w' | 'x'), value) => match value {
-                V::Reg(r) if slot.size <= 32 => asm_reg_name_32(*r).to_string(),
+                V::Reg(r) if slot.size <= crate::units::Bits::new(32) => {
+                    asm_reg_name_32(*r).to_string()
+                }
                 V::Reg(r) => asm_reg_name_64(*r).to_string(),
                 V::RegName(text) | V::Mem(text) => text.clone(),
                 V::Int(v) => v.to_string(),

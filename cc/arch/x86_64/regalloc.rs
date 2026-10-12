@@ -53,7 +53,7 @@ use crate::arch::regalloc::{
 use crate::float::FloatVal;
 use crate::ir::{AsmData, Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::TypeTable;
-use crate::units::Bits;
+use crate::units::{Bits, ByteSize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 // x86-64 Register Definitions
@@ -751,7 +751,7 @@ pub enum Loc {
     /// Immediate integer constant
     Imm(i128),
     /// Immediate float constant (value, size in bits)
-    FImm(FloatVal, u32),
+    FImm(FloatVal, Bits),
     /// Global symbol
     Global(String),
 }
@@ -974,7 +974,7 @@ impl FrameBase {
                 local
                     .explicit_align
                     .map(|a| a as i32)
-                    .unwrap_or_else(|| (types.alignment(local.typ) as i32).max(8))
+                    .unwrap_or_else(|| (crate::abi::slot_align(types.align(local.typ))).max(8))
             })
             .max()
             .unwrap_or(8);
@@ -990,7 +990,7 @@ impl FrameBase {
             .flat_map(|b| b.insns.iter())
             .filter(|insn| matches!(insn.op, Opcode::Call))
             .flat_map(|insn| insn.extra().arg_types.iter())
-            .map(|t| types.alignment(*t) as i32)
+            .map(|t| crate::abi::slot_align(types.align(*t)))
             .max()
             .unwrap_or(8);
         // `%rbp` is as aligned as the stack was at the call, 16 bytes or,
@@ -1075,7 +1075,7 @@ fn args_in_place(insn: &Instruction, types: &TypeTable) -> Vec<(PseudoId, Reg)> 
     let scalar = |t: &crate::types::TypeId| {
         (types.is_integer(*t) || types.kind(*t) == crate::types::TypeKind::Pointer)
             && !types.is_complex(*t)
-            && types.size_bits(*t) <= 64
+            && types.byte_size(*t) <= ByteSize::new(8)
     };
     if insn.op != Opcode::Call
         || !system_v
@@ -1877,7 +1877,7 @@ impl RegAlloc {
                     Loc::IncomingArg(IncomingOff::take(&mut stack_arg_offset, 16, 16)),
                 );
                 self.fp_pseudos.insert(pseudo_id);
-            } else if sse_struct.is_some() && types.size_bits(*typ) <= 64 {
+            } else if sse_struct.is_some() && types.byte_size(*typ) <= ByteSize::new(8) {
                 // One eightbyte, arriving in an XMM register as a value: the
                 // parameter pseudo *is* that value, and the linearizer's
                 // small-struct path stores it straight into the local. Larger
@@ -1893,7 +1893,7 @@ impl RegAlloc {
                         Loc::IncomingArg(IncomingOff::take(
                             &mut stack_arg_offset,
                             8,
-                            types.alignment(*typ) as i32,
+                            crate::abi::slot_align(types.align(*typ)),
                         )),
                     );
                     self.fp_pseudos.insert(pseudo_id);
@@ -1926,7 +1926,7 @@ impl RegAlloc {
                                 self.func_pos,
                                 "a stacked parameter",
                             ),
-                            types.alignment(*typ) as i32,
+                            crate::abi::slot_align(types.align(*typ)),
                         )),
                     );
                 }
@@ -1956,7 +1956,7 @@ impl RegAlloc {
                                 self.func_pos,
                                 "a stacked parameter",
                             ),
-                            types.alignment(*typ) as i32,
+                            crate::abi::slot_align(types.align(*typ)),
                         )),
                     );
                 } else {
@@ -1982,7 +1982,7 @@ impl RegAlloc {
                                 self.func_pos,
                                 "a stacked parameter",
                             ),
-                            types.alignment(*typ) as i32,
+                            crate::abi::slot_align(types.align(*typ)),
                         )),
                     );
                 } else if fp_arg_idx + sse_regs <= fp_arg_regs.len() {
@@ -2006,7 +2006,7 @@ impl RegAlloc {
                                 self.func_pos,
                                 "a stacked parameter",
                             ),
-                            types.alignment(*typ) as i32,
+                            crate::abi::slot_align(types.align(*typ)),
                         )),
                     );
                 }
@@ -2028,7 +2028,7 @@ impl RegAlloc {
                                 self.func_pos,
                                 "a stacked parameter",
                             ),
-                            types.alignment(*typ) as i32,
+                            crate::abi::slot_align(types.align(*typ)),
                         )),
                     );
                 }
@@ -2068,7 +2068,7 @@ impl RegAlloc {
                                 self.func_pos,
                                 "a stacked parameter",
                             ),
-                            types.alignment(*typ) as i32,
+                            crate::abi::slot_align(types.align(*typ)),
                         )),
                     );
                     // Don't increment int_arg_idx — no GP register consumed
@@ -2083,7 +2083,7 @@ impl RegAlloc {
                         Loc::IncomingArg(IncomingOff::take(
                             &mut stack_arg_offset,
                             8,
-                            types.alignment(*typ) as i32,
+                            crate::abi::slot_align(types.align(*typ)),
                         )),
                     );
                     spend_arg_regs(&mut int_arg_idx, 1, int_arg_regs.len());
@@ -2379,8 +2379,8 @@ impl RegAlloc {
                         // constants that merely *feed* a 128-bit instruction,
                         // and those are still ordinary immediates that get
                         // widened at the use site.
-                        let defined_128 = setval_sizes.get(&interval.pseudo)
-                            == Some(&crate::units::Bits::new(128));
+                        let defined_128 =
+                            setval_sizes.get(&interval.pseudo) == Some(&Bits::new(128));
                         if defined_128 {
                             self.home_on_stack(interval.pseudo, SlotShape::new(16, 16));
                             continue;
@@ -2389,7 +2389,10 @@ impl RegAlloc {
                         continue;
                     }
                     PseudoKind::FVal(v) => {
-                        let size = setval_sizes.get(&interval.pseudo).map_or(64, |b| b.get());
+                        let size = setval_sizes
+                            .get(&interval.pseudo)
+                            .copied()
+                            .unwrap_or(Bits::new(64));
                         self.locations.insert(interval.pseudo, Loc::FImm(*v, size));
                         self.fp_pseudos.insert(interval.pseudo);
                         continue;

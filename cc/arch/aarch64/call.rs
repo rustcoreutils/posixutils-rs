@@ -781,7 +781,7 @@ impl Aarch64CodeGen {
                 // writes its tail as wide as the tail is.
                 let src = self.aggregate_arg_address(stack_arg.pseudo);
                 for (done, chunk) in crate::ir::memexpand::block_chunks(bytes.into()) {
-                    let size = OperandSize::from_bits(chunk.bits());
+                    let size = OperandSize::from_bits(chunk.bits().get());
                     let done = done as i32;
                     self.push_lir(Aarch64Inst::Ldr {
                         size,
@@ -887,7 +887,7 @@ impl Aarch64CodeGen {
     /// shifted to its place, which is what clang emits for the same argument.
     fn load_object_bytes(&mut self, dst: Reg, base: Reg, offset: i32, bytes: i64) {
         for (at, chunk) in crate::ir::memexpand::block_chunks(bytes) {
-            let size = OperandSize::from_bits(chunk.bits());
+            let size = OperandSize::from_bits(chunk.bits().get());
             // The first piece lands in `dst`; the rest are shifted into it
             // through the address scratch, which the base is not held in.
             let into = if at == 0 { dst } else { Reg::X16 };
@@ -1152,7 +1152,7 @@ impl Aarch64CodeGen {
         let ret_size = insn
             .typ
             .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.max(32));
+            .unwrap_or(insn.size.get().max(32));
 
         let abi_info = insn
             .extra()

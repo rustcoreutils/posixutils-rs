@@ -46,13 +46,14 @@ use super::propagate;
 use super::strdata::ConstBytes;
 use super::{ConstValue, Function, Initializer, Instruction, Module, Opcode};
 use crate::types::{TypeId, TypeKind, TypeTable};
+use crate::units::Bits;
 use std::collections::HashMap;
 
 /// A global whose value is known for the whole run.
 struct KnownGlobal {
     value: ConstValue,
     typ: TypeId,
-    size: u32,
+    size: Bits,
 }
 
 /// The globals whose value is known for the whole run, by name: a fact about
@@ -122,12 +123,15 @@ fn collect(module: &Module, types: &TypeTable) -> HashMap<String, KnownGlobal> {
             // absent.
             _ => continue,
         };
+        let Some(size) = types.checked_value_bits(g.typ) else {
+            continue;
+        };
         known.insert(
             g.name.clone(),
             KnownGlobal {
                 value,
                 typ: g.typ,
-                size: types.size_bits(g.typ),
+                size,
             },
         );
     }
@@ -221,18 +225,17 @@ fn element_load(
     loc: &MemLoc,
 ) -> Option<ConstValue> {
     let typ = insn.typ?;
-    if !(types.is_integer(typ) || types.kind(typ) == TypeKind::Pointer)
-        || !insn.size.is_multiple_of(8)
-    {
+    if !(types.is_integer(typ) || types.kind(typ) == TypeKind::Pointer) {
         return None;
     }
+    let width = insn.size.whole_bytes()?;
     let MemBase::Global(name) = &loc.base else {
         return None;
     };
     let offset = usize::try_from(loc.offset?).ok()?;
-    let width = usize::try_from(insn.size / 8).ok()?;
+    let width = usize::try_from(width).ok()?;
     let v = int_at(aggregates.get(name.as_str())?, offset, width)?;
-    let v = at_width(v, insn.size, !types.is_unsigned(typ));
+    let v = at_width(v, insn.size.get(), !types.is_unsigned(typ));
     if types.kind(typ) == TypeKind::Bool && !(0..=1).contains(&v) {
         return None;
     }
@@ -330,7 +333,7 @@ fn byte_load(
     loc: &MemLoc,
 ) -> Option<ConstValue> {
     let typ = insn.typ?;
-    if insn.size != 8 || !types.is_integer(typ) || types.kind(typ) == TypeKind::Bool {
+    if insn.size != Bits::new(8) || !types.is_integer(typ) || types.kind(typ) == TypeKind::Bool {
         return None;
     }
     let MemBase::Global(name) = &loc.base else {
@@ -354,7 +357,7 @@ mod tests {
 
     /// A module with one global and a function that loads it whole.
     fn module_loading(global: GlobalDef, types: &TypeTable, load_typ: TypeId) -> Module {
-        let size = types.size_bits(global.typ);
+        let size = types.value_bits(global.typ);
         let mut func = Function::new("t", types.int_id);
         func.add_pseudo(Pseudo::sym(PseudoId(0), global.name.clone()));
         func.next_pseudo = 4;
@@ -463,7 +466,7 @@ mod tests {
             value,
             Some(ConstValue::Float(crate::float::FloatVal::from_f64(2.5)))
         );
-        assert_eq!(m.functions[0].blocks[0].insns[1].size, 32);
+        assert_eq!(m.functions[0].blocks[0].insns[1].size, Bits::new(32));
     }
 
     /// Each of these could have its value changed underneath the fold.
@@ -545,7 +548,7 @@ mod tests {
         let mut load = Instruction::new(Opcode::Load)
             .with_target(PseudoId(1))
             .with_src(PseudoId(2))
-            .with_type_and_size(typ, size);
+            .with_type_and_size(typ, Bits::new(size));
         load.offset = offset;
         b0.add_insn(load);
         b0.add_insn(Instruction::ret(Some(PseudoId(1))));
@@ -638,7 +641,7 @@ mod tests {
         let mut m = module_loading_through_address(g, &types, offset);
         let load = &mut m.functions[0].blocks[0].insns[2];
         load.typ = Some(typ);
-        load.size = size;
+        load.size = Bits::new(size);
         let known = KnownGlobals::collect(&m, &types);
         run(&mut m.functions[0], &types, &known);
         let func = &m.functions[0];
@@ -683,7 +686,7 @@ mod tests {
         let g = const_global("k", types.long_id, Initializer::Int(0x1_0000_0005));
         let mut m = module_loading(g, &types, types.long_id);
         // Narrow the load to half the object.
-        m.functions[0].blocks[0].insns[1].size = 32;
+        m.functions[0].blocks[0].insns[1].size = Bits::new(32);
         m.functions[0].blocks[0].insns[1].typ = Some(types.int_id);
         assert_eq!(fold(&mut m, &types).0, Opcode::Load);
     }

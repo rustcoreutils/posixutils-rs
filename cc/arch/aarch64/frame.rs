@@ -725,7 +725,7 @@ impl Aarch64CodeGen {
         }
         // The cursors point at the tail, so its pieces are offsets from them.
         for (off, chunk) in crate::ir::memexpand::block_chunks(bytes - pairs) {
-            let size = OperandSize::from_bits(chunk.bits());
+            let size = OperandSize::from_bits(chunk.bits().get());
             self.push_lir(Aarch64Inst::Ldr {
                 size,
                 addr: MemAddr::BaseOffset {
@@ -1161,7 +1161,7 @@ impl Aarch64CodeGen {
                             // one that is not a multiple of eight is moved as
                             // wide as it is and no wider.
                             for (done, chunk) in crate::ir::memexpand::block_chunks(bytes.into()) {
-                                let size = OperandSize::from_bits(chunk.bits());
+                                let size = OperandSize::from_bits(chunk.bits().get());
                                 let done = done as i32;
                                 self.push_lir(Aarch64Inst::Ldr {
                                     size,
@@ -1417,7 +1417,7 @@ impl Aarch64CodeGen {
             let ret_typ = insn.typ;
             let ret_size = ret_typ
                 .map(|t| types.size_bits(t).max(32))
-                .unwrap_or(insn.size.max(32));
+                .unwrap_or(insn.size.get().max(32));
 
             if let Some((fp_size, 1)) = hfa_ret {
                 // One V register carries all of it. The linearizer hands the

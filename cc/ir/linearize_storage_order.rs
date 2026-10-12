@@ -85,7 +85,7 @@ impl<'a> Linearizer<'a> {
         if !self.reject_unswappable(typ) && self.types.is_integer(typ) && bytes <= 8 {
             let word = self.word_type(bytes);
             let raw = self.alloc_reg_pseudo();
-            let bits = self.types.size_bits(word);
+            let bits = self.types.value_bits(word);
             self.emit(Instruction::load(raw, addr, offset, word, bits).with_access(access));
             self.emit_bswap_into(target, raw, bytes);
             return;
@@ -93,7 +93,7 @@ impl<'a> Linearizer<'a> {
         let native = self.native_scalar_type(typ);
         let temp = self.frame_temp_addr("__sso", native);
         self.copy_reversed(temp, 0, addr, offset, bytes, (Access::default(), access));
-        let bits = self.types.size_bits(native);
+        let bits = self.types.value_bits(native);
         self.emit(Instruction::load(target, temp, 0, native, bits));
     }
 
@@ -112,13 +112,13 @@ impl<'a> Linearizer<'a> {
             let word = self.word_type(bytes);
             let swapped = self.alloc_reg_pseudo();
             self.emit_bswap_into(swapped, value, bytes);
-            let bits = self.types.size_bits(word);
+            let bits = self.types.value_bits(word);
             self.emit(Instruction::store(swapped, addr, offset, word, bits).with_access(access));
             return;
         }
         let native = self.native_scalar_type(typ);
         let temp = self.frame_temp_addr("__sso", native);
-        let bits = self.types.size_bits(native);
+        let bits = self.types.value_bits(native);
         self.emit(Instruction::store(value, temp, 0, native, bits));
         self.copy_reversed(addr, offset, temp, 0, bytes, (access, Access::default()));
     }
@@ -138,7 +138,7 @@ impl<'a> Linearizer<'a> {
     ) {
         let step = bytes.min(8);
         let word = self.word_type(step);
-        let bits = self.types.size_bits(word);
+        let bits = self.types.value_bits(word);
         for k in 0..bytes / step {
             let from = src_offset + (k * step) as i64;
             let to = dst_offset + (bytes - (k + 1) * step) as i64;
@@ -159,8 +159,13 @@ impl<'a> Linearizer<'a> {
             8 => (Opcode::Bswap64, self.types.ulonglong_id),
             _ => unreachable!("no {bytes}-byte swap: the callers split wider values into words"),
         };
-        let bits = (bytes * 8) as u32;
-        self.emit(Instruction::unop(op, target, value, typ, bits));
+        self.emit(Instruction::unop(
+            op,
+            target,
+            value,
+            typ,
+            self.types.value_bits(typ),
+        ));
     }
 
     /// The unsigned integer type of `bytes` bytes.
@@ -216,7 +221,7 @@ impl<'a> Linearizer<'a> {
         }
         let half = self.types.complex_base(typ);
         let half_bytes = self.types.size_bytes(half) as i64;
-        let half_bits = self.types.size_bits(half);
+        let half_bits = self.types.value_bits(half);
         let access = Access::of(self.types, typ);
         let copy = self.frame_temp_addr("__sso", self.types.make_complex(half));
         for offset in [0, half_bytes] {

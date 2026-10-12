@@ -37,6 +37,7 @@ use super::facts::ConstMap;
 use super::{Function, GlobalDef, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::parse::ast::MemEffect;
 use crate::types::{TypeId, TypeTable};
+use crate::units::Bits;
 use std::collections::HashMap;
 
 /// How far the address walk follows a chain before giving up.
@@ -61,9 +62,9 @@ pub(crate) struct MemLoc {
     pub(crate) base: MemBase,
     /// `None` when the displacement is not a compile-time constant.
     pub(crate) offset: Option<i64>,
-    /// Access width in **bits**, as `Instruction::size` carries it. Zero
-    /// means an unknown extent -- a `Memcpy`, a `VaStart`.
-    pub(crate) size: u32,
+    /// Access width, as `Instruction::size` carries it. Zero means an
+    /// unknown extent -- a `Memcpy`, a `VaStart`.
+    pub(crate) size: Bits,
     pub(crate) typ: Option<TypeId>,
 }
 
@@ -73,7 +74,7 @@ impl MemLoc {
         MemLoc {
             base: MemBase::Unknown,
             offset: None,
-            size: 0,
+            size: Bits::new(0),
             typ: None,
         }
     }
@@ -86,11 +87,14 @@ impl MemLoc {
     /// the displacement and the width are all known. A width that is not a
     /// whole number of bytes still touches the byte it ends in.
     pub(crate) fn byte_extent(&self) -> Option<(i64, i64)> {
-        if !self.is_known() || self.size == 0 {
+        if !self.is_known() || self.size == Bits::ZERO {
             return None;
         }
         let start = self.offset?;
-        Some((start, start.checked_add(self.size.div_ceil(8) as i64)?))
+        Some((
+            start,
+            start.checked_add(i64::from(self.size.bytes_covering()))?,
+        ))
     }
 }
 
@@ -167,12 +171,12 @@ impl AddrMap {
         func: &Function,
         types: &TypeTable,
         id: PseudoId,
-    ) -> Option<(u32, Option<TypeId>)> {
+    ) -> Option<(Bits, Option<TypeId>)> {
         if let Some(d) = self.def(func, id) {
             return Some((d.size, d.typ));
         }
         func.arg_value_type(id, types)
-            .map(|t| (types.size_bits(t), Some(t)))
+            .map(|t| (types.value_bits(t), Some(t)))
     }
 
     /// The constant a pseudo carries, if any, read as the `width`-bit
@@ -197,7 +201,7 @@ impl AddrMap {
     /// The whole object `p` points into: its base and how far in `p` is,
     /// with the extent left unknown.
     pub(crate) fn object_of(&self, func: &Function, p: PseudoId) -> MemLoc {
-        self.resolve(func, p, 0, 0, None)
+        self.resolve(func, p, 0, Bits::ZERO, None)
     }
 
     /// What memory `insn` may read and may write.
@@ -314,7 +318,7 @@ impl AddrMap {
         func: &Function,
         addr: PseudoId,
         offset: i64,
-        size: u32,
+        size: Bits,
         typ: Option<TypeId>,
     ) -> MemLoc {
         let mut cur = addr;
@@ -343,13 +347,13 @@ impl AddrMap {
                 Opcode::Copy | Opcode::SymAddr if d.src.len() == 1 => cur = d.src[0],
                 Opcode::Add if d.src.len() == 2 => {
                     let (a, b) = (d.src[0], d.src[1]);
-                    if let Some(c) = self.const_operand(b, d.size) {
+                    if let Some(c) = self.const_operand(b, d.size.get()) {
                         let Some(n) = add_offset(off, c) else {
                             return MemLoc::unknown();
                         };
                         off = n;
                         cur = a;
-                    } else if let Some(c) = self.const_operand(a, d.size) {
+                    } else if let Some(c) = self.const_operand(a, d.size.get()) {
                         let Some(n) = add_offset(off, c) else {
                             return MemLoc::unknown();
                         };
@@ -360,7 +364,7 @@ impl AddrMap {
                     }
                 }
                 Opcode::Sub if d.src.len() == 2 => {
-                    let Some(c) = self.const_operand(d.src[1], d.size) else {
+                    let Some(c) = self.const_operand(d.src[1], d.size.get()) else {
                         return MemLoc::unknown();
                     };
                     let Some(n) = c.checked_neg().and_then(|n| add_offset(off, n)) else {
@@ -580,7 +584,7 @@ pub(crate) fn is_ordinary_object(
     mi: &ModuleInfo,
     loc: &MemLoc,
 ) -> bool {
-    if loc.offset.is_none() || loc.size == 0 {
+    if loc.offset.is_none() || loc.size == Bits::ZERO {
         return false;
     }
     if let Some(t) = loc.typ {
@@ -649,7 +653,7 @@ pub(crate) fn is_same_access(a: &MemLoc, b: &MemLoc, types: &TypeTable) -> bool 
         && a.offset.is_some()
         && a.offset == b.offset
         && a.size == b.size
-        && a.size != 0
+        && a.size != Bits::ZERO
         && same_register_file(types, a.typ, b.typ)
 }
 
@@ -667,7 +671,7 @@ mod tests {
         let at = |offset, size| MemLoc {
             base: MemBase::Local(PseudoId(0)),
             offset,
-            size,
+            size: Bits::new(size),
             typ: None,
         };
         assert_eq!(at(Some(4), 32).byte_extent(), Some((4, 8)));
@@ -677,7 +681,7 @@ mod tests {
         assert_eq!(at(Some(i64::MAX), 8).byte_extent(), None, "overflow");
         let anywhere = MemLoc {
             offset: Some(0),
-            size: 8,
+            size: Bits::new(8),
             ..MemLoc::unknown()
         };
         assert_eq!(anywhere.byte_extent(), None, "unknown base");
@@ -720,12 +724,36 @@ mod tests {
             PseudoId(10),
             PseudoId(11),
             i32t,
-            64,
+            Bits::new(64),
         ));
-        bb.add_insn(Instruction::store(PseudoId(20), PseudoId(12), 0, i32t, 32));
-        bb.add_insn(Instruction::load(PseudoId(13), PseudoId(0), 0, i32t, 32));
-        bb.add_insn(Instruction::load(PseudoId(14), PseudoId(1), 0, i32t, 32));
-        bb.add_insn(Instruction::load(PseudoId(15), PseudoId(2), 0, i32t, 32));
+        bb.add_insn(Instruction::store(
+            PseudoId(20),
+            PseudoId(12),
+            0,
+            i32t,
+            Bits::new(32),
+        ));
+        bb.add_insn(Instruction::load(
+            PseudoId(13),
+            PseudoId(0),
+            0,
+            i32t,
+            Bits::new(32),
+        ));
+        bb.add_insn(Instruction::load(
+            PseudoId(14),
+            PseudoId(1),
+            0,
+            i32t,
+            Bits::new(32),
+        ));
+        bb.add_insn(Instruction::load(
+            PseudoId(15),
+            PseudoId(2),
+            0,
+            i32t,
+            Bits::new(32),
+        ));
         f.blocks.push(bb);
         f.entry = BasicBlockId(0);
         (f, types)
@@ -797,7 +825,7 @@ mod tests {
         assert!(may_alias(&MemLoc::unknown(), &a0, &mi));
 
         let mut sizeless = a0.clone();
-        sizeless.size = 0;
+        sizeless.size = Bits::ZERO;
         assert!(may_alias(&a0, &sizeless, &mi));
 
         let mut no_offset = a0.clone();
@@ -834,7 +862,7 @@ mod tests {
         let at = |n: &str| MemLoc {
             base: MemBase::Global(n.into()),
             offset: Some(0),
-            size: 32,
+            size: Bits::new(32),
             typ: None,
         };
         assert!(!may_alias(&at("g"), &at("h"), &mi));
@@ -915,7 +943,7 @@ mod tests {
         let at = |n: &str| MemLoc {
             base: MemBase::Global(n.into()),
             offset: Some(0),
-            size: 32,
+            size: Bits::new(32),
             typ: None,
         };
         assert!(may_alias(&at("a"), &at("b"), &mi));
@@ -949,7 +977,7 @@ mod tests {
         let at = |t: TypeId| MemLoc {
             base: MemBase::Local(PseudoId(0)),
             offset: Some(0),
-            size: 64,
+            size: Bits::new(64),
             typ: Some(t),
         };
         assert!(is_same_access(
@@ -968,7 +996,7 @@ mod tests {
         shifted.offset = Some(1);
         assert!(!is_same_access(&at(types.long_id), &shifted, &types));
         let mut sizeless = at(types.long_id);
-        sizeless.size = 0;
+        sizeless.size = Bits::ZERO;
         assert!(!is_same_access(&sizeless, &sizeless, &types));
     }
 
@@ -981,7 +1009,7 @@ mod tests {
         let types = host_types();
         let mi = empty_module_info();
         let call = |known: Option<LibFn>| {
-            let mut c = Instruction::call(None, "f", vec![], vec![], types.int_id, 32);
+            let mut c = Instruction::call(None, "f", vec![], vec![], types.int_id, Bits::new(32));
             c.extra_mut().known = known;
             c
         };
@@ -1013,7 +1041,7 @@ mod tests {
             Instruction::new(Opcode::Copy)
                 .with_target(PseudoId(10))
                 .with_src(PseudoId(0))
-                .with_type_and_size(i64t, 64),
+                .with_type_and_size(i64t, Bits::new(64)),
         );
         let mut asm = Instruction::new(Opcode::Asm);
         asm.extra_mut().asm_data = Some(Box::new(crate::ir::AsmData {
@@ -1022,14 +1050,20 @@ mod tests {
                 PseudoId(10),
                 "=r",
                 crate::target::Arch::X86_64,
-                64,
+                Bits::new(64),
             )],
             inputs: vec![],
             clobbers: vec![],
             goto_labels: vec![],
         }));
         bb.add_insn(asm);
-        bb.add_insn(Instruction::load(PseudoId(11), PseudoId(10), 0, i64t, 64));
+        bb.add_insn(Instruction::load(
+            PseudoId(11),
+            PseudoId(10),
+            0,
+            i64t,
+            Bits::new(64),
+        ));
         f.blocks.push(bb);
         f.entry = BasicBlockId(0);
 
@@ -1098,7 +1132,7 @@ mod tests {
         Footprint::Object(MemLoc {
             base: MemBase::Local(PseudoId(p)),
             offset: Some(0),
-            size: 0,
+            size: Bits::new(0),
             typ: None,
         })
     }
@@ -1106,7 +1140,7 @@ mod tests {
     fn block_op(op: Opcode, dest: PseudoId, src: PseudoId) -> Instruction {
         Instruction::new(op)
             .with_src3(dest, src, PseudoId(11))
-            .with_type_and_size(host_types().void_ptr_id, 64)
+            .with_type_and_size(host_types().void_ptr_id, Bits::new(64))
     }
 
     /// The opcode table: a load and a store touch exactly their bytes; a
@@ -1157,7 +1191,7 @@ mod tests {
         };
         assert_eq!(
             (m.base.clone(), m.offset, m.size),
-            (MemBase::Local(PseudoId(0)), Some(8), 0)
+            (MemBase::Local(PseudoId(0)), Some(8), Bits::ZERO)
         );
     }
 
@@ -1167,7 +1201,8 @@ mod tests {
     #[test]
     fn memloc_access_of_a_call() {
         let types = host_types();
-        let call = |target| Instruction::call(target, "f", vec![], vec![], types.int_id, 32);
+        let call =
+            |target| Instruction::call(target, "f", vec![], vec![], types.int_id, Bits::new(32));
         let (dirty, _) = access_of(call(None), MemEffect::Unknown);
         assert_eq!(dirty.reads, vec![Footprint::Escaped]);
         assert_eq!(dirty.writes, vec![Footprint::Escaped]);
@@ -1222,8 +1257,20 @@ mod tests {
         let (f, _types) = two_locals();
         let am = AddrMap::build(&f);
         let insns = [
-            Instruction::load(PseudoId(30), PseudoId(1), 0, host_types().int_id, 32),
-            Instruction::store(PseudoId(11), PseudoId(1), 0, host_types().int_id, 32),
+            Instruction::load(
+                PseudoId(30),
+                PseudoId(1),
+                0,
+                host_types().int_id,
+                Bits::new(32),
+            ),
+            Instruction::store(
+                PseudoId(11),
+                PseudoId(1),
+                0,
+                host_types().int_id,
+                Bits::new(32),
+            ),
             block_op(Opcode::Memset, PseudoId(1), PseudoId(11)),
             block_op(Opcode::Memcpy, PseudoId(1), PseudoId(0)),
             block_op(Opcode::Memmove, PseudoId(1), PseudoId(0)),
@@ -1270,14 +1317,14 @@ mod tests {
             vec![PseudoId(16)],
             vec![types.long_id],
             types.void_id,
-            0,
+            Bits::new(0),
         ));
         let esc = EscapeInfo::analyze(&f, &types);
         let mi = empty_module_info();
         let at = |base: MemBase| MemLoc {
             base,
             offset: Some(0),
-            size: 32,
+            size: Bits::new(32),
             typ: None,
         };
         let (a, b, g) = (
@@ -1323,10 +1370,10 @@ mod tests {
         };
         let mut bb = BasicBlock::new(BasicBlockId(0));
         bb.add_insn(Instruction::new(Opcode::Entry));
-        bb.add_insn(insn(Opcode::Copy, 10, 1, i64t, 64));
-        bb.add_insn(insn(Opcode::Copy, 11, 10, i64t, 64));
-        bb.add_insn(insn(Opcode::Copy, 12, 2, i32t, 32));
-        bb.add_insn(insn(Opcode::Trunc, 13, 3, i8t, 8));
+        bb.add_insn(insn(Opcode::Copy, 10, 1, i64t, Bits::new(64)));
+        bb.add_insn(insn(Opcode::Copy, 11, 10, i64t, Bits::new(64)));
+        bb.add_insn(insn(Opcode::Copy, 12, 2, i32t, Bits::new(32)));
+        bb.add_insn(insn(Opcode::Trunc, 13, 3, i8t, Bits::new(8)));
         f.blocks.push(bb);
         f.entry = BasicBlockId(0);
 

@@ -29,7 +29,7 @@ impl Aarch64CodeGen {
         let (lane, _) = types
             .vector_lanes(vec)
             .expect("a vector operation's type is a vector");
-        let total = insn.size as usize / 8;
+        let total = insn.size.get() as usize / 8;
         // The carrier the operands are held in, which picks the Q or D move.
         let carrier = if total == 16 {
             types.float128_id
@@ -54,11 +54,11 @@ impl Aarch64CodeGen {
             } else {
                 Arrangement::of(lane_bytes, total)
             };
-            let src1 = self.simd_operand(insn.src[0], VReg::V17, carrier, insn.size, types);
+            let src1 = self.simd_operand(insn.src[0], VReg::V17, carrier, insn.size.get(), types);
             let mut src2 = insn
                 .src
                 .get(1)
-                .map(|&s| self.simd_operand(s, VReg::V18, carrier, insn.size, types));
+                .map(|&s| self.simd_operand(s, VReg::V18, carrier, insn.size.get(), types));
             if matches!(op, SimdOp::Lsr | SimdOp::Asr) {
                 // A right shift is a left shift by the negated counts,
                 // made in V18 so an operand's own register is untouched.
@@ -91,7 +91,7 @@ impl Aarch64CodeGen {
             }
         }
         if !matches!(dst_loc, Loc::VReg(v) if v == dst) {
-            self.emit_fp_move_to_loc(dst, &dst_loc, Some(carrier), insn.size, types);
+            self.emit_fp_move_to_loc(dst, &dst_loc, Some(carrier), insn.size.get(), types);
         }
     }
 
@@ -128,7 +128,7 @@ impl Aarch64CodeGen {
         dst: VReg,
         types: &TypeTable,
     ) {
-        let total = insn.size as usize / 8;
+        let total = insn.size.get() as usize / 8;
         let carrier = if total == 16 {
             types.float128_id
         } else {
@@ -137,14 +137,27 @@ impl Aarch64CodeGen {
         let n = total / lane_bytes;
         let second = (insn.src.len() == 2).then_some(VReg::V18);
         let table = if second.is_some() {
-            self.simd_pair(insn.src[0], insn.src[1], dst, carrier, insn.size, types);
+            self.simd_pair(
+                insn.src[0],
+                insn.src[1],
+                dst,
+                carrier,
+                insn.size.get(),
+                types,
+            );
             VReg::V17
         } else {
             match self.get_location(insn.src[0]) {
                 // Not the target's register, which the index is built in.
                 Loc::VReg(v) if v != dst => v,
                 _ => {
-                    self.emit_fp_move(insn.src[0], VReg::V17, Some(carrier), insn.size, types);
+                    self.emit_fp_move(
+                        insn.src[0],
+                        VReg::V17,
+                        Some(carrier),
+                        insn.size.get(),
+                        types,
+                    );
                     VReg::V17
                 }
             }

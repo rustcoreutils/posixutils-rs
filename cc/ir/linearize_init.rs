@@ -22,6 +22,7 @@ use crate::symbol::Linkage;
 use crate::target::ByteOrder;
 use crate::token::lexer::Position;
 use crate::types::{MemberInfo, Type, TypeId, TypeKind, TypeModifiers, TypeTable};
+use crate::units::Bits;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Determine whether a declared object type is `const`-qualified for the
@@ -452,7 +453,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         );
         if is_address
             && self.types.is_integer(typ)
-            && self.types.size_bits(typ) < self.target.pointer_width
+            && self.types.value_bits(typ) < Bits::new(self.target.pointer_width)
         {
             self.reject_initializer(expr);
             return Initializer::None;
@@ -1151,18 +1152,18 @@ impl<'a> super::linearize::Linearizer<'a> {
         if self.types.kind(to) == TypeKind::Bool {
             return i128::from(value != 0);
         }
-        let full = self.types.size_bits(to);
-        let bits = bit_width.map_or(full, |w| w.min(full));
+        let full = self.types.value_bits(to);
+        let bits = bit_width.map_or(full, |w| Bits::new(w.min(full.get())));
         let unsigned = self.types.is_unsigned(to);
-        let converted = constexpr::reduce_to_width(value, bits, unsigned);
+        let converted = constexpr::reduce_to_width(value, bits.get(), unsigned);
         if converted == value {
             return converted;
         }
         let Some(from) = expr.typ.filter(|&t| self.types.is_integer(t)) else {
             return converted;
         };
-        let fits_signed = constexpr::reduce_to_width(value, bits, false) == value;
-        let fits_unsigned = constexpr::reduce_to_width(value, bits, true) == value;
+        let fits_signed = constexpr::reduce_to_width(value, bits.get(), false) == value;
+        let fits_unsigned = constexpr::reduce_to_width(value, bits.get(), true) == value;
         let prefix = if unsigned {
             if fits_signed {
                 // A change of sign only, which is `-Wsign-conversion`'s.
@@ -1173,14 +1174,14 @@ impl<'a> super::linearize::Linearizer<'a> {
             } else {
                 "unsigned conversion"
             }
-        } else if !fits_unsigned || (crate::diag::pedantic() && self.types.size_bits(from) != bits)
+        } else if !fits_unsigned || (crate::diag::pedantic() && self.types.value_bits(from) != bits)
         {
             "overflow in conversion"
         } else {
             return converted;
         };
         let to_name = if bits < full {
-            self.types.gcc_bitfield_type_name(bits, unsigned)
+            self.types.gcc_bitfield_type_name(bits.get(), unsigned)
         } else {
             self.types.gcc_type_name(to, Some(self.strings))
         };

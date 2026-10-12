@@ -148,7 +148,7 @@ impl X86_64CodeGen {
             at = qwords * 8;
         }
         for (off, chunk) in crate::ir::memexpand::block_chunks(bytes - at) {
-            let size = OperandSize::from_bits(chunk.bits());
+            let size = OperandSize::from_bits(chunk.bits().get());
             let byte = (at + off) as i32;
             self.push_lir(X86Inst::Mov {
                 size,
@@ -602,7 +602,7 @@ impl X86_64CodeGen {
     /// chunking both ask for is `ir::memexpand::block_chunks`.
     fn load_object_bytes(&mut self, dst: Reg, base: Reg, offset: i32, bytes: i64) {
         for (at, chunk) in crate::ir::memexpand::block_chunks(bytes) {
-            let size = OperandSize::from_bits(chunk.bits());
+            let size = OperandSize::from_bits(chunk.bits().get());
             let mem = GpOperand::Mem(MemAddr::BaseOffset {
                 base,
                 offset: offset + at as i32,
@@ -1030,7 +1030,7 @@ impl X86_64CodeGen {
         let ret_size = insn
             .typ
             .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.max(32));
+            .unwrap_or(insn.size.get().max(32));
         let ret_fmt = self.fp_format(insn.typ, ret_size, types);
 
         let abi_info = insn

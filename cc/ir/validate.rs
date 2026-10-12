@@ -126,6 +126,7 @@
 // which is where it used to live, so it ran in none of them.
 
 use super::{BasicBlock, BasicBlockId, Function, Instruction, Module, Opcode, PseudoId};
+use crate::units::Bits;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -198,7 +199,7 @@ pub enum Invariant {
     StrayLifetimeEnd,
     /// I12: an integer width change from `from` bits to `to` that does not
     /// change the width the way its opcode says.
-    WidthChangeBackwards { from: u32, to: u32 },
+    WidthChangeBackwards { from: Bits, to: Bits },
     /// I13: `pseudo`, the highest id in the function, is not below
     /// `next_pseudo`.
     PseudoPastAllocator { pseudo: PseudoId, next_pseudo: u32 },
@@ -560,15 +561,16 @@ impl<'a> Walk<'a> {
         }
 
         // I10
-        if insn.op.reads_another_type() && (insn.src_typ.is_none() || insn.src_size == 0) {
+        if insn.op.reads_another_type() && (insn.src_typ.is_none() || insn.src_size == Bits::new(0))
+        {
             self.report(at, Invariant::MissingOperandType);
         }
 
         // I12, of a width change that records its source width at all
-        if insn.op.is_int_width_change() && insn.src_size != 0 {
+        if insn.op.is_int_width_change() && insn.src_size != Bits::ZERO {
             let (from, to) = (insn.src_size, insn.size);
             let as_said = if insn.op == Opcode::Trunc {
-                0 < to && to < from
+                Bits::ZERO < to && to < from
             } else {
                 from < to
             };
@@ -859,7 +861,7 @@ mod tests {
             &mut func,
             Instruction::new(Opcode::VaArgPackLen)
                 .with_target(PseudoId(0))
-                .with_type_and_size(types.int_id, 32),
+                .with_type_and_size(types.int_id, Bits::new(32)),
         );
         let errors = validate_function_at(&func, Stage::Lowered).unwrap_err();
         assert!(
@@ -882,13 +884,21 @@ mod tests {
     #[test]
     fn validate_flags_a_displacement_past_i32() {
         let types = TypeTable::new(&Target::host());
-        let load = |offset| Instruction::load(PseudoId(1), PseudoId(0), offset, types.int_id, 32);
+        let load = |offset| {
+            Instruction::load(
+                PseudoId(1),
+                PseudoId(0),
+                offset,
+                types.int_id,
+                Bits::new(32),
+            )
+        };
         let atomic = |offset| {
             Instruction::new(Opcode::AtomicLoad)
                 .with_target(PseudoId(1))
                 .with_src(PseudoId(0))
                 .with_offset(offset)
-                .with_type_and_size(types.int_id, 32)
+                .with_type_and_size(types.int_id, Bits::new(32))
         };
         let max = i64::from(i32::MAX);
         for (insn, ok) in [
@@ -968,7 +978,7 @@ mod tests {
                 PseudoId(2),
                 "=r",
                 crate::target::Arch::X86_64,
-                32,
+                Bits::new(32),
             )],
             inputs: vec![],
             clobbers: vec![],
@@ -1145,17 +1155,17 @@ mod tests {
             BasicBlockId(2),
         ));
         let mut b1 = BasicBlock::new(BasicBlockId(1));
-        let mut src1 = Instruction::phi_source(PseudoId(4), PseudoId(1), int, 32);
+        let mut src1 = Instruction::phi_source(PseudoId(4), PseudoId(1), int, Bits::new(32));
         src1.phi_list = vec![(BasicBlockId(3), PseudoId(3))];
         b1.add_insn(src1);
         b1.add_insn(Instruction::br(BasicBlockId(3)));
         let mut b2 = BasicBlock::new(BasicBlockId(2));
-        let mut src2 = Instruction::phi_source(PseudoId(5), PseudoId(2), int, 32);
+        let mut src2 = Instruction::phi_source(PseudoId(5), PseudoId(2), int, Bits::new(32));
         src2.phi_list = vec![(BasicBlockId(3), PseudoId(3))];
         b2.add_insn(src2);
         b2.add_insn(Instruction::br(BasicBlockId(3)));
         let mut b3 = BasicBlock::new(BasicBlockId(3));
-        let mut phi = Instruction::phi(PseudoId(3), int, 32);
+        let mut phi = Instruction::phi(PseudoId(3), int, Bits::new(32));
         phi.phi_list = vec![
             (BasicBlockId(1), PseudoId(4)),
             (BasicBlockId(2), PseudoId(5)),
@@ -1337,7 +1347,7 @@ mod tests {
         let bare = Instruction::new(Opcode::SetLt)
             .with_target(PseudoId(2))
             .with_src2(PseudoId(0), PseudoId(1))
-            .with_type_and_size(types.int_id, 32);
+            .with_type_and_size(types.int_id, Bits::new(32));
         push(&mut func, bare);
         let errors = validate_function(&func).unwrap_err();
         assert!(errors.iter().any(|e| matches!(
@@ -1360,14 +1370,14 @@ mod tests {
             Opcode::SetLt,
             PseudoId(2),
             (PseudoId(0), PseudoId(1)),
-            (types.long_id, 64),
-            (types.int_id, 32),
+            (types.long_id, Bits::new(64)),
+            (types.int_id, Bits::new(32)),
         );
         assert_eq!(
-            (cmp.operand_type(), cmp.operand_width()),
+            (cmp.operand_type(), cmp.operand_width().get()),
             (Some(types.long_id), 64)
         );
-        assert_eq!((cmp.typ, cmp.size), (Some(types.int_id), 32));
+        assert_eq!((cmp.typ, cmp.size.get()), (Some(types.int_id), 32));
         push(&mut func, cmp);
         assert!(
             validate_function(&func).is_ok(),
@@ -1396,9 +1406,9 @@ mod tests {
         (from, from_size): (TypeId, u32),
         (to, size): (TypeId, u32),
     ) -> Instruction {
-        let mut insn = Instruction::unop(op, PseudoId(1), PseudoId(0), to, size);
+        let mut insn = Instruction::unop(op, PseudoId(1), PseudoId(0), to, Bits::new(size));
         insn.src_typ = Some(from);
-        insn.src_size = from_size;
+        insn.src_size = Bits::new(from_size);
         insn
     }
 
@@ -1423,7 +1433,7 @@ mod tests {
             assert!(op.reads_another_type(), "{op:?}");
             assert_eq!(kinds_of(conversion(op, from, to)), vec![], "{op:?}");
             let mut bare = conversion(op, from, to);
-            bare.src_size = 0;
+            bare.src_size = Bits::new(0);
             assert_eq!(
                 kinds_of(bare),
                 vec![Invariant::MissingOperandType],
@@ -1462,8 +1472,8 @@ mod tests {
             assert_eq!(
                 kinds_of(conversion(op, from, to)),
                 vec![Invariant::WidthChangeBackwards {
-                    from: from.1,
-                    to: to.1
+                    from: Bits::new(from.1),
+                    to: Bits::new(to.1)
                 }],
                 "{op:?} {from:?} -> {to:?}"
             );
@@ -1479,7 +1489,7 @@ mod tests {
         let mut f = Function::new("f", types.void_id);
         f.next_pseudo = NEXT_PSEUDO;
         f.entry = BasicBlockId(0);
-        let mut call = Instruction::call(None, "g", vec![], vec![], types.void_id, 0);
+        let mut call = Instruction::call(None, "g", vec![], vec![], types.void_id, Bits::new(0));
         call.extra_mut().landing_pad = Some(BasicBlockId(2));
         let mut b0 = BasicBlock::new(BasicBlockId(0));
         b0.add_insn(Instruction::new(Opcode::Entry));
@@ -1497,7 +1507,7 @@ mod tests {
         let landing = Instruction::new(Opcode::LandingPad)
             .with_target(PseudoId(2))
             .with_type(types.void_ptr_id)
-            .with_size(64);
+            .with_size(Bits::new(64));
         let mut b2 = BasicBlock::new(BasicBlockId(2));
         if pad_first {
             b2.add_insn(landing);

@@ -53,7 +53,7 @@ impl Aarch64CodeGen {
     }
     /// Emit a floating-point load instruction
     pub(super) fn emit_fp_load(&mut self, insn: &Instruction, types: &TypeTable) {
-        let size = Self::size_from_type(insn.typ, insn.size, types);
+        let size = Self::size_from_type(insn.typ, insn.size.get(), types);
         let addr = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -69,7 +69,7 @@ impl Aarch64CodeGen {
         };
         let addr_loc = self.get_location(addr);
 
-        let fp_size = self.fp_size_from_type(insn.typ, insn.size, types);
+        let fp_size = self.fp_size_from_type(insn.typ, insn.size.get(), types);
 
         match addr_loc {
             Loc::Reg(r) => {
@@ -342,8 +342,8 @@ impl Aarch64CodeGen {
 
     /// Emit FP binary operation (fadd, fsub, fmul, fdiv)
     pub(super) fn emit_fp_binop(&mut self, insn: &Instruction, types: &TypeTable) {
-        let size = Self::size_from_type(insn.typ, insn.size, types);
-        let fp_size = self.fp_size_from_type(insn.typ, insn.size, types);
+        let size = Self::size_from_type(insn.typ, insn.size.get(), types);
+        let fp_size = self.fp_size_from_type(insn.typ, insn.size.get(), types);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
             _ => return,
@@ -480,8 +480,8 @@ impl Aarch64CodeGen {
         let (Some(target), [x, y, z]) = (insn.target, insn.src.as_slice()) else {
             return;
         };
-        let size = Self::size_from_type(insn.typ, insn.size, types);
-        let fp_size = self.fp_size_from_type(insn.typ, insn.size, types);
+        let size = Self::size_from_type(insn.typ, insn.size.get(), types);
+        let fp_size = self.fp_size_from_type(insn.typ, insn.size.get(), types);
         debug_assert!(fp_size != FpSize::Quad, "a binary128 fma is a call");
         let dst_loc = self.get_location(target);
         let work_reg = match &dst_loc {
@@ -565,8 +565,8 @@ impl Aarch64CodeGen {
         let (Some(&src), Some(target)) = (insn.src.first(), insn.target) else {
             return;
         };
-        let size = Self::size_from_type(insn.src_typ, insn.src_size, types);
-        let fp_size = self.fp_size_from_type(insn.src_typ, insn.src_size, types);
+        let size = Self::size_from_type(insn.src_typ, insn.src_size.get(), types);
+        let fp_size = self.fp_size_from_type(insn.src_typ, insn.src_size.get(), types);
         let (scratch0, _, _) = Reg::scratch_regs();
         self.emit_fp_move(src, VReg::V17, insn.src_typ, size, types);
         let width = self.emit_fp_sign_half_to_gp(fp_size, VReg::V17, scratch0);
@@ -587,8 +587,8 @@ impl Aarch64CodeGen {
         else {
             return;
         };
-        let size = Self::size_from_type(insn.typ, insn.size, types);
-        let fp_size = self.fp_size_from_type(insn.typ, insn.size, types);
+        let size = Self::size_from_type(insn.typ, insn.size.get(), types);
+        let fp_size = self.fp_size_from_type(insn.typ, insn.size.get(), types);
         let dst_loc = self.get_location(target);
         let work_reg = match &dst_loc {
             Loc::VReg(v) => *v,
@@ -643,8 +643,8 @@ impl Aarch64CodeGen {
         types: &TypeTable,
         emit: impl FnOnce(&mut Self, FpSize, VReg, VReg),
     ) {
-        let size = Self::size_from_type(insn.typ, insn.size, types);
-        let fp_size = self.fp_size_from_type(insn.typ, insn.size, types);
+        let size = Self::size_from_type(insn.typ, insn.size.get(), types);
+        let fp_size = self.fp_size_from_type(insn.typ, insn.size.get(), types);
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -672,8 +672,8 @@ impl Aarch64CodeGen {
     pub(super) fn emit_fp_compare(&mut self, insn: &Instruction, types: &TypeTable) {
         // The operands' format; the result is an `int`.
         let (operand, width) = (insn.operand_type(), insn.operand_width());
-        let size = Self::size_from_type(operand, width, types);
-        let fp_size = self.fp_size_from_type(operand, width, types);
+        let size = Self::size_from_type(operand, width.get(), types);
+        let fp_size = self.fp_size_from_type(operand, width.get(), types);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
             _ => return,
@@ -742,9 +742,9 @@ impl Aarch64CodeGen {
             None => return,
         };
 
-        let src_size = Self::size_from_type(insn.src_typ, insn.src_size, types);
-        let dst_size = Self::size_from_type(insn.typ, insn.size, types);
-        let fp_size = self.fp_size_from_type(insn.typ, insn.size, types);
+        let src_size = Self::size_from_type(insn.src_typ, insn.src_size.get(), types);
+        let dst_size = Self::size_from_type(insn.typ, insn.size.get(), types);
+        let fp_size = self.fp_size_from_type(insn.typ, insn.size.get(), types);
         let int_size = OperandSize::from_bits(src_size);
 
         let dst_loc = self.get_location(target);
@@ -795,9 +795,9 @@ impl Aarch64CodeGen {
             None => return,
         };
 
-        let src_size = Self::size_from_type(insn.src_typ, insn.src_size, types);
-        let dst_size = Self::size_from_type(insn.typ, insn.size, types);
-        let fp_size = self.fp_size_from_type(insn.src_typ, insn.src_size, types);
+        let src_size = Self::size_from_type(insn.src_typ, insn.src_size.get(), types);
+        let dst_size = Self::size_from_type(insn.typ, insn.size.get(), types);
+        let fp_size = self.fp_size_from_type(insn.src_typ, insn.src_size.get(), types);
         let int_size = OperandSize::from_bits(dst_size);
 
         let dst_loc = self.get_location(target);
@@ -871,10 +871,10 @@ impl Aarch64CodeGen {
             None => return,
         };
 
-        let src_size = Self::size_from_type(insn.src_typ, insn.src_size, types);
-        let dst_size = Self::size_from_type(insn.typ, insn.size, types);
-        let src_fp_size = self.fp_size_from_type(insn.src_typ, insn.src_size, types);
-        let dst_fp_size = self.fp_size_from_type(insn.typ, insn.size, types);
+        let src_size = Self::size_from_type(insn.src_typ, insn.src_size.get(), types);
+        let dst_size = Self::size_from_type(insn.typ, insn.size.get(), types);
+        let src_fp_size = self.fp_size_from_type(insn.src_typ, insn.src_size.get(), types);
+        let dst_fp_size = self.fp_size_from_type(insn.typ, insn.size.get(), types);
 
         let dst_loc = self.get_location(target);
         let dst_vreg = match &dst_loc {
@@ -940,14 +940,14 @@ impl Aarch64CodeGen {
             _ => return,
         };
 
-        let fp_size = self.fp_size_from_type(insn.typ, insn.size, types);
+        let fp_size = self.fp_size_from_type(insn.typ, insn.size.get(), types);
 
         // Get the value into a V register. V17 is a scratch V register.
         let value_loc = self.get_location(value);
         let src_vreg = match value_loc {
             Loc::VReg(v) => v,
             _ => {
-                self.emit_fp_move(value, VReg::V17, insn.typ, insn.size, types);
+                self.emit_fp_move(value, VReg::V17, insn.typ, insn.size.get(), types);
                 VReg::V17
             }
         };

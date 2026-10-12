@@ -33,6 +33,7 @@ use super::build::Builder;
 use super::facts::ConstMap;
 use super::{Function, Instruction, Opcode, PseudoId};
 use crate::types::{TypeId, TypeTable};
+use crate::units::Bits;
 
 /// The most bytes a `memcpy` or `memset` of a constant length is expanded
 /// into, and the most an aggregate copy the linearizer emits is.
@@ -78,8 +79,8 @@ impl Chunk {
         }
     }
 
-    pub(crate) fn bits(self) -> u32 {
-        self.bytes() as u32 * 8
+    pub(crate) fn bits(self) -> Bits {
+        Bits::new(self.bytes() as u32 * 8)
     }
 
     /// The unsigned integer type the chunk is moved as.
@@ -211,13 +212,13 @@ impl BlockOp {
 /// constant. Answers whether anything changed.
 pub fn run(func: &mut Function, types: &TypeTable) -> bool {
     let consts = ConstMap::new(func);
-    let size_t_bits = types.size_bits(types.ulong_id);
+    let size_t_bits = types.value_bits(types.ulong_id);
     let mut changed = false;
     for b in 0..func.blocks.len() {
         let insns = std::mem::take(&mut func.blocks[b].insns);
         let mut out = Vec::with_capacity(insns.len());
         for insn in insns {
-            match expandable(&insn, &consts, size_t_bits) {
+            match expandable(&insn, &consts, size_t_bits.get()) {
                 Some((op, n)) => {
                     Expander {
                         b: Builder::new(&mut *func, types, insn.pos, &mut out),
@@ -417,7 +418,7 @@ mod tests {
             chunk_copy(src, dst, 0, n, width_type, || PseudoId(0))
                 .iter()
                 .step_by(2)
-                .map(|i| (i.offset, i.size / 8))
+                .map(|i| (i.offset, i.size.bytes_exact()))
                 .collect::<Vec<_>>()
         };
         assert!(widths(0).is_empty());
@@ -467,7 +468,13 @@ mod tests {
             Some(n) => {
                 let k = f.create_const_pseudo(n);
                 let copy = f.alloc_pseudo();
-                bb.add_insn(Instruction::unop(Opcode::Copy, copy, k, types.ulong_id, 64));
+                bb.add_insn(Instruction::unop(
+                    Opcode::Copy,
+                    copy,
+                    k,
+                    types.ulong_id,
+                    Bits::new(64),
+                ));
                 copy
             }
             None => PseudoId(2),
@@ -482,9 +489,9 @@ mod tests {
                 .with_func(op.name())
                 .with_target(result)
                 .with_src3(PseudoId(0), second, len)
-                .with_type_and_size(vp, 64),
+                .with_type_and_size(vp, Bits::new(64)),
         );
-        bb.add_insn(Instruction::ret_typed(Some(result), vp, 64));
+        bb.add_insn(Instruction::ret_typed(Some(result), vp, Bits::new(64)));
         f.blocks.push(bb);
         f.entry = BasicBlockId(0);
         (f, types)
@@ -515,7 +522,7 @@ mod tests {
             .insns
             .iter()
             .filter(|i| i.op == Opcode::Store)
-            .map(|i| (i.offset, i.size))
+            .map(|i| (i.offset, i.size.get()))
             .collect();
         assert_eq!(widths, vec![(0, 64), (8, 64), (16, 32), (20, 16), (22, 8)]);
         // Each store is of the load just before it, from the source.
@@ -560,7 +567,7 @@ mod tests {
             .insns
             .iter()
             .filter(|i| i.op == Opcode::Store)
-            .map(|i| (i.size, val(&f, i.src[1])))
+            .map(|i| (i.size.get(), val(&f, i.src[1])))
             .collect();
         assert_eq!(
             stored,

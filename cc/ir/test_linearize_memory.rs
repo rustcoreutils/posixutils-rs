@@ -23,6 +23,7 @@ use crate::target::{Arch, Os, Target};
 use crate::types::{
     ArrayExtent, CompositeType, MemberAlign, StructMember, Type, TypeModifiers, TypeTable,
 };
+use crate::units::Bits;
 
 // Static local variables
 
@@ -1141,7 +1142,7 @@ fn test_zero_sized_aggregate_is_never_loaded_or_stored() {
     let func = module.functions.iter().find(|f| f.name == "f").expect("f");
     for insn in func.blocks.iter().flat_map(|bb| bb.insns.iter()) {
         if matches!(insn.op, Opcode::Load | Opcode::Store) {
-            assert!(insn.size > 0, "a zero-width access: {insn:?}");
+            assert!(insn.size > Bits::new(0), "a zero-width access: {insn:?}");
         }
     }
 }

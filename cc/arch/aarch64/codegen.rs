@@ -28,6 +28,7 @@ use crate::float::FloatVal;
 use crate::ir::{Instruction, Module, Opcode, PseudoId, PseudoKind};
 use crate::target::{Os, Target};
 use crate::types::{TypeId, TypeTable};
+use crate::units::Bits;
 use std::collections::{HashMap, HashSet};
 
 // AArch64 Code Generator
@@ -407,7 +408,11 @@ impl Aarch64CodeGen {
                 return true;
             }
             Loc::VReg(v) => {
-                let bit_size = if insn.size == 0 { 64 } else { insn.size };
+                let bit_size = if insn.size == Bits::new(0) {
+                    64
+                } else {
+                    insn.size.get()
+                };
                 let fp_size = if bit_size <= 32 {
                     FpSize::Single
                 } else {
@@ -456,7 +461,7 @@ impl Aarch64CodeGen {
         let switch_size = insn
             .typ
             .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.max(32));
+            .unwrap_or(insn.size.get().max(32));
         let op_size = OperandSize::from_bits(switch_size);
 
         // Move switch value to scratch0
@@ -670,7 +675,7 @@ impl Aarch64CodeGen {
                         match self.locations.get(target) {
                             Some(Loc::Reg(r)) => {
                                 if let PseudoKind::Val(v) = &pseudo.kind {
-                                    self.emit_mov_imm(r, *v as i64, insn.size);
+                                    self.emit_mov_imm(r, *v as i64, insn.size.get());
                                 }
                             }
                             Some(Loc::VReg(v)) => {
@@ -680,7 +685,7 @@ impl Aarch64CodeGen {
                                     // here and was loaded as a double's bits
                                     // into a binary128 register.
                                     let fp_size =
-                                        self.fp_size_from_type(insn.typ, insn.size, types);
+                                        self.fp_size_from_type(insn.typ, insn.size.get(), types);
                                     let (lo, hi) = super::float::fp_const_bits(*f, fp_size);
                                     self.emit_fp_bits(lo, hi, fp_size, v);
                                 }
@@ -694,7 +699,7 @@ impl Aarch64CodeGen {
             Opcode::Copy => {
                 if let (Some(target), Some(&src)) = (insn.target, insn.src.first()) {
                     // Pass the type for proper sign/zero extension
-                    self.emit_copy_with_type(src, target, insn.size, insn.typ, types);
+                    self.emit_copy_with_type(src, target, insn.size.get(), insn.typ, types);
                 }
             }
 

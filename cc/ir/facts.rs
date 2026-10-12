@@ -106,7 +106,7 @@ impl ConstMap {
                     continue;
                 }
                 if let Some(target) = insn.target {
-                    let entry = (insn.src[0], insn.size.max(1));
+                    let entry = (insn.src[0], insn.size.get().max(1));
                     if let Some(prev) = copies.insert(target, entry) {
                         if prev != entry {
                             poisoned.push(target);
@@ -333,7 +333,7 @@ impl CmpFacts {
         if insn.src.len() != 2 {
             return;
         }
-        let width = insn.operand_width();
+        let width = insn.operand_width().get();
         self.facts.insert(
             target,
             CmpFact {
@@ -579,6 +579,7 @@ mod tests {
     use crate::ir::{BasicBlock, BasicBlockId, Instruction, Pseudo};
     use crate::target::Target;
     use crate::types::TypeTable;
+    use crate::units::Bits;
 
     /// `%1 = $v`; `%2 = copy.<copy_bits> %1`; `%3 = trunc.<trunc_bits> %2`;
     /// `%4 = setlt.32 %2, %5` and `%6 = copy.32 %4`, with `%5` an argument.
@@ -593,25 +594,25 @@ mod tests {
         let mut copy = Instruction::new(Opcode::Copy)
             .with_target(PseudoId(2))
             .with_src(PseudoId(1));
-        copy.size = copy_bits;
+        copy.size = Bits::new(copy_bits);
         bb.add_insn(copy);
         let mut trunc = Instruction::new(Opcode::Trunc)
             .with_target(PseudoId(3))
             .with_src(PseudoId(2));
-        trunc.size = trunc_bits;
-        trunc.src_size = copy_bits;
+        trunc.size = Bits::new(trunc_bits);
+        trunc.src_size = Bits::new(copy_bits);
         bb.add_insn(trunc);
         bb.add_insn(Instruction::compare(
             Opcode::SetLt,
             PseudoId(4),
             (PseudoId(2), PseudoId(5)),
-            (int, 32),
-            (int, 32),
+            (int, Bits::new(32)),
+            (int, Bits::new(32)),
         ));
         let mut copy = Instruction::new(Opcode::Copy)
             .with_target(PseudoId(6))
             .with_src(PseudoId(4));
-        copy.size = 32;
+        copy.size = Bits::new(32);
         bb.add_insn(copy);
         bb.add_insn(Instruction::ret(None));
         f.add_block(bb);
@@ -700,7 +701,7 @@ mod tests {
                 PseudoId(2),
                 "=r",
                 crate::target::Arch::X86_64,
-                32,
+                Bits::new(32),
             )],
             inputs: vec![],
             clobbers: vec![],

@@ -16,13 +16,14 @@ use crate::arch::codegen::UnaryOp;
 use crate::arch::lir::{CondCode, Directive, OperandSize};
 use crate::ir::{Instruction, Opcode, PseudoId};
 use crate::types::TypeTable;
+use crate::units::Bits;
 
 impl Aarch64CodeGen {
     pub(super) fn emit_binop(&mut self, insn: &Instruction, types: &TypeTable) {
         let size = insn
             .typ
             .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.max(32));
+            .unwrap_or(insn.size.get().max(32));
 
         // 128-bit shifts are still handled by the backend (mapping pass doesn't expand them)
         if size == 128 {
@@ -134,7 +135,7 @@ impl Aarch64CodeGen {
         let size = insn
             .typ
             .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.max(32));
+            .unwrap_or(insn.size.get().max(32));
 
         let op_size = OperandSize::from_bits(size);
         let src = match insn.src.first() {
@@ -174,7 +175,7 @@ impl Aarch64CodeGen {
         let size = insn
             .typ
             .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.max(32));
+            .unwrap_or(insn.size.get().max(32));
 
         let op_size = OperandSize::from_bits(size);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
@@ -210,7 +211,7 @@ impl Aarch64CodeGen {
         let size = insn
             .typ
             .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.max(32));
+            .unwrap_or(insn.size.get().max(32));
 
         let op_size = OperandSize::from_bits(size);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
@@ -271,7 +272,7 @@ impl Aarch64CodeGen {
         let size = insn
             .operand_type()
             .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.operand_width().max(32));
+            .unwrap_or(insn.operand_width().get().max(32));
 
         let op_size = OperandSize::from_bits(size);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
@@ -343,7 +344,7 @@ impl Aarch64CodeGen {
         };
 
         // Handle truncation FROM 128-bit (Zext/Sext TO 128 handled by mapping pass)
-        if insn.src_size == 128 && insn.op == Opcode::Trunc {
+        if insn.src_size == Bits::new(128) && insn.op == Opcode::Trunc {
             self.emit_int128_trunc(insn);
             return;
         }
@@ -358,7 +359,7 @@ impl Aarch64CodeGen {
             Opcode::Zext => {
                 // Zero extend: use uxtb, uxth, or just mov for 32->64
                 self.emit_move(src, dst_reg, 64);
-                match insn.src_size {
+                match insn.src_size.get() {
                     8 => {
                         self.push_lir(Aarch64Inst::Uxtb {
                             src: dst_reg,
@@ -391,7 +392,7 @@ impl Aarch64CodeGen {
             Opcode::Sext => {
                 // Sign extend: use sxtb, sxth, sxtw based on source size
                 self.emit_move(src, dst_reg, 64);
-                match insn.src_size {
+                match insn.src_size.get() {
                     8 => {
                         self.push_lir(Aarch64Inst::Sxtb {
                             dst_size: OperandSize::B64,
@@ -428,7 +429,7 @@ impl Aarch64CodeGen {
                 // it reads -61.
                 self.emit_move(src, dst_reg, 64);
                 let signed = insn.typ.is_some_and(|t| !types.is_unsigned(t));
-                match insn.size {
+                match insn.size.get() {
                     8 if signed => {
                         self.push_lir(Aarch64Inst::Sxtb {
                             dst_size: OperandSize::B32,
@@ -478,7 +479,7 @@ impl Aarch64CodeGen {
         }
 
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, insn.size);
+            self.emit_move_to_loc(dst_reg, &dst_loc, insn.size.get());
         }
     }
 
@@ -901,7 +902,7 @@ impl Aarch64CodeGen {
         // Truncate from 128: just take lo half (or part of it)
         self.load_int128(src, Reg::X9, Reg::X10);
         // X9 has lo half, which is what we want
-        let target_size = insn.size;
+        let target_size = insn.size.get();
         let dst_loc = self.get_location(target);
         let dst_reg = match &dst_loc {
             Loc::Reg(r) => *r,

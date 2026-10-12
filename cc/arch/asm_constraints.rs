@@ -889,6 +889,7 @@ impl<R: Copy + Ord> InstrConstraints<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::units::Bits;
     use AsmRegClass::*;
 
     fn x86(s: &str) -> AsmOperandClass {
@@ -1286,7 +1287,7 @@ mod tests {
     }
 
     fn operand(pseudo: u32, constraint: &str) -> crate::ir::AsmConstraint {
-        crate::ir::AsmConstraint::new(PseudoId(pseudo), constraint, Arch::X86_64, 64)
+        crate::ir::AsmConstraint::new(PseudoId(pseudo), constraint, Arch::X86_64, Bits::new(64))
     }
 
     #[test]

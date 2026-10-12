@@ -54,8 +54,8 @@ impl X86_64CodeGen {
         // The memory operand must be exactly as wide as the object; widening
         // it to 32 bits made an 8- or 16-bit atomic read-modify-write touch
         // its neighbours. Register moves still use at least 32 bits.
-        let mem_size = insn.size;
-        let size = insn.size.max(32);
+        let mem_size = insn.size.get();
+        let size = insn.size.get().max(32);
         let op_size = OperandSize::from_bits(mem_size);
 
         // XCHG is a store with a full barrier; anything weaker is a plain
@@ -88,8 +88,8 @@ impl X86_64CodeGen {
         // The memory operand must be exactly as wide as the object; widening
         // it to 32 bits made an 8- or 16-bit atomic read-modify-write touch
         // its neighbours. Register moves still use at least 32 bits.
-        let mem_size = insn.size;
-        let size = insn.size.max(32);
+        let mem_size = insn.size.get();
+        let size = insn.size.get().max(32);
         let op_size = OperandSize::from_bits(mem_size);
 
         let value_loc = self.get_location(value);
@@ -128,8 +128,8 @@ impl X86_64CodeGen {
         let desired = insn.src[2];
         // As above: the compare-and-exchange must be exactly as wide as the
         // object, or it reads and writes adjacent bytes.
-        let mem_size = insn.size;
-        let size = insn.size.max(32);
+        let mem_size = insn.size.get();
+        let size = insn.size.get().max(32);
 
         let op_size = OperandSize::from_bits(mem_size);
 
@@ -206,7 +206,7 @@ impl X86_64CodeGen {
     /// signedness rule `emit_load` uses, so `_Atomic signed char` reads back
     /// negative rather than as a large positive.
     fn extend_narrow_atomic_result(&mut self, insn: &Instruction, types: &TypeTable) {
-        let mem_size = insn.size;
+        let mem_size = insn.size.get();
         if mem_size >= 32 {
             return;
         }
@@ -238,8 +238,8 @@ impl X86_64CodeGen {
         // The memory operand must be exactly as wide as the object; widening
         // it to 32 bits made an 8- or 16-bit atomic read-modify-write touch
         // its neighbours. Register moves still use at least 32 bits.
-        let mem_size = insn.size;
-        let size = insn.size.max(32);
+        let mem_size = insn.size.get();
+        let size = insn.size.get().max(32);
         let op_size = OperandSize::from_bits(mem_size);
 
         let value_loc = self.get_location(value);
@@ -278,8 +278,8 @@ impl X86_64CodeGen {
         // The memory operand must be exactly as wide as the object; widening
         // it to 32 bits made an 8- or 16-bit atomic read-modify-write touch
         // its neighbours. Register moves still use at least 32 bits.
-        let mem_size = insn.size;
-        let size = insn.size.max(32);
+        let mem_size = insn.size.get();
+        let size = insn.size.get().max(32);
         let op_size = OperandSize::from_bits(mem_size);
 
         let value_loc = self.get_location(value);
@@ -335,8 +335,8 @@ impl X86_64CodeGen {
         // The memory operand must be exactly as wide as the object; widening
         // it to 32 bits made an 8- or 16-bit atomic read-modify-write touch
         // its neighbours. Register moves still use at least 32 bits.
-        let mem_size = insn.size;
-        let size = insn.size.max(32);
+        let mem_size = insn.size.get();
+        let size = insn.size.get().max(32);
         let op_size = OperandSize::from_bits(mem_size);
 
         let value_loc = self.get_location(value);

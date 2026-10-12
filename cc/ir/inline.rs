@@ -17,6 +17,7 @@ use super::{
 };
 use crate::opt::Optimization;
 use crate::types::TypeId;
+use crate::units::Bits;
 use std::collections::{HashMap, HashSet};
 
 // Inlining Constants
@@ -688,7 +689,7 @@ struct InlineContext<'a> {
     /// must agree on type/size; we capture once and reuse for the Phi.
     ret_typ: Option<TypeId>,
     /// Size (in bits) captured from the first cloned `Ret`.
-    ret_size: u32,
+    ret_size: Bits,
     /// Pseudos allocated while lowering a cloned `Ret`: the PhiSource target
     /// of a value return, and the temporaries that carry an aggregate handed
     /// back by address into the result local. Added to the caller alongside
@@ -749,7 +750,7 @@ impl<'a> InlineContext<'a> {
             current_callee_bb: None,
             ret_arms: Vec::new(),
             ret_typ: None,
-            ret_size: 0,
+            ret_size: Bits::ZERO,
             ret_pseudos: Vec::new(),
             const_pseudos: Vec::new(),
         };
@@ -1019,21 +1020,21 @@ fn clone_ret(
                 // it disagreed with the *load* in
                 // `emit_reg_aggregate_return`, which has always narrowed the
                 // high half to `min(64, struct_size - 64)`.
-                let high_bits = match insn.size.checked_sub(64) {
+                let high_bits = Bits::new(match insn.size.get().checked_sub(64) {
                     Some(rest) if rest > 0 => rest.min(64),
                     // Two registers means more than eight bytes, so
                     // this is not a shape `emit_reg_aggregate_return`
                     // produces. Keep the old width rather than emit a
                     // store of no bits at all.
                     _ => 64,
-                };
+                });
 
                 let mut store_low = Instruction::store(
                     remapped_low,
                     target,
                     0,
                     insn.typ.unwrap_or(TypeId::INVALID),
-                    64,
+                    Bits::new(64),
                 );
                 store_low.pos = insn.pos;
                 result.push(store_low);
@@ -1093,7 +1094,7 @@ fn clone_ret(
                     src_addr,
                     target,
                     0,
-                    i64::from(insn.size / 8),
+                    i64::from(insn.size.bytes_exact()),
                     |_| typ,
                     || {
                         let temp = ctx.alloc_pseudo_id();
@@ -1400,7 +1401,7 @@ fn implicit_param_copy(
             local,
             0,
             copy.qword_type,
-            bits,
+            Bits::new(bits),
         )];
     }
 
@@ -1463,7 +1464,7 @@ fn alloca_stack_mark(ctx: &mut InlineContext, callee: &Function) -> Option<Stack
 struct StackMark {
     pseudo: PseudoId,
     typ: TypeId,
-    size: u32,
+    size: Bits,
 }
 
 /// Save the stack pointer into `mark` just before the call block's branch
@@ -2376,7 +2377,7 @@ mod tests {
                 vec![],
                 vec![],
                 types.int_id,
-                32,
+                Bits::new(32),
             ));
         }
         bb.add_insn(Instruction::ret(None));
@@ -2532,7 +2533,7 @@ mod tests {
                 vec![],
                 vec![],
                 types.int_id,
-                32,
+                Bits::new(32),
             ));
         }
         bb.add_insn(Instruction::ret(None));
@@ -2614,7 +2615,7 @@ mod tests {
                 PseudoId(1),
                 "m",
                 Target::host().arch,
-                32,
+                Bits::new(32),
             )],
             clobbers: Vec::new(),
             goto_labels: Vec::new(),
@@ -2818,7 +2819,7 @@ mod tests {
             PseudoId(1),
             0,
             types.int_id,
-            32,
+            Bits::new(32),
         ));
         bb.add_insn(Instruction::ret(None));
         main_func.add_block(bb);
@@ -3196,11 +3197,11 @@ mod tests {
                 (4294967296, 4294967296, BasicBlockId(2)),
             ],
             Some(BasicBlockId(3)),
-            64,
+            Bits::new(64),
         );
         sw.typ = Some(types.ulong_id);
         let cbr = Instruction::cbr(PseudoId(0), BasicBlockId(1), BasicBlockId(2));
-        let mut phi = Instruction::phi(PseudoId(1), types.int_id, 32);
+        let mut phi = Instruction::phi(PseudoId(1), types.int_id, Bits::new(32));
         phi.phi_list = vec![
             (BasicBlockId(1), PseudoId(0)),
             (BasicBlockId(2), PseudoId(0)),
@@ -3213,7 +3214,7 @@ mod tests {
                 PseudoId(0),
                 "r",
                 Target::host().arch,
-                32,
+                Bits::new(32),
             )],
             clobbers: Vec::new(),
             goto_labels: vec![(BasicBlockId(3), "out".to_string())],
@@ -3268,7 +3269,7 @@ mod tests {
         lab.insns.push(Instruction::ret_typed(
             Some(PseudoId(1)),
             types.void_ptr_id,
-            64,
+            Bits::new(64),
         ));
         callee.add_block(lab);
         callee.entry = BasicBlockId(0);
@@ -3324,7 +3325,7 @@ mod tests {
             vec![PseudoId(0)],
             vec![types.void_ptr_id],
             types.void_id,
-            0,
+            Bits::new(0),
         ));
         cb.insns.push(Instruction::ret(None));
         caller.add_block(cb);
@@ -3339,7 +3340,7 @@ mod tests {
             .iter()
             .flat_map(|b| b.insns.iter())
             .filter(|i| matches!(i.op, Opcode::Load | Opcode::Store))
-            .map(|i| (i.op, i.offset, i.size))
+            .map(|i| (i.op, i.offset, i.size.get()))
             .collect();
         assert_eq!(
             moves,
@@ -3373,7 +3374,8 @@ mod tests {
             PseudoId(0),
             types.long_id,
         ));
-        let mut ret_insn = Instruction::ret_typed(Some(PseudoId(1)), types.long_id, size_bits);
+        let mut ret_insn =
+            Instruction::ret_typed(Some(PseudoId(1)), types.long_id, Bits::new(size_bits));
         ret_insn.extra_mut().abi_info = Some(Box::new(crate::ir::CallAbiInfo::new(vec![], ret)));
         bb.insns.push(ret_insn);
         callee.add_block(bb);
@@ -3447,7 +3449,7 @@ mod tests {
                 vec![],
                 vec![],
                 types.long_id,
-                size_bits,
+                Bits::new(size_bits),
             ));
             cb.insns.push(Instruction::ret(None));
             caller.add_block(cb);
@@ -3462,7 +3464,7 @@ mod tests {
             let moves: Vec<(Opcode, i64, u32)> = insns
                 .iter()
                 .filter(|i| matches!(i.op, Opcode::Load | Opcode::Store))
-                .map(|i| (i.op, i.offset, i.size))
+                .map(|i| (i.op, i.offset, i.size.get()))
                 .collect();
             assert_eq!(moves, want, "{what}");
 
@@ -3508,13 +3510,13 @@ mod tests {
                 vec![],
                 vec![],
                 types.void_ptr_id,
-                64,
+                Bits::new(64),
             ));
         }
         bb.insns.push(Instruction::ret_typed(
             Some(PseudoId(1)),
             types.void_ptr_id,
-            64,
+            Bits::new(64),
         ));
         caller.add_block(bb);
         caller.entry = BasicBlockId(0);
@@ -3686,7 +3688,8 @@ int caller(void) { return lib() + attr() + plain(); }
 
         // Build a PhiSource instruction to clone:
         // %1 = phisrc %0, back-pointer → (bb5, %2)
-        let mut phisrc = Instruction::phi_source(PseudoId(1), PseudoId(0), types.int_id, 32);
+        let mut phisrc =
+            Instruction::phi_source(PseudoId(1), PseudoId(0), types.int_id, Bits::new(32));
         phisrc.phi_list = vec![(BasicBlockId(5), PseudoId(2))];
 
         let cloned = clone_instruction(&mut ctx, &phisrc, &callee);
@@ -3719,7 +3722,7 @@ int caller(void) { return lib() + attr() + plain(); }
 
         // Verify type and size preserved
         assert_eq!(cloned_insn.typ, Some(types.int_id));
-        assert_eq!(cloned_insn.size, 32);
+        assert_eq!(cloned_insn.size, Bits::new(32));
     }
 
     /// A function of `adds` additions and a `ret`, and `calls` calls to
@@ -3740,7 +3743,7 @@ int caller(void) { return lib() + attr() + plain(); }
                 PseudoId(0),
                 PseudoId(0),
                 int,
-                32,
+                Bits::new(32),
             ));
         }
         for _ in 0..calls {
@@ -3750,7 +3753,7 @@ int caller(void) { return lib() + attr() + plain(); }
                 vec![],
                 vec![],
                 types.void_id,
-                0,
+                Bits::new(0),
             ));
         }
         bb.insns.push(Instruction::ret(Some(PseudoId(0))));

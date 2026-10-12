@@ -309,7 +309,7 @@ fn block(b: &mut Builder, ctx: &FoldCtx, op: BlockOp, dest: PseudoId, second: Ps
             .with_func(callee)
             .with_target(result)
             .with_src3(dest, second, n)
-            .with_type_and_size(void_ptr, b.types.size_bits(void_ptr)),
+            .with_type_and_size(void_ptr, b.types.value_bits(void_ptr)),
     );
 }
 

@@ -17,6 +17,7 @@ use crate::float::{FloatVal, FpFormat};
 use crate::ir::{Function, Initializer, Instruction, Module, Opcode, Pseudo, PseudoId};
 use crate::target::{Os, Target};
 use crate::types::TypeTable;
+use crate::units::Bits;
 
 // Shared Helper Types
 
@@ -2057,7 +2058,7 @@ impl SelectOperands {
             width: insn
                 .typ
                 .map(|t| types.size_bits(t).max(32))
-                .unwrap_or(insn.size.max(32)),
+                .unwrap_or(insn.size.get().max(32)),
         })
     }
 }
@@ -2081,8 +2082,8 @@ impl ValueWidths {
                 .map(|(p, t)| (p, types.size_bits(t)))
                 .collect();
         for insn in func.blocks.iter().flat_map(|b| &b.insns) {
-            if let Some(t) = insn.target.filter(|_| insn.size > 0) {
-                widths.insert(t, insn.size);
+            if let Some(t) = insn.target.filter(|_| insn.size > Bits::new(0)) {
+                widths.insert(t, insn.size.get());
             }
         }
         ValueWidths(widths)

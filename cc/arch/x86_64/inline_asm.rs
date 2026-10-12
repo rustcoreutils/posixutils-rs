@@ -282,7 +282,7 @@ impl X86_64CodeGen {
         // Process output operands (they go first: %0, %1, etc.)
         for (idx, output) in asm_data.outputs.iter().enumerate() {
             let loc = self.get_location(output.pseudo);
-            let op_size = output.size;
+            let op_size = output.size.get();
             let op_name = output.name.clone();
             // Helper to build the slot with the shared per-operand
             // context already filled in. Each branch supplies the
@@ -465,7 +465,7 @@ impl X86_64CodeGen {
         let mut hidden: Vec<usize> = Vec::new();
         // Process input operands
         for (input_idx, input) in asm_data.inputs.iter().enumerate() {
-            let op_size = input.size;
+            let op_size = input.size.get();
 
             // Handle matching constraints - use the matched output's location/register
             let loc = match input.matching_output {
@@ -551,11 +551,11 @@ impl X86_64CodeGen {
                     if let Some(slot) = x87_slot(class) {
                         let depth = Self::x87_depth(slot, x87_slots);
                         let name = Self::x87_slot_name(depth);
-                        if Self::x87_input_home(&loc, input.size) {
+                        if Self::x87_input_home(&loc, input.size.get()) {
                             x87_pushes.push(X87Operand {
                                 depth,
                                 pseudo: input.pseudo,
-                                size: input.size,
+                                size: input.size.get(),
                             });
                         } else {
                             crate::diag::error(

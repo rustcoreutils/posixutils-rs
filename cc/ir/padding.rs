@@ -33,6 +33,7 @@ use crate::ir::Access;
 use crate::parse::ast::Expr;
 use crate::strings::StringId;
 use crate::types::{TypeId, TypeKind, TypeTable};
+use crate::units::Bits;
 
 /// Which bits of each byte of an object of type `typ` belong to a member:
 /// one mask per byte, a bit set where some member keeps a value. Every other
@@ -270,7 +271,7 @@ impl Linearizer<'_> {
             count,
             size,
             ulong,
-            64,
+            Bits::new(64),
         ));
         let end = self.alloc_pseudo();
         self.emit(Instruction::binop(
@@ -279,23 +280,23 @@ impl Linearizer<'_> {
             base,
             bytes,
             ptr_type,
-            64,
+            Bits::new(64),
         ));
         let cursor = self.frame_temp("__clear_padding", ptr_type);
-        self.emit(Instruction::store(base, cursor, 0, ptr_type, 64));
+        self.emit(Instruction::store(base, cursor, 0, ptr_type, Bits::new(64)));
 
         let (cond_bb, body_bb, exit_bb) = (self.alloc_bb(), self.alloc_bb(), self.alloc_bb());
         self.branch_to(cond_bb);
         self.switch_bb(cond_bb);
         let cur = self.alloc_pseudo();
-        self.emit(Instruction::load(cur, cursor, 0, ptr_type, 64));
+        self.emit(Instruction::load(cur, cursor, 0, ptr_type, Bits::new(64)));
         let more = self.alloc_pseudo();
         self.emit(Instruction::compare(
             Opcode::SetB,
             more,
             (cur, end),
-            (ptr_type, 64),
-            (self.types.int_id, 32),
+            (ptr_type, Bits::new(64)),
+            (self.types.int_id, Bits::new(32)),
         ));
         self.emit(Instruction::cbr(more, body_bb, exit_bb));
         self.link_bb(cond_bb, body_bb);
@@ -303,7 +304,7 @@ impl Linearizer<'_> {
 
         self.switch_bb(body_bb);
         let cur = self.alloc_pseudo();
-        self.emit(Instruction::load(cur, cursor, 0, ptr_type, 64));
+        self.emit(Instruction::load(cur, cursor, 0, ptr_type, Bits::new(64)));
         self.emit_padding_ops(cur, ops, access);
         let next = self.alloc_pseudo();
         self.emit(Instruction::binop(
@@ -312,9 +313,9 @@ impl Linearizer<'_> {
             cur,
             size,
             ptr_type,
-            64,
+            Bits::new(64),
         ));
-        self.emit(Instruction::store(next, cursor, 0, ptr_type, 64));
+        self.emit(Instruction::store(next, cursor, 0, ptr_type, Bits::new(64)));
         self.branch_to(cond_bb);
         self.switch_bb(exit_bb);
     }
@@ -338,11 +339,22 @@ impl Linearizer<'_> {
                 PaddingOp::Mask { at, keep } => {
                     let at = at as i64;
                     let byte = self.alloc_pseudo();
-                    self.emit(Instruction::load(byte, base, at, uchar, 8).with_access(access));
+                    self.emit(
+                        Instruction::load(byte, base, at, uchar, Bits::new(8)).with_access(access),
+                    );
                     let mask = self.emit_const(i128::from(keep), uchar);
                     let kept = self.alloc_pseudo();
-                    self.emit(Instruction::binop(Opcode::And, kept, byte, mask, uchar, 8));
-                    self.emit(Instruction::store(kept, base, at, uchar, 8).with_access(access));
+                    self.emit(Instruction::binop(
+                        Opcode::And,
+                        kept,
+                        byte,
+                        mask,
+                        uchar,
+                        Bits::new(8),
+                    ));
+                    self.emit(
+                        Instruction::store(kept, base, at, uchar, Bits::new(8)).with_access(access),
+                    );
                 }
             }
         }
@@ -560,11 +572,18 @@ mod tests {
                         .iter()
                         .find(|i| i.op == Opcode::Store && i.src.get(1) == insn.target.as_ref())
                         .unwrap();
-                    assert_eq!(store.size, 8, "a partial byte is stored as a byte");
+                    assert_eq!(
+                        store.size,
+                        Bits::new(8),
+                        "a partial byte is stored as a byte"
+                    );
                     masks.push((store.offset, mask));
                 }
                 Opcode::Store if func.const_val(insn.src[1]) == Some(0) => {
-                    zeros.push((base_offset(insn.src[0]) + insn.offset, insn.size / 8));
+                    zeros.push((
+                        base_offset(insn.src[0]) + insn.offset,
+                        insn.size.bytes_exact(),
+                    ));
                 }
                 _ => {}
             }

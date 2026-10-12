@@ -22,6 +22,7 @@ use crate::parse::ast::{
 use crate::strings::StringTable;
 use crate::target::{Arch, Os, Target};
 use crate::types::{CompositeType, MemberAlign, StructMember, Type, TypeModifiers, TypeTable};
+use crate::units::Bits;
 
 // C99 6.7.8p14: a scalar initializes the first array element.
 
@@ -1871,7 +1872,7 @@ fn test_complex_struct_member_init_stores_both_halves() {
         .iter()
         .flat_map(|b| b.insns.iter())
         .filter(|i| i.op == Opcode::Store)
-        .filter(|i| i.size == 64)
+        .filter(|i| i.size == Bits::new(64))
         .map(|i| i.offset)
         .collect();
 
@@ -1888,7 +1889,7 @@ fn test_complex_struct_member_init_stores_both_halves() {
             .blocks
             .iter()
             .flat_map(|b| b.insns.iter())
-            .any(|i| i.op == Opcode::Store && i.size == 128),
+            .any(|i| i.op == Opcode::Store && i.size == Bits::new(128)),
         "a complex member must not be stored as one 128-bit value: {}",
         module.display(&ctx.types)
     );
@@ -1921,7 +1922,7 @@ fn stores_of(module: &Module, name: &str) -> Vec<(i64, u32, Option<i128>)> {
     insns_of(module, name)
         .iter()
         .filter(|i| i.op == Opcode::Store)
-        .map(|i| (i.offset, i.size, const_of(module, name, i.src[1])))
+        .map(|i| (i.offset, i.size.get(), const_of(module, name, i.src[1])))
         .collect()
 }
 

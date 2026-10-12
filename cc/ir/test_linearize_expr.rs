@@ -21,6 +21,7 @@ use crate::parse::ast::{
 use crate::strings::StringTable;
 use crate::target::{Arch, Os, Target};
 use crate::types::{CompositeType, MemberAlign, StructMember, Type, TypeTable};
+use crate::units::Bits;
 
 // Unary operation tests
 
@@ -1240,8 +1241,8 @@ fn test_bool_is_an_unsigned_type_for_bitfield_extension() {
     // The storage unit a one-byte `_Bool` field is read through is unsigned
     // either way, so the extension decision rests entirely on the member type.
     assert_eq!(
-        types.size_bits(types.bool_id),
-        8,
+        types.value_bits(types.bool_id),
+        Bits::new(8),
         "a _Bool bitfield is backed by a one-byte unit"
     );
 }
@@ -1607,14 +1608,18 @@ fn test_function_and_array_convert_from_their_address() {
                 .iter()
                 .find(|i| i.op == Opcode::SetNe)
                 .unwrap_or_else(|| panic!("{f}: no comparison\n{body:?}"));
-            assert_eq!(test.operand_width(), 64, "{f}: {test:?}");
+            assert_eq!(test.operand_width(), Bits::new(64), "{f}: {test:?}");
         }
         let body = insns("fn_int");
         let trunc = body
             .iter()
             .find(|i| i.op == Opcode::Trunc)
             .unwrap_or_else(|| panic!("fn_int: no truncation\n{body:?}"));
-        assert_eq!((trunc.src_size, trunc.size), (64, 32), "{trunc:?}");
+        assert_eq!(
+            (trunc.src_size.get(), trunc.size.get()),
+            (64, 32),
+            "{trunc:?}"
+        );
         for (global, sym) in [("file_long", "h"), ("file_arr", "arr")] {
             let def = module.globals.iter().find(|g| g.name == global).unwrap();
             assert!(
@@ -1770,10 +1775,10 @@ fn test_bool_conversion_compares_at_the_operand_width() {
         .expect("a _Bool conversion compares against zero");
     assert_eq!(
         cmp.operand_width(),
-        64,
+        Bits::new(64),
         "the compare reads its operand at its own width, not _Bool's"
     );
-    assert_eq!(cmp.size, 8, "and produces the _Bool");
+    assert_eq!(cmp.size, Bits::new(8), "and produces the _Bool");
 }
 
 /// An explicit cast to `_Bool` from a floating type takes the same rule, and
@@ -1863,8 +1868,13 @@ fn test_bit_counts_record_their_operand() {
             64
         };
         assert_eq!(insn.typ, Some(types.int_id), "{:?}", insn.op);
-        assert_eq!(insn.size, 32, "{:?}: the count is an int", insn.op);
-        assert_eq!(insn.operand_width(), operand, "{:?}", insn.op);
+        assert_eq!(
+            insn.size,
+            Bits::new(32),
+            "{:?}: the count is an int",
+            insn.op
+        );
+        assert_eq!(insn.operand_width(), Bits::new(operand), "{:?}", insn.op);
         assert!(insn.src_typ.is_some(), "{:?}", insn.op);
     }
 }

@@ -62,6 +62,7 @@ use crate::diag::Position;
 use crate::float::{FloatVal, IntegerRounding, IntegralRounding};
 use crate::target::Target;
 use crate::types::{AddressSpace, TypeId, TypeTable};
+use crate::units::Bits;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -102,7 +103,7 @@ impl CallAbiInfo {
     }
 }
 
-/// Whether an aggregate of `size_bits` returned in class `ret` is handed back
+/// Whether an aggregate `width` bits wide returned in class `ret` is handed back
 /// by *address*: the `Ret` carries a pointer to the value's storage rather
 /// than the value, and whoever consumes the return has to read the bytes out.
 ///
@@ -130,9 +131,9 @@ impl CallAbiInfo {
 /// drifted: the flag omitted the one-SSE case, so a `struct { __float128 a; }`
 /// return reported a value-carrying `Ret`, the inliner spliced the body in and
 /// phi-ed the callee's local *address* as though it were the aggregate.
-pub fn aggregate_ret_is_address(ret: &ArgClass, size_bits: u32) -> bool {
+pub fn aggregate_ret_is_address(ret: &ArgClass, width: Bits) -> bool {
     use crate::abi::RegClass;
-    size_bits > 64
+    width > Bits::new(64)
         && match ret {
             ArgClass::X87 { .. } | ArgClass::Hfa { .. } => true,
             ArgClass::Direct { classes, .. } => classes.as_slice() == [RegClass::Sse],
@@ -299,7 +300,7 @@ pub fn conversion_raises_fp(types: &TypeTable, from: TypeId, to: TypeId) -> bool
     match (types.fp_format(from), types.fp_format(to)) {
         (Some(f), Some(t)) => !t.holds(f),
         (Some(_), None) => types.is_integer(to),
-        (None, Some(t)) => !t.holds_integer(types.size_bits(from), !types.is_unsigned(from)),
+        (None, Some(t)) => !t.holds_integer(types.value_bits(from).get(), !types.is_unsigned(from)),
         (None, None) => false,
     }
 }
@@ -1718,8 +1719,8 @@ pub struct AsmConstraint {
     /// What the constraint allows, classified once for the target. Every
     /// question about the operand's letters is answered from here.
     pub class: AsmOperandClass,
-    /// Size of the operand in bits (8, 16, 32, 64), derived from the C type
-    pub size: u32,
+    /// Width of the operand (8, 16, 32, 64 bits), derived from the C type
+    pub size: Bits,
     /// For a memory operand whose `pseudo` is a `Sym` -- the object itself,
     /// not an address held in a value -- the byte offset into that object.
     /// Zero otherwise.
@@ -1742,7 +1743,7 @@ impl AsmConstraint {
     /// An operand of `constraint` on `arch`, `size` bits wide, with no name,
     /// matching output or object offset.
     #[cfg(test)]
-    pub fn new(pseudo: PseudoId, constraint: &str, arch: crate::target::Arch, size: u32) -> Self {
+    pub fn new(pseudo: PseudoId, constraint: &str, arch: crate::target::Arch, size: Bits) -> Self {
         Self {
             pseudo,
             name: None,
@@ -1910,12 +1911,12 @@ pub struct Instruction {
     pub offset: i64,
     /// For phi nodes: list of (bb, pseudo) pairs
     pub phi_list: Vec<(BasicBlockId, PseudoId)>,
-    /// Bit size of the result -- for every opcode.
-    pub size: u32,
-    /// Bit size of the operands, for an opcode whose operands are of another
-    /// type than its result ([`Opcode::reads_another_type`]); 0 otherwise.
+    /// Width of the result -- for every opcode.
+    pub size: Bits,
+    /// Width of the operands, for an opcode whose operands are of another
+    /// type than its result ([`Opcode::reads_another_type`]); zero otherwise.
     /// Read it through [`Instruction::operand_width`].
-    pub src_size: u32,
+    pub src_size: Bits,
     /// Source type for conversion operations (interned TypeId)
     pub src_typ: Option<TypeId>,
     /// Source position for debug info
@@ -2057,8 +2058,8 @@ impl Default for Instruction {
             bb_false: None,
             offset: 0,
             phi_list: Vec::new(),
-            size: 0,
-            src_size: 0,
+            size: Bits::new(0),
+            src_size: Bits::new(0),
             src_typ: None,
             pos: None,
             is_volatile: false,
@@ -2199,7 +2200,7 @@ impl Instruction {
     }
 
     /// Set type and size together (convenience for callers with TypeTable access)
-    pub fn with_type_and_size(mut self, typ: TypeId, size: u32) -> Self {
+    pub fn with_type_and_size(mut self, typ: TypeId, size: Bits) -> Self {
         self.typ = Some(typ);
         self.size = size;
         self
@@ -2264,8 +2265,8 @@ impl Instruction {
         }
     }
 
-    /// Set bit size
-    pub fn with_size(mut self, size: u32) -> Self {
+    /// Set the result width
+    pub fn with_size(mut self, size: Bits) -> Self {
         self.size = size;
         self
     }
@@ -2440,7 +2441,7 @@ impl Instruction {
     }
 
     /// Create a return instruction with type
-    pub fn ret_typed(src: Option<PseudoId>, typ: TypeId, size: u32) -> Self {
+    pub fn ret_typed(src: Option<PseudoId>, typ: TypeId, size: Bits) -> Self {
         Self::ret(src).with_type_and_size(typ, size)
     }
 
@@ -2474,7 +2475,7 @@ impl Instruction {
         value: PseudoId,
         cases: Vec<(i64, i64, BasicBlockId)>,
         default: Option<BasicBlockId>,
-        size: u32,
+        size: Bits,
     ) -> Self {
         Self {
             op: Opcode::Switch,
@@ -2496,7 +2497,7 @@ impl Instruction {
         src1: PseudoId,
         src2: PseudoId,
         typ: TypeId,
-        size: u32,
+        size: Bits,
     ) -> Self {
         // Not an assertion only debug builds make: every gate runs release.
         assert!(
@@ -2523,8 +2524,8 @@ impl Instruction {
         op: Opcode,
         target: PseudoId,
         (lhs, rhs): (PseudoId, PseudoId),
-        operand: (TypeId, u32),
-        result: (TypeId, u32),
+        operand: (TypeId, Bits),
+        result: (TypeId, Bits),
     ) -> Self {
         assert!(op.is_comparison(), "{op:?} is not a comparison");
         let mut insn = Self::new(op)
@@ -2546,11 +2547,11 @@ impl Instruction {
         target: PseudoId,
         (a, b): (PseudoId, PseudoId),
         typ: TypeId,
-        size: u32,
+        size: Bits,
     ) -> Self {
         if op.is_comparison() {
             let int = crate::types::TypeTable::new(&crate::target::Target::host()).int_id;
-            Self::compare(op, target, (a, b), (typ, size), (int, 32))
+            Self::compare(op, target, (a, b), (typ, size), (int, Bits::new(32)))
         } else {
             Self::binop(op, target, a, b, typ, size)
         }
@@ -2583,7 +2584,7 @@ impl Instruction {
     }
 
     /// The width of this instruction's operands; see [`Self::operand_type`].
-    pub fn operand_width(&self) -> u32 {
+    pub fn operand_width(&self) -> Bits {
         if self.op.reads_another_type() {
             self.src_size
         } else {
@@ -2592,7 +2593,7 @@ impl Instruction {
     }
 
     /// Create a unary operation
-    pub fn unop(op: Opcode, target: PseudoId, src: PseudoId, typ: TypeId, size: u32) -> Self {
+    pub fn unop(op: Opcode, target: PseudoId, src: PseudoId, typ: TypeId, size: Bits) -> Self {
         Self::new(op)
             .with_target(target)
             .with_src(src)
@@ -2608,7 +2609,7 @@ impl Instruction {
         Self::new(op)
             .with_target(target)
             .with_offset(i64::from(level))
-            .with_type_and_size(void_ptr, 64)
+            .with_type_and_size(void_ptr, Bits::new(64))
     }
 
     /// The level of a `FrameAddress`/`ReturnAddress` built by
@@ -2634,7 +2635,7 @@ impl Instruction {
             .expect("a memory access offset past i32 reached a backend; Linearizer::emit folds it")
     }
 
-    pub fn load(target: PseudoId, addr: PseudoId, offset: i64, typ: TypeId, size: u32) -> Self {
+    pub fn load(target: PseudoId, addr: PseudoId, offset: i64, typ: TypeId, size: Bits) -> Self {
         Self::new(Opcode::Load)
             .with_target(target)
             .with_src(addr)
@@ -2642,7 +2643,7 @@ impl Instruction {
             .with_type_and_size(typ, size)
     }
 
-    pub fn store(value: PseudoId, addr: PseudoId, offset: i64, typ: TypeId, size: u32) -> Self {
+    pub fn store(value: PseudoId, addr: PseudoId, offset: i64, typ: TypeId, size: Bits) -> Self {
         Self::new(Opcode::Store)
             .with_src(addr)
             .with_src(value)
@@ -2656,7 +2657,7 @@ impl Instruction {
         args: Vec<PseudoId>,
         arg_types: Vec<TypeId>,
         ret_type: TypeId,
-        ret_size: u32,
+        ret_size: Bits,
     ) -> Self {
         let mut insn = Self::new(Opcode::Call)
             .with_func(func)
@@ -2686,7 +2687,7 @@ impl Instruction {
         types: &TypeTable,
         target_info: &Target,
     ) -> Self {
-        let ret_size = types.size_bits(ret_type);
+        let ret_size = types.value_bits(ret_type);
         let abi = get_abi_for_conv(conv, target_info);
         let param_classes: Vec<_> = arg_types
             .iter()
@@ -2707,7 +2708,7 @@ impl Instruction {
         args: Vec<PseudoId>,
         arg_types: Vec<TypeId>,
         ret_type: TypeId,
-        ret_size: u32,
+        ret_size: Bits,
     ) -> Self {
         let mut insn = Self::call(target, "<indirect>", args, arg_types, ret_type, ret_size);
         insn.extra_mut().indirect_target = Some(func_addr);
@@ -2719,7 +2720,7 @@ impl Instruction {
         Self::new(Opcode::SymAddr)
             .with_target(target)
             .with_src(sym)
-            .with_type_and_size(typ, 64) // Pointers are always 64-bit
+            .with_type_and_size(typ, Bits::new(64)) // Pointers are always 64-bit
     }
 
     /// Create a thread-local address instruction. See [`Opcode::TlsAddr`].
@@ -2727,10 +2728,10 @@ impl Instruction {
         Self::new(Opcode::TlsAddr)
             .with_target(target)
             .with_src(sym)
-            .with_type_and_size(typ, 64)
+            .with_type_and_size(typ, Bits::new(64))
     }
 
-    pub fn phi(target: PseudoId, typ: TypeId, size: u32) -> Self {
+    pub fn phi(target: PseudoId, typ: TypeId, size: Bits) -> Self {
         Self::new(Opcode::Phi)
             .with_target(target)
             .with_type_and_size(typ, size)
@@ -2739,7 +2740,7 @@ impl Instruction {
     /// The `SetVal` that defines the constant pseudo `target` at `typ` and
     /// `size` bits. The value lives in `target` (`PseudoKind::Val`/`FVal`),
     /// never in the instruction.
-    pub fn set_val(target: PseudoId, typ: TypeId, size: u32) -> Self {
+    pub fn set_val(target: PseudoId, typ: TypeId, size: Bits) -> Self {
         Self::new(Opcode::SetVal)
             .with_target(target)
             .with_type_and_size(typ, size)
@@ -2747,7 +2748,7 @@ impl Instruction {
 
     /// Create a phi source instruction (placed in predecessor block).
     /// Back-pointer to owning phi is stored in phi_list by the caller.
-    pub fn phi_source(target: PseudoId, src: PseudoId, typ: TypeId, size: u32) -> Self {
+    pub fn phi_source(target: PseudoId, src: PseudoId, typ: TypeId, size: Bits) -> Self {
         Self::new(Opcode::PhiSource)
             .with_target(target)
             .with_src(src)
@@ -2773,7 +2774,7 @@ impl Instruction {
         if_true: PseudoId,
         if_false: PseudoId,
         typ: TypeId,
-        size: u32,
+        size: Bits,
     ) -> Self {
         Self::new(Opcode::Select)
             .with_target(target)
@@ -2923,9 +2924,12 @@ impl fmt::Display for InstructionDisplay<'_> {
         write!(f, "{}", self.insn.op.name())?;
 
         // Size suffix (for conversions, show src_size→size)
-        if this.src_size > 0 && this.src_size != this.size && this.op.reads_another_type() {
+        if this.src_size > Bits::new(0)
+            && this.src_size != this.size
+            && this.op.reads_another_type()
+        {
             write!(f, ".{}to{}", this.src_size, this.size)?;
-        } else if this.size > 0 {
+        } else if this.size > Bits::new(0) {
             write!(f, ".{}", this.size)?;
         }
 
@@ -5155,15 +5159,25 @@ mod tests {
         assert!(conversion_raises_fp(&a64, a64.int128_id, a64.float128_id));
 
         // The instruction asks the same question of the types it records.
-        let mut narrow =
-            Instruction::unop(Opcode::FCvtF, PseudoId(1), PseudoId(0), x86.float_id, 32);
+        let mut narrow = Instruction::unop(
+            Opcode::FCvtF,
+            PseudoId(1),
+            PseudoId(0),
+            x86.float_id,
+            Bits::new(32),
+        );
         narrow.src_typ = Some(x86.double_id);
-        narrow.src_size = 64;
+        narrow.src_size = Bits::new(64);
         assert!(narrow.may_raise_fp_exception(&x86));
-        let mut widen =
-            Instruction::unop(Opcode::FCvtF, PseudoId(1), PseudoId(0), x86.double_id, 64);
+        let mut widen = Instruction::unop(
+            Opcode::FCvtF,
+            PseudoId(1),
+            PseudoId(0),
+            x86.double_id,
+            Bits::new(64),
+        );
         widen.src_typ = Some(x86.float_id);
-        widen.src_size = 32;
+        widen.src_size = Bits::new(32);
         assert!(!widen.may_raise_fp_exception(&x86));
         widen.src_typ = None;
         assert!(
@@ -5288,7 +5302,7 @@ mod tests {
             PseudoId(1),
             PseudoId(2),
             types.int_id,
-            32,
+            Bits::new(32),
         );
         assert_eq!(insn.op, Opcode::Add);
         assert_eq!(insn.target, Some(PseudoId(3)));
@@ -5304,7 +5318,7 @@ mod tests {
             PseudoId(1),
             PseudoId(2),
             types.int_id,
-            32,
+            Bits::new(32),
         );
         let ctx = IrCtx {
             types: &types,
@@ -5347,7 +5361,7 @@ mod tests {
         func.add_pseudo(Pseudo::val(k, 42));
 
         let mut entry = BasicBlock::new(BasicBlockId(0));
-        entry.add_insn(Instruction::set_val(k, types.int_id, 32));
+        entry.add_insn(Instruction::set_val(k, types.int_id, Bits::new(32)));
         entry.add_insn(Instruction::ret(Some(k)));
         func.add_block(entry);
 
@@ -5406,7 +5420,7 @@ mod tests {
             vec![PseudoId(2), PseudoId(3)],
             arg_types.clone(),
             types.int_id,
-            32,
+            Bits::new(32),
         );
         // Add abi_info (required for codegen)
         call.extra_mut().abi_info = Some(Box::new(CallAbiInfo::new(
@@ -5436,11 +5450,11 @@ mod tests {
     fn test_load_store() {
         let types = TypeTable::new(&Target::host());
 
-        let load = Instruction::load(PseudoId(1), PseudoId(2), 8, types.int_id, 32);
+        let load = Instruction::load(PseudoId(1), PseudoId(2), 8, types.int_id, Bits::new(32));
         assert_eq!(load.op, Opcode::Load);
         assert_eq!(load.offset, 8);
 
-        let store = Instruction::store(PseudoId(1), PseudoId(2), 0, types.int_id, 32);
+        let store = Instruction::store(PseudoId(1), PseudoId(2), 0, types.int_id, Bits::new(32));
         assert_eq!(store.op, Opcode::Store);
         assert_eq!(store.src.len(), 2);
     }
@@ -5479,21 +5493,21 @@ mod tests {
             vec![],
             vec![],
             types.int_id,
-            32,
+            Bits::new(32),
         ));
         bb.add_insn(Instruction::load(
             PseudoId(3),
             PseudoId(1),
             0,
             types.int_id,
-            32,
+            Bits::new(32),
         ));
         bb.add_insn(Instruction::load(
             PseudoId(4),
             PseudoId(2),
             0,
             types.int_id,
-            32,
+            Bits::new(32),
         ));
         bb.add_insn(Instruction::asm(AsmData {
             template: "call in_template".to_string(),
@@ -5545,7 +5559,7 @@ mod tests {
                 vec![],
                 vec![],
                 types.int_id,
-                32,
+                Bits::new(32),
             ));
             bb.add_insn(Instruction::ret(None));
             func.add_block(bb);
@@ -5985,7 +5999,7 @@ mod tests {
             PseudoId(5),
             vec![(0, 0, BasicBlockId(1)), (1, 1, BasicBlockId(2))],
             Some(BasicBlockId(3)),
-            32,
+            Bits::new(32),
         );
         assert!(insn.target.is_none());
         assert_eq!(insn.src.len(), 1);
@@ -6012,7 +6026,7 @@ mod tests {
             PseudoId(1),
             PseudoId(2),
             types.int_id,
-            32,
+            Bits::new(32),
         );
         insn.phi_list.push((BasicBlockId(0), PseudoId(10)));
         assert_eq!(insn.op, Opcode::Add);
@@ -6153,11 +6167,12 @@ mod tests {
     #[test]
     fn test_phi_source_dest() {
         let types = TypeTable::new(&Target::host());
-        let mut src = Instruction::phi_source(PseudoId(1), PseudoId(0), types.int_id, 32);
+        let mut src =
+            Instruction::phi_source(PseudoId(1), PseudoId(0), types.int_id, Bits::new(32));
         assert_eq!(src.phi_source_dest(), None, "no back-pointer yet");
         src.phi_list = vec![(BasicBlockId(3), PseudoId(2))];
         assert_eq!(src.phi_source_dest(), Some((BasicBlockId(3), PseudoId(2))));
-        let mut phi = Instruction::phi(PseudoId(2), types.int_id, 32);
+        let mut phi = Instruction::phi(PseudoId(2), types.int_id, Bits::new(32));
         phi.phi_list = vec![(BasicBlockId(1), PseudoId(1))];
         assert_eq!(phi.phi_source_dest(), None, "a phi feeds nothing");
     }
@@ -6171,9 +6186,14 @@ mod tests {
                 template: String::new(),
                 outputs: outs
                     .iter()
-                    .map(|&n| AsmConstraint::new(PseudoId(n), "=r", Arch::X86_64, 32))
+                    .map(|&n| AsmConstraint::new(PseudoId(n), "=r", Arch::X86_64, Bits::new(32)))
                     .collect(),
-                inputs: vec![AsmConstraint::new(PseudoId(9), "r", Arch::X86_64, 32)],
+                inputs: vec![AsmConstraint::new(
+                    PseudoId(9),
+                    "r",
+                    Arch::X86_64,
+                    Bits::new(32),
+                )],
                 clobbers: vec![],
                 goto_labels: vec![],
             })
@@ -6187,7 +6207,7 @@ mod tests {
             PseudoId(3),
             PseudoId(1),
             types.int_id,
-            32,
+            Bits::new(32),
         ));
         let mut b1 = BasicBlock::new(BasicBlockId(1));
         b1.add_insn(asm(&[4]));
@@ -6257,10 +6277,16 @@ mod tests {
             classes: vec![RegClass::Sse; n],
             size_bits: bits,
         };
-        assert!(aggregate_ret_is_address(&sse(1, 128), 128), "one SSE, 16B");
-        assert!(!aggregate_ret_is_address(&sse(1, 64), 64), "one SSE, 8B");
         assert!(
-            !aggregate_ret_is_address(&sse(2, 128), 128),
+            aggregate_ret_is_address(&sse(1, 128), Bits::new(128)),
+            "one SSE, 16B"
+        );
+        assert!(
+            !aggregate_ret_is_address(&sse(1, 64), Bits::new(64)),
+            "one SSE, 8B"
+        );
+        assert!(
+            !aggregate_ret_is_address(&sse(2, 128), Bits::new(128)),
             "two SSE registers carry the halves, not an address"
         );
         assert!(
@@ -6269,20 +6295,20 @@ mod tests {
                     classes: vec![RegClass::Integer, RegClass::Integer],
                     size_bits: 128,
                 },
-                128
+                Bits::new(128)
             ),
             "__int128 comes back in RAX/RDX"
         );
         assert!(aggregate_ret_is_address(
             &ArgClass::X87 { size_bits: 80 },
-            128
+            Bits::new(128)
         ));
         assert!(aggregate_ret_is_address(
             &ArgClass::Hfa {
                 base: crate::abi::HfaBase::Float64,
                 count: 4,
             },
-            256
+            Bits::new(256)
         ));
         assert!(
             !aggregate_ret_is_address(
@@ -6290,11 +6316,11 @@ mod tests {
                     align: 8,
                     size_bytes: 64,
                 },
-                512
+                Bits::new(512)
             ),
             "the hidden pointer is not this"
         );
-        assert!(!aggregate_ret_is_address(&ArgClass::Ignore, 0));
+        assert!(!aggregate_ret_is_address(&ArgClass::Ignore, Bits::new(0)));
     }
 
     // Function::create_reg_pseudo
@@ -6390,7 +6416,7 @@ mod tests {
         );
 
         // Size should be set from ret_type
-        assert_eq!(insn.size, types.size_bits(types.double_id));
+        assert_eq!(insn.size, types.value_bits(types.double_id));
     }
 
     // is_memory_barrier
@@ -6499,7 +6525,7 @@ mod tests {
     fn constraint(c: &str, matching_output: Option<usize>) -> AsmConstraint {
         AsmConstraint {
             matching_output,
-            ..AsmConstraint::new(PseudoId(0), c, crate::target::Arch::X86_64, 64)
+            ..AsmConstraint::new(PseudoId(0), c, crate::target::Arch::X86_64, Bits::new(64))
         }
     }
 
@@ -6534,7 +6560,9 @@ mod tests {
             assert!(!constraint(c, None).wants_register(), "{c}");
         }
         // aarch64's register letter is a register class there.
-        assert!(AsmConstraint::new(PseudoId(0), "=w", Arch::Aarch64, 64).wants_register());
+        assert!(
+            AsmConstraint::new(PseudoId(0), "=w", Arch::Aarch64, Bits::new(64)).wants_register()
+        );
     }
 
     /// Liveness asks `is_memory` of each output, so it must read the letters
@@ -6543,7 +6571,8 @@ mod tests {
     /// x86-64.
     #[test]
     fn test_asm_constraint_is_memory_per_target() {
-        let on = |c: &str, arch| AsmConstraint::new(PseudoId(0), c, arch, 64).is_memory();
+        let on =
+            |c: &str, arch| AsmConstraint::new(PseudoId(0), c, arch, Bits::new(64)).is_memory();
         assert!(on("=m", Arch::X86_64) && on("=m", Arch::Aarch64));
         assert!(!on("+wm", Arch::Aarch64));
         assert!(on("Q", Arch::Aarch64));
@@ -6555,8 +6584,8 @@ mod tests {
         asm.extra_mut().asm_data = Some(Box::new(AsmData {
             template: String::new(),
             outputs: vec![
-                AsmConstraint::new(PseudoId(1), "+wm", Arch::Aarch64, 64),
-                AsmConstraint::new(PseudoId(2), "=Q", Arch::Aarch64, 64),
+                AsmConstraint::new(PseudoId(1), "+wm", Arch::Aarch64, Bits::new(64)),
+                AsmConstraint::new(PseudoId(2), "=Q", Arch::Aarch64, Bits::new(64)),
             ],
             inputs: Vec::new(),
             clobbers: Vec::new(),
@@ -6604,8 +6633,9 @@ mod tests {
     /// An instruction of `op` with every `PseudoId` and block slot filled,
     /// each with its own id, whether or not `op` uses the field.
     fn every_slot_filled(op: Opcode) -> Instruction {
-        let operand =
-            |pseudo: u32| AsmConstraint::new(PseudoId(pseudo), "r", Target::host().arch, 64);
+        let operand = |pseudo: u32| {
+            AsmConstraint::new(PseudoId(pseudo), "r", Target::host().arch, Bits::new(64))
+        };
         let mut insn = Instruction::new(op);
         insn.target = Some(PseudoId(1));
         insn.src = vec![PseudoId(2), PseudoId(3)];
@@ -6675,7 +6705,7 @@ mod tests {
     fn test_for_each_block_mut_visits_every_block_slot() {
         for &op in Opcode::ALL {
             let mut insn = every_slot_filled(op);
-            insn.size = 64;
+            insn.size = Bits::new(64);
             insn.pos = Some(Position {
                 line: 7,
                 ..Default::default()
@@ -6703,7 +6733,7 @@ mod tests {
             );
             let preds: Vec<BasicBlockId> = insn.phi_list.iter().map(|&(b, _)| b).collect();
             assert_eq!(preds, [101, 102].map(BasicBlockId), "{op:?}");
-            assert_eq!((insn.size, insn.pos.map(|p| p.line)), (64, Some(7)));
+            assert_eq!((insn.size.get(), insn.pos.map(|p| p.line)), (64, Some(7)));
         }
     }
 }

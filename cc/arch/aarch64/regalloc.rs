@@ -48,6 +48,7 @@ use crate::arch::regalloc::{
 use crate::float::FloatVal;
 use crate::ir::{AsmData, Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::{TypeId, TypeKind, TypeTable};
+use crate::units::Bits;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 // AArch64 Register Definitions
@@ -1400,13 +1401,13 @@ fn narrow_v_values(func: &Function, types: &TypeTable) -> HashSet<PseudoId> {
     let mut seen: HashSet<PseudoId> = HashSet::new();
     for insn in func.blocks.iter().flat_map(|b| &b.insns) {
         if let Some(t) = insn.target {
-            if seen.insert(t) && insn.size > 0 && insn.size <= 64 {
+            if seen.insert(t) && insn.size > Bits::new(0) && insn.size <= Bits::new(64) {
                 narrow.insert(t);
             }
         }
         if let Some(asm) = insn.extra().asm_data.as_deref() {
             for out in asm.outputs.iter().filter(|o| !o.is_memory()) {
-                if seen.insert(out.pseudo) && out.size > 0 && out.size <= 64 {
+                if seen.insert(out.pseudo) && out.size > Bits::new(0) && out.size <= Bits::new(64) {
                     narrow.insert(out.pseudo);
                 }
             }
@@ -1438,8 +1439,8 @@ fn fp_pseudo_bytes(func: &Function, pseudo: PseudoId) -> i32 {
         .flat_map(|b| &b.insns)
         .find(|insn| insn.target == Some(pseudo))
         .map(|insn| insn.size)
-        .unwrap_or(64);
-    if bits > 64 {
+        .unwrap_or(Bits::new(64));
+    if bits > Bits::new(64) {
         16
     } else {
         8
@@ -2868,7 +2869,9 @@ mod tests {
         use crate::ir::{AsmConstraint, AsmData};
         let (outputs, inputs): (Vec<_>, Vec<_>) = operands
             .iter()
-            .map(|&(c, pseudo)| AsmConstraint::new(pseudo, c, crate::target::Arch::Aarch64, 64))
+            .map(|&(c, pseudo)| {
+                AsmConstraint::new(pseudo, c, crate::target::Arch::Aarch64, Bits::new(64))
+            })
             .partition(|c| c.class.access != AsmAccess::Read);
         let mut insn = Instruction::new(Opcode::Asm);
         insn.extra_mut().asm_data = Some(Box::new(AsmData {

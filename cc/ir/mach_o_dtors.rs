@@ -28,6 +28,7 @@ use crate::abi::{get_abi_for_conv, CallingConv};
 use crate::ir::CallAbiInfo;
 use crate::target::Target;
 use crate::types::TypeTable;
+use crate::units::Bits;
 
 /// Rewrite every `destructor` in `module` into an `atexit` registration.
 ///
@@ -77,7 +78,14 @@ pub fn register_destructors_with_atexit(
         registrar.add_pseudo(Pseudo::reg(addr, addr.0));
         registrar.next_pseudo = 2;
 
-        let mut call = Instruction::call(None, "atexit", vec![addr], vec![void_ptr], void, 0);
+        let mut call = Instruction::call(
+            None,
+            "atexit",
+            vec![addr],
+            vec![void_ptr],
+            void,
+            Bits::new(0),
+        );
         call.extra_mut().abi_info = Some(Box::new(CallAbiInfo::new(
             vec![param_class.clone()],
             ret_class.clone(),

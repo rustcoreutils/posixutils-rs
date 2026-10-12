@@ -136,7 +136,7 @@ impl X86_64CodeGen {
             let from = if off == 0 { src } else { Reg::R10 };
             let addr = self.stack_field(local, (at + off) as i32);
             self.push_lir(X86Inst::Mov {
-                size: OperandSize::from_bits(chunk.bits()),
+                size: OperandSize::from_bits(chunk.bits().get()),
                 src: GpOperand::Reg(from),
                 dst: GpOperand::Mem(addr),
             });
@@ -195,7 +195,7 @@ impl X86_64CodeGen {
         };
         let dst_offset = *dst_offset;
         for (at, chunk) in crate::ir::memexpand::block_chunks(bytes.into()) {
-            let size = OperandSize::from_bits(chunk.bits());
+            let size = OperandSize::from_bits(chunk.bits().get());
             let at = at as i32;
             self.push_lir(X86Inst::Mov {
                 size,
@@ -1227,7 +1227,7 @@ impl X86_64CodeGen {
             // Derive return size from type to avoid 32-bit truncation
             let ret_size = ret_typ
                 .map(|t| types.size_bits(t).max(32))
-                .unwrap_or(insn.size.max(32));
+                .unwrap_or(insn.size.get().max(32));
 
             let one_sse_ret = matches!(
                 insn.ret_class(),

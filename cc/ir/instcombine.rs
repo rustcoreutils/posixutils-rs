@@ -34,6 +34,7 @@ use super::propagate;
 use super::{ConstValue, Function, Instruction, Opcode, PseudoId};
 use crate::float::FloatVal;
 use crate::types::{TypeId, TypeTable};
+use crate::units::Bits;
 use std::collections::{HashMap, HashSet};
 
 // Constant Resolution
@@ -151,8 +152,12 @@ pub fn run(func: &mut Function, types: &TypeTable) -> bool {
             }
             if let Some(target) = insn.target {
                 match &result {
-                    Simplification::FoldToConst(v) => consts.record_int(target, insn.size, *v),
-                    Simplification::CopyFrom(src) => consts.record_copy(target, insn.size, *src),
+                    Simplification::FoldToConst(v) => {
+                        consts.record_int(target, insn.size.get(), *v)
+                    }
+                    Simplification::CopyFrom(src) => {
+                        consts.record_copy(target, insn.size.get(), *src)
+                    }
                     Simplification::FoldToFloat(v) => consts.record_float(target, *v),
                 }
             }
@@ -255,7 +260,7 @@ fn fold_with(insn: &Instruction, ops: &[i128]) -> Option<Simplification> {
 fn make_copy_from_parts(
     target: Option<PseudoId>,
     typ: Option<TypeId>,
-    size: u32,
+    size: Bits,
     src: PseudoId,
 ) -> Instruction {
     Instruction {
@@ -306,7 +311,7 @@ fn simplify_sub(insn: &Instruction, consts: &ConstMap) -> Option<Simplification>
 
     // Identity: x - x -> 0, by root: the two sides are usually distinct
     // copies of one value.
-    if consts.same(src1, src2, insn.size.max(1)) {
+    if consts.same(src1, src2, insn.size.get().max(1)) {
         return Some(Simplification::FoldToConst(0));
     }
 
@@ -367,9 +372,9 @@ fn simplify_div(insn: &Instruction, consts: &ConstMap) -> Option<Simplification>
     // sign, so `(int)0xFFFFFFFFu` arriving as 4294967295 rather than -1
     // answered 2147483647 where C says 0.
     let signed = insn.op == Opcode::DivS;
-    let size = insn.size.max(1);
-    let val1 = consts.get(src1).map(|v| at_width(v, size, signed));
-    let val2 = consts.get(src2).map(|v| at_width(v, size, signed));
+    let size = insn.size.max(Bits::new(1));
+    let val1 = consts.get(src1).map(|v| at_width(v, size.get(), signed));
+    let val2 = consts.get(src2).map(|v| at_width(v, size.get(), signed));
 
     // A division that can trap is left to trap: `constfold::divmod_may_trap`
     // states the rule and both of the operand pairs it covers. This is the
@@ -377,7 +382,7 @@ fn simplify_div(insn: &Instruction, consts: &ConstMap) -> Option<Simplification>
     // `0 / x` used to fold to zero here without ever asking what `x` was, and
     // a divisor of -1 is only safe once the dividend is known not to be the
     // most negative value.
-    if divmod_may_trap(insn.op, size, val1, val2) {
+    if divmod_may_trap(insn.op, size.get(), val1, val2) {
         return None;
     }
 
@@ -403,15 +408,15 @@ fn simplify_mod(insn: &Instruction, consts: &ConstMap) -> Option<Simplification>
     let src2 = insn.src[1];
     // Same width and signedness discipline as `simplify_div`.
     let signed = insn.op == Opcode::ModS;
-    let size = insn.size.max(1);
-    let val1 = consts.get(src1).map(|v| at_width(v, size, signed));
-    let val2 = consts.get(src2).map(|v| at_width(v, size, signed));
+    let size = insn.size.max(Bits::new(1));
+    let val1 = consts.get(src1).map(|v| at_width(v, size.get(), signed));
+    let val2 = consts.get(src2).map(|v| at_width(v, size.get(), signed));
 
     // The remainder traps exactly where the division does -- on x86-64 it is
     // the same `idiv`, computing the same quotient -- so it asks the same
     // question. `0 % x` folded to zero here for an unknown `x`, and
     // `INT_MIN % -1` folded to zero through `fold_with`.
-    if divmod_may_trap(insn.op, size, val1, val2) {
+    if divmod_may_trap(insn.op, size.get(), val1, val2) {
         return None;
     }
 
@@ -443,9 +448,9 @@ fn simplify_shift(insn: &Instruction, consts: &ConstMap) -> Option<Simplificatio
     // shifts in zeros -- and the operand has to be read *signed* at its own
     // width to be recognized at all, which is what `get` deliberately refuses
     // to guess.
-    let size = insn.size.max(1);
-    if insn.op == Opcode::Asr && consts.get_at(src1, size, true) == Some(-1) {
-        return Some(Simplification::FoldToConst(at_width(-1, size, true)));
+    let size = insn.size.max(Bits::new(1));
+    if insn.op == Opcode::Asr && consts.get_at(src1, size.get(), true) == Some(-1) {
+        return Some(Simplification::FoldToConst(at_width(-1, size.get(), true)));
     }
 
     match (val1, val2) {
@@ -517,7 +522,7 @@ fn simplify_bitwise(insn: &Instruction, consts: &ConstMap) -> Option<Simplificat
     let src2 = insn.src[1];
 
     // x op x -> self_result, by root as above.
-    if consts.same(src1, src2, insn.size.max(1)) {
+    if consts.same(src1, src2, insn.size.get().max(1)) {
         return match info.self_result {
             SelfOpResult::CopySrc => Some(Simplification::CopyFrom(src1)),
             SelfOpResult::Const(c) => Some(Simplification::FoldToConst(c)),
@@ -571,7 +576,10 @@ fn simplify_comparison(
     if insn.op == Opcode::SetNe {
         for (bool_side, zero_side) in [(src1, src2), (src2, src1)] {
             if consts.get(zero_side) == Some(0)
-                && facts.cmps.get_through(consts, bool_side, width).is_some()
+                && facts
+                    .cmps
+                    .get_through(consts, bool_side, width.get())
+                    .is_some()
             {
                 return Some(Simplification::CopyFrom(bool_side));
             }
@@ -584,7 +592,7 @@ fn simplify_comparison(
     // By root rather than by pseudo id: promotion out of memory gives every
     // use of a local its own `Copy`, so `x >> 0 != x` arrives as two distinct
     // pseudos naming one value.
-    if consts.same(src1, src2, width) {
+    if consts.same(src1, src2, width.get()) {
         if let Some(v) = mask.decide(domain.reflexive()) {
             return Some(Simplification::FoldToConst(i128::from(v)));
         }
@@ -592,8 +600,8 @@ fn simplify_comparison(
 
     // Constant folding. A comparison knows its operand width and signedness
     // from the opcode, so it can read a value `get` would refuse to guess at.
-    let val1 = consts.get_at(src1, width, signed);
-    let val2 = consts.get_at(src2, width, signed);
+    let val1 = consts.get_at(src1, width.get(), signed);
+    let val2 = consts.get_at(src2, width.get(), signed);
 
     if let (Some(a), Some(b)) = (val1, val2) {
         return fold_with(insn, &[a, b]);
@@ -622,7 +630,10 @@ fn simplify_comparison(
 /// a float `(x >= y) || (x < y)` is not decided.
 fn decided(insn: &Instruction, consts: &ConstMap, facts: &RunFacts) -> Option<Simplification> {
     let target = insn.target?;
-    match facts.cmps.relation(consts, target, insn.size.max(1))? {
+    match facts
+        .cmps
+        .relation(consts, target, insn.size.get().max(1))?
+    {
         Relation::Known(v) => Some(Simplification::FoldToConst(i128::from(v))),
         Relation::Holds(_) => None,
     }
@@ -645,8 +656,8 @@ fn simplify_select(
         return Some(Simplification::CopyFrom(if c != 0 { t } else { f }));
     }
     // Both arms the same value, whatever the condition.
-    let width = insn.size.max(1);
-    if consts.same(t, f, width) {
+    let width = insn.size.max(Bits::new(1));
+    if consts.same(t, f, width.get()) {
         return Some(Simplification::CopyFrom(t));
     }
 
@@ -672,7 +683,7 @@ fn simplify_convert(insn: &Instruction, consts: &ConstMap) -> Option<Simplificat
         Opcode::Trunc => (insn.size, true),
         _ => (insn.operand_width(), insn.op == Opcode::Sext),
     };
-    fold_with(insn, &[consts.get_at(insn.src[0], width, signed)?])
+    fold_with(insn, &[consts.get_at(insn.src[0], width.get(), signed)?])
 }
 
 // Floating-Point Simplification
@@ -712,8 +723,8 @@ fn simplify_fcmp(
 /// are the same value, and whether one is never below zero.
 fn possible_fcmp_outcomes(insn: &Instruction, consts: &ConstMap, facts: &RunFacts) -> Outcomes {
     let (lhs, rhs) = (insn.src[0], insn.src[1]);
-    let width = insn.operand_width().max(1);
-    if consts.same(lhs, rhs, width) {
+    let width = insn.operand_width().max(Bits::new(1));
+    if consts.same(lhs, rhs, width.get()) {
         return CmpDomain::Float.reflexive();
     }
     // A constant is compared as the value it has in the operands' format. A
@@ -723,8 +734,8 @@ fn possible_fcmp_outcomes(insn: &Instruction, consts: &ConstMap, facts: &RunFact
     // `1e39f` finite, which in `float` it is not. Not knowing the format
     // means not knowing the value.
     let fmt = facts.fp_format(insn.operand_type());
-    let known = |id| Some(consts.fget(id, width)?.round_to_format(fmt?));
-    let never_below = |id: PseudoId| facts.never_lt_zero.contains(&consts.root(id, width));
+    let known = |id| Some(consts.fget(id, width.get())?.round_to_format(fmt?));
+    let never_below = |id: PseudoId| facts.never_lt_zero.contains(&consts.root(id, width.get()));
     match (known(lhs), known(rhs)) {
         (Some(a), Some(b)) => Outcomes::of_ordering(a.cmp_value(b)),
         (None, Some(c)) => possible_against(c, never_below(lhs)),
@@ -742,9 +753,9 @@ fn simplify_fbinop(
     if insn.src.len() != 2 {
         return None;
     }
-    let width = insn.size.max(1);
-    let a = consts.fget(insn.src[0], width)?;
-    let b = consts.fget(insn.src[1], width)?;
+    let width = insn.size.max(Bits::new(1));
+    let a = consts.fget(insn.src[0], width.get())?;
+    let b = consts.fget(insn.src[1], width.get())?;
     let fmt = facts.fp_format(insn.typ)?;
     eval_fbinop(insn.op, fmt, a, b, facts.func.fp_rounding).map(Simplification::FoldToFloat)
 }
@@ -755,13 +766,13 @@ fn simplify_fternop(
     consts: &ConstMap,
     facts: &RunFacts,
 ) -> Option<Simplification> {
-    let width = insn.size.max(1);
+    let width = insn.size.max(Bits::new(1));
     let (Some(fmt), [a, b, c]) = (facts.fp_format(insn.typ), insn.src.as_slice()) else {
         return None;
     };
-    let a = consts.fget(*a, width)?;
-    let b = consts.fget(*b, width)?;
-    let c = consts.fget(*c, width)?;
+    let a = consts.fget(*a, width.get())?;
+    let b = consts.fget(*b, width.get())?;
+    let c = consts.fget(*c, width.get())?;
     eval_fternop(insn.op, fmt, a, b, c, facts.func.fp_rounding).map(Simplification::FoldToFloat)
 }
 
@@ -778,7 +789,7 @@ fn simplify_funop(
     if insn.src.len() != 1 {
         return None;
     }
-    let a = consts.fget(insn.src[0], insn.size.max(1))?;
+    let a = consts.fget(insn.src[0], insn.size.get().max(1))?;
     let fmt = facts.fp_format(insn.typ)?;
     eval_funop(insn.op, fmt, a, facts.func.fp_rounding).map(Simplification::FoldToFloat)
 }
@@ -792,7 +803,7 @@ fn simplify_fcvtf(
     if insn.src.len() != 1 {
         return None;
     }
-    let a = consts.fget(insn.src[0], insn.operand_width())?;
+    let a = consts.fget(insn.src[0], insn.operand_width().get())?;
     let src_fmt = facts.fp_format(insn.operand_type())?;
     let dst_fmt = facts.fp_format(insn.typ)?;
     eval_fcvtf(insn.op, src_fmt, dst_fmt, a, facts.func.fp_rounding)
@@ -813,9 +824,9 @@ fn simplify_fcvt(
     if insn.src.len() != 1 {
         return None;
     }
-    let a = consts.fget(insn.src[0], insn.operand_width())?;
+    let a = consts.fget(insn.src[0], insn.operand_width().get())?;
     let fmt = facts.fp_format(insn.operand_type())?;
-    eval_fcvt(insn.op, insn.size.max(1), fmt, a).map(Simplification::FoldToConst)
+    eval_fcvt(insn.op, insn.size.get().max(1), fmt, a).map(Simplification::FoldToConst)
 }
 
 /// Fold an operation with no algebraic identities -- `-x`, `~x`, a
@@ -874,7 +885,7 @@ mod tests {
             PseudoId(0), // x
             PseudoId(1), // 0
             types.int_id,
-            32,
+            Bits::new(32),
         );
         let pseudos = vec![
             Pseudo::reg(PseudoId(0), 0),
@@ -901,7 +912,7 @@ mod tests {
             PseudoId(0), // 0
             PseudoId(1), // x
             types.int_id,
-            32,
+            Bits::new(32),
         );
         let pseudos = vec![
             Pseudo::val(PseudoId(0), 0),
@@ -928,7 +939,7 @@ mod tests {
             PseudoId(0),
             PseudoId(1), // 1
             types.int_id,
-            32,
+            Bits::new(32),
         );
         let pseudos = vec![
             Pseudo::reg(PseudoId(0), 0),
@@ -955,7 +966,7 @@ mod tests {
             PseudoId(0),
             PseudoId(0),
             types.int_id,
-            32,
+            Bits::new(32),
         );
         let pseudos = vec![Pseudo::reg(PseudoId(0), 0), Pseudo::reg(PseudoId(1), 1)];
         let mut func = make_test_func_with_insn(insn, pseudos);
@@ -978,7 +989,7 @@ mod tests {
             PseudoId(0),
             PseudoId(0),
             types.int_id,
-            32,
+            Bits::new(32),
         );
         let pseudos = vec![Pseudo::reg(PseudoId(0), 0), Pseudo::reg(PseudoId(1), 1)];
         let mut func = make_test_func_with_insn(insn, pseudos);
@@ -1001,7 +1012,7 @@ mod tests {
             PseudoId(0),
             PseudoId(1), // 0
             types.int_id,
-            32,
+            Bits::new(32),
         );
         let pseudos = vec![
             Pseudo::reg(PseudoId(0), 0),
@@ -1028,7 +1039,7 @@ mod tests {
             PseudoId(0),
             PseudoId(0),
             types.int_id,
-            32,
+            Bits::new(32),
         );
         let pseudos = vec![Pseudo::reg(PseudoId(0), 0), Pseudo::reg(PseudoId(1), 1)];
         let mut func = make_test_func_with_insn(insn, pseudos);
@@ -1052,7 +1063,7 @@ mod tests {
             PseudoId(0),
             PseudoId(1),
             types.int_id,
-            32,
+            Bits::new(32),
         );
         let pseudos = vec![
             Pseudo::reg(PseudoId(0), 0),
@@ -1080,7 +1091,7 @@ mod tests {
             PseudoId(0), // 2
             PseudoId(1), // 3
             types.int_id,
-            32,
+            Bits::new(32),
         );
         let pseudos = vec![
             Pseudo::val(PseudoId(0), 2),
@@ -1110,7 +1121,7 @@ mod tests {
             PseudoId(0),
             PseudoId(1),
             types.int_id,
-            32,
+            Bits::new(32),
         );
         let pseudos = vec![
             Pseudo::val(PseudoId(0), 10),
@@ -1139,7 +1150,7 @@ mod tests {
             PseudoId(0),
             PseudoId(0),
             types.int_id,
-            32,
+            Bits::new(32),
         );
         let pseudos = vec![Pseudo::reg(PseudoId(0), 0), Pseudo::reg(PseudoId(1), 1)];
         let mut func = make_test_func_with_insn(insn, pseudos);
@@ -1164,7 +1175,7 @@ mod tests {
             PseudoId(0),
             PseudoId(1),
             types.int_id,
-            32,
+            Bits::new(32),
         );
         let pseudos = vec![
             Pseudo::val(PseudoId(0), 6),
@@ -1193,7 +1204,7 @@ mod tests {
             PseudoId(0),
             PseudoId(1), // 0
             types.int_id,
-            32,
+            Bits::new(32),
         );
         let pseudos = vec![
             Pseudo::reg(PseudoId(0), 0),
@@ -1226,7 +1237,7 @@ mod tests {
                 PseudoId(0),
                 PseudoId(1),
                 types.uint128_id,
-                128,
+                Bits::new(128),
             ),
             vec![
                 Pseudo::val(PseudoId(0), 0),
@@ -1246,7 +1257,7 @@ mod tests {
                     PseudoId(5),
                     PseudoId(0),
                     types.int_id,
-                    32,
+                    Bits::new(32),
                 ),
             );
         }
@@ -1270,7 +1281,7 @@ mod tests {
             PseudoId(0),
             PseudoId(1),
             types.int_id,
-            32,
+            Bits::new(32),
         );
         let pseudos = vec![
             Pseudo::val(PseudoId(0), 10),
@@ -1299,7 +1310,7 @@ mod tests {
             PseudoId(0),
             PseudoId(1),
             types.int_id,
-            32,
+            Bits::new(32),
         );
         let pseudos = vec![
             Pseudo::val(PseudoId(0), 10),
@@ -1328,7 +1339,7 @@ mod tests {
             PseudoId(0),
             PseudoId(1),
             types.int_id,
-            32,
+            Bits::new(32),
         );
         let pseudos = vec![
             Pseudo::val(PseudoId(0), 1),
@@ -1357,7 +1368,7 @@ mod tests {
             PseudoId(0),
             PseudoId(1),
             types.int_id,
-            32,
+            Bits::new(32),
         );
         let pseudos = vec![
             Pseudo::val(PseudoId(0), 0xFF),
@@ -1386,8 +1397,8 @@ mod tests {
             Opcode::SetEq,
             PseudoId(2),
             (PseudoId(0), PseudoId(1)),
-            (types.int_id, 32),
-            (int_type(), 32),
+            (types.int_id, Bits::new(32)),
+            (int_type(), Bits::new(32)),
         );
         let pseudos = vec![
             Pseudo::val(PseudoId(0), 5),
@@ -1414,8 +1425,8 @@ mod tests {
             Opcode::SetEq,
             PseudoId(2),
             (PseudoId(0), PseudoId(1)),
-            (types.int_id, 32),
-            (int_type(), 32),
+            (types.int_id, Bits::new(32)),
+            (int_type(), Bits::new(32)),
         );
         let pseudos = vec![
             Pseudo::val(PseudoId(0), 5),
@@ -1442,8 +1453,8 @@ mod tests {
             Opcode::SetLt,
             PseudoId(2),
             (PseudoId(0), PseudoId(1)),
-            (types.int_id, 32),
-            (int_type(), 32),
+            (types.int_id, Bits::new(32)),
+            (int_type(), Bits::new(32)),
         );
         let pseudos = vec![
             Pseudo::val(PseudoId(0), 3),
@@ -1470,8 +1481,8 @@ mod tests {
             Opcode::SetEq,
             PseudoId(1),
             (PseudoId(0), PseudoId(0)),
-            (types.int_id, 32),
-            (int_type(), 32),
+            (types.int_id, Bits::new(32)),
+            (int_type(), Bits::new(32)),
         );
         let pseudos = vec![Pseudo::reg(PseudoId(0), 0), Pseudo::reg(PseudoId(1), 1)];
         let mut func = make_test_func_with_insn(insn, pseudos);
@@ -1494,8 +1505,8 @@ mod tests {
             Opcode::SetLt,
             PseudoId(1),
             (PseudoId(0), PseudoId(0)),
-            (types.int_id, 32),
-            (int_type(), 32),
+            (types.int_id, Bits::new(32)),
+            (int_type(), Bits::new(32)),
         );
         let pseudos = vec![Pseudo::reg(PseudoId(0), 0), Pseudo::reg(PseudoId(1), 1)];
         let mut func = make_test_func_with_insn(insn, pseudos);
@@ -1516,7 +1527,13 @@ mod tests {
     fn test_const_fold_neg() {
         // -42 -> -42
         let types = TypeTable::new(&Target::host());
-        let insn = Instruction::unop(Opcode::Neg, PseudoId(1), PseudoId(0), types.int_id, 32);
+        let insn = Instruction::unop(
+            Opcode::Neg,
+            PseudoId(1),
+            PseudoId(0),
+            types.int_id,
+            Bits::new(32),
+        );
         let pseudos = vec![Pseudo::val(PseudoId(0), 42), Pseudo::reg(PseudoId(1), 1)];
         let mut func = make_test_func_with_insn(insn, pseudos);
 
@@ -1534,7 +1551,13 @@ mod tests {
     fn test_const_fold_not() {
         // ~0 -> -1
         let types = TypeTable::new(&Target::host());
-        let insn = Instruction::unop(Opcode::Not, PseudoId(1), PseudoId(0), types.int_id, 32);
+        let insn = Instruction::unop(
+            Opcode::Not,
+            PseudoId(1),
+            PseudoId(0),
+            types.int_id,
+            Bits::new(32),
+        );
         let pseudos = vec![Pseudo::val(PseudoId(0), 0), Pseudo::reg(PseudoId(1), 1)];
         let mut func = make_test_func_with_insn(insn, pseudos);
 
@@ -1567,9 +1590,10 @@ mod tests {
             (Opcode::Clz32, 1 << 40, 32),
         ] {
             let (_, size) = bit_opcode(op).unwrap();
-            let mut insn = Instruction::unop(op, PseudoId(1), PseudoId(0), types.int_id, 32);
+            let mut insn =
+                Instruction::unop(op, PseudoId(1), PseudoId(0), types.int_id, Bits::new(32));
             insn.src_typ = Some(types.ulonglong_id);
-            insn.src_size = size;
+            insn.src_size = Bits::new(size);
             let pseudos = vec![
                 Pseudo::val(PseudoId(0), operand),
                 Pseudo::reg(PseudoId(1), 1),
@@ -1580,7 +1604,7 @@ mod tests {
             let result_insn = &func.blocks[0].insns[1];
             assert_eq!(result_insn.op, Opcode::Copy);
             assert_eq!(result_insn.typ, Some(types.int_id));
-            assert_eq!(result_insn.size, 32, "the count is an int");
+            assert_eq!(result_insn.size, Bits::new(32), "the count is an int");
             assert_eq!(func.const_val(result_insn.src[0]), Some(count));
         }
     }
@@ -1637,14 +1661,14 @@ mod tests {
             Instruction::new(Opcode::Copy)
                 .with_target(PseudoId(1))
                 .with_src(PseudoId(0))
-                .with_type_and_size(int_id, 32),
+                .with_type_and_size(int_id, Bits::new(32)),
             Instruction::binop(
                 Opcode::Add,
                 PseudoId(3),
                 PseudoId(1),
                 PseudoId(2),
                 int_id,
-                32,
+                Bits::new(32),
             ),
         ];
         let pseudos = vec![
@@ -1667,14 +1691,14 @@ mod tests {
         let mut insns = vec![Instruction::new(Opcode::Copy)
             .with_target(PseudoId(1))
             .with_src(PseudoId(0))
-            .with_type_and_size(int_id, 32)];
+            .with_type_and_size(int_id, Bits::new(32))];
         // Two more links: %2 = copy %1 ; %3 = copy %2
         for i in 2..=3u32 {
             insns.push(
                 Instruction::new(Opcode::Copy)
                     .with_target(PseudoId(i))
                     .with_src(PseudoId(i - 1))
-                    .with_type_and_size(int_id, 32),
+                    .with_type_and_size(int_id, Bits::new(32)),
             );
         }
         insns.push(Instruction::binop(
@@ -1683,7 +1707,7 @@ mod tests {
             PseudoId(3),
             PseudoId(4),
             int_id,
-            32,
+            Bits::new(32),
         ));
         let mut pseudos = vec![Pseudo::val(PseudoId(0), 5)];
         for i in 1..=3u32 {
@@ -1713,7 +1737,7 @@ mod tests {
                 PseudoId(0),
                 PseudoId(1),
                 int_id,
-                32,
+                Bits::new(32),
             ),
             Instruction::binop(
                 Opcode::Mul,
@@ -1721,7 +1745,7 @@ mod tests {
                 PseudoId(2),
                 PseudoId(3),
                 int_id,
-                32,
+                Bits::new(32),
             ),
             Instruction::binop(
                 Opcode::Add,
@@ -1729,7 +1753,7 @@ mod tests {
                 PseudoId(4),
                 PseudoId(5),
                 int_id,
-                32,
+                Bits::new(32),
             ),
         ];
         let pseudos = vec![
@@ -1773,7 +1797,7 @@ mod tests {
                 PseudoId(0),
                 PseudoId(1),
                 int_id,
-                32,
+                Bits::new(32),
             ),
             Instruction::binop(
                 Opcode::DivS,
@@ -1781,7 +1805,7 @@ mod tests {
                 PseudoId(2),
                 PseudoId(3),
                 int_id,
-                32,
+                Bits::new(32),
             ),
         ];
         let pseudos = vec![
@@ -1809,14 +1833,14 @@ mod tests {
             Instruction::new(Opcode::Copy)
                 .with_target(PseudoId(10))
                 .with_src(src_id)
-                .with_type_and_size(int_id, 32),
+                .with_type_and_size(int_id, Bits::new(32)),
             Instruction::binop(
                 Opcode::Add,
                 PseudoId(12),
                 PseudoId(10),
                 PseudoId(11),
                 int_id,
-                32,
+                Bits::new(32),
             ),
         ];
         let pseudos = vec![
@@ -1863,18 +1887,18 @@ mod tests {
             Instruction::new(Opcode::Copy)
                 .with_target(PseudoId(0))
                 .with_src(PseudoId(1))
-                .with_type_and_size(int_id, 32),
+                .with_type_and_size(int_id, Bits::new(32)),
             Instruction::new(Opcode::Copy)
                 .with_target(PseudoId(1))
                 .with_src(PseudoId(0))
-                .with_type_and_size(int_id, 32),
+                .with_type_and_size(int_id, Bits::new(32)),
             Instruction::binop(
                 Opcode::Add,
                 PseudoId(3),
                 PseudoId(0),
                 PseudoId(2),
                 int_id,
-                32,
+                Bits::new(32),
             ),
         ];
         let pseudos = vec![
@@ -1901,14 +1925,14 @@ mod tests {
             Instruction::new(Opcode::Copy)
                 .with_target(PseudoId(1))
                 .with_src(PseudoId(0))
-                .with_type_and_size(int_id, 32),
+                .with_type_and_size(int_id, Bits::new(32)),
             Instruction::binop(
                 Opcode::Add,
                 PseudoId(3),
                 PseudoId(2),
                 PseudoId(1),
                 int_id,
-                32,
+                Bits::new(32),
             ),
         ];
         let pseudos = vec![
@@ -1933,14 +1957,14 @@ mod tests {
             Instruction::new(Opcode::Copy)
                 .with_target(PseudoId(1))
                 .with_src(PseudoId(0))
-                .with_type_and_size(int_id, 32),
+                .with_type_and_size(int_id, Bits::new(32)),
             Instruction::binop(
                 Opcode::Add,
                 PseudoId(3),
                 PseudoId(1),
                 PseudoId(2),
                 int_id,
-                32,
+                Bits::new(32),
             ),
         ];
         let pseudos = vec![
@@ -1967,7 +1991,7 @@ mod tests {
             PseudoId(0),
             PseudoId(1),
             int_id,
-            32,
+            Bits::new(32),
         )];
         let pseudos = vec![
             Pseudo::val(PseudoId(0), 0xFFFF_FFFF),
@@ -1990,7 +2014,7 @@ mod tests {
             PseudoId(0),
             PseudoId(1),
             int_id,
-            32,
+            Bits::new(32),
         )];
         let pseudos = vec![
             Pseudo::val(PseudoId(0), 0xFFFF_FFFF),
@@ -2013,7 +2037,7 @@ mod tests {
             PseudoId(0),
             PseudoId(1),
             uint_id,
-            32,
+            Bits::new(32),
         )];
         let pseudos = vec![
             Pseudo::val(PseudoId(0), 0xFFFF_FFFF),
@@ -2038,8 +2062,8 @@ mod tests {
             Opcode::SetLt,
             PseudoId(2),
             (PseudoId(0), PseudoId(1)),
-            (int_id, 32),
-            (int_type(), 32),
+            (int_id, Bits::new(32)),
+            (int_type(), Bits::new(32)),
         )];
         let pseudos = vec![
             Pseudo::val(PseudoId(0), 0xFFFF_FFFF),
@@ -2064,8 +2088,8 @@ mod tests {
             Opcode::SetNe,
             PseudoId(2),
             (PseudoId(0), PseudoId(1)),
-            (int_id, 32),
-            (bool_id, 8),
+            (int_id, Bits::new(32)),
+            (bool_id, Bits::new(8)),
         );
         let pseudos = vec![
             Pseudo::val(PseudoId(0), 256),
@@ -2090,14 +2114,26 @@ mod tests {
         let mut func = make_test_func_with_insns(
             vec![
                 // %1 = copy %0 ; %2 = copy %0 ; %3 = setne %1, %2
-                Instruction::unop(Opcode::Copy, PseudoId(1), PseudoId(0), types.int_id, 32),
-                Instruction::unop(Opcode::Copy, PseudoId(2), PseudoId(0), types.int_id, 32),
+                Instruction::unop(
+                    Opcode::Copy,
+                    PseudoId(1),
+                    PseudoId(0),
+                    types.int_id,
+                    Bits::new(32),
+                ),
+                Instruction::unop(
+                    Opcode::Copy,
+                    PseudoId(2),
+                    PseudoId(0),
+                    types.int_id,
+                    Bits::new(32),
+                ),
                 Instruction::compare(
                     Opcode::SetNe,
                     PseudoId(3),
                     (PseudoId(1), PseudoId(2)),
-                    (types.int_id, 32),
-                    (int_type(), 32),
+                    (types.int_id, Bits::new(32)),
+                    (int_type(), Bits::new(32)),
                 ),
             ],
             vec![
@@ -2121,8 +2157,20 @@ mod tests {
         let func = make_test_func_with_insns(
             vec![
                 // %1 = copy.8 %0 -- truncates; %2 = copy.32 %0 -- does not
-                Instruction::unop(Opcode::Copy, PseudoId(1), PseudoId(0), types.int_id, 8),
-                Instruction::unop(Opcode::Copy, PseudoId(2), PseudoId(0), types.int_id, 32),
+                Instruction::unop(
+                    Opcode::Copy,
+                    PseudoId(1),
+                    PseudoId(0),
+                    types.int_id,
+                    Bits::new(8),
+                ),
+                Instruction::unop(
+                    Opcode::Copy,
+                    PseudoId(2),
+                    PseudoId(0),
+                    types.int_id,
+                    Bits::new(32),
+                ),
             ],
             vec![
                 Pseudo::arg(PseudoId(0), 0),
@@ -2154,7 +2202,7 @@ mod tests {
                 PseudoId(0),
                 PseudoId(1),
                 types.int_id,
-                32,
+                Bits::new(32),
             )],
             vec![
                 Pseudo::val(PseudoId(0), -1),
@@ -2180,7 +2228,7 @@ mod tests {
                 PseudoId(0),
                 PseudoId(1),
                 types.int_id,
-                32,
+                Bits::new(32),
             )],
             vec![
                 Pseudo::val(PseudoId(0), -1),
@@ -2203,7 +2251,7 @@ mod tests {
                 PseudoId(1),
                 PseudoId(0),
                 types.int_id,
-                32,
+                Bits::new(32),
             )],
             vec![Pseudo::val(PseudoId(0), -1), Pseudo::reg(PseudoId(1), 1)],
         );
@@ -2264,16 +2312,16 @@ mod tests {
                     Opcode::SetLt,
                     PseudoId(2),
                     (PseudoId(0), PseudoId(1)),
-                    (types.int_id, 32),
-                    (int_type(), 32),
+                    (types.int_id, Bits::new(32)),
+                    (int_type(), Bits::new(32)),
                 ),
                 // operands swapped
                 Instruction::compare(
                     Opcode::SetLt,
                     PseudoId(3),
                     (PseudoId(1), PseudoId(0)),
-                    (types.int_id, 32),
-                    (int_type(), 32),
+                    (types.int_id, Bits::new(32)),
+                    (int_type(), Bits::new(32)),
                 ),
                 Instruction::select(
                     PseudoId(5),
@@ -2281,7 +2329,7 @@ mod tests {
                     PseudoId(3),
                     PseudoId(4),
                     types.int_id,
-                    32,
+                    Bits::new(32),
                 ),
             ],
             vec![
@@ -2334,16 +2382,16 @@ mod tests {
                     PseudoId(2),
                     (PseudoId(0), PseudoId(1)),
                     typ,
-                    size,
+                    Bits::new(size),
                 ),
                 Instruction::test_binary(
                     arm_op,
                     PseudoId(3),
                     (PseudoId(0), PseudoId(1)),
                     typ,
-                    size,
+                    Bits::new(size),
                 ),
-                Instruction::select(PseudoId(5), PseudoId(2), t, f, types.int_id, 32),
+                Instruction::select(PseudoId(5), PseudoId(2), t, f, types.int_id, Bits::new(32)),
             ],
             vec![
                 Pseudo::arg(PseudoId(0), 0),
@@ -2383,7 +2431,7 @@ mod tests {
                 PseudoId(2),
                 (PseudoId(0), PseudoId(1)),
                 types.double_id,
-                64,
+                Bits::new(64),
             )],
             vec![fval(0, a), fval(1, b), Pseudo::reg(PseudoId(2), 2)],
         );
@@ -2444,8 +2492,8 @@ mod tests {
                 Opcode::FCmpOLt,
                 PseudoId(2),
                 (PseudoId(0), PseudoId(1)),
-                (types.double_id, 64),
-                (int_type(), 32),
+                (types.double_id, Bits::new(64)),
+                (int_type(), Bits::new(32)),
             )],
             vec![fval(0, 1.0), fval(1, 2.0), Pseudo::reg(PseudoId(2), 2)],
         );
@@ -2453,7 +2501,7 @@ mod tests {
         let insn = insn_at(&func, 0);
         assert_eq!(insn.op, Opcode::Copy);
         assert_eq!(insn.typ, Some(types.int_id));
-        assert_eq!(insn.size, types.size_bits(types.int_id));
+        assert_eq!(insn.size, types.value_bits(types.int_id));
     }
 
     /// `fabs(x) < 0.0` is false for every `x`, a NaN included, because an
@@ -2479,8 +2527,14 @@ mod tests {
                     Instruction::new(unary)
                         .with_target(PseudoId(1))
                         .with_src(PseudoId(0))
-                        .with_type_and_size(types.double_id, 64),
-                    Instruction::test_binary(op, PseudoId(3), (l, r), types.double_id, 64),
+                        .with_type_and_size(types.double_id, Bits::new(64)),
+                    Instruction::test_binary(
+                        op,
+                        PseudoId(3),
+                        (l, r),
+                        types.double_id,
+                        Bits::new(64),
+                    ),
                 ],
                 vec![
                     Pseudo::arg(PseudoId(0), 0),
@@ -2507,13 +2561,13 @@ mod tests {
                     Instruction::new(Opcode::Fabs)
                         .with_target(PseudoId(1))
                         .with_src(PseudoId(0))
-                        .with_type_and_size(types.double_id, 64),
+                        .with_type_and_size(types.double_id, Bits::new(64)),
                     Instruction::test_binary(
                         op,
                         PseudoId(3),
                         (PseudoId(1), PseudoId(2)),
                         types.double_id,
-                        64,
+                        Bits::new(64),
                     ),
                 ],
                 vec![
@@ -2544,7 +2598,13 @@ mod tests {
             (PseudoId(0), PseudoId(1))
         };
         let mut func = make_test_func_with_insns(
-            vec![Instruction::test_binary(op, PseudoId(2), (l, r), typ, size)],
+            vec![Instruction::test_binary(
+                op,
+                PseudoId(2),
+                (l, r),
+                typ,
+                Bits::new(size),
+            )],
             vec![
                 Pseudo::arg(PseudoId(0), 0),
                 fval(1, c),
@@ -2645,13 +2705,13 @@ mod tests {
                     Instruction::new(Opcode::Copy)
                         .with_target(PseudoId(1))
                         .with_src(PseudoId(0))
-                        .with_type_and_size(types.double_id, 64),
+                        .with_type_and_size(types.double_id, Bits::new(64)),
                     Instruction::test_binary(
                         op,
                         PseudoId(2),
                         (PseudoId(0), PseudoId(1)),
                         types.double_id,
-                        64,
+                        Bits::new(64),
                     ),
                 ],
                 vec![
@@ -2728,15 +2788,15 @@ mod tests {
                 Opcode::FCmpONe,
                 PseudoId(2),
                 (PseudoId(first), PseudoId(first)),
-                (dbl, 64),
-                (int_type(), 32),
+                (dbl, Bits::new(64)),
+                (int_type(), Bits::new(32)),
             ),
             Instruction::compare(
                 Opcode::FCmpONe,
                 PseudoId(3),
                 (PseudoId(second), PseudoId(second)),
-                (dbl, 64),
-                (int_type(), 32),
+                (dbl, Bits::new(64)),
+                (int_type(), Bits::new(32)),
             ),
             Instruction::binop(
                 Opcode::Or,
@@ -2744,7 +2804,7 @@ mod tests {
                 PseudoId(2),
                 PseudoId(3),
                 types.int_id,
-                32,
+                Bits::new(32),
             ),
         ]
     }
@@ -2777,7 +2837,7 @@ mod tests {
             PseudoId(target),
             (PseudoId(l), PseudoId(r)),
             types.double_id,
-            64,
+            Bits::new(64),
         )
     }
 
@@ -2789,7 +2849,7 @@ mod tests {
             PseudoId(t),
             PseudoId(f),
             types.int_id,
-            32,
+            Bits::new(32),
         )
     }
 
@@ -2844,14 +2904,14 @@ mod tests {
                 PseudoId(5),
                 PseudoId(6),
                 host_types().int_id,
-                32,
+                Bits::new(32),
             ),
             Instruction::compare(
                 Opcode::SetEq,
                 PseudoId(8),
                 (PseudoId(7), PseudoId(10)),
-                (host_types().int_id, 32),
-                (host_types().int_id, 32),
+                (host_types().int_id, Bits::new(32)),
+                (host_types().int_id, Bits::new(32)),
             ),
             select(9, 4, 11, 8),
         ];
@@ -2884,9 +2944,9 @@ mod tests {
         let mut insn = Instruction::new(op)
             .with_target(PseudoId(1))
             .with_src(PseudoId(0))
-            .with_type_and_size(types.int_id, dst_size);
+            .with_type_and_size(types.int_id, Bits::new(dst_size));
         insn.src_typ = Some(types.double_id);
-        insn.src_size = 64;
+        insn.src_size = Bits::new(64);
         let mut func =
             make_test_func_with_insns(vec![insn], vec![fval(0, v), Pseudo::reg(PseudoId(1), 1)]);
         run(&mut func, &host_types());
@@ -2954,15 +3014,15 @@ mod tests {
         let mut insn = Instruction::new(Opcode::Signbit)
             .with_target(PseudoId(1))
             .with_src(PseudoId(0))
-            .with_type_and_size(types.int_id, 32);
+            .with_type_and_size(types.int_id, Bits::new(32));
         insn.src_typ = Some(types.double_id);
-        insn.src_size = 64;
+        insn.src_size = Bits::new(64);
         let mut func =
             make_test_func_with_insns(vec![insn], vec![fval(0, -2.0), Pseudo::reg(PseudoId(1), 1)]);
         assert!(run(&mut func, &host_types()));
         let got = insn_at(&func, 0);
         assert_eq!(got.op, Opcode::Copy);
-        assert_eq!((got.typ, got.size), (Some(types.int_id), 32));
+        assert_eq!((got.typ, got.size), (Some(types.int_id), Bits::new(32)));
     }
 
     /// `CopySign` of constants folds at every width and for every pair: the
@@ -2974,7 +3034,10 @@ mod tests {
         let widths = [
             (types.float_id, 32),
             (types.double_id, 64),
-            (types.longdouble_id, types.size_bits(types.longdouble_id)),
+            (
+                types.longdouble_id,
+                types.value_bits(types.longdouble_id).get(),
+            ),
         ];
         let nan = f64::from_bits(0x7ff8_0000_0000_1234);
         for (typ, size) in widths {
@@ -3032,11 +3095,17 @@ mod tests {
             .collect();
         pseudos.push(Pseudo::reg(target, target.0));
         let insn = match args.len() {
-            2 => Instruction::test_binary(op, target, (PseudoId(0), PseudoId(1)), typ, size),
+            2 => Instruction::test_binary(
+                op,
+                target,
+                (PseudoId(0), PseudoId(1)),
+                typ,
+                Bits::new(size),
+            ),
             n => {
                 let mut insn = Instruction::new(op)
                     .with_target(target)
-                    .with_type_and_size(typ, size);
+                    .with_type_and_size(typ, Bits::new(size));
                 insn.src = (0..n as u32).map(PseudoId).collect();
                 insn
             }
@@ -3049,7 +3118,7 @@ mod tests {
         }
         let size = got.size;
         match func.get_pseudo(target).map(|p| p.kind.clone()) {
-            Some(PseudoKind::FVal(v)) => Some((v, size)),
+            Some(PseudoKind::FVal(v)) => Some((v, size.get())),
             _ => None,
         }
     }
@@ -3129,7 +3198,10 @@ mod tests {
         let widths = [
             (types.float_id, 32),
             (types.double_id, 64),
-            (types.longdouble_id, types.size_bits(types.longdouble_id)),
+            (
+                types.longdouble_id,
+                types.value_bits(types.longdouble_id).get(),
+            ),
         ];
         for (typ, size) in widths {
             for (arg, want) in [(4.0, 2.0), (0.25, 0.5), (f64::INFINITY, f64::INFINITY)] {
@@ -3228,7 +3300,10 @@ mod tests {
         let widths = [
             (types.float_id, 32),
             (types.double_id, 64),
-            (types.longdouble_id, types.size_bits(types.longdouble_id)),
+            (
+                types.longdouble_id,
+                types.value_bits(types.longdouble_id).get(),
+            ),
         ];
         for (typ, size) in widths {
             for (arg, want) in [(-1.5, 1.5), (2.0, 2.0), (f64::NEG_INFINITY, f64::INFINITY)] {
@@ -3280,19 +3355,19 @@ mod tests {
             match ld_fmt {
                 FpFormat::X87Extended => (
                     ld,
-                    types.size_bits(ld),
+                    types.value_bits(ld).get(),
                     0xffff_c000_0000_0000_1234,
                     0xffff_8000_0000_0000_1234,
                 ),
                 FpFormat::Binary128 => (
                     ld,
-                    types.size_bits(ld),
+                    types.value_bits(ld).get(),
                     0xffff_8000_0000_0000_0000_0000_0000_1234,
                     0xffff_0000_0000_0000_0000_0000_0000_1234,
                 ),
                 _ => (
                     ld,
-                    types.size_bits(ld),
+                    types.value_bits(ld).get(),
                     0xfff8_0000_0000_1234,
                     0xfff0_0000_0000_1234,
                 ),
@@ -3317,9 +3392,9 @@ mod tests {
         let mut insn = Instruction::new(Opcode::FCvtF)
             .with_target(PseudoId(1))
             .with_src(PseudoId(0))
-            .with_type_and_size(dst.0, dst.1);
+            .with_type_and_size(dst.0, Bits::new(dst.1));
         insn.src_typ = Some(src.0);
-        insn.src_size = src.1;
+        insn.src_size = Bits::new(src.1);
         let mut func =
             make_test_func_with_insns(vec![insn], vec![fval(0, v), Pseudo::reg(PseudoId(1), 1)]);
         run(&mut func, &host_types());
@@ -3374,7 +3449,7 @@ mod tests {
             vec![Instruction::new(Opcode::FNeg)
                 .with_target(PseudoId(1))
                 .with_src(PseudoId(0))
-                .with_type_and_size(types.double_id, 64)],
+                .with_type_and_size(types.double_id, Bits::new(64))],
             vec![fval(0, 1.5), Pseudo::arg(PseudoId(1), 0)],
         );
         run(&mut func, &host_types());
@@ -3398,8 +3473,8 @@ mod tests {
         let mut insn = Instruction::new(op)
             .with_target(PseudoId(1))
             .with_src(PseudoId(0))
-            .with_type_and_size(types.int_id, dst_size);
-        insn.src_size = src_size;
+            .with_type_and_size(types.int_id, Bits::new(dst_size));
+        insn.src_size = Bits::new(src_size);
         let mut func = make_test_func_with_insns(
             vec![insn],
             vec![Pseudo::val(PseudoId(0), v), Pseudo::reg(PseudoId(1), 1)],
@@ -3451,15 +3526,29 @@ mod tests {
         let ptr = types.void_ptr_id;
         let insns = vec![
             Instruction::sym_addr(PseudoId(2), PseudoId(0), ptr),
-            Instruction::binop(Opcode::Add, PseudoId(3), PseudoId(2), PseudoId(4), ptr, 64),
+            Instruction::binop(
+                Opcode::Add,
+                PseudoId(3),
+                PseudoId(2),
+                PseudoId(4),
+                ptr,
+                Bits::new(64),
+            ),
             Instruction::sym_addr(PseudoId(5), PseudoId(1), ptr),
-            Instruction::binop(Opcode::Add, PseudoId(6), PseudoId(5), PseudoId(7), ptr, 64),
+            Instruction::binop(
+                Opcode::Add,
+                PseudoId(6),
+                PseudoId(5),
+                PseudoId(7),
+                ptr,
+                Bits::new(64),
+            ),
             Instruction::compare(
                 op,
                 PseudoId(8),
                 (PseudoId(3), PseudoId(6)),
-                (ptr, 64),
-                (types.int_id, 32),
+                (ptr, Bits::new(64)),
+                (types.int_id, Bits::new(32)),
             ),
         ];
         let pseudos = vec![

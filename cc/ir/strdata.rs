@@ -38,6 +38,7 @@ use super::memloc::{AddrMap, MemBase, MemLoc};
 use super::{Function, GlobalDef, Initializer, Module, Opcode, PseudoId};
 use crate::token::lexer::payload_bytes;
 use crate::types::{TypeKind, TypeTable};
+use crate::units::Bits;
 use std::collections::{HashMap, HashSet};
 
 /// How many definitions `string_len` follows before it gives up.
@@ -196,7 +197,7 @@ pub(crate) struct StrReader<'a> {
     func: &'a Function,
     am: &'a AddrMap,
     /// The width of an address: what pointer arithmetic is done at.
-    ptr_bits: u32,
+    ptr_bits: Bits,
     /// Where a local array's bytes are read, when they are.
     locals: Option<LocalBytes<'a>>,
 }
@@ -223,7 +224,7 @@ impl<'a> StrReader<'a> {
             data,
             func,
             am,
-            ptr_bits: types.size_bits(types.void_ptr_id),
+            ptr_bits: types.value_bits(types.void_ptr_id),
             locals: None,
         }
     }
@@ -333,7 +334,7 @@ impl<'a> StrReader<'a> {
             let byte = MemLoc {
                 base: at.base.clone(),
                 offset: Some(i64::try_from(offset).ok()?),
-                size: 8,
+                size: Bits::new(8),
                 typ: Some(locals.types.uchar_id),
             };
             if locals
@@ -461,7 +462,7 @@ pub(crate) mod fixture {
         pub(crate) fn op(&mut self, op: Opcode, a: PseudoId, b: PseudoId) -> PseudoId {
             let t = self.func().alloc_pseudo();
             let ulong = self.types.ulong_id;
-            self.push(Instruction::binop(op, t, a, b, ulong, 64));
+            self.push(Instruction::binop(op, t, a, b, ulong, Bits::new(64)));
             t
         }
 
@@ -469,17 +470,17 @@ pub(crate) mod fixture {
             let cond = self.unknown();
             let t = self.func().alloc_pseudo();
             let ptr = self.types.char_ptr_id;
-            self.push(Instruction::select(t, cond, a, b, ptr, 64));
+            self.push(Instruction::select(t, cond, a, b, ptr, Bits::new(64)));
             t
         }
 
         /// `target = phi(arms...)`, each arm through its `PhiSource`.
         pub(crate) fn phi_into(&mut self, target: PseudoId, arms: &[PseudoId]) {
             let ptr = self.types.char_ptr_id;
-            let mut phi = Instruction::phi(target, ptr, 64);
+            let mut phi = Instruction::phi(target, ptr, Bits::new(64));
             for &arm in arms {
                 let src = self.func().alloc_pseudo();
-                self.push(Instruction::phi_source(src, arm, ptr, 64));
+                self.push(Instruction::phi_source(src, arm, ptr, Bits::new(64)));
                 phi.phi_list.push((BasicBlockId(0), src));
             }
             self.push(phi);
@@ -501,7 +502,7 @@ pub(crate) mod fixture {
         /// `p[at] = v`, one `char` wide.
         pub(crate) fn store_byte(&mut self, p: PseudoId, at: i64, v: PseudoId) {
             let c = self.types.char_id;
-            self.push(Instruction::store(v, p, at, c, 8));
+            self.push(Instruction::store(v, p, at, c, Bits::new(8)));
         }
 
         pub(crate) fn fresh(&mut self) -> PseudoId {
@@ -522,7 +523,7 @@ pub(crate) mod fixture {
         ) -> PseudoId {
             let t = self.func().alloc_pseudo();
             let (srcs, arg_types): (Vec<_>, Vec<_>) = args.iter().copied().unzip();
-            let size = self.types.size_bits(ret);
+            let size = self.types.value_bits(ret);
             let mut call = Instruction::call(Some(t), name, srcs, arg_types, ret, size);
             call.extra_mut().known = Some(known);
             self.push(call);

@@ -44,6 +44,7 @@ use super::escape::EscapeInfo;
 use super::memloc::{is_ordinary_object, may_alias, Access, AddrMap, MemBase, MemLoc, ModuleInfo};
 use super::{BasicBlockId, Function, Opcode, PseudoId};
 use crate::types::TypeTable;
+use crate::units::Bits;
 use std::collections::HashMap;
 
 /// How many sweeps the dead-at-exit fixed point may take before it gives up.
@@ -266,7 +267,7 @@ impl DseCtx<'_> {
             .map(|&c| MemLoc {
                 base: MemBase::Local(c),
                 offset: Some(0),
-                size: 0,
+                size: Bits::new(0),
                 typ: None,
             })
             .collect();
@@ -417,9 +418,9 @@ mod tests {
             0,
             vec![
                 entry(),
-                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, 32),
-                Instruction::store(PseudoId(6), PseudoId(0), 0, i32t, 32),
-                Instruction::load(PseudoId(20), PseudoId(0), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, Bits::new(32)),
+                Instruction::store(PseudoId(6), PseudoId(0), 0, i32t, Bits::new(32)),
+                Instruction::load(PseudoId(20), PseudoId(0), 0, i32t, Bits::new(32)),
                 Instruction::new(Opcode::Ret).with_src(PseudoId(20)),
             ],
             vec![],
@@ -441,10 +442,10 @@ mod tests {
             0,
             vec![
                 entry(),
-                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, Bits::new(32)),
                 fence,
-                Instruction::store(PseudoId(6), PseudoId(0), 0, i32t, 32),
-                Instruction::load(PseudoId(20), PseudoId(0), 0, i32t, 32),
+                Instruction::store(PseudoId(6), PseudoId(0), 0, i32t, Bits::new(32)),
+                Instruction::load(PseudoId(20), PseudoId(0), 0, i32t, Bits::new(32)),
                 Instruction::new(Opcode::Ret).with_src(PseudoId(20)),
             ],
             vec![],
@@ -468,10 +469,10 @@ mod tests {
             0,
             vec![
                 entry(),
-                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, 32),
-                Instruction::load(PseudoId(20), PseudoId(0), 0, i32t, 32),
-                Instruction::store(PseudoId(6), PseudoId(0), 0, i32t, 32),
-                Instruction::load(PseudoId(21), PseudoId(0), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, Bits::new(32)),
+                Instruction::load(PseudoId(20), PseudoId(0), 0, i32t, Bits::new(32)),
+                Instruction::store(PseudoId(6), PseudoId(0), 0, i32t, Bits::new(32)),
+                Instruction::load(PseudoId(21), PseudoId(0), 0, i32t, Bits::new(32)),
                 Instruction::new(Opcode::Ret).with_src(PseudoId(21)),
             ],
             vec![],
@@ -489,11 +490,11 @@ mod tests {
             0,
             vec![
                 entry(),
-                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, Bits::new(32)),
                 // one byte inside the four just written
-                Instruction::load(PseudoId(20), PseudoId(0), 1, i8t, 8),
-                Instruction::store(PseudoId(6), PseudoId(0), 0, i32t, 32),
-                Instruction::load(PseudoId(21), PseudoId(0), 0, i32t, 32),
+                Instruction::load(PseudoId(20), PseudoId(0), 1, i8t, Bits::new(8)),
+                Instruction::store(PseudoId(6), PseudoId(0), 0, i32t, Bits::new(32)),
+                Instruction::load(PseudoId(21), PseudoId(0), 0, i32t, Bits::new(32)),
                 Instruction::new(Opcode::Ret).with_src(PseudoId(21)),
             ],
             vec![],
@@ -511,9 +512,9 @@ mod tests {
             0,
             vec![
                 entry(),
-                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, 32),
-                Instruction::store(PseudoId(6), PseudoId(0), 1, i8t, 8),
-                Instruction::load(PseudoId(20), PseudoId(0), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, Bits::new(32)),
+                Instruction::store(PseudoId(6), PseudoId(0), 1, i8t, Bits::new(8)),
+                Instruction::load(PseudoId(20), PseudoId(0), 0, i32t, Bits::new(32)),
                 Instruction::new(Opcode::Ret).with_src(PseudoId(20)),
             ],
             vec![],
@@ -533,10 +534,10 @@ mod tests {
             0,
             vec![
                 entry(),
-                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, 32),
-                Instruction::call(None, "opaque", vec![], vec![], void, 0),
-                Instruction::store(PseudoId(6), PseudoId(0), 0, i32t, 32),
-                Instruction::load(PseudoId(20), PseudoId(0), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, Bits::new(32)),
+                Instruction::call(None, "opaque", vec![], vec![], void, Bits::new(0)),
+                Instruction::store(PseudoId(6), PseudoId(0), 0, i32t, Bits::new(32)),
+                Instruction::load(PseudoId(20), PseudoId(0), 0, i32t, Bits::new(32)),
                 Instruction::new(Opcode::Ret).with_src(PseudoId(20)),
             ],
             vec![],
@@ -556,9 +557,9 @@ mod tests {
             0,
             vec![
                 entry(),
-                Instruction::store(PseudoId(5), PseudoId(2), 0, i32t, 32),
-                Instruction::call(None, "opaque", vec![], vec![], void, 0),
-                Instruction::store(PseudoId(6), PseudoId(2), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(2), 0, i32t, Bits::new(32)),
+                Instruction::call(None, "opaque", vec![], vec![], void, Bits::new(0)),
+                Instruction::store(PseudoId(6), PseudoId(2), 0, i32t, Bits::new(32)),
                 Instruction::new(Opcode::Ret),
             ],
             vec![],
@@ -577,7 +578,7 @@ mod tests {
             0,
             vec![
                 entry(),
-                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, Bits::new(32)),
                 br(1),
             ],
             vec![1],
@@ -596,7 +597,7 @@ mod tests {
             0,
             vec![
                 entry(),
-                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, Bits::new(32)),
                 br(1),
             ],
             vec![1],
@@ -604,7 +605,7 @@ mod tests {
         b.block(
             1,
             vec![
-                Instruction::load(PseudoId(20), PseudoId(0), 0, i32t, 32),
+                Instruction::load(PseudoId(20), PseudoId(0), 0, i32t, Bits::new(32)),
                 Instruction::new(Opcode::Ret).with_src(PseudoId(20)),
             ],
             vec![],
@@ -623,7 +624,7 @@ mod tests {
             0,
             vec![
                 entry(),
-                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, Bits::new(32)),
                 cbr(PseudoId(7), 1, 2),
             ],
             vec![1, 2],
@@ -631,7 +632,7 @@ mod tests {
         b.block(
             1,
             vec![
-                Instruction::load(PseudoId(20), PseudoId(0), 0, i32t, 32),
+                Instruction::load(PseudoId(20), PseudoId(0), 0, i32t, Bits::new(32)),
                 br(3),
             ],
             vec![3],
@@ -652,8 +653,8 @@ mod tests {
         b.block(
             1,
             vec![
-                Instruction::load(PseudoId(20), PseudoId(0), 0, i32t, 32),
-                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, 32),
+                Instruction::load(PseudoId(20), PseudoId(0), 0, i32t, Bits::new(32)),
+                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, Bits::new(32)),
                 cbr(PseudoId(7), 1, 2),
             ],
             vec![1, 2],
@@ -680,8 +681,8 @@ mod tests {
             0,
             vec![
                 entry(),
-                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, 32),
-                Instruction::store(PseudoId(6), PseudoId(0), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, Bits::new(32)),
+                Instruction::store(PseudoId(6), PseudoId(0), 0, i32t, Bits::new(32)),
                 Instruction::new(Opcode::Ret),
             ],
             vec![],
@@ -708,9 +709,9 @@ mod tests {
                     vec![PseudoId(10)],
                     vec![b.types.long_id],
                     void,
-                    0,
+                    Bits::new(0),
                 ),
-                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, Bits::new(32)),
                 Instruction::new(Opcode::Ret),
             ],
             vec![],
@@ -729,7 +730,7 @@ mod tests {
             0,
             vec![
                 entry(),
-                Instruction::store(PseudoId(5), PseudoId(2), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(2), 0, i32t, Bits::new(32)),
                 Instruction::new(Opcode::Ret),
             ],
             vec![],
@@ -748,7 +749,7 @@ mod tests {
             0,
             vec![
                 entry(),
-                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, Bits::new(32)),
                 Instruction::new(Opcode::Setjmp),
                 Instruction::new(Opcode::Ret),
             ],
@@ -768,10 +769,10 @@ mod tests {
             0,
             vec![
                 entry(),
-                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, 32),
-                Instruction::store(PseudoId(6), PseudoId(1), 0, i32t, 32),
-                Instruction::load(PseudoId(20), PseudoId(0), 0, i32t, 32),
-                Instruction::load(PseudoId(21), PseudoId(1), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, Bits::new(32)),
+                Instruction::store(PseudoId(6), PseudoId(1), 0, i32t, Bits::new(32)),
+                Instruction::load(PseudoId(20), PseudoId(0), 0, i32t, Bits::new(32)),
+                Instruction::load(PseudoId(21), PseudoId(1), 0, i32t, Bits::new(32)),
                 Instruction::new(Opcode::Ret).with_src(PseudoId(20)),
             ],
             vec![],
@@ -785,7 +786,7 @@ mod tests {
     fn block_op(op: Opcode, dest: PseudoId, src: PseudoId, types: &TypeTable) -> Instruction {
         Instruction::new(op)
             .with_src3(dest, src, PseudoId(5))
-            .with_type_and_size(types.void_ptr_id, 64)
+            .with_type_and_size(types.void_ptr_id, Bits::new(64))
     }
 
     /// A local whose address went only to a block op has not escaped, so a
@@ -800,7 +801,7 @@ mod tests {
             0,
             vec![
                 entry(),
-                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, Bits::new(32)),
                 set,
                 Instruction::new(Opcode::Ret),
             ],
@@ -829,10 +830,10 @@ mod tests {
                 0,
                 vec![
                     entry(),
-                    Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, 32),
+                    Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, Bits::new(32)),
                     copy,
-                    Instruction::store(PseudoId(6), PseudoId(0), 0, i32t, 32),
-                    Instruction::load(PseudoId(20), PseudoId(0), 0, i32t, 32),
+                    Instruction::store(PseudoId(6), PseudoId(0), 0, i32t, Bits::new(32)),
+                    Instruction::load(PseudoId(20), PseudoId(0), 0, i32t, Bits::new(32)),
                     Instruction::new(Opcode::Ret).with_src(PseudoId(20)),
                 ],
                 vec![],
@@ -848,7 +849,7 @@ mod tests {
         let at = |off: i64, bits: u32| MemLoc {
             base: MemBase::Local(PseudoId(0)),
             offset: Some(off),
-            size: bits,
+            size: Bits::new(bits),
             typ: None,
         };
         assert!(covers(&at(0, 32), &at(0, 32)));
@@ -863,7 +864,7 @@ mod tests {
         let elsewhere = MemLoc {
             base: MemBase::Local(PseudoId(1)),
             offset: Some(0),
-            size: 32,
+            size: Bits::new(32),
             typ: None,
         };
         assert!(!covers(&at(0, 32), &elsewhere));

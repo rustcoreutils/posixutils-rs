@@ -53,6 +53,7 @@ use crate::arch::regalloc::{
 use crate::float::FloatVal;
 use crate::ir::{AsmData, Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::TypeTable;
+use crate::units::Bits;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 // x86-64 Register Definitions
@@ -1646,7 +1647,7 @@ impl RegAlloc {
             };
             for c in super::inline_asm::x87_operands(asm) {
                 self.fp_pseudos.insert(c.pseudo);
-                if c.size > 64 {
+                if c.size > Bits::new(64) {
                     self.ld_pseudos.insert(c.pseudo);
                 }
             }
@@ -1669,7 +1670,7 @@ impl RegAlloc {
             };
             for c in super::inline_asm::sse_operands(asm) {
                 self.fp_pseudos.insert(c.pseudo);
-                if c.size > 64 {
+                if c.size > Bits::new(64) {
                     self.quad_pseudos.insert(c.pseudo);
                 }
             }
@@ -1694,7 +1695,7 @@ impl RegAlloc {
                 let is_quad = insn
                     .typ
                     .is_some_and(|t| types.kind(t) == crate::types::TypeKind::Float128)
-                    || (matches!(insn.op, Opcode::Simd(_)) && insn.size > 64);
+                    || (matches!(insn.op, Opcode::Simd(_)) && insn.size > Bits::new(64));
                 if is_quad {
                     if let Some(target) = insn.target {
                         self.quad_pseudos.insert(target);
@@ -3244,7 +3245,9 @@ mod tests {
         use crate::ir::{AsmConstraint, AsmData};
         let (outputs, inputs): (Vec<_>, Vec<_>) = operands
             .iter()
-            .map(|&(c, pseudo)| AsmConstraint::new(pseudo, c, crate::target::Arch::X86_64, 64))
+            .map(|&(c, pseudo)| {
+                AsmConstraint::new(pseudo, c, crate::target::Arch::X86_64, Bits::new(64))
+            })
             .partition(|c| c.class.access != AsmAccess::Read);
         let mut insn = Instruction::new(Opcode::Asm);
         insn.extra_mut().asm_data = Some(Box::new(AsmData {
@@ -3331,7 +3334,7 @@ mod tests {
         let data = asm.extra_mut().asm_data.as_mut().unwrap();
         data.inputs[1].matching_output = Some(0);
         let mut ld = make_asm_insn(&[], &[("=f", PseudoId(5))]);
-        ld.extra_mut().asm_data.as_mut().unwrap().outputs[0].size = 128;
+        ld.extra_mut().asm_data.as_mut().unwrap().outputs[0].size = Bits::new(128);
 
         let types = crate::types::TypeTable::new(&crate::target::Target::host());
         let mut func = Function::new("f", types.void_id);

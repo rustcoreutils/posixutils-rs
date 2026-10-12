@@ -965,6 +965,7 @@ mod tests {
     use crate::arch::regalloc::compute_live_intervals;
     use crate::ir::{BasicBlock, Pseudo};
     use crate::types::TypeTable;
+    use crate::units::Bits;
 
     /// A location in the tests' toy machine: a register, `bytes` of frame
     /// from `lo`, or a constant.
@@ -1034,11 +1035,11 @@ mod tests {
     }
 
     fn copy(types: &TypeTable, target: u32, src: PseudoId) -> Instruction {
-        Instruction::unop(Opcode::Copy, p(target), src, types.long_id, 64)
+        Instruction::unop(Opcode::Copy, p(target), src, types.long_id, Bits::new(64))
     }
 
     fn add(types: &TypeTable, target: u32, a: PseudoId, b: PseudoId) -> Instruction {
-        Instruction::binop(Opcode::Add, p(target), a, b, types.long_id, 64)
+        Instruction::binop(Opcode::Add, p(target), a, b, types.long_id, Bits::new(64))
     }
 
     /// Check `func` with `placed`, `clobbers` and `reserved`; `share` says
@@ -1215,7 +1216,7 @@ mod tests {
                     vec![p(2)],
                     vec![types.long_id],
                     types.long_id,
-                    64,
+                    Bits::new(64),
                 ),
                 add(&types, 4, p(1), p(3)),
                 Instruction::ret(Some(p(4))),
@@ -1320,7 +1321,9 @@ mod tests {
     fn locals_share_a_slot_only_outside_each_others_lifetimes() {
         let types = types();
         let scopes = |reread: bool| {
-            let load = |t: u32, from: u32| Instruction::load(p(t), p(from), 0, types.long_id, 64);
+            let load = |t: u32, from: u32| {
+                Instruction::load(p(t), p(from), 0, types.long_id, Bits::new(64))
+            };
             let mut insns = vec![load(1, 5), Instruction::lifetime_end(p(5)), load(2, 6)];
             if reread {
                 insns.push(load(3, 5));
@@ -1396,7 +1399,7 @@ mod tests {
             &[],
             vec![
                 copy(&types, 1, ONE),
-                setjmp.with_type_and_size(types.int_id, 32),
+                setjmp.with_type_and_size(types.int_id, Bits::new(32)),
                 Instruction::cbr(p(2), b1, b2),
             ],
         );

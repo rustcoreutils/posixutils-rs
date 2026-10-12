@@ -261,7 +261,7 @@ pub fn setval_sizes(func: &Function) -> HashMap<PseudoId, u32> {
     for insn in func.blocks.iter().flat_map(|b| &b.insns) {
         if insn.op == Opcode::SetVal {
             if let Some(target) = insn.target {
-                sizes.entry(target).or_insert(insn.size);
+                sizes.entry(target).or_insert(insn.size.get());
             }
         }
     }
@@ -2092,6 +2092,7 @@ impl AbiLowering {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::units::Bits;
 
     /// The asm register operands are the ones the template needs in a
     /// register of their own: `"r"`, and a `"0"` tied to one. An operand
@@ -2109,7 +2110,7 @@ mod tests {
         f.next_pseudo = 6;
         let op = |p: u32, c: &str, tied: Option<usize>| AsmConstraint {
             matching_output: tied,
-            ..AsmConstraint::new(PseudoId(p), c, Arch::X86_64, 64)
+            ..AsmConstraint::new(PseudoId(p), c, Arch::X86_64, Bits::new(64))
         };
         let mut asm = Instruction::new(Opcode::Asm);
         asm.extra_mut().asm_data = Some(Box::new(AsmData {
@@ -2158,7 +2159,7 @@ mod tests {
             PseudoId(0),
             0,
             types.long_id,
-            64,
+            Bits::new(64),
         ));
         bb.add_insn(Instruction::lifetime_end(PseudoId(0)));
         bb.add_insn(Instruction::load(
@@ -2166,7 +2167,7 @@ mod tests {
             PseudoId(1),
             0,
             types.long_id,
-            64,
+            Bits::new(64),
         ));
         bb.add_insn(Instruction::lifetime_end(PseudoId(1)));
         bb.add_insn(Instruction::load(
@@ -2174,7 +2175,7 @@ mod tests {
             PseudoId(2),
             0,
             types.int_id,
-            32,
+            Bits::new(32),
         ));
         bb.add_insn(Instruction::ret(Some(PseudoId(5))));
         f.add_block(bb);
@@ -2232,10 +2233,10 @@ mod tests {
             PseudoId(2),
             0,
             types.int_id,
-            32,
+            Bits::new(32),
         ));
         twice.target = Some(PseudoId(4));
-        entry.add_insn(twice.with_type_and_size(types.int_id, 32));
+        entry.add_insn(twice.with_type_and_size(types.int_id, Bits::new(32)));
         entry.add_insn(Instruction::cbr(PseudoId(4), b1, b2));
         entry.children = vec![b1, b2];
         let mut resumed = BasicBlock::new(b1);
@@ -2247,7 +2248,7 @@ mod tests {
             PseudoId(2),
             0,
             types.int_id,
-            32,
+            Bits::new(32),
         ));
         direct.add_insn(Instruction::ret(Some(PseudoId(5))));
         direct.parents = vec![b0];
@@ -2261,7 +2262,7 @@ mod tests {
     #[test]
     fn a_value_live_across_setjmp_spans_to_the_end() {
         let types = TypeTable::new(&crate::target::Target::host());
-        let mut call = Instruction::call(None, "rt", vec![], vec![], types.int_id, 32);
+        let mut call = Instruction::call(None, "rt", vec![], vec![], types.int_id, Bits::new(32));
         call.extra_mut().returns_twice_call = true;
         for twice in [Instruction::new(Opcode::Setjmp), call] {
             let kind = twice.op;
@@ -2318,7 +2319,7 @@ mod tests {
             PseudoId(5),
             PseudoId(6),
             types.int_id,
-            32,
+            Bits::new(32),
         ));
         first.add_insn(Instruction::ret(Some(PseudoId(5))));
         first.parents = vec![b2];
@@ -2328,11 +2329,11 @@ mod tests {
             PseudoId(2),
             0,
             types.int_id,
-            32,
+            Bits::new(32),
         ));
         let mut setjmp = Instruction::new(Opcode::Setjmp);
         setjmp.target = Some(PseudoId(4));
-        set.add_insn(setjmp.with_type_and_size(types.int_id, 32));
+        set.add_insn(setjmp.with_type_and_size(types.int_id, Bits::new(32)));
         set.add_insn(Instruction::cbr(PseudoId(4), b3, b1));
         set.parents = vec![b0];
         set.children = vec![b3, b1];
@@ -2477,7 +2478,7 @@ mod tests {
                 PseudoId(a),
                 PseudoId(b),
                 types.long_id,
-                64,
+                Bits::new(64),
             )
         };
         let mut bb = BasicBlock::new(BasicBlockId(0));
@@ -2546,7 +2547,7 @@ mod tests {
                 PseudoId(0),
                 PseudoId(0),
                 types.long_id,
-                64,
+                Bits::new(64),
             )
         };
         let mut entry = BasicBlock::new(b0);
@@ -2581,7 +2582,7 @@ mod tests {
     #[test]
     fn stack_slot_across_setjmp_is_its_own() {
         let types = TypeTable::new(&crate::target::Target::host());
-        let mut call = Instruction::call(None, "rt", vec![], vec![], types.int_id, 32);
+        let mut call = Instruction::call(None, "rt", vec![], vec![], types.int_id, Bits::new(32));
         call.extra_mut().returns_twice_call = true;
         for twice in [Instruction::new(Opcode::Setjmp), call] {
             let kind = twice.op;
@@ -2591,7 +2592,7 @@ mod tests {
             // Without the setjmp the two would share.
             let mut plain = f.clone();
             plain.blocks[0].insns[2] =
-                Instruction::load(PseudoId(4), PseudoId(2), 0, types.int_id, 32);
+                Instruction::load(PseudoId(4), PseudoId(2), 0, types.int_id, Bits::new(32));
             let slot = stack_slots(&plain, &[(3, EIGHT), (5, EIGHT)]);
             assert_eq!(slot[&3], slot[&5], "{kind:?} replaced by a load");
         }
@@ -2620,7 +2621,7 @@ mod tests {
                 PseudoId(a),
                 PseudoId(0),
                 types.long_id,
-                64,
+                Bits::new(64),
             )
         };
         let mut entry = BasicBlock::new(b0);
@@ -2639,7 +2640,7 @@ mod tests {
             vec![PseudoId(0)],
             vec![types.long_id],
             types.long_id,
-            64,
+            Bits::new(64),
         ));
         call.add_insn(add(5, 4));
         call.add_insn(Instruction::ret(Some(PseudoId(5))));

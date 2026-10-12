@@ -291,7 +291,7 @@ impl Aarch64CodeGen {
             let loc = self.get_location(output.pseudo);
             let requires_mem = output.is_memory();
             let read_write = output.class.access == AsmAccess::ReadWrite;
-            let op_size = output.size;
+            let op_size = output.size.get();
             let op_name = output.name.clone();
             let mk = |value: AsmOperandValue<Reg>| crate::arch::AsmOperandSlot {
                 value,
@@ -441,7 +441,7 @@ impl Aarch64CodeGen {
                         if let Some(m) = self.pinned_move(
                             pin,
                             pseudo,
-                            input.size,
+                            input.size.get(),
                             &mut addr_regs,
                             &mut gp_scratch,
                             insn,
@@ -483,7 +483,7 @@ impl Aarch64CodeGen {
             };
             let class = &input.class;
             let requires_mem = input.is_memory();
-            let op_size = input.size;
+            let op_size = input.size.get();
             let op_name = input.name.clone();
             let mk = |value: AsmOperandValue<Reg>| crate::arch::AsmOperandSlot {
                 value,

@@ -75,6 +75,12 @@ impl Bits {
         }
     }
 
+    /// The bytes a value of this width touches: a partial byte counts as a
+    /// whole one, since an access to it still reaches the byte it ends in.
+    pub const fn bytes_covering(self) -> u32 {
+        self.0.div_ceil(8)
+    }
+
     /// The width as an object size: the bytes a value of this width occupies
     /// in memory, when it is a whole number of them.
     pub fn byte_size(self) -> Option<ByteSize> {
@@ -269,6 +275,9 @@ mod tests {
         assert_eq!(Bits::new(128).bytes_exact(), 16);
         assert_eq!(Bits::new(32).byte_size(), Some(ByteSize::new(4)));
         assert_eq!(Bits::new(3).byte_size(), None);
+        assert_eq!(Bits::new(3).bytes_covering(), 1);
+        assert_eq!(Bits::new(64).bytes_covering(), 8);
+        assert_eq!(Bits::new(65).bytes_covering(), 9);
         assert_eq!(Bits::new(7).get(), 7);
         assert!(Bits::new(32) < Bits::new(64));
         assert_eq!(Bits::ZERO, Bits::new(0));

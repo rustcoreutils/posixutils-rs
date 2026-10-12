@@ -20,6 +20,7 @@ use super::{Function, Instruction, Opcode, Pseudo, PseudoId};
 use crate::diag::Position;
 use crate::float::FloatVal;
 use crate::types::{TypeId, TypeTable};
+use crate::units::Bits;
 
 /// The instructions that replace one instruction, appended to `out` in
 /// order, each at the replaced instruction's source position.
@@ -51,8 +52,8 @@ impl<'a> Builder<'a> {
     }
 
     /// The width a value of `typ` has in the IR.
-    fn bits(&self, typ: TypeId) -> u32 {
-        self.types.size_bits(typ)
+    fn bits(&self, typ: TypeId) -> Bits {
+        self.types.value_bits(typ)
     }
 
     /// A load of a `typ` from `addr + at`.
@@ -80,7 +81,7 @@ impl<'a> Builder<'a> {
     /// width.
     pub(crate) fn constant(&mut self, v: i128, typ: TypeId) -> PseudoId {
         let size = self.bits(typ);
-        let id = self.func.create_const_pseudo(at_width(v, size, true));
+        let id = self.func.create_const_pseudo(at_width(v, size.get(), true));
         self.push(Instruction::set_val(id, typ, size));
         id
     }
@@ -199,7 +200,7 @@ mod tests {
         b.store(w, p, 0, int);
         b.store(f, p, 8, dbl);
         b.copy_into(PseudoId(1), sum, ptr);
-        let bits = |t| types.size_bits(t);
+        let bits = |t| types.value_bits(t);
         let widths: Vec<_> = out.iter().map(|i| (i.op, i.size)).collect();
         assert_eq!(
             widths,

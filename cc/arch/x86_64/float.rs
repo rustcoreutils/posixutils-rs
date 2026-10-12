@@ -68,7 +68,8 @@ impl X86_64CodeGen {
         let addr_loc = self.get_location(addr);
 
         // Use type-aware FP size determination
-        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types, &self.base.target);
+        let fp_size =
+            FpSize::from_type_or_bits(insn.typ, insn.size.get(), types, &self.base.target);
 
         match addr_loc {
             Loc::Reg(r) => {
@@ -136,7 +137,7 @@ impl X86_64CodeGen {
             self.emit_fp_move_from_xmm(
                 dst_xmm,
                 &dst_loc,
-                self.fp_format(insn.typ, insn.size, types),
+                self.fp_format(insn.typ, insn.size.get(), types),
             );
         }
     }
@@ -148,7 +149,8 @@ impl X86_64CodeGen {
             _ => return,
         };
         // Use type-aware FP size determination
-        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types, &self.base.target);
+        let fp_size =
+            FpSize::from_type_or_bits(insn.typ, insn.size.get(), types, &self.base.target);
 
         // IMPORTANT: Check address location BEFORE emit_fp_move, because emit_fp_move
         // may clobber RAX when loading immediate values. If addr is in RAX, we need
@@ -172,7 +174,7 @@ impl X86_64CodeGen {
         self.emit_fp_move(
             value,
             XmmReg::Xmm15,
-            self.fp_format(insn.typ, insn.size, types),
+            self.fp_format(insn.typ, insn.size.get(), types),
         );
 
         match addr_loc {
@@ -335,7 +337,8 @@ impl X86_64CodeGen {
             _ => XmmReg::Xmm15,
         };
         // Use type-aware FP size determination
-        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types, &self.base.target);
+        let fp_size =
+            FpSize::from_type_or_bits(insn.typ, insn.size.get(), types, &self.base.target);
 
         // Helper to emit the FP binop LIR instruction
         let emit_fp_binop_lir = |cg: &mut Self, src: XmmOperand, dst: XmmReg| match insn.op {
@@ -386,7 +389,11 @@ impl X86_64CodeGen {
         };
 
         // Move first operand to destination XMM register
-        self.emit_fp_move(src1, dst_xmm, self.fp_format(insn.typ, insn.size, types));
+        self.emit_fp_move(
+            src1,
+            dst_xmm,
+            self.fp_format(insn.typ, insn.size.get(), types),
+        );
 
         // Apply operation with second operand
         match src2_loc {
@@ -410,7 +417,7 @@ impl X86_64CodeGen {
                 self.emit_fp_imm_to_xmm(
                     v,
                     scratch,
-                    Self::size_from_type(insn.typ, insn.size, types),
+                    Self::size_from_type(insn.typ, insn.size.get(), types),
                 );
                 emit_fp_binop_lir(self, XmmOperand::Reg(scratch), dst_xmm);
             }
@@ -422,7 +429,11 @@ impl X86_64CodeGen {
                 } else {
                     XmmReg::Xmm15
                 };
-                self.emit_fp_move(src2, scratch, self.fp_format(insn.typ, insn.size, types));
+                self.emit_fp_move(
+                    src2,
+                    scratch,
+                    self.fp_format(insn.typ, insn.size.get(), types),
+                );
                 emit_fp_binop_lir(self, XmmOperand::Reg(scratch), dst_xmm);
             }
         }
@@ -432,7 +443,7 @@ impl X86_64CodeGen {
             self.emit_fp_move_from_xmm(
                 dst_xmm,
                 &dst_loc,
-                self.fp_format(insn.typ, insn.size, types),
+                self.fp_format(insn.typ, insn.size.get(), types),
             );
         }
     }
@@ -454,7 +465,7 @@ impl X86_64CodeGen {
         let (Some(&src), Some(target)) = (insn.src.first(), insn.target) else {
             return;
         };
-        let fp_size = self.fp_format(insn.typ, insn.size, types);
+        let fp_size = self.fp_format(insn.typ, insn.size.get(), types);
         let dst_loc = self.get_location(target);
         // A reserved scratch register when the result lives on the stack; see
         // emit_fp_binop.
@@ -502,7 +513,7 @@ impl X86_64CodeGen {
         let (&[a, b, c], Some(target)) = (insn.src.as_slice(), insn.target) else {
             return;
         };
-        let size = self.fp_format(insn.typ, insn.size, types);
+        let size = self.fp_format(insn.typ, insn.size.get(), types);
         let form = self
             .base
             .isa
@@ -672,7 +683,7 @@ impl X86_64CodeGen {
         let (Some(&src), Some(target)) = (insn.src.first(), insn.target) else {
             return;
         };
-        let fp_size = self.fp_format(insn.typ, insn.size, types);
+        let fp_size = self.fp_format(insn.typ, insn.size.get(), types);
         if self.base.isa.simd() >= X86Simd::Sse41 {
             self.emit_sse41_round(src, target, how, fp_size);
             return;
@@ -909,10 +920,15 @@ impl X86_64CodeGen {
             _ => XmmReg::Xmm15,
         };
         // Use type-aware FP size determination
-        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types, &self.base.target);
+        let fp_size =
+            FpSize::from_type_or_bits(insn.typ, insn.size.get(), types, &self.base.target);
 
         // Move source to destination
-        self.emit_fp_move(src, dst_xmm, self.fp_format(insn.typ, insn.size, types));
+        self.emit_fp_move(
+            src,
+            dst_xmm,
+            self.fp_format(insn.typ, insn.size.get(), types),
+        );
 
         // The sign-bit mask goes in a scratch register that's not dst_xmm.
         let scratch_xmm = if dst_xmm == XmmReg::Xmm15 {
@@ -969,7 +985,7 @@ impl X86_64CodeGen {
             self.emit_fp_move_from_xmm(
                 dst_xmm,
                 &dst_loc,
-                self.fp_format(insn.typ, insn.size, types),
+                self.fp_format(insn.typ, insn.size.get(), types),
             );
         }
     }
@@ -998,7 +1014,7 @@ impl X86_64CodeGen {
         let (Some(&src), Some(target)) = (insn.src.first(), insn.target) else {
             return;
         };
-        let fp_size = self.fp_format(insn.src_typ, insn.src_size, types);
+        let fp_size = self.fp_format(insn.src_typ, insn.src_size.get(), types);
         let size = Self::fp_bits_size(fp_size);
         self.emit_fp_move(src, XmmReg::Xmm15, fp_size);
         self.emit_xmm_bits_to_gp(XmmReg::Xmm15, fp_size, Reg::R10);
@@ -1025,7 +1041,7 @@ impl X86_64CodeGen {
         else {
             return;
         };
-        let fp_size = self.fp_format(insn.typ, insn.size, types);
+        let fp_size = self.fp_format(insn.typ, insn.size.get(), types);
         let size = Self::fp_bits_size(fp_size);
         let top = ShiftCount::Imm((size.bits() - 1) as u8);
         let one = ShiftCount::Imm(1);
@@ -1095,8 +1111,8 @@ impl X86_64CodeGen {
         let nan = cmp.nan();
         // The operands' format; the result is an `int`.
         let (operand, width) = (insn.operand_type(), insn.operand_width());
-        let fp_size = FpSize::from_type_or_bits(operand, width, types, &self.base.target);
-        let move_size = self.fp_format(operand, width, types);
+        let fp_size = FpSize::from_type_or_bits(operand, width.get(), types, &self.base.target);
+        let move_size = self.fp_format(operand, width.get(), types);
 
         // Use Xmm15 as the work register for src1 (Xmm15/Xmm14 are
         // reserved scratch — not in the allocator palette). src2 cannot
@@ -1237,7 +1253,7 @@ impl X86_64CodeGen {
         let src_size = insn
             .src_typ
             .map(|t| types.size_bits(t))
-            .unwrap_or(insn.src_size)
+            .unwrap_or(insn.src_size.get())
             .max(32);
         let src = match insn.src.first() {
             Some(&s) => s,
@@ -1255,7 +1271,8 @@ impl X86_64CodeGen {
             _ => XmmReg::Xmm15,
         };
 
-        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types, &self.base.target);
+        let fp_size =
+            FpSize::from_type_or_bits(insn.typ, insn.size.get(), types, &self.base.target);
         let is_unsigned_64 = insn.op == Opcode::UCvtF && src_size == 64;
 
         // Move integer to R10 first (scratch register)
@@ -1364,7 +1381,7 @@ impl X86_64CodeGen {
             self.emit_fp_move_from_xmm(
                 dst_xmm,
                 &dst_loc,
-                self.fp_format(insn.typ, insn.size, types),
+                self.fp_format(insn.typ, insn.size.get(), types),
             );
         }
     }
@@ -1385,11 +1402,11 @@ impl X86_64CodeGen {
 
         // Move float to XMM15 (reserved scratch — see emit_fp_binop).
         let fp_size =
-            FpSize::from_type_or_bits(insn.src_typ, insn.src_size, types, &self.base.target);
+            FpSize::from_type_or_bits(insn.src_typ, insn.src_size.get(), types, &self.base.target);
         self.emit_fp_move(
             src,
             XmmReg::Xmm15,
-            self.fp_format(insn.src_typ, insn.src_size, types),
+            self.fp_format(insn.src_typ, insn.src_size.get(), types),
         );
 
         let dst_loc = self.get_location(target);
@@ -1568,7 +1585,7 @@ impl X86_64CodeGen {
         self.emit_fp_move(
             src,
             src_xmm,
-            self.fp_format(insn.src_typ, insn.src_size, types),
+            self.fp_format(insn.src_typ, insn.src_size.get(), types),
         );
 
         // Check types directly to determine conversion needed
@@ -1597,8 +1614,12 @@ impl X86_64CodeGen {
             _ => {
                 // Same type or types unknown, just move if needed
                 if dst_xmm != src_xmm {
-                    let dst_fp_size =
-                        FpSize::from_type_or_bits(insn.typ, insn.size, types, &self.base.target);
+                    let dst_fp_size = FpSize::from_type_or_bits(
+                        insn.typ,
+                        insn.size.get(),
+                        types,
+                        &self.base.target,
+                    );
                     self.push_lir(X86Inst::MovFp {
                         size: dst_fp_size,
                         src: XmmOperand::Reg(src_xmm),
@@ -1612,7 +1633,7 @@ impl X86_64CodeGen {
             self.emit_fp_move_from_xmm(
                 dst_xmm,
                 &dst_loc,
-                self.fp_format(insn.typ, insn.size, types),
+                self.fp_format(insn.typ, insn.size.get(), types),
             );
         }
     }

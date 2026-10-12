@@ -120,7 +120,7 @@ impl Speculation<'_> {
                 cond,
                 arm_on_true,
                 (*lhs, *rhs),
-                insn.operand_width(),
+                insn.operand_width().get(),
             )
     }
 }
@@ -363,6 +363,7 @@ mod tests {
     use crate::ir::{BasicBlock, Pseudo, PseudoId};
     use crate::target::Target;
     use crate::types::TypeTable;
+    use crate::units::Bits;
 
     /// The pass, for the host's types.
     fn run(func: &mut Function) -> bool {
@@ -391,7 +392,7 @@ mod tests {
 
         let mut b0 = BasicBlock::new(pred);
         b0.add_insn(Instruction::new(Opcode::Entry));
-        let mut ps0 = Instruction::phi_source(PseudoId(3), PseudoId(1), int, 32);
+        let mut ps0 = Instruction::phi_source(PseudoId(3), PseudoId(1), int, Bits::new(32));
         ps0.phi_list = vec![(merge, PseudoId(5))];
         b0.add_insn(ps0);
         b0.add_insn(Instruction::cbr(PseudoId(0), arm, merge));
@@ -399,7 +400,7 @@ mod tests {
 
         let mut b1 = BasicBlock::new(arm);
         b1.add_insn(arm_body);
-        let mut ps1 = Instruction::phi_source(PseudoId(4), PseudoId(2), int, 32);
+        let mut ps1 = Instruction::phi_source(PseudoId(4), PseudoId(2), int, Bits::new(32));
         ps1.phi_list = vec![(merge, PseudoId(5))];
         b1.add_insn(ps1);
         b1.add_insn(Instruction::br(merge));
@@ -407,7 +408,7 @@ mod tests {
         b1.children = vec![merge];
 
         let mut b2 = BasicBlock::new(merge);
-        let mut phi = Instruction::phi(PseudoId(5), int, 32);
+        let mut phi = Instruction::phi(PseudoId(5), int, Bits::new(32));
         phi.phi_list = vec![(pred, PseudoId(3)), (arm, PseudoId(4))];
         b2.add_insn(phi);
         b2.add_insn(Instruction::ret(Some(PseudoId(5))));
@@ -426,8 +427,8 @@ mod tests {
             Opcode::SetNe,
             PseudoId(2),
             (PseudoId(0), PseudoId(1)),
-            (types.int_id, 32),
-            (types.int_id, 32),
+            (types.int_id, Bits::new(32)),
+            (types.int_id, Bits::new(32)),
         )
     }
 
@@ -475,7 +476,7 @@ mod tests {
                 PseudoId(2),
                 (PseudoId(0), PseudoId(1)),
                 types.double_id,
-                64,
+                Bits::new(64),
             );
             let mut func = diamond(arm);
             assert!(run(&mut func), "{op:?} must be speculated");
@@ -493,7 +494,7 @@ mod tests {
                 PseudoId(2),
                 (PseudoId(0), PseudoId(1)),
                 types.double_id,
-                64,
+                Bits::new(64),
             );
             arm.src_typ = Some(types.double_id);
             let mut func = diamond(arm);
@@ -505,7 +506,7 @@ mod tests {
             PseudoId(0),
             PseudoId(1),
             types.double_id,
-            64,
+            Bits::new(64),
         );
         let mut func = diamond(fdiv);
         assert!(!run(&mut func), "a float division must not be speculated");
@@ -518,7 +519,7 @@ mod tests {
                 PseudoId(0),
                 PseudoId(1),
                 types.double_id,
-                64,
+                Bits::new(64),
             );
             let mut func = diamond(arm);
             assert!(!run(&mut func), "{op:?} must not be speculated");
@@ -528,9 +529,9 @@ mod tests {
             (Opcode::FCvtS, types.double_id, types.int_id),
             (Opcode::SCvtF, types.long_id, types.double_id),
         ] {
-            let mut arm = Instruction::unop(op, PseudoId(2), PseudoId(0), to, types.size_bits(to));
+            let mut arm = Instruction::unop(op, PseudoId(2), PseudoId(0), to, types.value_bits(to));
             arm.src_typ = Some(from);
-            arm.src_size = 64;
+            arm.src_size = Bits::new(64);
             assert!(arm.may_raise_fp_exception(&types), "{op:?}");
             let mut func = diamond(arm);
             assert!(!run(&mut func), "{op:?} must not be speculated");
@@ -622,11 +623,18 @@ mod tests {
         let unsafe_arms = [
             (
                 "call",
-                Instruction::call(Some(PseudoId(2)), "f", vec![], vec![], types.int_id, 32),
+                Instruction::call(
+                    Some(PseudoId(2)),
+                    "f",
+                    vec![],
+                    vec![],
+                    types.int_id,
+                    Bits::new(32),
+                ),
             ),
             (
                 "load",
-                Instruction::load(PseudoId(2), PseudoId(0), 0, types.int_id, 32),
+                Instruction::load(PseudoId(2), PseudoId(0), 0, types.int_id, Bits::new(32)),
             ),
             (
                 "divide",
@@ -636,7 +644,7 @@ mod tests {
                     PseudoId(0),
                     PseudoId(1),
                     types.int_id,
-                    32,
+                    Bits::new(32),
                 ),
             ),
             (
@@ -647,7 +655,7 @@ mod tests {
                     PseudoId(0),
                     PseudoId(1),
                     types.int_id,
-                    32,
+                    Bits::new(32),
                 ),
             ),
         ];
@@ -705,12 +713,12 @@ mod tests {
         for id in 6..=8 {
             func.add_pseudo(Pseudo::reg(PseudoId(id), id));
         }
-        let mut ps = Instruction::phi_source(PseudoId(8), PseudoId(0), int, 32);
+        let mut ps = Instruction::phi_source(PseudoId(8), PseudoId(0), int, Bits::new(32));
         ps.phi_list = vec![(merge, PseudoId(6))];
         func.get_block_mut(arm)
             .unwrap()
             .insert_before_terminator(ps);
-        let mut phi = Instruction::phi(PseudoId(6), int, 32);
+        let mut phi = Instruction::phi(PseudoId(6), int, Bits::new(32));
         phi.phi_list = vec![(pred, PseudoId(7)), (arm, PseudoId(8))];
         func.get_block_mut(merge).unwrap().insns.insert(1, phi);
 
@@ -739,17 +747,17 @@ mod tests {
         for id in 6..=8 {
             func.add_pseudo(Pseudo::reg(PseudoId(id), id));
         }
-        let mut ps_pred = Instruction::phi_source(PseudoId(7), PseudoId(0), int, 32);
+        let mut ps_pred = Instruction::phi_source(PseudoId(7), PseudoId(0), int, Bits::new(32));
         ps_pred.phi_list = vec![(merge, PseudoId(6))];
         func.get_block_mut(pred)
             .unwrap()
             .insert_before_terminator(ps_pred);
-        let mut ps_arm = Instruction::phi_source(PseudoId(8), PseudoId(1), int, 32);
+        let mut ps_arm = Instruction::phi_source(PseudoId(8), PseudoId(1), int, Bits::new(32));
         ps_arm.phi_list = vec![(merge, PseudoId(6))];
         func.get_block_mut(arm)
             .unwrap()
             .insert_before_terminator(ps_arm);
-        let mut phi = Instruction::phi(PseudoId(6), int, 32);
+        let mut phi = Instruction::phi(PseudoId(6), int, Bits::new(32));
         phi.phi_list = vec![(pred, PseudoId(7)), (arm, PseudoId(8))];
         func.get_block_mut(merge).unwrap().insns.insert(1, phi);
 

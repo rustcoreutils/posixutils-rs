@@ -785,7 +785,7 @@ impl X86_64CodeGen {
         let switch_size = insn
             .typ
             .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.max(32));
+            .unwrap_or(insn.size.get().max(32));
         self.emit_move(val, Reg::R10, switch_size);
         let op_size = if switch_size > 32 {
             OperandSize::B64
@@ -915,7 +915,7 @@ impl X86_64CodeGen {
                     PseudoKind::Val(v) => match target_loc {
                         Some(Loc::Reg(r)) => {
                             self.push_lir(X86Inst::Mov {
-                                size: OperandSize::from_bits(insn.size),
+                                size: OperandSize::from_bits(insn.size.get()),
                                 src: GpOperand::Imm(*v as i64),
                                 dst: GpOperand::Reg(r),
                             });
@@ -935,7 +935,7 @@ impl X86_64CodeGen {
                         // Only emit code if the target is in an XMM register
                         // FImm locations are materialized inline at use sites
                         if let Some(Loc::Xmm(_)) = target_loc {
-                            let fmt = self.fp_format(insn.typ, insn.size, types);
+                            let fmt = self.fp_format(insn.typ, insn.size.get(), types);
                             self.emit_fp_const_load(target, *v, fmt);
                         }
                         // For FImm locations, do nothing - the value will be
@@ -1157,7 +1157,7 @@ impl X86_64CodeGen {
 
             // The operand's format is its `src_typ`: `typ` is the `int`.
             Opcode::Signbit => {
-                if self.fp_format(insn.src_typ, insn.src_size, types) == FpSize::Extended {
+                if self.fp_format(insn.src_typ, insn.src_size.get(), types) == FpSize::Extended {
                     self.emit_x87_signbit(insn);
                 } else {
                     self.emit_fp_signbit(insn, types);
@@ -1228,7 +1228,7 @@ impl X86_64CodeGen {
             Opcode::Copy => {
                 if let (Some(target), Some(&src)) = (insn.target, insn.src.first()) {
                     // Pass the type to emit_copy for proper sign/zero extension
-                    self.emit_copy_with_type(src, target, insn.size, insn.typ, types);
+                    self.emit_copy_with_type(src, target, insn.size.get(), insn.typ, types);
                 }
             }
 

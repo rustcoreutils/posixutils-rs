@@ -67,6 +67,7 @@ mod tests {
     use crate::ir::{Instruction, Opcode, PseudoId};
     use crate::target::{Arch, Os, Target};
     use crate::types::TypeTable;
+    use crate::units::Bits;
 
     #[test]
     fn test_aarch64_legal_insns() {
@@ -103,7 +104,7 @@ mod tests {
             PseudoId(0),
             PseudoId(1),
             types.int128_id,
-            128,
+            Bits::new(128),
         );
         let mut func = make_minimal_func(&types);
         let mut ctx = MappingCtx {
@@ -119,7 +120,7 @@ mod tests {
             PseudoId(0),
             PseudoId(1),
             types.uint128_id,
-            128,
+            Bits::new(128),
         );
         let mut func = make_minimal_func(&types);
         let mut ctx = MappingCtx {
@@ -151,7 +152,7 @@ mod tests {
                 PseudoId(0),
                 PseudoId(1),
                 types.longdouble_id,
-                128,
+                Bits::new(128),
             );
             let mut func = make_minimal_func(&types);
             let mut ctx = MappingCtx {
@@ -177,7 +178,7 @@ mod tests {
             PseudoId(0),
             PseudoId(1),
             types.longdouble_id,
-            64,
+            Bits::new(64),
         );
         let mut func = make_minimal_func(&types);
         let mut ctx = MappingCtx {
@@ -199,7 +200,7 @@ mod tests {
             PseudoId(2),
             PseudoId(0),
             types.longdouble_id,
-            128,
+            Bits::new(128),
         );
         let mut func = make_minimal_func(&types);
         let mut ctx = MappingCtx {
@@ -221,8 +222,8 @@ mod tests {
             Opcode::FCmpsOLt,
             PseudoId(2),
             (PseudoId(0), PseudoId(1)),
-            (types.int_id, 128),
-            (types.int_id, 32),
+            (types.int_id, Bits::new(128)),
+            (types.int_id, Bits::new(32)),
         );
         insn.src_typ = Some(types.longdouble_id);
         let mut func = make_minimal_func(&types);
@@ -242,8 +243,8 @@ mod tests {
             Opcode::FCmpOEq,
             PseudoId(2),
             (PseudoId(0), PseudoId(1)),
-            (types.int_id, 128),
-            (types.int_id, 32),
+            (types.int_id, Bits::new(128)),
+            (types.int_id, Bits::new(32)),
         );
         insn.src_typ = Some(types.longdouble_id);
         let mut func = make_minimal_func(&types);
@@ -281,8 +282,8 @@ mod tests {
                 op,
                 PseudoId(2),
                 (PseudoId(0), PseudoId(1)),
-                (types.int_id, 128),
-                (types.int_id, 32),
+                (types.int_id, Bits::new(128)),
+                (types.int_id, Bits::new(32)),
             );
             insn.src_typ = Some(types.longdouble_id);
             let mut func = make_minimal_func(&types);
@@ -304,8 +305,8 @@ mod tests {
             Opcode::FCmpOLt,
             PseudoId(2),
             (PseudoId(0), PseudoId(1)),
-            (types.int_id, 128),
-            (types.int_id, 32),
+            (types.int_id, Bits::new(128)),
+            (types.int_id, Bits::new(32)),
         );
         insn.src_typ = Some(types.longdouble_id);
         let mut func = make_minimal_func(&types);

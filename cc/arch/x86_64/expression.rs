@@ -16,13 +16,14 @@ use crate::arch::codegen::UnaryOp;
 use crate::arch::lir::{CondCode, Directive, Label, OperandSize};
 use crate::ir::{Instruction, Opcode, PseudoId};
 use crate::types::{TypeKind, TypeTable};
+use crate::units::Bits;
 
 impl X86_64CodeGen {
     pub(super) fn emit_binop(&mut self, insn: &Instruction, types: &TypeTable) {
         let size = insn
             .typ
             .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.max(32));
+            .unwrap_or(insn.size.get().max(32));
         // `kind` and not `is_plain_int128`: complex arithmetic is split into
         // per-half operations whose type is the base `__int128`, so no
         // instruction reaching here carries a complex type. Checked:
@@ -160,7 +161,7 @@ impl X86_64CodeGen {
         let size = insn
             .typ
             .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.max(32));
+            .unwrap_or(insn.size.get().max(32));
         let op_size = OperandSize::from_bits(size);
         let src = match insn.src.first() {
             Some(&s) => s,
@@ -195,7 +196,7 @@ impl X86_64CodeGen {
         let size = insn
             .typ
             .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.max(32));
+            .unwrap_or(insn.size.get().max(32));
         let op_size = OperandSize::from_bits(size);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
@@ -230,7 +231,7 @@ impl X86_64CodeGen {
         let size = insn
             .typ
             .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.max(32));
+            .unwrap_or(insn.size.get().max(32));
         let op_size = OperandSize::from_bits(size);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
@@ -307,7 +308,7 @@ impl X86_64CodeGen {
         let size = insn
             .operand_type()
             .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.operand_width().max(32));
+            .unwrap_or(insn.operand_width().get().max(32));
         let op_size = OperandSize::from_bits(size);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
@@ -358,7 +359,7 @@ impl X86_64CodeGen {
         let narrow = insn
             .operand_type()
             .map(|t| types.size_bits(t))
-            .unwrap_or(insn.operand_width());
+            .unwrap_or(insn.operand_width().get());
         if narrow < 32 {
             let signed = matches!(
                 cc,
@@ -461,10 +462,10 @@ impl X86_64CodeGen {
                 // The source may have been sign-extended by a prior load
                 // (e.g., load.8 of a 'char' produces movsbl), so we must
                 // mask to the actual source width to get the unsigned value.
-                self.emit_move(src, dst_reg, insn.src_size.max(32));
-                if insn.src_size < 32 {
+                self.emit_move(src, dst_reg, insn.src_size.get().max(32));
+                if insn.src_size < Bits::new(32) {
                     // Mask to source width: AND with (1 << src_size) - 1
-                    let mask = (1i64 << insn.src_size) - 1;
+                    let mask = (1i64 << insn.src_size.get()) - 1;
                     self.push_lir(X86Inst::And {
                         size: OperandSize::B32,
                         src: GpOperand::Imm(mask),
@@ -474,8 +475,8 @@ impl X86_64CodeGen {
             }
             Opcode::Sext => {
                 // Move source at its original size, then sign-extend
-                self.emit_move(src, dst_reg, insn.src_size.max(32));
-                match insn.src_size {
+                self.emit_move(src, dst_reg, insn.src_size.get().max(32));
+                match insn.src_size.get() {
                     8 => {
                         // LIR: sign-extend byte to qword
                         self.push_lir(X86Inst::Movsx {
@@ -517,11 +518,11 @@ impl X86_64CodeGen {
                 // and reads whatever the caller left above the byte.
                 self.emit_move(src, dst_reg, 64);
                 let signed = insn.typ.is_some_and(|t| !types.is_unsigned(t));
-                match insn.size {
+                match insn.size.get() {
                     8 | 16 if signed => {
                         // LIR: sign-extend byte/word to dword
                         self.push_lir(X86Inst::Movsx {
-                            src_size: if insn.size == 8 {
+                            src_size: if insn.size == Bits::new(8) {
                                 OperandSize::B8
                             } else {
                                 OperandSize::B16
@@ -563,7 +564,7 @@ impl X86_64CodeGen {
             _ => {}
         }
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, insn.size);
+            self.emit_move_to_loc(dst_reg, &dst_loc, insn.size.get());
         }
     }
 
@@ -1127,7 +1128,7 @@ impl X86_64CodeGen {
         };
         self.int128_load_lo(src, dst_reg);
         // Truncate to target size
-        match insn.size {
+        match insn.size.get() {
             8 => {
                 self.push_lir(X86Inst::Movzx {
                     src_size: OperandSize::B8,
@@ -1154,7 +1155,7 @@ impl X86_64CodeGen {
             _ => {} // 64-bit: lo half is the result
         }
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, insn.size);
+            self.emit_move_to_loc(dst_reg, &dst_loc, insn.size.get());
         }
     }
 

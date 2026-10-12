@@ -28,6 +28,7 @@ use crate::parse::expr_check::register_address_refusal;
 use crate::symbol::SymbolId;
 use crate::token::lexer::payload_bytes;
 use crate::types::TypeTable;
+use crate::units::Bits;
 use gettextrs::gettext;
 
 use crate::types::{TypeId, TypeKind, TypeModifiers};
@@ -188,7 +189,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         let addr = self.vector_addr(e);
                         let conv = self.current_calling_conv;
                         let val = self.vector_return_value(addr, vec, func_ret_type, conv);
-                        let size = self.types.size_bits(func_ret_type);
+                        let size = self.types.value_bits(func_ret_type);
                         self.emit_return(Instruction::ret_typed(Some(val), func_ret_type, size));
                     } else if let Some(sret_ptr) = self.struct_return_ptr {
                         self.emit_sret_return(e, sret_ptr, func_ret_type);
@@ -212,9 +213,9 @@ impl<'a> super::linearize::Linearizer<'a> {
                         let converted_val = self.outlive_cleanups(converted_val, func_ret_type, 0);
                         // Function types decay to pointers when returned
                         let typ_size = if self.types.kind(func_ret_type) == TypeKind::Function {
-                            self.target.pointer_width
+                            Bits::new(self.target.pointer_width)
                         } else {
-                            self.types.size_bits(func_ret_type)
+                            self.types.value_bits(func_ret_type)
                         };
                         self.emit_return(Instruction::ret_typed(
                             Some(converted_val),
@@ -552,7 +553,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         let val = self.linearize_expr(init);
                         let init_type = self.expr_type(init);
                         let converted = self.emit_convert(val, init_type, typ);
-                        let size = self.types.size_bits(typ);
+                        let size = self.types.value_bits(typ);
                         self.emit(Instruction::store(converted, sym_id, 0, typ, size));
                     }
                 } else if self.types.is_complex(typ) || self.types.is_vector(typ) {
@@ -574,7 +575,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         // Simple scalar initializer, converted as if by
                         // assignment (C17 6.7.9p11).
                         let converted = self.linearize_converted(init, typ);
-                        let size = self.types.size_bits(typ);
+                        let size = self.types.value_bits(typ);
                         self.emit(Instruction::store(converted, sym_id, 0, typ, size));
                     }
                 }
@@ -671,7 +672,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         );
 
         // Store num_elements into the hidden size variable
-        let ulong_bits = self.types.size_bits(ulong_type);
+        let ulong_bits = self.types.value_bits(ulong_type);
         let store_size_insn =
             Instruction::store(num_elements, size_sym_id, 0, ulong_type, ulong_bits);
         self.emit(store_size_insn);
@@ -990,7 +991,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         continue;
                     }
                     let converted = self.linearize_converted(&last.value, elem_type);
-                    let elem_size = self.types.size_bits(elem_type);
+                    let elem_size = self.types.value_bits(elem_type);
                     self.emit(Instruction::store(
                         converted, base_sym, offset, elem_type, elem_size,
                     ));
@@ -1113,7 +1114,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         return;
                     }
                     let converted = self.linearize_converted(&element.value, typ);
-                    let typ_size = self.types.size_bits(typ);
+                    let typ_size = self.types.value_bits(typ);
                     self.emit(Instruction::store(
                         converted,
                         base_sym,
@@ -1323,7 +1324,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
             } else {
                 let converted = self.linearize_converted(value, field_type);
-                let size = self.types.size_bits(field_type);
+                let size = self.types.value_bits(field_type);
                 self.emit(Instruction::store(
                     converted, base_sym, offset, field_type, size,
                 ));
@@ -1333,9 +1334,9 @@ impl<'a> super::linearize::Linearizer<'a> {
         } else {
             let (actual_type, actual_size) = if self.types.kind(field_type) == TypeKind::Array {
                 let elem_type = self.types.base_type(field_type).unwrap_or(field_type);
-                (elem_type, self.types.size_bits(elem_type))
+                (elem_type, self.types.value_bits(elem_type))
             } else {
-                (field_type, self.types.size_bits(field_type))
+                (field_type, self.types.value_bits(field_type))
             };
             let converted = self.linearize_converted(value, actual_type);
             self.emit(Instruction::store(
@@ -1600,7 +1601,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         // where the promoted comparison is -1 against 255.
         let cmp_type = self.types.integer_promote(expr_type);
         let switch_val = self.emit_convert(switch_val, expr_type, cmp_type);
-        let size = self.types.size_bits(cmp_type);
+        let size = self.types.value_bits(cmp_type);
 
         let exit_bb = self.alloc_bb();
 
@@ -1645,7 +1646,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.emit(Instruction::br(target));
                 self.link_bb(current, target);
             }
-        } else if size > 64 {
+        } else if size > Bits::new(64) {
             // The `Switch` instruction carries its labels as `i64` and both
             // backends compare in one general register, so a controlling
             // expression wider than that had its high half ignored:
@@ -2177,8 +2178,8 @@ impl<'a> super::linearize::Linearizer<'a> {
             _ => self.types.int_id,
         };
         let elem_type = self.types.base_type(arr_typ).unwrap_or(default_elem);
-        let elem_size = self.types.size_bits(elem_type);
-        let elem_bytes = (elem_size / 8) as i64;
+        let elem_size = self.types.value_bits(elem_type);
+        let elem_bytes = i64::from(elem_size.bytes_exact());
 
         // C17 6.7.9p14 lets an array be exactly as long as the string, in
         // which case the terminating null is dropped rather than written --
@@ -2670,7 +2671,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 let at_least = self.emit_compare(ge, switch_val, lo_k, cmp_type);
                 let at_most = self.emit_compare(le, switch_val, hi_k, cmp_type);
                 let int_typ = self.types.int_id;
-                let int_bits = self.types.size_bits(int_typ);
+                let int_bits = self.types.value_bits(int_typ);
                 self.emit_int_binop(Opcode::And, at_least, at_most, int_typ, int_bits)
             };
             self.branch_on(Controlling::Value(cond), case_bb, next);
@@ -2933,7 +2934,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             matching_output: None,
             constraint: if access == AsmAccess::Read { "r" } else { "=r" }.to_string(),
             class: AsmOperandClass::in_register(reg, access),
-            size: self.types.size_bits(typ),
+            size: self.types.value_bits(typ),
             offset: 0,
             addr_space: crate::types::AddressSpace::Generic,
         }
@@ -3035,7 +3036,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             let name = op.name.map(|n| self.str(n).to_string());
 
             let typ = self.asm_operand_type(&op.expr, is_memory);
-            let size = self.types.size_bits(typ);
+            let size = self.asm_operand_width(typ);
 
             // For memory-class outputs (`=m`/`+m`/...): the asm operand
             // is the ADDRESS of the lvalue, not a register holding a
@@ -3089,7 +3090,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             // be an integer's: gcc takes any integer or pointer object.
             let flag_type = (self.types.is_integer(typ) && !self.types.is_complex(typ))
                 || self.types.kind(typ) == TypeKind::Pointer;
-            if class.flag.is_some() && !(flag_type && size <= 64) {
+            if class.flag.is_some() && !(flag_type && size <= Bits::new(64)) {
                 error(op.expr.pos, "invalid type for 'asm' flag output");
             }
             // The flags are read once the template has run, on the
@@ -3178,7 +3179,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 TypeKind::Function if !is_memory => self.types.pointer_to(typ),
                 _ => typ,
             };
-            let size = self.types.size_bits(typ);
+            let size = self.asm_operand_width(typ);
 
             // For matching constraints (like "0"), we need to load the input value
             // into the matched output's pseudo so they use the same register
@@ -3358,6 +3359,13 @@ impl<'a> super::linearize::Linearizer<'a> {
             // expression is not evaluated a second time.
             self.store_rmw_place(&output_places[i], out_pseudo, typ);
         }
+    }
+
+    /// The width an asm operand of type `typ` is given. An object too large
+    /// to have a value width can only be a memory operand, which is reached
+    /// through its address and given none.
+    fn asm_operand_width(&self, typ: TypeId) -> Bits {
+        self.types.checked_value_bits(typ).unwrap_or(Bits::ZERO)
     }
 
     /// The type a register operand of expression `e` is handled at: its own,
@@ -4231,7 +4239,7 @@ impl CaseConv {
     /// The conversion a `switch` whose promoted controlling type is `typ`
     /// applies to its labels.
     pub(crate) fn of(types: &TypeTable, typ: TypeId) -> Self {
-        Self::new(types.size_bits(typ), types.is_unsigned(typ))
+        Self::new(types.value_bits(typ).get(), types.is_unsigned(typ))
     }
 
     pub(crate) fn unsigned(self) -> bool {
@@ -4725,7 +4733,7 @@ mod asm_operand_tests {
             .unwrap()
             .inputs
             .iter()
-            .map(|c| c.size)
+            .map(|c| c.size.get())
             .collect();
         assert_eq!(sizes, [64, 64, 256]);
     }

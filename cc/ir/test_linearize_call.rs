@@ -15,6 +15,7 @@ use super::test_linearize::{insns_of, linearize_source, linearize_source_with_ty
 use crate::ir::{Function, Instruction, Module, Opcode, PseudoKind};
 use crate::target::{Arch, Os, Target};
 use crate::types::{TypeKind, TypeTable};
+use crate::units::Bits;
 
 fn x86() -> Target {
     Target::new(Arch::X86_64, Os::Linux)
@@ -84,7 +85,7 @@ fn every_return_kind_builds_one_classified_call() {
     assert_eq!(calls.len(), 2);
     let (big, stop) = (calls[0], calls[1]);
     assert_eq!(types.kind(big.typ.unwrap()), TypeKind::Pointer);
-    assert_eq!(big.size, 64);
+    assert_eq!(big.size, Bits::new(64));
     assert_eq!(
         kinds(&types, big),
         [TypeKind::Pointer],

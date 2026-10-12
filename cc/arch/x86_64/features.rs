@@ -594,7 +594,7 @@ impl X86_64CodeGen {
             at = (qwords * 8) as i32;
         }
         for (off, chunk) in crate::ir::memexpand::block_chunks(i64::from(nbytes - at)) {
-            let size = OperandSize::from_bits(chunk.bits());
+            let size = OperandSize::from_bits(chunk.bits().get());
             let done = at + off as i32;
             self.push_lir(X86Inst::Mov {
                 size,
@@ -1440,7 +1440,7 @@ impl X86_64CodeGen {
             self.push_lir(insn);
         }
         for (off, chunk) in crate::ir::memexpand::block_chunks(bytes % 8) {
-            tail(self, off as i32, OperandSize::from_bits(chunk.bits()));
+            tail(self, off as i32, OperandSize::from_bits(chunk.bits().get()));
         }
         self.push_lir(X86Inst::Lea {
             addr: MemAddr::BaseOffset {

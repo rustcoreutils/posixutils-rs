@@ -453,8 +453,8 @@ impl Aarch64CodeGen {
     }
 
     pub(super) fn emit_load(&mut self, insn: &Instruction, types: &TypeTable) {
-        let mem_size = insn.size;
-        let reg_size = insn.size.max(32);
+        let mem_size = insn.size.get();
+        let reg_size = insn.size.get().max(32);
         let addr = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -598,7 +598,7 @@ impl Aarch64CodeGen {
 
     pub(super) fn emit_store(&mut self, insn: &Instruction, types: &TypeTable) {
         // Use actual size for memory stores (8, 16, 32, 64 bits)
-        let mem_size = insn.size;
+        let mem_size = insn.size.get();
 
         let (addr, value) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&a), Some(&v)) => (a, v),
@@ -643,7 +643,7 @@ impl Aarch64CodeGen {
         let reg_size = if store_size == OperandSize::B64 {
             64
         } else {
-            insn.size.max(32)
+            insn.size.get().max(32)
         };
 
         self.emit_move(value, Reg::X9, reg_size);
@@ -671,7 +671,7 @@ impl Aarch64CodeGen {
     /// Emit a struct copy (store of size > 64 bits)
     /// The value is a symbol containing the source struct data
     fn emit_struct_store(&mut self, insn: &Instruction, addr: PseudoId, value: PseudoId) {
-        let struct_size = insn.size; // Size in bits
+        let struct_size = insn.size.get(); // Size in bits
         let num_qwords = struct_size.div_ceil(64);
 
         // Get source address (where the struct data is)

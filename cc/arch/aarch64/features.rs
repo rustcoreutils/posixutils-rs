@@ -719,7 +719,7 @@ impl Aarch64CodeGen {
             return;
         }
         for (done, chunk) in crate::ir::memexpand::block_chunks(bytes.into()) {
-            let size = OperandSize::from_bits(chunk.bits());
+            let size = OperandSize::from_bits(chunk.bits().get());
             let done = done as i32;
             self.push_lir(Aarch64Inst::Ldr {
                 size,

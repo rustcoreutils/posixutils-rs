@@ -109,7 +109,7 @@ impl Solver {
         let mut widths = vec![0; n];
         for insn in func.blocks.iter().flat_map(|bb| &bb.insns) {
             if let Some(w) = insn.target.and_then(|t| widths.get_mut(t.0 as usize)) {
-                *w = insn.size;
+                *w = insn.size.get();
             }
         }
         Solver {
@@ -324,7 +324,7 @@ impl Solver {
             return None;
         }
         for (slot, s) in ops.iter_mut().zip(&insn.src) {
-            let RVal::Known(r) = self.operand(block, *s, insn.operand_width()) else {
+            let RVal::Known(r) = self.operand(block, *s, insn.operand_width().get()) else {
                 return None;
             };
             *slot = r.single_value()? as i128;
@@ -354,7 +354,7 @@ impl Solver {
         if insn.src.len() != 1 {
             return RVal::Bottom;
         }
-        let Some(w) = Range::at(insn.size) else {
+        let Some(w) = Range::at(insn.size.get()) else {
             return RVal::Bottom;
         };
         let RVal::Known(a) = self.operand(block, insn.src[0], w) else {
@@ -375,7 +375,10 @@ impl Solver {
         // records (validator I10): reading an extension at its destination
         // width would make it the identity, which is how a negative `char`
         // comes back positive.
-        let (Some(src), Some(dst)) = (Range::at(insn.operand_width()), Range::at(insn.size)) else {
+        let (Some(src), Some(dst)) = (
+            Range::at(insn.operand_width().get()),
+            Range::at(insn.size.get()),
+        ) else {
             return RVal::Bottom;
         };
         let RVal::Known(a) = self.operand(block, insn.src[0], src) else {
@@ -393,7 +396,7 @@ impl Solver {
         if insn.src.len() != 2 {
             return RVal::Bottom;
         }
-        let Some(w) = Range::at(insn.size) else {
+        let Some(w) = Range::at(insn.size.get()) else {
             return RVal::Bottom;
         };
         let (RVal::Known(a), RVal::Known(b)) = (
@@ -426,8 +429,10 @@ impl Solver {
         if insn.src.len() != 2 {
             return RVal::Bottom;
         }
-        let (Some(rw), Some(ow)) = (Range::at(result_width), Range::at(insn.operand_width()))
-        else {
+        let (Some(rw), Some(ow)) = (
+            Range::at(result_width),
+            Range::at(insn.operand_width().get()),
+        ) else {
             return RVal::Bottom;
         };
         let Some((mask, domain @ CmpDomain::Int { signed })) = Outcomes::of_op(insn.op) else {
@@ -469,13 +474,16 @@ impl SparseAnalysis for Solver {
     }
 
     fn transfer(&self, insn: &Instruction, block: BasicBlockId) -> RVal {
-        let target_width = insn.target.map(|t| self.width_of(t)).unwrap_or(insn.size);
+        let target_width = insn
+            .target
+            .map(|t| self.width_of(t))
+            .unwrap_or(insn.size.get());
 
         match insn.op {
-            Opcode::Copy | Opcode::PhiSource => self.operand(block, insn.src[0], insn.size),
+            Opcode::Copy | Opcode::PhiSource => self.operand(block, insn.src[0], insn.size.get()),
 
             Opcode::SetVal => match insn.target.and_then(|t| self.const_of(t)) {
-                Some(v) => match Range::at(insn.size) {
+                Some(v) => match Range::at(insn.size.get()) {
                     Some(w) => RVal::Known(Range::from_const(w, v)),
                     None => RVal::Bottom,
                 },
@@ -488,17 +496,17 @@ impl SparseAnalysis for Solver {
                     if !self.core.is_edge_executable(*pred, block) {
                         continue;
                     }
-                    acc = acc.meet(self.operand(block, *src, insn.size));
+                    acc = acc.meet(self.operand(block, *src, insn.size.get()));
                 }
                 acc
             }
 
             Opcode::Select if insn.src.len() == 3 => match self.branch_value(block, insn.src[0]) {
-                Some(true) => self.operand(block, insn.src[1], insn.size),
-                Some(false) => self.operand(block, insn.src[2], insn.size),
+                Some(true) => self.operand(block, insn.src[1], insn.size.get()),
+                Some(false) => self.operand(block, insn.src[2], insn.size.get()),
                 None => self
-                    .operand(block, insn.src[1], insn.size)
-                    .meet(self.operand(block, insn.src[2], insn.size)),
+                    .operand(block, insn.src[1], insn.size.get())
+                    .meet(self.operand(block, insn.src[2], insn.size.get())),
             },
 
             op if is_int_foldable(op) => self.int_op(insn, block, target_width),
@@ -594,6 +602,7 @@ mod tests {
     use crate::ir::{BasicBlock, Pseudo};
     use crate::target::Target;
     use crate::types::TypeTable;
+    use crate::units::Bits;
 
     fn host_types() -> TypeTable {
         TypeTable::new(&Target::host())
@@ -633,20 +642,20 @@ mod tests {
             Opcode::SetLe,
             PseudoId(4),
             (PseudoId(0), PseudoId(3)),
-            (i32t, 32),
-            (types.int_id, 32),
+            (i32t, Bits::new(32)),
+            (types.int_id, Bits::new(32)),
         ));
         l0.add_insn(Instruction::compare(
             Opcode::SetNe,
             PseudoId(5),
             (PseudoId(4), PseudoId(6)),
-            (i32t, 32),
-            (types.int_id, 32),
+            (i32t, Bits::new(32)),
+            (types.int_id, Bits::new(32)),
         ));
         let mut ps0 = Instruction::new(Opcode::PhiSource)
             .with_target(PseudoId(22))
             .with_src(PseudoId(7))
-            .with_type_and_size(i32t, 32);
+            .with_type_and_size(i32t, Bits::new(32));
         ps0.phi_list.push((BasicBlockId(2), PseudoId(21)));
         l0.add_insn(ps0);
         let mut cbr = Instruction::new(Opcode::Cbr).with_src(PseudoId(5));
@@ -662,26 +671,26 @@ mod tests {
             PseudoId(0),
             PseudoId(9),
             i32t,
-            32,
+            Bits::new(32),
         ));
         let mut zext = Instruction::new(Opcode::Zext)
             .with_target(PseudoId(11))
             .with_src(PseudoId(10))
-            .with_type_and_size(i64t, 64);
+            .with_type_and_size(i64t, Bits::new(64));
         zext.src_typ = Some(i32t);
-        zext.src_size = 32;
+        zext.src_size = Bits::new(32);
         l1.add_insn(zext);
         l1.add_insn(Instruction::compare(
             Opcode::SetB,
             PseudoId(18),
             (PseudoId(11), PseudoId(17)),
-            (i64t, 64),
-            (types.int_id, 32),
+            (i64t, Bits::new(64)),
+            (types.int_id, Bits::new(32)),
         ));
         let mut ps1 = Instruction::new(Opcode::PhiSource)
             .with_target(PseudoId(23))
             .with_src(PseudoId(18))
-            .with_type_and_size(i32t, 32);
+            .with_type_and_size(i32t, Bits::new(32));
         ps1.phi_list.push((BasicBlockId(2), PseudoId(21)));
         l1.add_insn(ps1);
         let mut br = Instruction::new(Opcode::Br);
@@ -693,7 +702,7 @@ mod tests {
         let mut l2 = BasicBlock::new(BasicBlockId(2));
         let mut phi = Instruction::new(Opcode::Phi)
             .with_target(PseudoId(21))
-            .with_type_and_size(i32t, 32);
+            .with_type_and_size(i32t, Bits::new(32));
         phi.phi_list.push((BasicBlockId(0), PseudoId(22)));
         phi.phi_list.push((BasicBlockId(1), PseudoId(23)));
         l2.add_insn(phi);
@@ -711,7 +720,7 @@ mod tests {
             vec![],
             vec![],
             types.void_id,
-            0,
+            Bits::new(0),
         ));
         let mut br3 = Instruction::new(Opcode::Br);
         br3.bb_true = Some(BasicBlockId(5));
@@ -803,7 +812,7 @@ mod tests {
         bb.insns[0] = Instruction::new(Opcode::Load)
             .with_target(PseudoId(10))
             .with_src(PseudoId(0))
-            .with_type_and_size(types.int_id, 32);
+            .with_type_and_size(types.int_id, Bits::new(32));
         run(&mut func);
         assert!(
             !folds_the_guard(&func),
@@ -854,7 +863,7 @@ mod tests {
         let mut ps = Instruction::new(Opcode::PhiSource)
             .with_target(PseudoId(3))
             .with_src(PseudoId(1))
-            .with_type_and_size(i32t, 32);
+            .with_type_and_size(i32t, Bits::new(32));
         ps.phi_list.push((BasicBlockId(1), PseudoId(5)));
         entry.add_insn(ps);
         let mut b = Instruction::new(Opcode::Br);
@@ -865,7 +874,7 @@ mod tests {
         let mut body = BasicBlock::new(BasicBlockId(1));
         let mut phi = Instruction::new(Opcode::Phi)
             .with_target(PseudoId(5))
-            .with_type_and_size(i32t, 32);
+            .with_type_and_size(i32t, Bits::new(32));
         phi.phi_list.push((BasicBlockId(0), PseudoId(3)));
         phi.phi_list.push((BasicBlockId(1), PseudoId(7)));
         body.add_insn(phi);
@@ -875,12 +884,12 @@ mod tests {
             PseudoId(5),
             PseudoId(2),
             i32t,
-            32,
+            Bits::new(32),
         ));
         let mut ps2 = Instruction::new(Opcode::PhiSource)
             .with_target(PseudoId(7))
             .with_src(PseudoId(6))
-            .with_type_and_size(i32t, 32);
+            .with_type_and_size(i32t, Bits::new(32));
         ps2.phi_list.push((BasicBlockId(1), PseudoId(5)));
         body.add_insn(ps2);
         // Exit on something the pass cannot know.
@@ -951,7 +960,7 @@ mod tests {
         let mut ps0 = Instruction::new(Opcode::PhiSource)
             .with_target(PseudoId(10))
             .with_src(PseudoId(2))
-            .with_type_and_size(i64t, 64);
+            .with_type_and_size(i64t, Bits::new(64));
         ps0.phi_list.push((BasicBlockId(1), PseudoId(12)));
         l0.add_insn(ps0);
         let mut br = Instruction::new(Opcode::Br);
@@ -962,7 +971,7 @@ mod tests {
         let mut l1 = BasicBlock::new(BasicBlockId(1));
         let mut phi = Instruction::new(Opcode::Phi)
             .with_target(PseudoId(12))
-            .with_type_and_size(i64t, 64);
+            .with_type_and_size(i64t, Bits::new(64));
         phi.src = vec![PseudoId(10), PseudoId(11)];
         phi.phi_list = vec![
             (BasicBlockId(0), PseudoId(10)),
@@ -982,7 +991,7 @@ mod tests {
             PseudoId(12),
             PseudoId(3),
             i64t,
-            64,
+            Bits::new(64),
         ));
         // The `Copy` indirections matter: they are what SSA promotion
         // leaves around every value that came out of a local, and they are
@@ -992,26 +1001,26 @@ mod tests {
             Instruction::new(Opcode::Copy)
                 .with_target(PseudoId(15))
                 .with_src(PseudoId(13))
-                .with_type_and_size(i64t, 64),
+                .with_type_and_size(i64t, Bits::new(64)),
         );
         l2.add_insn(
             Instruction::new(Opcode::Copy)
                 .with_target(PseudoId(16))
                 .with_src(PseudoId(0))
-                .with_type_and_size(i64t, 64),
+                .with_type_and_size(i64t, Bits::new(64)),
         );
         l2.add_insn(Instruction::compare(
             Opcode::SetEq,
             PseudoId(14),
             (PseudoId(15), PseudoId(16)),
-            (i64t, 64),
-            (types.int_id, 32),
+            (i64t, Bits::new(64)),
+            (types.int_id, Bits::new(32)),
         ));
         l2.add_insn(
             Instruction::new(Opcode::Copy)
                 .with_target(PseudoId(17))
                 .with_src(PseudoId(14))
-                .with_type_and_size(types.int_id, 32),
+                .with_type_and_size(types.int_id, Bits::new(32)),
         );
         let mut cbr2 = Instruction::new(Opcode::Cbr).with_src(PseudoId(17));
         cbr2.bb_true = Some(BasicBlockId(3));
@@ -1024,26 +1033,26 @@ mod tests {
             Instruction::new(Opcode::Copy)
                 .with_target(PseudoId(20))
                 .with_src(PseudoId(0))
-                .with_type_and_size(i64t, 64),
+                .with_type_and_size(i64t, Bits::new(64)),
         );
         l3.add_insn(
             Instruction::new(Opcode::Ret)
                 .with_src(PseudoId(20))
-                .with_type_and_size(i64t, 64),
+                .with_type_and_size(i64t, Bits::new(64)),
         );
 
         let mut l4 = BasicBlock::new(BasicBlockId(4));
         l4.add_insn(
             Instruction::new(Opcode::Ret)
                 .with_src(PseudoId(12))
-                .with_type_and_size(i64t, 64),
+                .with_type_and_size(i64t, Bits::new(64)),
         );
 
         let mut l5 = BasicBlock::new(BasicBlockId(5));
         let mut ps1 = Instruction::new(Opcode::PhiSource)
             .with_target(PseudoId(11))
             .with_src(PseudoId(13))
-            .with_type_and_size(i64t, 64);
+            .with_type_and_size(i64t, Bits::new(64));
         ps1.phi_list.push((BasicBlockId(1), PseudoId(12)));
         l5.add_insn(ps1);
         let mut back = Instruction::new(Opcode::Br);
@@ -1140,23 +1149,29 @@ mod tests {
             Opcode::SetEq,
             PseudoId(1),
             (PseudoId(0), PseudoId(2)),
-            (int, 32),
-            (int, 32),
+            (int, Bits::new(32)),
+            (int, Bits::new(32)),
         ));
         b0.add_insn(Instruction::cbr(PseudoId(1), l1, l2));
         b0.children = vec![l1, l2];
 
         let mut b1 = BasicBlock::new(l1);
-        let mut count = Instruction::unop(Opcode::Popcount32, PseudoId(3), PseudoId(0), int, 32);
+        let mut count = Instruction::unop(
+            Opcode::Popcount32,
+            PseudoId(3),
+            PseudoId(0),
+            int,
+            Bits::new(32),
+        );
         count.src_typ = Some(int);
-        count.src_size = 32;
+        count.src_size = Bits::new(32);
         b1.add_insn(count);
         b1.add_insn(Instruction::compare(
             Opcode::SetNe,
             PseudoId(4),
             (PseudoId(3), PseudoId(5)),
-            (int, 32),
-            (int, 32),
+            (int, Bits::new(32)),
+            (int, Bits::new(32)),
         ));
         b1.add_insn(Instruction::cbr(PseudoId(4), l3, l2));
         b1.parents = vec![l0];
@@ -1173,7 +1188,7 @@ mod tests {
             vec![],
             vec![],
             types.void_id,
-            0,
+            Bits::new(0),
         ));
         b3.add_insn(Instruction::ret(None));
         b3.parents = vec![l1];
@@ -1219,7 +1234,7 @@ mod tests {
             PseudoId(0),
             PseudoId(30),
             types.int_id,
-            32,
+            Bits::new(32),
         );
         run(&mut func);
         assert!(
@@ -1243,7 +1258,7 @@ mod tests {
             PseudoId(0),
             PseudoId(0),
             types.int_id,
-            32,
+            Bits::new(32),
         );
         assert!(run(&mut func));
         assert!(folds_the_guard(&func));

@@ -29,6 +29,7 @@ use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize};
 use crate::float::FpFormat;
 use crate::ir::{FloatCmp, Instruction, NanCompare, Opcode, PseudoId};
 use crate::types::{TypeKind, TypeTable};
+use crate::units::Bits;
 
 /// 2^63 as the bit pattern of a `double`.
 ///
@@ -127,7 +128,7 @@ impl X86_64CodeGen {
     /// Asked of its *operands*: a comparison of two `long double`s produces
     /// an `int`, and is an x87 operation all the same.
     pub fn is_longdouble_op(&self, insn: &Instruction, types: &TypeTable) -> bool {
-        insn.operand_width() >= 80
+        insn.operand_width() >= Bits::new(80)
             && insn
                 .operand_type()
                 .is_some_and(|t| types.kind(t) == TypeKind::LongDouble)
@@ -931,7 +932,7 @@ impl X86_64CodeGen {
             None => return,
         };
 
-        let src_size = insn.src_size.max(32);
+        let src_size = insn.src_size.get().max(32);
         let src_loc = self.get_location(src);
 
         // We need the integer in memory for fild. If it's in a register, store it first.
@@ -1023,7 +1024,7 @@ impl X86_64CodeGen {
             None => return,
         };
 
-        let dst_size = insn.size;
+        let dst_size = insn.size.get();
         let dst_loc = self.get_location(target);
 
         // Load long double to x87 stack
@@ -1232,7 +1233,7 @@ pub(super) fn uses_x87_scratch(insn: &Instruction, types: &TypeTable) -> bool {
                 .extra()
                 .asm_data
                 .as_ref()
-                .is_some_and(|asm| x87_operands(asm).any(|c| c.size <= 64)))
+                .is_some_and(|asm| x87_operands(asm).any(|c| c.size <= Bits::new(64))))
 }
 
 fn is_long_double(typ: Option<crate::types::TypeId>, types: &TypeTable) -> bool {

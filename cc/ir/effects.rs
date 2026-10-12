@@ -262,6 +262,7 @@ mod tests {
     use crate::ir::{BasicBlock, BasicBlockId, Instruction, Pseudo, PseudoId};
     use crate::target::Target;
     use crate::types::TypeTable;
+    use crate::units::Bits;
 
     fn types() -> TypeTable {
         TypeTable::new(&Target::host())
@@ -299,7 +300,7 @@ mod tests {
     fn effects_an_empty_body_is_const() {
         let t = types();
         let f = func("f", true, |_, bb| {
-            bb.add_insn(Instruction::new(Opcode::Ret).with_type_and_size(t.void_id, 0));
+            bb.add_insn(Instruction::new(Opcode::Ret).with_type_and_size(t.void_id, Bits::new(0)));
         });
         let table = EffectTable::build(&module(vec![f]), &types());
         assert_eq!(table.of("f"), MemEffect::Const);
@@ -310,7 +311,7 @@ mod tests {
     fn effects_noipa_body_is_not_inferred() {
         let t = types();
         let mut f = func("f", true, |_, bb| {
-            bb.add_insn(Instruction::new(Opcode::Ret).with_type_and_size(t.void_id, 0));
+            bb.add_insn(Instruction::new(Opcode::Ret).with_type_and_size(t.void_id, Bits::new(0)));
         });
         f.is_noipa = true;
         let table = EffectTable::build(&module(vec![f]), &types());
@@ -323,7 +324,13 @@ mod tests {
         let t = types();
         let reader = func("r", true, |f, bb| {
             f.add_pseudo(Pseudo::sym(PseudoId(0), "g".into()));
-            bb.add_insn(Instruction::load(PseudoId(1), PseudoId(0), 0, t.int_id, 32));
+            bb.add_insn(Instruction::load(
+                PseudoId(1),
+                PseudoId(0),
+                0,
+                t.int_id,
+                Bits::new(32),
+            ));
         });
         let writer = func("w", true, |f, bb| {
             f.add_pseudo(Pseudo::sym(PseudoId(0), "g".into()));
@@ -333,7 +340,7 @@ mod tests {
                 PseudoId(0),
                 0,
                 t.int_id,
-                32,
+                Bits::new(32),
             ));
         });
         let table = EffectTable::build(&module(vec![reader, writer]), &types());
@@ -356,9 +363,15 @@ mod tests {
                 PseudoId(0),
                 0,
                 t.int_id,
-                32,
+                Bits::new(32),
             ));
-            bb.add_insn(Instruction::load(PseudoId(2), PseudoId(0), 0, t.int_id, 32));
+            bb.add_insn(Instruction::load(
+                PseudoId(2),
+                PseudoId(0),
+                0,
+                t.int_id,
+                Bits::new(32),
+            ));
         });
         let table = EffectTable::build(&module(vec![f]), &types());
         assert_eq!(table.of("f"), MemEffect::Const);
@@ -375,7 +388,7 @@ mod tests {
             move |f: &mut Function, bb: &mut BasicBlock| {
                 f.add_pseudo(Pseudo::sym(PseudoId(0), "g".into()));
                 bb.add_insn(
-                    Instruction::load(PseudoId(2), PseudoId(0), 0, t.int_id, 32)
+                    Instruction::load(PseudoId(2), PseudoId(0), 0, t.int_id, Bits::new(32))
                         .with_volatile(volatile),
                 );
             }
@@ -390,7 +403,8 @@ mod tests {
             f.add_pseudo(Pseudo::sym(PseudoId(0), "a.0".into()));
             f.add_local("a.0", PseudoId(0), t.int_id, None, None);
             bb.add_insn(
-                Instruction::load(PseudoId(2), PseudoId(0), 0, t.int_id, 32).with_volatile(true),
+                Instruction::load(PseudoId(2), PseudoId(0), 0, t.int_id, Bits::new(32))
+                    .with_volatile(true),
             );
         });
         let table = EffectTable::build(&module(vec![local]), &types());
@@ -412,14 +426,14 @@ mod tests {
                 vec![PseudoId(3)],
                 vec![t.long_id],
                 t.void_id,
-                0,
+                Bits::new(0),
             ));
             bb.add_insn(Instruction::store(
                 PseudoId(1),
                 PseudoId(0),
                 0,
                 t.int_id,
-                32,
+                Bits::new(32),
             ));
         });
         let table = EffectTable::build(&module(vec![f]), &types());
@@ -431,7 +445,7 @@ mod tests {
     fn block_op(op: Opcode, dest: PseudoId, src: PseudoId) -> Instruction {
         Instruction::new(op)
             .with_src3(dest, src, PseudoId(9))
-            .with_type_and_size(types().void_ptr_id, 64)
+            .with_type_and_size(types().void_ptr_id, Bits::new(64))
     }
 
     /// The effect of a static function with two local buffers
@@ -489,7 +503,7 @@ mod tests {
                 PseudoId(20),
                 0,
                 t.int_id,
-                32,
+                Bits::new(32),
             ));
         });
         assert_eq!(e, MemEffect::Pure, "a load through an unresolved pointer");
@@ -536,7 +550,7 @@ mod tests {
                         vec![PseudoId(10)],
                         vec![t.void_ptr_id],
                         t.void_id,
-                        0,
+                        Bits::new(0),
                     ));
                 }),
             ),
@@ -551,7 +565,7 @@ mod tests {
                         Instruction::new(Opcode::AtomicLoad)
                             .with_target(PseudoId(20))
                             .with_src(PseudoId(10))
-                            .with_type_and_size(t.int_id, 32),
+                            .with_type_and_size(t.int_id, Bits::new(32)),
                     )
                 }),
             ),
@@ -559,7 +573,7 @@ mod tests {
                 "a volatile store to a private buffer",
                 Box::new(move |_, bb| {
                     bb.add_insn(
-                        Instruction::store(PseudoId(9), PseudoId(10), 0, t.int_id, 32)
+                        Instruction::store(PseudoId(9), PseudoId(10), 0, t.int_id, Bits::new(32))
                             .with_volatile(true),
                     )
                 }),
@@ -575,7 +589,7 @@ mod tests {
                 PseudoId(12),
                 0,
                 t.int_id,
-                32,
+                Bits::new(32),
             ));
         });
         assert_eq!(e, MemEffect::Pure);
@@ -593,7 +607,7 @@ mod tests {
                 PseudoId(0),
                 0,
                 t.int_id,
-                32,
+                Bits::new(32),
             ));
         });
         let caller = func("caller", true, |_, bb| {
@@ -603,11 +617,11 @@ mod tests {
                 vec![],
                 vec![],
                 t.void_id,
-                0,
+                Bits::new(0),
             ));
         });
         let clean = func("clean", true, |_, bb| {
-            bb.add_insn(Instruction::new(Opcode::Ret).with_type_and_size(t.void_id, 0));
+            bb.add_insn(Instruction::new(Opcode::Ret).with_type_and_size(t.void_id, Bits::new(0)));
         });
         let clean_caller = func("clean_caller", true, |_, bb| {
             bb.add_insn(Instruction::call(
@@ -616,7 +630,7 @@ mod tests {
                 vec![],
                 vec![],
                 t.void_id,
-                0,
+                Bits::new(0),
             ));
         });
         let table =
@@ -630,10 +644,24 @@ mod tests {
     fn effects_recursion_converges() {
         let t = types();
         let a = func("a", true, |_, bb| {
-            bb.add_insn(Instruction::call(None, "b", vec![], vec![], t.void_id, 0));
+            bb.add_insn(Instruction::call(
+                None,
+                "b",
+                vec![],
+                vec![],
+                t.void_id,
+                Bits::new(0),
+            ));
         });
         let b = func("b", true, |_, bb| {
-            bb.add_insn(Instruction::call(None, "a", vec![], vec![], t.void_id, 0));
+            bb.add_insn(Instruction::call(
+                None,
+                "a",
+                vec![],
+                vec![],
+                t.void_id,
+                Bits::new(0),
+            ));
         });
         let table = EffectTable::build(&module(vec![a, b]), &types());
         assert_eq!(table.of("a"), MemEffect::Const);
@@ -646,11 +674,11 @@ mod tests {
     fn effects_only_internal_linkage_is_inferred() {
         let t = types();
         let mut external = func("ext", false, |_, bb| {
-            bb.add_insn(Instruction::new(Opcode::Ret).with_type_and_size(t.void_id, 0));
+            bb.add_insn(Instruction::new(Opcode::Ret).with_type_and_size(t.void_id, Bits::new(0)));
         });
         external.is_static = false;
         let mut weak = func("wk", true, |_, bb| {
-            bb.add_insn(Instruction::new(Opcode::Ret).with_type_and_size(t.void_id, 0));
+            bb.add_insn(Instruction::new(Opcode::Ret).with_type_and_size(t.void_id, Bits::new(0)));
         });
         weak.symbol_attrs.weak = true;
         let table = EffectTable::build(&module(vec![external, weak]), &types());
@@ -672,7 +700,7 @@ mod tests {
                 PseudoId(0),
                 0,
                 t.int_id,
-                32,
+                Bits::new(32),
             ));
         });
         f.declared_effect = MemEffect::Pure;

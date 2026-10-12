@@ -82,7 +82,7 @@ impl AddrWalk<'_> {
         match insn.op {
             Opcode::Sext | Opcode::Zext => {
                 let v = self.constant(*insn.src.first()?)?;
-                let bits = insn.src_size;
+                let bits = insn.src_size.get();
                 Some(if bits == 0 || bits >= 64 {
                     v
                 } else if insn.op == Opcode::Sext {
@@ -274,10 +274,10 @@ fn out_of_range(func: &Function, c: &AsmConstraint, found: &Immediate) -> Result
     let imm = c.class.imm;
     let int = match found {
         Immediate::Int(p) => match kind(*p) {
-            Some(PseudoKind::Val(v)) => canonical_int(*v, c.size),
+            Some(PseudoKind::Val(v)) => canonical_int(*v, c.size.get()),
             _ => return Ok(()),
         },
-        Immediate::Folded(v) => canonical_int((*v).into(), c.size),
+        Immediate::Folded(v) => canonical_int((*v).into(), c.size.get()),
         Immediate::Float(p) => {
             return match kind(*p) {
                 Some(PseudoKind::FVal(v)) if !imm.float.admits(*v) => {
@@ -301,6 +301,7 @@ mod tests {
     use crate::ir::{AsmConstraint, AsmData, BasicBlock, BasicBlockId, Pseudo};
     use crate::target::Arch;
     use crate::types::TypeTable;
+    use crate::units::Bits;
 
     /// `entry; <defs>; asm "" :: <constraint>(%operand); ret` over x86-64.
     fn func_with_asm(defs: Vec<Instruction>, constraint: &str, operand: PseudoId) -> Function {
@@ -314,7 +315,12 @@ mod tests {
         entry.add_insn(Instruction::asm(AsmData {
             template: String::new(),
             outputs: Vec::new(),
-            inputs: vec![AsmConstraint::new(operand, constraint, Arch::X86_64, 64)],
+            inputs: vec![AsmConstraint::new(
+                operand,
+                constraint,
+                Arch::X86_64,
+                Bits::new(64),
+            )],
             clobbers: Vec::new(),
             goto_labels: Vec::new(),
         }));
@@ -336,7 +342,7 @@ mod tests {
         Instruction::new(Opcode::Copy)
             .with_target(PseudoId(target))
             .with_src(PseudoId(src))
-            .with_size(32)
+            .with_size(Bits::new(32))
     }
 
     /// A constant reached through copies -- an inlined parameter -- is
@@ -358,11 +364,11 @@ mod tests {
         let symaddr = Instruction::new(Opcode::SymAddr)
             .with_target(PseudoId(1))
             .with_src(PseudoId(0))
-            .with_size(64);
+            .with_size(Bits::new(64));
         let add = Instruction::new(Opcode::Add)
             .with_target(PseudoId(3))
             .with_src2(PseudoId(1), PseudoId(2))
-            .with_size(64);
+            .with_size(Bits::new(64));
         let mut func = func_with_asm(vec![symaddr, add], "i", PseudoId(3));
         func.add_pseudo(Pseudo::sym(PseudoId(0), "arr".to_string()));
         func.add_pseudo(Pseudo::val(PseudoId(2), 4));
@@ -380,7 +386,7 @@ mod tests {
             let types = TypeTable::new(&crate::target::Target::host());
             let mut func = Function::new("f", types.int_id);
             func.add_pseudo(Pseudo::val(PseudoId(0), value));
-            let c = AsmConstraint::new(PseudoId(0), constraint, Arch::X86_64, size);
+            let c = AsmConstraint::new(PseudoId(0), constraint, Arch::X86_64, Bits::new(size));
             out_of_range(&func, &c, &Immediate::Int(PseudoId(0)))
         };
         assert_eq!(check("I", 31, 32), Ok(()));

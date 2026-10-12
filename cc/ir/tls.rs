@@ -35,6 +35,7 @@
 
 use super::{Function, Instruction, Module, Opcode, Pseudo, PseudoId};
 use crate::types::{TypeId, TypeTable};
+use crate::units::Bits;
 use std::collections::{BTreeMap, HashSet};
 
 /// Rewrite every access in `module` to a thread-local reached by a call
@@ -65,7 +66,7 @@ pub fn expand_dynamic_tls(
     }
 
     let ptr_type = types.void_ptr_id;
-    let ptr = (ptr_type, types.size_bits(ptr_type));
+    let ptr = (ptr_type, types.value_bits(ptr_type));
     for func in &mut module.functions {
         expand_function(func, &tls, ptr);
     }
@@ -86,7 +87,7 @@ fn tls_name(func: &Function, id: super::PseudoId, tls: &HashSet<String>) -> Opti
 }
 
 /// `ptr` is the type and width of the addresses it introduces.
-fn expand_function(func: &mut Function, tls: &HashSet<String>, ptr: (TypeId, u32)) {
+fn expand_function(func: &mut Function, tls: &HashSet<String>, ptr: (TypeId, Bits)) {
     let (ptr_type, ptr_bits) = ptr;
     for block_idx in 0..func.blocks.len() {
         let old = std::mem::take(&mut func.blocks[block_idx].insns);
@@ -222,7 +223,13 @@ mod tests {
         let mut entry = BasicBlock::new(BasicBlockId(0));
         entry.add_insn(Instruction::new(Opcode::Entry));
         for i in 0..3 {
-            entry.add_insn(Instruction::load(PseudoId(3), PseudoId(i), 0, int, 32));
+            entry.add_insn(Instruction::load(
+                PseudoId(3),
+                PseudoId(i),
+                0,
+                int,
+                Bits::new(32),
+            ));
         }
         entry.add_insn(Instruction::ret(None));
         func.entry = BasicBlockId(0);
@@ -272,7 +279,7 @@ mod tests {
         func.next_pseudo = 2;
         let operand = |pseudo, constraint: &str, offset| AsmConstraint {
             offset,
-            ..AsmConstraint::new(pseudo, constraint, Target::host().arch, 64)
+            ..AsmConstraint::new(pseudo, constraint, Target::host().arch, Bits::new(64))
         };
         let mut entry = BasicBlock::new(BasicBlockId(0));
         entry.add_insn(Instruction::new(Opcode::Entry));
@@ -348,10 +355,10 @@ mod tests {
         func.next_pseudo = 6;
         let mut entry = BasicBlock::new(BasicBlockId(0));
         entry.add_insn(Instruction::new(Opcode::Entry));
-        entry.add_insn(Instruction::store(one, global, 0, int, 32));
-        entry.add_insn(Instruction::load(loaded, global, 0, int, 32));
+        entry.add_insn(Instruction::store(one, global, 0, int, Bits::new(32)));
+        entry.add_insn(Instruction::load(loaded, global, 0, int, Bits::new(32)));
         entry.add_insn(Instruction::sym_addr(addr, global, types.void_ptr_id));
-        entry.add_insn(Instruction::load(from_param, param, 0, int, 32));
+        entry.add_insn(Instruction::load(from_param, param, 0, int, Bits::new(32)));
         entry.add_insn(Instruction::ret(None));
         func.entry = BasicBlockId(0);
         func.blocks = vec![entry];

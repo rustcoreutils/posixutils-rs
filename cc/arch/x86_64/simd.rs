@@ -31,6 +31,7 @@ use crate::arch::simd::X86Shuffle;
 use crate::ir::{Instruction, Opcode, PseudoId, SimdOp};
 use crate::target::X86Simd;
 use crate::types::TypeTable;
+use crate::units::Bits;
 
 /// The third temporary of the SSE2 sequences, beside the two reserved
 /// scratch registers. It is allocatable: the allocator keeps it free of
@@ -77,7 +78,7 @@ impl X86_64CodeGen {
         let lane_bytes = types.size_bytes(lane);
         // An eight-byte vector rides in the low half; integer lanes never
         // read across, and `arch::simd` keeps floating ones at sixteen.
-        let size = if insn.size > 64 {
+        let size = if insn.size > Bits::new(64) {
             FpSize::Quad
         } else {
             FpSize::Double

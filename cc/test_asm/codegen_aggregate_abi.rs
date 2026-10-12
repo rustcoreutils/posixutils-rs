@@ -124,7 +124,9 @@ long stride(struct Big *p, int i) { return (char *)&p[i] - (char *)p; }
 /// (`struct_return_size`), or through `ArgClass::Indirect`'s payload.
 ///
 /// Every shape below copied 536870911 bytes of a 600000000-byte object, on both
-/// targets, at every optimization level. `a = b` is the one that matters most:
+/// targets, at every optimization level -- a member initialized from a struct
+/// value as millions of unrolled moves, gigabytes of assembly for one
+/// function. `a = b` is the one that matters most:
 /// it is the plainest aggregate copy in the language.
 ///
 /// Asserted on x86-64 alone, and the source is shaped to stay cheap. Both are
@@ -158,6 +160,8 @@ void initialize(void) { struct Big loc = src; sink(&loc); }
 void by_value_param(struct Big p) { sink(&p); }
 struct Big returns_it(void) { return src; }
 unsigned long extent(void) { return __builtin_object_size(src.x, 0); }
+struct W { int x; struct Big b; };
+void member(struct W *d) { struct W w = { 1, src }; *d = w; }
 "#;
 
     let asm = asm_for_with("aggregate_copy_length", X86_64_LINUX, SRC, &["-O2"]);
@@ -167,6 +171,7 @@ unsigned long extent(void) { return __builtin_object_size(src.x, 0); }
         "by_value_param",
         "returns_it",
         "extent",
+        "member",
     ] {
         let body = body_of(&asm, func);
         assert!(

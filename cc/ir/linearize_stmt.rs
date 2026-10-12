@@ -1331,6 +1331,15 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
         } else if self.types.is_complex(field_type) || self.types.is_vector(field_type) {
             self.store_addressed_value_at(base_sym, offset, field_type, value);
+        } else if self.types.checked_value_bits(field_type).is_none() {
+            // A member too large for a value width -- past 512 MiB -- is
+            // copied by its byte size from where the value lives, as an
+            // aggregate is everywhere else; a store's width would not hold
+            // it.
+            let src_addr = self.linearize_converted(value, field_type);
+            let bytes = self.types.byte_size(field_type);
+            let vol = self.block_volatility(field_type, self.expr_type(value));
+            self.emit_block_copy_at_offset(base_sym, offset, src_addr, bytes, vol);
         } else {
             let (actual_type, actual_size) = if self.types.kind(field_type) == TypeKind::Array {
                 let elem_type = self.types.base_type(field_type).unwrap_or(field_type);

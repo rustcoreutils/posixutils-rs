@@ -10,7 +10,7 @@
 //
 
 use crate::arch::mapping::{
-    map_int128_divmod, map_int128_expand, map_int128_float_convert, map_int128_to_float16,
+    map_int128_divmod, map_int128_expand, map_int128_float16_convert, map_int128_float_convert,
     ArchMapper, MappedInsn, MappingCtx,
 };
 use crate::float::FpFormat;
@@ -33,10 +33,9 @@ impl ArchMapper for Aarch64Mapper {
         if let Some(r) = map_int128_float_convert(insn, ctx) {
             return r;
         }
-        // int128 → _Float16, which the pass above declines: it has no
-        // `float_suffix` for a half. Left unlowered, codegen emitted a native
-        // `scvtf h0, x9` reading only the low 64 bits.
-        if let Some(r) = map_int128_to_float16(insn, ctx) {
+        // int128 <-> _Float16, which the pass above declines: it has no
+        // `float_suffix` for a half. Lowered through `float`.
+        if let Some(r) = map_int128_float16_convert(insn, ctx) {
             return r;
         }
         MappedInsn::Legal
@@ -416,76 +415,110 @@ mod tests {
         assert_libcall(&mapper.map_insn(&insn, &mut ctx), "__floattitf");
     }
 
-    /// `_Float16` to and from binary128 and `__int128`: libgcc's `hf`
-    /// routines, as gcc calls. The binary128 arms named no `hf` mode, so
-    /// the conversion reached the back end as an `fcvt` between `h` and `q`
-    /// registers, which A64 has not, and the assembler refused it; the
-    /// `__int128` arms left it unconverted.
+    /// `_Float16` to and from binary128: libgcc's `hf` routines, as gcc
+    /// calls them, since A64 has no `fcvt` between `h` and `q` registers.
     #[test]
-    fn test_aarch64_float16_binary128_and_int128() {
+    fn test_aarch64_float16_binary128() {
         let target = Target::new(Arch::Aarch64, Os::Linux);
         let types = TypeTable::new(&target);
         let mapper = Aarch64Mapper;
         let cases = [
-            (
-                Opcode::FCvtF,
-                types.longdouble_id,
-                types.float16_id,
-                "__extendhftf2",
-            ),
-            (
-                Opcode::FCvtF,
-                types.float16_id,
-                types.longdouble_id,
-                "__trunctfhf2",
-            ),
-            (
-                Opcode::FCvtF,
-                types.float128_id,
-                types.float16_id,
-                "__extendhftf2",
-            ),
-            (
-                Opcode::SCvtF,
-                types.float16_id,
-                types.int128_id,
-                "__floattihf",
-            ),
-            (
-                Opcode::UCvtF,
-                types.float16_id,
-                types.uint128_id,
-                "__floatuntihf",
-            ),
-            (
-                Opcode::FCvtS,
-                types.int128_id,
-                types.float16_id,
-                "__fixhfti",
-            ),
-            (
-                Opcode::FCvtU,
-                types.uint128_id,
-                types.float16_id,
-                "__fixunshfti",
-            ),
+            (types.longdouble_id, types.float16_id, "__extendhftf2"),
+            (types.float16_id, types.longdouble_id, "__trunctfhf2"),
+            (types.float128_id, types.float16_id, "__extendhftf2"),
+            (types.float16_id, types.float128_id, "__trunctfhf2"),
         ];
-        for (op, to, from, name) in cases {
-            let insn =
-                make_convert_insn(op, to, types.value_bits(to), from, types.value_bits(from));
+        for (to, from, name) in cases {
+            let insn = make_convert_insn(
+                Opcode::FCvtF,
+                to,
+                types.value_bits(to),
+                from,
+                types.value_bits(from),
+            );
             let mut func = make_minimal_func(&types);
             let mut ctx = MappingCtx {
                 func: &mut func,
                 types: &types,
                 target: &target,
             };
-            // A float-to-float conversion is legal to map and becomes its
-            // call in the library-call pass; an `__int128` one is mapped.
-            if op == Opcode::FCvtF {
-                assert_legal(&mapper.map_insn(&insn, &mut ctx));
-                assert_libcall(&library_call(&insn, &mut ctx, &mapper), name);
-            } else {
-                assert_libcall(&mapper.map_insn(&insn, &mut ctx), name);
+            // Legal to map; the library-call pass makes it the call.
+            assert_legal(&mapper.map_insn(&insn, &mut ctx));
+            assert_libcall(&library_call(&insn, &mut ctx, &mapper), name);
+        }
+    }
+
+    /// `__int128` <-> `_Float16` goes through `float` with the `sf` routines
+    /// and a native `fcvt` on the half side, on Linux and on Apple, whose
+    /// runtime has no half<->TI helper.
+    #[test]
+    fn test_aarch64_float16_int128_via_float() {
+        for os in [Os::Linux, Os::MacOS] {
+            let target = Target::new(Arch::Aarch64, os);
+            let types = TypeTable::new(&target);
+            let mapper = Aarch64Mapper;
+            let cases = [
+                (
+                    Opcode::SCvtF,
+                    types.float16_id,
+                    types.int128_id,
+                    "__floattisf",
+                ),
+                (
+                    Opcode::UCvtF,
+                    types.float16_id,
+                    types.uint128_id,
+                    "__floatuntisf",
+                ),
+                (
+                    Opcode::FCvtS,
+                    types.int128_id,
+                    types.float16_id,
+                    "__fixsfti",
+                ),
+                (
+                    Opcode::FCvtU,
+                    types.uint128_id,
+                    types.float16_id,
+                    "__fixunssfti",
+                ),
+            ];
+            for (op, to, from, name) in cases {
+                let insn =
+                    make_convert_insn(op, to, types.value_bits(to), from, types.value_bits(from));
+                let mut func = make_minimal_func(&types);
+                let mut ctx = MappingCtx {
+                    func: &mut func,
+                    types: &types,
+                    target: &target,
+                };
+                let MappedInsn::Replace(insns) = mapper.map_insn(&insn, &mut ctx) else {
+                    panic!("{os:?} {op:?}: left unlowered");
+                };
+                let ops: Vec<Opcode> = insns.iter().map(|i| i.op).collect();
+                let call = insns
+                    .iter()
+                    .find(|i| i.op == Opcode::Call)
+                    .expect("a library call");
+                assert_eq!(
+                    call.extra().func_name.as_deref(),
+                    Some(name),
+                    "{os:?} {op:?}"
+                );
+                // The half side is a native conversion to or from `float`.
+                let fcvt = insns
+                    .iter()
+                    .find(|i| i.op == Opcode::FCvtF)
+                    .expect("a half <-> float conversion");
+                let (half, single) = if matches!(op, Opcode::SCvtF | Opcode::UCvtF) {
+                    assert_eq!(ops, [Opcode::Call, Opcode::FCvtF]);
+                    (fcvt.typ, fcvt.src_typ)
+                } else {
+                    assert_eq!(ops, [Opcode::FCvtF, Opcode::Call]);
+                    (fcvt.src_typ, fcvt.typ)
+                };
+                assert_eq!(half, Some(types.float16_id));
+                assert_eq!(single, Some(types.float_id));
             }
         }
     }

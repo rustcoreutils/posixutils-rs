@@ -217,8 +217,7 @@ pub(crate) fn float_suffix(types: &TypeTable, typ: TypeId) -> &'static str {
         Some(FpFormat::Binary64) => "df",
         Some(FpFormat::X87Extended) => "xf",
         Some(FpFormat::Binary128) => "tf",
-        Some(FpFormat::Binary16) => "hf",
-        None => "",
+        Some(FpFormat::Binary16) | None => "",
     }
 }
 
@@ -1423,24 +1422,30 @@ pub(crate) fn expand_float16_arith(
     insns
 }
 
-/// Lower `__int128` -> `_Float16` as int128 -> float -> half, for a target
-/// whose half conversions are native.
+/// Lower `__int128` <-> `_Float16` through `float`, for a target whose half
+/// conversions are native.
 ///
-/// `map_int128_float_convert` declines a `_Float16` destination, because
-/// `float_suffix` has no arm for it, so nothing lowered this and codegen
-/// emitted a native conversion from the low 64 bits of the value:
-/// `(_Float16)((__int128)1 << 100)` came out 0 where it must be infinite.
+/// `map_int128_float_convert` declines a `_Float16` side, because
+/// `float_suffix` has no arm for it, and no runtime is asked for a half<->TI
+/// helper: Apple's has no `__floattihf`, `__floatuntihf`, `__fixhfti` or
+/// `__fixunshfti`. Through `float` is exact both ways: a half widens to a
+/// float exactly, and an integer too large for a float to hold exactly (2^24
+/// and up) is beyond the largest half (65504) and becomes infinite either way.
 ///
-/// The narrowing step is left as an ordinary `FCvtF` rather than a call:
-/// aarch64 has `fcvt h, s` in hardware, and its libgcc defines no
-/// `__truncsfhf2` to call instead. The widening step must be a call -- there is
-/// no instruction that reads 128 bits.
-pub(crate) fn map_int128_to_float16(
+/// The half side is an ordinary `FCvtF` rather than a call: aarch64 has
+/// `fcvt h, s` and `fcvt s, h` in hardware. The 128-bit side is the libcall
+/// itself, built here: `map_function` pushes a replacement verbatim and does
+/// not re-map it, and no instruction reads or writes 128 bits.
+pub(crate) fn map_int128_float16_convert(
     insn: &Instruction,
     ctx: &mut MappingCtx<'_>,
 ) -> Option<MappedInsn> {
     let types = ctx.types;
+    let float_type = types.float_id;
+    let float_size = types.value_bits(float_type);
+    let result = insn.target?;
     match insn.op {
+        // __int128 -> float -> half
         Opcode::SCvtF | Opcode::UCvtF => {
             let dst_typ = insn.typ?;
             if types.kind(dst_typ) != TypeKind::Float16 {
@@ -1451,9 +1456,6 @@ pub(crate) fn map_int128_to_float16(
                 return None;
             }
 
-            let float_type = types.float_id;
-            let float_size = types.value_bits(float_type);
-            let result = insn.target?;
             let src = *insn.src.first()?;
             let as_float = ctx.func.create_reg_pseudo();
 
@@ -1480,6 +1482,44 @@ pub(crate) fn map_int128_to_float16(
             narrow.pos = insn.pos;
 
             Some(MappedInsn::Replace(vec![call, narrow]))
+        }
+        // half -> float -> __int128
+        Opcode::FCvtS | Opcode::FCvtU => {
+            let dst_typ = insn.typ?;
+            if types.kind(dst_typ) != TypeKind::Int128 {
+                return None;
+            }
+            let src_typ = insn.src_typ?;
+            if types.kind(src_typ) != TypeKind::Float16 {
+                return None;
+            }
+
+            let src = *insn.src.first()?;
+            let as_float = ctx.func.create_reg_pseudo();
+
+            let mut widen = Instruction::unop(Opcode::FCvtF, as_float, src, float_type, float_size);
+            widen.src_typ = Some(src_typ);
+            widen.src_size = types.value_bits(src_typ);
+            widen.pos = insn.pos;
+
+            let mut step = Instruction::unop(
+                insn.op,
+                result,
+                as_float,
+                dst_typ,
+                types.value_bits(dst_typ),
+            );
+            step.src_typ = Some(float_type);
+            step.src_size = float_size;
+            step.pos = insn.pos;
+            let name = if insn.op == Opcode::FCvtU {
+                "__fixunssfti"
+            } else {
+                "__fixsfti"
+            };
+            let call = build_convert_rtlib_call(&step, name, types, ctx.target);
+
+            Some(MappedInsn::Replace(vec![widen, call]))
         }
         _ => None,
     }
@@ -1828,12 +1868,10 @@ pub(crate) fn map_int128_float_convert(
                 (false, "df") => "__floattidf",
                 (false, "xf") => "__floattixf",
                 (false, "tf") => "__floattitf",
-                (false, "hf") => "__floattihf",
                 (true, "sf") => "__floatuntisf",
                 (true, "df") => "__floatuntidf",
                 (true, "xf") => "__floatuntixf",
                 (true, "tf") => "__floatuntitf",
-                (true, "hf") => "__floatuntihf",
                 _ => return None,
             };
             let call = build_convert_rtlib_call(insn, func_name, types, target);
@@ -1859,12 +1897,10 @@ pub(crate) fn map_int128_float_convert(
                 (false, "df") => "__fixdfti",
                 (false, "xf") => "__fixxfti",
                 (false, "tf") => "__fixtfti",
-                (false, "hf") => "__fixhfti",
                 (true, "sf") => "__fixunssfti",
                 (true, "df") => "__fixunsdfti",
                 (true, "xf") => "__fixunsxfti",
                 (true, "tf") => "__fixunstfti",
-                (true, "hf") => "__fixunshfti",
                 _ => return None,
             };
             let call = build_convert_rtlib_call(insn, func_name, types, target);
@@ -2048,16 +2084,21 @@ fn map_binary128(insn: &Instruction, ctx: &mut MappingCtx<'_>) -> Option<MappedI
             // where it is x87 extended -- omitting that arm left every
             // `long double` <-> `__float128` conversion unlowered, and it fell
             // through to a hardware path that has no such instruction.
+            //
+            // `_Float16` has no `float_suffix`, so it is matched by format:
+            // A64 has no `fcvt` between `h` and `q` registers, and libgcc's
+            // half routines convert it directly, as gcc calls them.
             let other = if src_quad { dst_typ } else { src_typ };
+            let half = ctx.types.fp_format(other) == Some(FpFormat::Binary16);
             let name: &'static str = match (src_quad, float_suffix(ctx.types, other)) {
+                (true, _) if half => "__trunctfhf2",
+                (false, _) if half => "__extendhftf2",
                 (true, "sf") => "__trunctfsf2",
                 (true, "df") => "__trunctfdf2",
                 (true, "xf") => "__trunctfxf2",
-                (true, "hf") => "__trunctfhf2",
                 (false, "sf") => "__extendsftf2",
                 (false, "df") => "__extenddftf2",
                 (false, "xf") => "__extendxftf2",
-                (false, "hf") => "__extendhftf2",
                 _ => return None,
             };
             let call = build_convert_rtlib_call(insn, name, ctx.types, ctx.target);

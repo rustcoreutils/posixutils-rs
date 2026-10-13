@@ -114,19 +114,21 @@ fn asm_modifier_on_the_wrong_kind_of_operand() {
     }
 }
 
-/// What follows a `%` must name an operand: gcc rejects each of these.
+/// What follows a `%` must name an operand: gcc rejects each of these, in
+/// these words. (`%!` is one of x86-64 gcc's own punctuation codes, which
+/// c17 does not write; aarch64 gcc refuses it too.)
 #[test]
 fn asm_template_references_that_name_nothing() {
     let cases: &[(&str, &str, &str)] = &[
         (
             "asm_tpl_reg",
             r##""movl %eax, %0" :: "r"(x)"##,
-            "operand number missing after '%e'",
+            "invalid 'asm': operand number missing after %-letter",
         ),
         (
             "asm_tpl_range",
             r##""# %3" :: "r"(x)"##,
-            "asm operand number 3 out of range",
+            "invalid 'asm': operand number out of range",
         ),
         (
             "asm_tpl_name",
@@ -141,38 +143,96 @@ fn asm_template_references_that_name_nothing() {
         (
             "asm_tpl_bang",
             r##""# %!" :: "r"(x)"##,
-            "invalid '%!' in asm template",
+            "invalid 'asm': invalid %-code",
         ),
         (
             "asm_tpl_label",
             r##""# %l0" :: "r"(x)"##,
-            "asm operand 0 named by '%l' is not a label",
+            "invalid 'asm': '%l' operand isn't a label",
+        ),
+        (
+            "asm_tpl_label_range",
+            r##""# %l1" :: "r"(x)"##,
+            "invalid 'asm': operand number out of range",
         ),
         (
             "asm_tpl_end",
             r##""# %" :: "r"(x)"##,
-            "'%' at the end of an asm template",
+            "invalid 'asm': invalid %-code",
         ),
-        // x86 dialect alternatives that do not close, or nest, as gcc says.
+        // x86 dialect alternatives that do not close after a `|`, or nest,
+        // as gcc says.
         (
             "asm_tpl_dialect_open",
-            r##""mov{q %0, %%rax" :: "r"(x)"##,
-            "unterminated assembly dialect alternative",
+            r##""mov{q|l %0, %%rax" :: "r"(x)"##,
+            "invalid 'asm': unterminated assembly dialect alternative",
         ),
         (
             "asm_tpl_dialect_nested",
             r##""mov{q {a} %0, %%rax|x}" :: "r"(x)"##,
-            "nested assembly dialect alternatives",
+            "invalid 'asm': nested assembly dialect alternatives",
         ),
         // No operands at all is still extended asm.
         (
             "asm_tpl_no_ops",
             r##""movl %eax, %ebx" ::"##,
-            "operand number missing after '%e'",
+            "invalid 'asm': operand number missing after %-letter",
         ),
     ];
     for &(name, body, wanted) in cases {
         expect_rejected(name, &statement(body), X86, "-O0", wanted, 3);
+    }
+    // A `{` with no `|` or `}` after it runs to the end of the template,
+    // and gcc says nothing.
+    let asm = expect_accepted(
+        "asm_tpl_dialect_unclosed",
+        &statement(r##""mov{q %0, %%rax" :: "r"(x)"##),
+        X86,
+        "-O0",
+    );
+    assert!(asm.contains("movq %"), "{asm}");
+}
+
+/// A `%[name]` or `%l[name]` naming nothing, or with no `]`, is reported
+/// as the statement is parsed, as gcc does: in a `static inline` function
+/// no one calls too, for which the backend writes nothing. gcc leaves the
+/// rest -- an operand number out of range here -- to the function's output,
+/// so an unused function is not reported for it, by either compiler.
+#[test]
+fn asm_template_names_in_an_unused_function() {
+    let unused = |stmt: &str| {
+        format!(
+            "static inline void h(long x) {{\n\
+             {stmt}\n\
+             }}\n\
+             void f(void) {{ }}\n"
+        )
+    };
+    for opt in OPTS {
+        for target in [X86, A64] {
+            for (stmt, wanted) in [
+                (
+                    r##"__asm__("# %[nope]" :: "r"(x));"##,
+                    "undefined named operand 'nope'",
+                ),
+                (
+                    r##"__asm__ goto("# %l[nope]" :: "r"(x) :: out); out:;"##,
+                    "undefined named operand 'nope'",
+                ),
+                (
+                    r##"__asm__("# %[x" :: [x] "r"(x));"##,
+                    "missing close brace for named operand",
+                ),
+            ] {
+                expect_rejected("asm_tpl_unused", &unused(stmt), target, opt, wanted, 2);
+            }
+            expect_accepted(
+                "asm_tpl_unused_range",
+                &unused(r##"__asm__("# %3" :: "r"(x));"##),
+                target,
+                opt,
+            );
+        }
     }
 }
 

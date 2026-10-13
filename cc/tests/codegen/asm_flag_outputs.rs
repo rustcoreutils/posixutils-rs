@@ -187,3 +187,136 @@ int main(void) {
 "#;
     compile_and_run_everywhere("asm_flag_outputs_homes", src);
 }
+
+/// Flag outputs of an `asm goto`, on the fall-through and on the jump to
+/// each label: outputs are valid on every path out (gcc's rule since gcc
+/// 11), so the jump reads the flags too. Several outputs, two labels, one
+/// output in memory, and a register output beside them. c17 refused flag
+/// outputs in an `asm goto`; gcc 13 takes them but reads them on the
+/// fall-through only, leaving the jump's value whatever its register held.
+#[test]
+fn asm_flag_outputs_in_asm_goto() {
+    let src = r#"
+#if defined(__x86_64__)
+#define CMP_JUMP "cmp %[b], %[a]\n\tjl %l[less]\n\tje %l[same]"
+#define EQ "e"
+#define LT "l"
+#define ULT "b"
+#elif defined(__aarch64__)
+#define CMP_JUMP "cmp %[a], %[b]\n\tb.lt %l[less]\n\tb.eq %l[same]"
+#define EQ "eq"
+#define LT "lt"
+#define ULT "lo"
+#endif
+
+int g_ult;
+
+/* 100 * path + 4 * eq + 2 * lt + ult, read on whichever path was taken. */
+__attribute__((noinline)) int classify(long a, long b) {
+    int eq, lt;
+    __asm__ goto(CMP_JUMP : "=@cc" EQ(eq), "=@cc" LT(lt), "=@cc" ULT(g_ult)
+                 : [a] "r"(a), [b] "r"(b) : : less, same);
+    return 300 + 4 * eq + 2 * lt + g_ult;
+less:
+    return 100 + 4 * eq + 2 * lt + g_ult;
+same:
+    return 200 + 4 * eq + 2 * lt + g_ult;
+}
+
+/* A register output written by the template beside a flag output. */
+__attribute__((noinline)) long with_register(long a, long b, int *eq) {
+    long d;
+#if defined(__x86_64__)
+    __asm__ goto("mov %[a], %[d]\n\tsub %[b], %[d]\n\tje %l[zero]"
+                 : [d] "=&r"(d), "=@cc" EQ(*eq) : [a] "r"(a), [b] "r"(b) : : zero);
+#elif defined(__aarch64__)
+    __asm__ goto("subs %[d], %[a], %[b]\n\tb.eq %l[zero]"
+                 : [d] "=r"(d), "=@cc" EQ(*eq) : [a] "r"(a), [b] "r"(b) : : zero);
+#endif
+    return d;
+zero:
+    return 1000 + d;
+}
+
+int main(void) {
+    /* -1 < 2 signed, but not unsigned. */
+    if (classify(-1, 2) != 100 + 2) return 1;
+    if (classify(1, 2) != 100 + 2 + 1) return 2;
+    if (classify(5, 5) != 200 + 4) return 3;
+    if (classify(6, 5) != 300) return 4;
+    if (classify(2, -1) != 300 + 1) return 5;
+    int eq = 9;
+    if (with_register(7, 7, &eq) != 1000 || eq != 1) return 6;
+    if (with_register(9, 7, &eq) != 2 || eq != 0) return 7;
+    return 0;
+}
+"#;
+    compile_and_run_everywhere("asm_flag_outputs_goto", src);
+}
+
+/// Flag outputs of every type gcc lays out as an integer: `__int128`, and a
+/// struct, union or array of 1, 2, 4, 8 or 16 bytes whose members are no
+/// floating value filling it. The whole object is written, 0 or 1 in its
+/// low byte and zeros above, as gcc writes the integer mode. c17 refused
+/// all of these ("invalid type for 'asm' flag output").
+#[test]
+fn asm_flag_outputs_integer_layout_types() {
+    let src = r#"
+#include <string.h>
+#if defined(__x86_64__)
+#define CMP "cmp %2, %1"
+#define EQ "=@ccz"
+#elif defined(__aarch64__)
+#define CMP "cmp %1, %2"
+#define EQ "=@cceq"
+#endif
+#define FLAG(T, a, b) ({ T x; memset(&x, 0xa5, sizeof x); \
+    __asm__(CMP : EQ(x) : "r"((long)(a)), "r"((long)(b))); check(&x, sizeof x, (a) == (b)); })
+
+static int bad;
+static void check(const void *p, unsigned n, int want) {
+    const unsigned char *b = p;
+    if (b[0] != want) bad = 1;
+    for (unsigned i = 1; i < n; i++)
+        if (b[i] != 0) bad = 1;
+}
+
+struct S1 { char c; };
+struct S2 { char a, b; };
+struct S4 { int i; };
+struct S8 { long l; };
+struct S16 { long a, b; };
+struct FF { float a, b; };
+struct FI { float f; int i; };
+struct BF { int b : 3; };
+struct NS { struct S2 s; short t; };
+struct A2 { short a[2]; };
+union UF { float f; };
+union UL { long l; char c[8]; };
+struct LI { long a; int b; };
+
+int main(void) {
+    for (int a = 0; a < 2; a++) {
+        FLAG(__int128, a, 1);
+        FLAG(unsigned __int128, a, 1);
+        FLAG(struct S1, a, 1);
+        FLAG(struct S2, a, 1);
+        FLAG(struct S4, a, 1);
+        FLAG(struct S8, a, 1);
+        FLAG(struct S16, a, 1);
+        FLAG(struct FF, a, 1);
+        FLAG(struct FI, a, 1);
+        FLAG(struct BF, a, 1);
+        FLAG(struct NS, a, 1);
+        FLAG(struct A2, a, 1);
+        FLAG(union UF, a, 1);
+        FLAG(union UL, a, 1);
+        FLAG(struct LI, a, 1);
+        typedef char C4[4];
+        FLAG(C4, a, 1);
+    }
+    return bad;
+}
+"#;
+    compile_and_run_everywhere("asm_flag_outputs_layouts", src);
+}

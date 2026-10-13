@@ -1156,15 +1156,6 @@ int main(void)
     }
 }
 
-/// Several aggregate `va_arg` results live at once.
-///
-/// An aggregate wider than a register was given an ordinary pseudo with no
-/// storage behind it, so the backend was handed a register that held whatever
-/// happened to be there and treated it as the destination's address. One such
-/// call could survive on luck; four in a function did not, which is why this
-/// looked cumulative rather than shape-specific and hid behind register
-/// pressure.
-
 /// AAPCS64 §6.4.2 stage C rounds the next stacked-argument address up to
 /// `max(8, alignof(type))` before placing the argument, not just its size
 /// afterwards. Advancing by the rounded size alone put a sixteen-byte-aligned

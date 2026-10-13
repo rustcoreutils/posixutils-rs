@@ -784,8 +784,17 @@ const C17_GROUPS: &[&str] = &[crate::f_options::UNSUPPORTED_WARNING, "c17-dialec
 /// The tag of a warning in `group`, as gcc's names its option.
 fn warning_tag(group: Option<&str>) -> String {
     match group {
-        Some(g) if !C17_GROUPS.contains(&g) => option_tag(&format!("-W{g}")),
+        Some(g) if !C17_GROUPS.contains(&g) => option_tag(&format!("-W{}", option_name(g))),
         _ => String::new(),
+    }
+}
+
+/// The option a warning group's tag names, as gcc spells it: `-Wformat`'s
+/// warnings are tagged with the option that takes a level, `-Wformat=`.
+fn option_name(group: &str) -> &str {
+    match group {
+        "format" => "format=",
+        g => g,
     }
 }
 
@@ -943,7 +952,7 @@ fn give_warning(group: Option<&str>, pos: Position, msg: &str) {
     }
     PROMOTED.set(PROMOTED.get() + 1);
     let tag = match group {
-        Some(group) => option_tag(&format!("-Werror={group}")),
+        Some(group) => option_tag(&format!("-Werror={}", option_name(group))),
         None => option_tag("-Werror"),
     };
     do_diag(DiagLevel::Error, pos, &format!("{msg}{tag}"));
@@ -1491,6 +1500,7 @@ mod tests {
     #[test]
     fn warning_tags_name_gccs_options() {
         assert_eq!(warning_tag(Some("overflow")), " [-Woverflow]");
+        assert_eq!(warning_tag(Some("format")), " [-Wformat=]");
         assert_eq!(warning_tag(None), "");
         assert_eq!(warning_tag(Some(crate::f_options::UNSUPPORTED_WARNING)), "");
         set_show_option(false);

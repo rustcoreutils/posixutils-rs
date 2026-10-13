@@ -128,7 +128,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             Stmt::Empty => {}
 
             Stmt::Expr(expr) => {
-                self.linearize_expr(expr);
+                self.linearize_discarded(expr);
             }
 
             Stmt::Block(items) => {
@@ -388,6 +388,16 @@ impl<'a> super::linearize::Linearizer<'a> {
                         .collect();
                     self.vm_typedef_dims.insert(declarator.symbol, variable);
                 }
+                continue;
+            }
+
+            // An object of an SVE type: its size is the machine's, which
+            // only SVE code knows, so it gets no storage -- an object
+            // nothing uses needs none, as in gcc -- and any use of it is
+            // reported (`sve_object_used`). A static or `extern` one, or an
+            // initialized one, the parser has already refused.
+            if self.types.sve_name(typ).is_some() {
+                self.sve_locals.insert(declarator.symbol);
                 continue;
             }
 
@@ -3037,6 +3047,9 @@ impl<'a> super::linearize::Linearizer<'a> {
         // other read-modify-write (see `RmwPlace`).
         let mut output_places: Vec<super::linearize_emit::RmwPlace> =
             Vec::with_capacity(outputs.len());
+        // For each output, the unsigned type a flag output wider than a
+        // register, or an aggregate, is stored back as.
+        let mut flag_carriers: Vec<Option<TypeId>> = Vec::with_capacity(outputs.len());
 
         // Process output operands
         for (output_idx, op) in outputs.iter().enumerate() {
@@ -3096,24 +3109,33 @@ impl<'a> super::linearize::Linearizer<'a> {
                 });
 
                 skip_post_handling.push(true);
+                flag_carriers.push(None);
                 continue;
             }
 
             // A flag output is written 0 or 1 at its own width, which has to
-            // be an integer's: gcc takes any integer or pointer object.
-            let flag_type = (self.types.is_integer(typ) && !self.types.is_complex(typ))
-                || self.types.kind(typ) == TypeKind::Pointer;
-            if class.flag.is_some() && !(flag_type && size <= Bits::new(64)) {
-                error(op.expr.pos, "invalid type for 'asm' flag output");
+            // be an integer mode's: gcc takes any object it lays out as an
+            // integer -- an integer or a pointer, `__int128`, and a small
+            // struct, union or array (`TypeTable::integer_mode_bits`). One
+            // wider than a register, or no scalar, is written as an `int`
+            // and stored back as the unsigned integer of its width.
+            let mut size = size;
+            let mut carrier = None;
+            if class.flag.is_some() {
+                let scalar = (self.types.is_integer(typ) && !self.types.is_complex(typ))
+                    || self.types.kind(typ) == TypeKind::Pointer;
+                // The object's own type: a small vector is handled at its
+                // integer carrier, but whether gcc takes it is its mode's.
+                match self.types.integer_mode_bits(self.expr_type(&op.expr)) {
+                    Some(bits) if !scalar || bits > 64 => {
+                        carrier = Some(self.unsigned_of_width(bits));
+                        size = self.types.value_bits(self.types.int_id);
+                    }
+                    Some(_) => {}
+                    None => error(op.expr.pos, "invalid type for 'asm' flag output"),
+                }
             }
-            // The flags are read once the template has run, on the
-            // fall-through; a jump to a label would leave the output unset.
-            if class.flag.is_some() && !goto_labels.is_empty() {
-                error(
-                    op.expr.pos,
-                    "flag outputs are not supported in an 'asm goto' statement",
-                );
-            }
+            flag_carriers.push(carrier);
 
             // Non-memory output (register or value class): allocate a
             // fresh pseudo for the asm to write into.
@@ -3330,6 +3352,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                                 &ir_outputs,
                                 &skip_post_handling,
                                 &output_places,
+                                &flag_carriers,
                             );
                         }
                         // The jump leaves this scope; the fall-through does
@@ -3345,7 +3368,13 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
         }
 
-        self.emit_asm_output_writeback(outputs, &ir_outputs, &skip_post_handling, &output_places);
+        self.emit_asm_output_writeback(
+            outputs,
+            &ir_outputs,
+            &skip_post_handling,
+            &output_places,
+            &flag_carriers,
+        );
     }
 
     /// Store an asm statement's register outputs back to their destinations.
@@ -3355,6 +3384,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         ir_outputs: &[AsmConstraint],
         skip_post_handling: &[bool],
         output_places: &[super::linearize_emit::RmwPlace],
+        flag_carriers: &[Option<TypeId>],
     ) {
         // store(value, addr, ...) - value first, then address
         for (i, op) in outputs.iter().enumerate() {
@@ -3367,11 +3397,35 @@ impl<'a> super::linearize::Linearizer<'a> {
 
             let out_pseudo = ir_outputs[i].pseudo;
 
+            // A flag output written as an `int`, widened to its object's
+            // width and stored over the whole object.
+            if let Some(carrier) = flag_carriers[i] {
+                let int = self.types.int_id;
+                let wide = self.emit_convert(out_pseudo, int, carrier);
+                self.store_rmw_place(&output_places[i], wide, carrier);
+                continue;
+            }
+
             let typ = self.asm_operand_type(&op.expr, false);
             // Back through the place the read came from, so the operand
             // expression is not evaluated a second time.
             self.store_rmw_place(&output_places[i], out_pseudo, typ);
         }
+    }
+
+    /// The unsigned integer type `bits` wide, for a flag output's object.
+    fn unsigned_of_width(&self, bits: u32) -> TypeId {
+        let t = self.types;
+        [
+            t.uchar_id,
+            t.ushort_id,
+            t.uint_id,
+            t.ulonglong_id,
+            t.uint128_id,
+        ]
+        .into_iter()
+        .find(|&u| t.value_bits(u) == Bits::new(bits))
+        .unwrap_or(t.uint_id)
     }
 
     /// The width an asm operand of type `typ` is given. An object too large

@@ -148,6 +148,46 @@ __attribute__((zero_call_used_regs("used-gpr"), patchable_function_entry(2, 1)))
     );
 }
 
+/// A `patchable_function_entry` argument that is no integer constant -- a
+/// variable, a floating constant, an address, an undeclared name -- is
+/// gcc's "not an integer constant", spelled as gcc spells it; it was
+/// dropped from the count and reported as the wrong number of arguments.
+#[test]
+fn patchable_function_entry_non_constant_arguments() {
+    let w = "[-Wattributes]";
+    for (attr, spelled) in [
+        ("patchable_function_entry(v)", "v"),
+        ("patchable_function_entry(2, v)", "v"),
+        ("patchable_function_entry(2.0)", "2.0e+0"),
+        ("patchable_function_entry(1.5)", "1.5e+0"),
+        ("patchable_function_entry(&v)", "&v"),
+    ] {
+        let src = format!("int v;\n__attribute__(({attr})) void f(void) {{ }}\n");
+        let (_, got) = messages("pfe_nonconst", &src, &[]);
+        assert_eq!(
+            got,
+            [format!(
+                "warning: 'patchable_function_entry' attribute argument '{spelled}' is not an \
+                 integer constant {w}"
+            )],
+            "{attr}"
+        );
+    }
+    let src = "__attribute__((patchable_function_entry(bogus))) void f(void) { }\n";
+    let (ok, got) = messages("pfe_undeclared", src, &[]);
+    assert!(!ok);
+    assert_eq!(
+        got,
+        [
+            "error: 'bogus' undeclared here (not in a function)".to_string(),
+            format!(
+                "warning: 'patchable_function_entry' attribute argument '<erroneous-expression>' \
+                 is not an integer constant {w}"
+            ),
+        ]
+    );
+}
+
 /// `no_caller_saved_registers` is x86-64's: a function type's attribute
 /// there, which gcc 13 cannot compile while SSE is enabled, and on aarch64
 /// no attribute at all.

@@ -9,7 +9,35 @@
 // Assembly cases of tests/codegen/floating.rs, in process.
 //
 
-use crate::test_asm::asm_probe::asm_for_at;
+use crate::test_asm::asm_probe::{
+    asm_for, asm_for_at, calls_any, mentions, AARCH64_DARWIN, AARCH64_LINUX, X86_64_LINUX,
+};
+
+/// `__int128` <-> `_Float16` goes through `float`, never a half<->TI helper:
+/// Apple's runtime has no `__fixhfti` or `__floattihf`, so a call to one
+/// failed the link on macOS arm64. Through `float` is exact both ways: a half
+/// widens to a float exactly, and an integer too large for a float to hold
+/// exactly (2^24 and up) is beyond the largest half (65504) and becomes
+/// infinite either way, so the two roundings never differ from one.
+#[test]
+fn codegen_int128_float16_conversions_go_through_float() {
+    let src = "_Float16 s2h(__int128 x) { return x; }\n\
+               _Float16 u2h(unsigned __int128 x) { return x; }\n\
+               __int128 h2s(_Float16 h) { return h; }\n\
+               unsigned __int128 h2u(_Float16 h) { return h; }\n";
+    for triple in [AARCH64_DARWIN, AARCH64_LINUX, X86_64_LINUX] {
+        let asm = asm_for("int128_half", triple, src);
+        for helper in ["__fixhfti", "__fixunshfti", "__floattihf", "__floatuntihf"] {
+            assert!(!mentions(&asm, helper), "{triple}: calls {helper}:\n{asm}");
+        }
+        for via_float in ["__floattisf", "__floatuntisf", "__fixsfti", "__fixunssfti"] {
+            assert!(
+                calls_any(&asm, &[via_float]),
+                "{triple}: no call of {via_float}:\n{asm}"
+            );
+        }
+    }
+}
 
 /// `fisttp` is SSE3, which the x86-64 baseline c17 targets does not include:
 /// gcc converts a long double to an integer by switching the x87 control word

@@ -692,7 +692,7 @@ impl X86_64CodeGen {
 
         let uid = self.unique_label_counter;
         self.unique_label_counter += 1;
-        let done = Label::block(&self.base.current_fn, 10000 + uid * 2);
+        let done = Label::internal("fp_bits_done", uid);
 
         self.emit_fp_move(src, x, fp_size);
         self.emit_xmm_bits_to_gp(x, fp_size, Reg::R11);
@@ -1279,9 +1279,8 @@ impl X86_64CodeGen {
             // .done:
             let uid = self.unique_label_counter;
             self.unique_label_counter += 1;
-            // Use high block_id values (10000+) to avoid colliding with basic block IDs
-            let unsigned_label = Label::block(&self.base.current_fn, 10000 + uid * 2);
-            let done_label = Label::block(&self.base.current_fn, 10000 + uid * 2 + 1);
+            let unsigned_label = Label::internal("u64_to_fp_big", uid);
+            let done_label = Label::internal("u64_to_fp_done", uid);
 
             // test r10, r10 — check sign bit
             self.push_lir(X86Inst::Test {
@@ -1479,10 +1478,8 @@ impl X86_64CodeGen {
 
         let uid = self.unique_label_counter;
         self.unique_label_counter += 1;
-        // High block_id values, as emit_int_to_float does, so these cannot
-        // collide with a basic block's own label.
-        let big_label = Label::block(&self.base.current_fn, 10000 + uid * 2);
-        let done_label = Label::block(&self.base.current_fn, 10000 + uid * 2 + 1);
+        let big_label = Label::internal("fp_to_u64_big", uid);
+        let done_label = Label::internal("fp_to_u64_done", uid);
 
         // 2^63 is exactly representable in both float and double.
         const TWO_POW_63: f64 = 9223372036854775808.0;

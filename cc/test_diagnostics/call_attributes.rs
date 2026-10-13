@@ -171,6 +171,83 @@ void after(void) __attribute__((warning("after W")));
     );
 }
 
+/// A function renamed by an asm label is reported by its C name, as gcc
+/// reports it: the call names the symbol, `g`, and the report said so.
+#[test]
+fn reports_name_the_c_identifier_not_the_asm_label() {
+    let src = r#"int f(void) __asm__("g") __attribute__((error("x")));
+int w(void) __asm__("w_impl") __attribute__((warning("y")));
+__attribute__((warning("def"))) int d(void) __asm__("d_impl");
+__attribute__((noinline)) int d(void) { return 1; }
+int l(void) __asm__("l_impl");
+int h(void) { return f() + w() + d() + l(); }
+int l(void) __attribute__((error("late")));
+int k(void) { extern int m(void) __asm__("m_impl") __attribute__((warning("blk"))); return m(); }
+"#;
+    for opt in ["-O0", "-O2"] {
+        let (ok, got) = diagnostics("attr_asm_label", src, &[opt]);
+        assert!(!ok);
+        assert_eq!(
+            got,
+            [
+                "6:22: error: call to 'f' declared with attribute error: x",
+                "6:28: warning: call to 'w' declared with attribute warning: y [-Wattribute-warning]",
+                "6:34: warning: call to 'd' declared with attribute warning: def [-Wattribute-warning]",
+                "6:40: error: call to 'l' declared with attribute error: late",
+                "8:92: warning: call to 'm' declared with attribute warning: blk [-Wattribute-warning]",
+            ],
+            "{opt}"
+        );
+    }
+}
+
+/// A call through a pointer that holds one known function is that
+/// function's call once optimizing, as gcc makes it from -O1: a local
+/// pointer, a `static const` one, and a member of a `const` table. At -O0
+/// it stays a call through the pointer, and is not reported; neither is a
+/// call through a pointer that may hold either of two functions, or a
+/// modifiable global one, at any level.
+#[test]
+fn calls_through_a_pointer_to_a_known_function() {
+    let src = r#"void f(void) __attribute__((warning("w")));
+void g(int);
+static void (*const sp)(void) = f;
+void (*gp)(void) = f;
+struct ops { int n; void (*go)(void); void (*put)(int); };
+static const struct ops tab = { 1, f, g };
+void h(void) { void (*p)(void) = f; p(); }
+void h2(void) { sp(); }
+void h3(void) { gp(); }
+void h4(int c) { void (*p)(void) = c ? f : (void (*)(void))0; p(); }
+void h5(void) { tab.go(); tab.put(4); }
+"#;
+    let (ok, got) = diagnostics("attr_devirt_o0", src, &["-O0"]);
+    assert!(ok && got.is_empty(), "{got:#?}");
+    for opt in ["-O1", "-O2"] {
+        let (ok, got) = diagnostics("attr_devirt", src, &[opt]);
+        assert!(ok, "{got:#?}");
+        let w = "warning: call to 'f' declared with attribute warning: w [-Wattribute-warning]";
+        assert_eq!(
+            got,
+            [
+                format!("7:37: {w}"),
+                format!("8:17: {w}"),
+                format!("11:17: {w}"),
+            ],
+            "{opt}"
+        );
+        let asm = compile(
+            "attr_devirt_asm",
+            src,
+            &["--target=x86_64-unknown-linux-gnu", opt],
+        )
+        .asm
+        .expect("assembly");
+        assert_eq!(asm.matches("call f").count(), 3, "{opt}:\n{asm}");
+        assert_eq!(asm.matches("call g").count(), 1, "{opt}:\n{asm}");
+    }
+}
+
 /// `-Wno-attribute-warning` silences the warnings, never the errors.
 #[test]
 fn warning_group_is_attribute_warning() {

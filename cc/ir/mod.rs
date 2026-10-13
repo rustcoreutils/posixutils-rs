@@ -20,6 +20,7 @@ pub mod constglobal;
 pub mod copyprop;
 pub mod dataflow;
 pub mod dce;
+pub mod devirt;
 pub mod dominate;
 pub mod dse;
 pub mod effects;
@@ -3380,6 +3381,10 @@ pub struct Function {
     /// The function's type is `nocf_check`: under branch protection its
     /// entry is no landing pad.
     pub nocf_check: bool,
+    /// The function's type is `aarch64_vector_pcs`: it preserves all of
+    /// q8-q23 for its caller, where the base standard preserves only the low
+    /// halves of v8-v15. Its calls still follow the base standard.
+    pub vector_pcs: bool,
     /// `__attribute__((constructor))`: emit a pointer to this function in
     /// `.init_array` so it runs before `main`. `Some(None)` is the attribute
     /// without a priority; `Some(Some(p))` carries one.
@@ -3449,6 +3454,7 @@ impl Default for Function {
             saves_all_registers: false,
             no_instrument: false,
             nocf_check: false,
+            vector_pcs: false,
             constructor: None,
             destructor: None,
             is_inline: false,

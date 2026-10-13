@@ -448,6 +448,20 @@ impl Parser<'_> {
         if let Some(attrs) = &fn_attrs {
             let body_follows = self.is_special(b'{') || self.is_declaration_start();
             if scope == DeclScope::File && first && body_follows {
+                // gcc's grammar has no attribute and no asm label between a
+                // definition's declarator and its body: the first it takes
+                // with an error, the second is a syntax error.
+                match self.extension_just_ended() {
+                    Some("__attribute__" | "__attribute") => diag::error(
+                        pos,
+                        "attributes should be specified before the declarator in a function definition",
+                    ),
+                    Some(_) if self.is_special(b'{') => diag::error(
+                        self.current_pos(),
+                        "expected ',' or ';' before '{' token",
+                    ),
+                    _ => {}
+                }
                 // C17 6.9.1p2: the declarator itself gives a definition its
                 // function type; one that came from a typedef has no
                 // parameter list for the body to name.
@@ -543,7 +557,24 @@ impl Parser<'_> {
             };
             // An initialized `extern` declaration is a definition (6.9.2p1),
             // so its object needs a size like any other.
-            if !is_fn && (!specs.is_extern() || init.is_some()) {
+            if !is_fn && self.types.sve_name(typ).is_some() {
+                // gcc refuses an SVE object of static storage duration, or
+                // an `extern` one, for its size. An automatic one needs SVE
+                // code only once something reads, writes or locates it --
+                // an initializer here; otherwise the linearizer reports the
+                // use, and an object nothing uses is no code at all, as in
+                // gcc.
+                let fixed = scope == DeclScope::File
+                    || specs.is_extern()
+                    || specs
+                        .storage_class
+                        .contains(crate::types::TypeModifiers::STATIC);
+                if fixed {
+                    self.report_sve_use(typ, super::target_types::SveUse::StaticObject, pos);
+                } else if init.is_some() {
+                    self.report_sve_use(typ, super::target_types::SveUse::Value, pos);
+                }
+            } else if !is_fn && (!specs.is_extern() || init.is_some()) {
                 self.check_object_complete(scope, name, typ, pos);
             }
             // A tentative definition of an array without its extent, which a
@@ -609,7 +640,10 @@ impl Parser<'_> {
         // declaration of its name has promised.
         let pending_effect = self.take_pending_fn_effect();
         let mut symbol_attrs = std::mem::take(&mut self.pending_symbol_attrs);
-        if !is_fn {
+        if is_fn {
+            let ident = self.idents.get_opt(name).unwrap_or("");
+            symbol_attrs.call_diagnostics.name_function(ident);
+        } else {
             Self::drop_ifunc(&mut symbol_attrs, pos);
             // Already warned about as a function's attribute.
             symbol_attrs.call_diagnostics = Default::default();
@@ -907,6 +941,7 @@ impl Parser<'_> {
         name: StringId,
         typ: &mut TypeId,
     ) -> Option<FunctionAttrs> {
+        self.check_format_uses(*typ);
         if specs.is_typedef() {
             self.drop_fn_decl_attrs(*typ);
             return None;

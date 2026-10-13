@@ -165,3 +165,95 @@ fn binary128_values_spilled_under_register_pressure() {
     );
     crate::common::compile_and_run_everywhere("binary128_spill_pressure", &src);
 }
+
+/// A `long double` argument for a `_Float128` parameter, and the reverse,
+/// is converted (C17 6.5.2.2p7). Calls decided by size whether a floating
+/// argument needed converting, and on x86-64 both types are sixteen bytes:
+/// the x87 value went over unconverted, on the stack, and the callee read
+/// %xmm0. The other conversions between the two are checked alongside.
+///
+/// Not on macOS: Apple's targets have no `_Float128`, as with clang.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn binary128_long_double_arguments_are_converted() {
+    let src = r#"
+long double g_ld = 0.5L;
+_Float128 g_q = 0.25f128;
+__attribute__((noinline)) double one(_Float128 x) { return (double)x; }
+__attribute__((noinline)) double two(_Float128 x, _Float128 y) { return (double)x * 10 + (double)y; }
+__attribute__((noinline)) double ldp(long double x) { return (double)x; }
+__attribute__((noinline)) _Float128 ret_q(long double x) { return x; }
+__attribute__((noinline)) long double ret_ld(_Float128 x) { return x; }
+struct S { _Float128 q; long double l; };
+int main(void) {
+    long double a = 0.5L, b = 0.25L;
+    if (one(g_ld) != 0.5) return 1;
+    if (two(g_ld, g_ld) != 5.5) return 2;
+    if (two(a, b) != 5.25) return 3;
+    if (ldp(g_q) != 0.25) return 4;
+    if ((double)ret_q(a) != 0.5) return 5;
+    if ((double)ret_ld(g_q) != 0.25) return 6;
+    struct S s = { a, g_q };
+    if ((double)s.q != 0.5 || (double)s.l != 0.25) return 7;
+    _Float128 q = 1; q += a;
+    if ((double)q != 1.5) return 8;
+    long double l = 1; l += g_q;
+    if ((double)l != 1.25) return 9;
+    if (!(a > g_q) || (a < g_q) || a == g_q) return 10;
+    if ((double)(a + g_q) != 0.75 || sizeof(a + g_q) != 16) return 11;
+    _Float128 arr[2] = { a, b };
+    if ((double)arr[1] != 0.25) return 12;
+    return 0;
+}
+"#;
+    crate::common::compile_and_run_everywhere("binary128_ld_args", src);
+}
+
+/// `_Float16` to and from binary128 (`long double` on aarch64, `_Float128`)
+/// and `__int128`, by libgcc's `hf` routines. On aarch64 the binary128
+/// conversions came out as an `fcvt` between an `h` and a `q` register, an
+/// instruction A64 does not have, and `__int128` from `_Float16` was wrong.
+///
+/// Not on macOS: Apple's targets have no `_Float128`, as with clang.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn binary128_half_conversions() {
+    let src = r#"
+_Float16 h = 1.5f16;
+volatile long double vld = 2.5L;
+volatile _Float128 vq = 3.5f128;
+volatile __int128 vi = 1000;
+volatile unsigned __int128 vu = 2000;
+volatile _Float16 vh = 1500.0f16;
+__attribute__((noinline)) long double a(void) { return h; }
+__attribute__((noinline)) _Float128 b(void) { return h; }
+__attribute__((noinline)) _Float16 c(long double x) { return x; }
+__attribute__((noinline)) _Float16 d(_Float128 x) { return x; }
+__attribute__((noinline)) double use(_Float128 q) { return (double)q; }
+__attribute__((noinline)) double e(void) { return use(h); }
+__attribute__((noinline)) _Float128 f(_Float16 x) { return (_Float128)x * 2; }
+__attribute__((noinline)) long double g(_Float16 x) { return (long double)x * 2; }
+int main(void) {
+    if (a() != 1.5L) return 1;
+    if (b() != 1.5f128) return 2;
+    if (c(vld) != 2.5f16) return 3;
+    if (d(vq) != 3.5f16) return 4;
+    if (e() != 1.5) return 5;
+    if (f(h) != 3.0f128) return 6;
+    if (g(h) != 3.0L) return 7;
+    _Float16 k = vld;
+    if (k != 2.5f16) return 8;
+    _Float16 m = vq;
+    if (m != 3.5f16) return 9;
+    if ((_Float128)h + vq != 5.0f128) return 10;
+    if (h + vld != 4.0L) return 11;
+    _Float16 i1 = vi, u1 = vu;
+    __int128 i2 = vh;
+    unsigned __int128 u2 = vh;
+    if (i1 != 1000.0f16 || u1 != 2000.0f16) return 12;
+    if (i2 != 1500 || u2 != 1500) return 13;
+    return 0;
+}
+"#;
+    crate::common::compile_and_run_everywhere("binary128_half", src);
+}

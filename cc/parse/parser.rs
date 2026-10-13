@@ -280,6 +280,9 @@ pub struct Parser<'a> {
     /// specifiers, between the type and the declarator, or after the
     /// parameter list. Cleared at the start of each external declaration.
     pub(super) pending_fn_attrs: crate::parse::ast::FunctionAttrs,
+    /// The type of the deallocation function a `malloc(dealloc, n)`
+    /// attribute names, while its arguments are read.
+    pub(super) malloc_deallocator: Option<crate::types::TypeId>,
     /// The function-type attributes -- `ms_abi`, `sysv_abi`, `nocf_check`
     /// -- awaiting the declarator whose function type they belong to. A
     /// property of the type, so they are applied with the other type
@@ -429,7 +432,7 @@ impl<'a> Parser<'a> {
         types: &'a mut TypeTable,
         layout_pragmas: Vec<(usize, LayoutPragma)>,
     ) -> Self {
-        Self {
+        let mut parser = Self {
             tokens,
             idents,
             symbols,
@@ -449,6 +452,7 @@ impl<'a> Parser<'a> {
             pending_written_attrs: Vec::new(),
             written_attrs: HashMap::new(),
             pending_fn_attrs: Default::default(),
+            malloc_deallocator: None,
             pending_fn_type: Default::default(),
             cf_branch: false,
             x86_isa: Default::default(),
@@ -482,7 +486,9 @@ impl<'a> Parser<'a> {
             pack_stack: Vec::new(),
             storage_order_current: StorageOrderPragma::Default,
             visibility_stack: Vec::new(),
-        }
+        };
+        parser.declare_target_types();
+        parser
     }
 
     /// Evaluate library builtins as the command line says: whether the
@@ -642,6 +648,40 @@ impl<'a> Parser<'a> {
             }
         }
         None
+    }
+
+    /// The GNU extension the tokens just before the current one end with --
+    /// `__attribute__((...))` or `__asm__("...")` -- by its keyword's
+    /// spelling, if they end with one.
+    pub(super) fn extension_just_ended(&self) -> Option<&str> {
+        let special = |t: &Token, c: u8| matches!(t.value, TokenValue::Special(v) if v == c as u32);
+        let mut i = self.pos.checked_sub(1)?;
+        if !special(self.tokens.get(i)?, b')') {
+            return None;
+        }
+        let mut depth = 0usize;
+        loop {
+            let t = self.tokens.get(i)?;
+            if special(t, b')') {
+                depth += 1;
+            } else if special(t, b'(') {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            i = i.checked_sub(1)?;
+        }
+        let keyword = self.tokens.get(i.checked_sub(1)?)?;
+        match &keyword.value {
+            TokenValue::Ident(id) => self.idents.get_opt(*id).filter(|k| {
+                matches!(
+                    *k,
+                    "__attribute__" | "__attribute" | "asm" | "__asm" | "__asm__"
+                )
+            }),
+            _ => None,
+        }
     }
 
     pub(crate) fn is_special(&self, c: u8) -> bool {

@@ -990,11 +990,13 @@ fn system_search(args: &Args) -> token::preprocess::SystemSearch<'_> {
 ///
 /// One sink serves the whole run: with several source operands the
 /// preprocessed forms concatenate, as they do on stdout.
-fn preprocess_sink(args: &Args) -> io::Result<Box<dyn Write>> {
+fn preprocess_sink(args: &Args, writes: bool) -> io::Result<Box<dyn Write>> {
     // Only `-E` may open `args.output`. Every other mode names its own output
     // downstream, and creating the file here would truncate the executable or
-    // object a normal compile is about to write.
+    // object a normal compile is about to write. Nor does `-E` when every
+    // operand is passed over: gcc then creates no file.
     match args.output.as_deref() {
+        Some(_) if args.preprocess_only && !writes => Ok(Box::new(io::sink())),
         Some(path) if args.preprocess_only && path != "-" => {
             Ok(Box::new(BufWriter::new(File::create(path)?)))
         }
@@ -3381,6 +3383,10 @@ enum OperandKind {
     LinkerInput,
     /// A language c17 does not compile, with what to say about it.
     Foreign(&'static str),
+    /// Under `-E`, `-M` or `-MM`, an input that is not preprocessed -- plain
+    /// assembler, or C already preprocessed: gcc passes it over without
+    /// opening it, writing nothing.
+    PassedOver,
 }
 
 /// A pathname operand together with its kind, keeping argument order.
@@ -3422,17 +3428,20 @@ enum Lang {
 fn bypasses_linker(kind: OperandKind, link_phase: bool) -> bool {
     match kind {
         OperandKind::LinkerInput => !link_phase,
-        OperandKind::Source | OperandKind::Asm | OperandKind::Foreign(_) => false,
+        OperandKind::Source
+        | OperandKind::Asm
+        | OperandKind::Foreign(_)
+        | OperandKind::PassedOver => false,
     }
 }
 
 impl Operand {
     fn classify(path: String, args: &Args) -> Self {
+        let preprocessing = args.preprocess_only || args.dependencies_replace_output();
         let kind = match args.lang_of(&path) {
+            Lang::Asm | Lang::Preprocessed if preprocessing => OperandKind::PassedOver,
             Lang::C | Lang::Preprocessed => OperandKind::Source,
-            Lang::Header if args.preprocess_only || args.dependencies_replace_output() => {
-                OperandKind::Source
-            }
+            Lang::Header if preprocessing => OperandKind::Source,
             Lang::Header => OperandKind::Foreign("c17 does not write precompiled headers"),
             Lang::Asm | Lang::AsmCpp => OperandKind::Asm,
             Lang::LinkerInput => OperandKind::LinkerInput,
@@ -4011,7 +4020,8 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Opened once, before the loop, so several source operands concatenate
     // into one `-E` output rather than each truncating the last.
-    let mut pp_out = preprocess_sink(&args)?;
+    let writes = operands.iter().any(|o| o.kind != OperandKind::PassedOver);
+    let mut pp_out = preprocess_sink(&args, writes)?;
     // The object each operand contributes to the link, by operand index.
     // `None` means the operand contributes nothing (`-c`, an early-exit mode,
     // or a language c17 does not compile).
@@ -4052,10 +4062,11 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
                 failed = true;
             }
             OperandKind::LinkerInput => operand_objects[idx] = Some(op.path.clone()),
+            OperandKind::PassedOver => {}
             // 87883-87885: with -E "no compilation shall be performed", so an
-            // assembler operand is never handed to `as`. Not assembling is not
-            // the same as producing nothing, though: preprocess it and write
-            // the text, as gcc does.
+            // assembler operand is never handed to `as`. One to preprocess
+            // (`.S`) is preprocessed and its text written, as gcc does; plain
+            // assembler is `PassedOver`.
             OperandKind::Asm if args.preprocess_only || args.dependencies_replace_output() => {
                 let result = preprocess_asm_operand(&op.path, &args, &target, &mut pp_out);
                 diag::finish_unit();

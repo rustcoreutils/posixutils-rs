@@ -699,6 +699,9 @@ pub struct Linearizer<'a> {
     /// Local variables (use Load/Store, converted to SSA later)
     /// Keyed by SymbolId for proper scope handling
     pub(crate) locals: HashMap<SymbolId, LocalVarInfo>,
+    /// The automatic objects of an SVE type, which have no storage: see
+    /// `linearize_local_decl`.
+    pub(crate) sve_locals: std::collections::HashSet<SymbolId>,
     /// The evaluated extents of each variably modified `typedef` in scope,
     /// keyed by the typedef's symbol.
     ///
@@ -934,6 +937,7 @@ impl<'a> Linearizer<'a> {
             next_pseudo: 0,
             next_bb: 0,
             locals: HashMap::with_capacity(DEFAULT_LOCALS_CAPACITY),
+            sve_locals: Default::default(),
             vm_typedef_dims: HashMap::new(),
             label_map: HashMap::with_capacity(DEFAULT_LABEL_MAP_CAPACITY),
             break_targets: Vec::with_capacity(DEFAULT_LOOP_DEPTH_CAPACITY),
@@ -1965,6 +1969,7 @@ impl<'a> Linearizer<'a> {
         self.next_pseudo = 0;
         self.next_bb = 0;
         self.locals.clear();
+        self.sve_locals.clear();
         self.local_scope_stack.clear();
         self.label_map.clear();
         self.range_values.clear();
@@ -2192,10 +2197,12 @@ impl<'a> Linearizer<'a> {
         ir_func.is_noipa = func.attrs.noipa;
         ir_func.saves_all_registers = func.attrs.saves_all_registers;
         ir_func.no_instrument = func.attrs.no_instrument;
-        ir_func.nocf_check = self
+        let fn_type = self
             .symbols
             .lookup(func.name, crate::symbol::Namespace::Ordinary)
-            .is_some_and(|s| self.types.get(s.typ).nocf_check);
+            .map(|s| self.types.get(s.typ));
+        ir_func.nocf_check = fn_type.is_some_and(|t| t.nocf_check);
+        ir_func.vector_pcs = fn_type.is_some_and(|t| t.vector_pcs);
 
         let ret_kind = self.types.kind(func.return_type);
         // A vector is returned as its carrier, which is what the function
@@ -3103,8 +3110,9 @@ impl<'a> Linearizer<'a> {
             // It writes the frame.
             ExprKind::UnwindInit => false,
 
-            // The counter reads differ, and `rdtscp` stores; a conversion
-            // or the thread pointer is a value.
+            // The counter reads differ, and `rdtscp` stores; so do reads
+            // and writes of aarch64's floating-point registers. A
+            // conversion or the thread pointer is a value.
             ExprKind::MachineBuiltin { op, args } => {
                 matches!(op, MachineOp::Cvtpd2ps | MachineOp::ThreadPointer)
                     && args.iter().all(|a| self.is_pure_expr(a, how))
@@ -3312,9 +3320,15 @@ impl<'a> Linearizer<'a> {
             TypeKind::Enum | TypeKind::Struct | TypeKind::Union
         ) && !self.types.is_composite_complete(typ);
         if incomplete {
-            let named = self.types.format_type(typ, Some(self.strings));
             let pos = self.current_pos.unwrap_or_default();
-            crate::diag::error_args(pos, "invalid use of incomplete type '{0}'", &[&named]);
+            // gcc's words for a value of an SVE builtin type, which only
+            // SVE code could load or store.
+            if self.types.sve_name(typ).is_some() {
+                crate::diag::error(pos, "this operation requires the SVE ISA extension");
+            } else {
+                let named = self.types.format_type(typ, Some(self.strings));
+                crate::diag::error_args(pos, "invalid use of incomplete type '{0}'", &[&named]);
+            }
         }
         incomplete
     }
@@ -3370,6 +3384,9 @@ impl<'a> Linearizer<'a> {
             ExprKind::VmTypeName { symbol, dims, expr } => {
                 self.record_type_name_extents(*symbol, self.expr_type(expr), dims);
                 self.linearize_lvalue(expr)
+            }
+            ExprKind::Ident(symbol_id) if self.sve_object_used(*symbol_id, expr.pos) => {
+                self.emit_const(0, self.types.ulong_id)
             }
             ExprKind::Ident(symbol_id) => {
                 let local = self.locals.get(symbol_id).cloned();
@@ -3577,7 +3594,7 @@ impl<'a> Linearizer<'a> {
         // for a NaN. The optimizer deleted the dead conversion at -O1 and
         // above, so only -O0 raised it.
         if self.types.kind(cast_type) == TypeKind::Void {
-            return self.linearize_expr(inner_expr);
+            return self.linearize_discarded(inner_expr);
         }
 
         // A floating constant to an integer type folds, saturated where it
@@ -4974,8 +4991,15 @@ impl<'a> Linearizer<'a> {
                 // in one byte, so `f(..., 'a')` recorded as `int`
                 // took four and moved every later argument.
                 || (arg_is_int && param_is_int && arg_size > param_size)
-                // FP size mismatch (float→double, long double→double, etc.)
-                || (arg_is_fp && param_is_fp && arg_size != param_size)
+                // FP format mismatch (float→double, long double→double,
+                // etc.). The format, not the size: x86-64's `long double`
+                // and `_Float128` are both sixteen bytes, and a `long
+                // double` handed unconverted to a `_Float128` parameter
+                // arrived as its x87 bytes, on the stack, where the callee
+                // read %xmm0.
+                || (arg_is_fp
+                    && param_is_fp
+                    && self.types.fp_format(arg_type) != self.types.fp_format(param_type))
                 // Integer to FP (uint32_t→double, int→float, etc.)
                 || (arg_is_int && param_is_fp)
                 // FP to integer (rare but legal)
@@ -5666,7 +5690,45 @@ impl<'a> Linearizer<'a> {
         result
     }
 
+    /// Evaluate `expr` for its side effects alone, its value discarded: an
+    /// expression statement, a cast to `void`, a comma's left operand.
+    ///
+    /// An object of an SVE type is then not read -- gcc reads none, and
+    /// reading one is SVE code -- so `(void)*p` and an unused SVE local's
+    /// `(void)v` are nothing but the pointer's own evaluation, as in gcc.
+    ///
+    /// Answers a pseudo of what it evaluated, which the caller discards.
+    pub(crate) fn linearize_discarded(&mut self, expr: &Expr) -> PseudoId {
+        let typ = self.expr_type(expr);
+        let volatile = self.types.modifiers(typ).contains(TypeModifiers::VOLATILE);
+        if self.types.sve_name(typ).is_some() && !volatile {
+            match &expr.kind {
+                ExprKind::Ident(_) => return self.emit_const(0, self.types.int_id),
+                ExprKind::Unary {
+                    op: UnaryOp::Deref,
+                    operand,
+                } => return self.linearize_expr(operand),
+                _ => {}
+            }
+        }
+        self.linearize_expr(expr)
+    }
+
+    /// Whether `symbol_id` is an automatic object of an SVE type, which is
+    /// then reported at `pos`: it has no storage to read, write or locate,
+    /// which only SVE code could give it.
+    pub(crate) fn sve_object_used(&self, symbol_id: SymbolId, pos: Position) -> bool {
+        let used = self.sve_locals.contains(&symbol_id);
+        if used {
+            crate::diag::error(pos, "this operation requires the SVE ISA extension");
+        }
+        used
+    }
+
     pub(crate) fn linearize_ident(&mut self, expr: &Expr, symbol_id: SymbolId) -> PseudoId {
+        if self.sve_object_used(symbol_id, expr.pos) {
+            return self.emit_const(0, self.types.int_id);
+        }
         let sym = self.symbols.get(symbol_id);
 
         // First check if it's an enum constant
@@ -7511,8 +7573,13 @@ impl<'a> Linearizer<'a> {
 
             ExprKind::Comma(exprs) => {
                 let mut result = self.emit_const(0, self.types.int_id);
-                for e in exprs {
-                    result = self.linearize_expr(e);
+                for (i, e) in exprs.iter().enumerate() {
+                    // Every operand but the last is evaluated for its effects.
+                    result = if i + 1 < exprs.len() {
+                        self.linearize_discarded(e)
+                    } else {
+                        self.linearize_expr(e)
+                    };
                 }
                 result
             }

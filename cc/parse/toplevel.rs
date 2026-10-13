@@ -134,7 +134,9 @@ impl Parser<'_> {
             // `TypeId`, completed along with the tag (`complete_struct`), so
             // `struct S; volatile struct S vs; struct S { int a; };` is
             // complete by now.
-            if self.types.is_composite_complete(typ) {
+            if self.types.is_composite_complete(typ)
+                || self.report_sve_use(typ, super::target_types::SveUse::StaticObject, pos)
+            {
                 continue;
             }
             let named = self.types.format_type(typ, Some(self.idents));
@@ -361,7 +363,9 @@ impl Parser<'_> {
         let mut params = params.unwrap_or_default();
         self.record_param_positions(name, &params);
         let typ = self.parse_old_style_parameters(typ, &mut params)?;
-        self.check_parameters_complete(&params, pos);
+        if !self.report_sve_definition(name, typ, pos) {
+            self.check_parameters_complete(&params, pos);
+        }
         self.check_identifier_list_against_prototype(name, typ, &params, pos);
         let func = self.types.get(typ);
         // An identifier list records no parameter types (C17 6.7.6.3p14).
@@ -375,6 +379,7 @@ impl Parser<'_> {
         // type, since its `return` makes one.
         if self.types.kind(return_type) != TypeKind::Void
             && self.type_name_is_incomplete(return_type)
+            && self.types.sve_name(return_type).is_none()
         {
             diag::error(pos, &gettext("return type is an incomplete type"));
         }
@@ -397,6 +402,8 @@ impl Parser<'_> {
             gnu_extern_inline: attrs.gnu_inline_only(specs.storage_class),
         });
         self.settle_visibility(name, linkage, true, &mut attrs.symbol.visibility);
+        let ident = self.idents.get_opt(name).unwrap_or("").to_string();
+        attrs.symbol.call_diagnostics.name_function(&ident);
         // After the definition the name has the composite type of it and any
         // earlier declaration (C17 6.2.7p4): `int (*fp(void))[6] { .. }`
         // keeps the extent an earlier `int (*fp(void))[];` lacked, and an

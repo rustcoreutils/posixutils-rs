@@ -18,6 +18,190 @@ use super::*;
 
 /// Undo the escaping of a `_Pragma` operand (C99 6.10.9p1): `\\"` becomes `"`
 /// and `\\\\` becomes `\\`, and nothing else changes.
+/// One token of a `#pragma GCC diagnostic` line, as its checks read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DiagPiece {
+    /// An identifier: `GCC`, `diagnostic`, a kind.
+    Word(String),
+    /// A string literal's text.
+    Str(String),
+    /// Anything else.
+    Other,
+}
+
+impl DiagPiece {
+    fn of(t: &Token, idents: &IdentTable) -> Self {
+        match &t.value {
+            TokenValue::Ident(id) => DiagPiece::Word(idents.get_opt(*id).unwrap_or("").to_string()),
+            TokenValue::String(payload) if t.typ == TokenType::String => {
+                DiagPiece::Str(payload_text(payload))
+            }
+            _ => DiagPiece::Other,
+        }
+    }
+
+    /// The pieces of the text of a `_Pragma` operand, destringified:
+    /// words, `"..."` strings, and anything else.
+    fn split(text: &str) -> Vec<Self> {
+        let mut out = Vec::new();
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c.is_whitespace() {
+                continue;
+            }
+            if c.is_alphabetic() || c == '_' {
+                let mut w = c.to_string();
+                while let Some(d) = chars.next_if(|d| d.is_alphanumeric() || *d == '_' || *d == '+')
+                {
+                    w.push(d);
+                }
+                out.push(DiagPiece::Word(w));
+            } else if c == '"' {
+                let mut s = String::new();
+                while let Some(d) = chars.next() {
+                    match d {
+                        '"' => break,
+                        '\\' => s.extend(chars.next()),
+                        _ => s.push(d),
+                    }
+                }
+                out.push(DiagPiece::Str(s));
+            } else {
+                out.push(DiagPiece::Other);
+            }
+        }
+        out
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            DiagPiece::Word(w) => w.chars().count(),
+            DiagPiece::Str(s) => s.chars().count() + 2,
+            DiagPiece::Other => 1,
+        }
+    }
+}
+
+/// `pos`, `n` columns on: where gcc reports what is missing after a token.
+fn after(pos: Position, n: usize) -> Position {
+    Position {
+        col: pos.col.saturating_add(u16::try_from(n).unwrap_or(u16::MAX)),
+        ..pos
+    }
+}
+
+/// gcc's `-Wpragmas` warnings for `#pragma GCC diagnostic`, whose
+/// `pieces` begin at `GCC`: a kind that is missing or none of gcc's, an
+/// option that is missing, unknown, no warning, or C++'s, and an
+/// `ignored_attributes` list gcc refuses.
+///
+/// c17 does not act on the pragma -- what it would change is which
+/// warnings are given, and its diagnostics are gcc's -- but a name gcc would
+/// warn about is a mistake in the program, which c17 reports as gcc does.
+/// Only while compiling: under `-E` the line travels as written, for the
+/// compile that reads it.
+fn check_diagnostic_pragma(pieces: &[(DiagPiece, Position)]) {
+    let [(DiagPiece::Word(gcc), gcc_pos), (DiagPiece::Word(diagnostic), diag_pos), rest @ ..] =
+        pieces
+    else {
+        return;
+    };
+    if gcc != "GCC" || diagnostic != "diagnostic" {
+        return;
+    }
+    let warn = |pos: Position, msg: &str, args: &[&str]| {
+        diag::group_warning_args(PRAGMAS_WARNING, pos, msg, args)
+    };
+    let Some(((kind, kind_pos), operands)) = rest.split_first() else {
+        warn(
+            after(*diag_pos, diagnostic.len()),
+            "missing 'error', 'warning', 'ignored', 'push', 'pop', or 'ignored_attributes' after '#pragma GCC diagnostic'",
+            &[],
+        );
+        return;
+    };
+    let kind_name = match kind {
+        DiagPiece::Word(w) => w.as_str(),
+        _ => "",
+    };
+    // Adjacent strings are one, as in any other string context.
+    let mut text: Option<String> = None;
+    for (piece, _) in operands {
+        match piece {
+            DiagPiece::Str(s) => text.get_or_insert_with(String::new).push_str(s),
+            _ => break,
+        }
+    }
+    let option_pos = operands
+        .first()
+        .filter(|(p, _)| matches!(p, DiagPiece::Str(_)))
+        .map_or(after(*kind_pos, kind.len()), |(_, pos)| *pos);
+    let missing_pos = match operands.first() {
+        Some((_, pos)) => *pos,
+        None => after(*kind_pos, kind.len()),
+    };
+    match kind_name {
+        "push" | "pop" => {}
+        "error" | "warning" | "ignored" => {
+            let Some(text) = text else {
+                warn(missing_pos, "missing option after '#pragma GCC diagnostic' kind", &[]);
+                return;
+            };
+            use crate::warn_options::{pragma_option, PragmaOption};
+            match pragma_option(&text) {
+                PragmaOption::Warning => {}
+                PragmaOption::NotAWarning => warn(
+                    option_pos,
+                    "'{0}' is not an option that controls warnings",
+                    &[&text],
+                ),
+                PragmaOption::CxxOnly => warn(
+                    option_pos,
+                    "option '{0}' is valid for C++/ObjC++ but not for C",
+                    &[&text],
+                ),
+                PragmaOption::Unknown => {
+                    warn(option_pos, "unknown option after '#pragma GCC diagnostic' kind", &[]);
+                    let suggestion = if text.starts_with("-Wno-error=") {
+                        Some("-Wno-error=".to_string())
+                    } else {
+                        crate::warn_options::suggest(&text)
+                    };
+                    if let Some(s) = suggestion {
+                        diag::note(option_pos, &format!("did you mean '{s}'?"));
+                    }
+                }
+            }
+        }
+        "ignored_attributes" => {
+            let Some(text) = text else {
+                warn(
+                    missing_pos,
+                    "missing attribute name after '#pragma GCC diagnostic ignored_attributes'",
+                    &[],
+                );
+                return;
+            };
+            // Each of a comma-separated list is `vendor::` or
+            // `vendor::name`.
+            let good = text.split(',').all(|item| {
+                item.trim()
+                    .split_once("::")
+                    .is_some_and(|(vendor, _)| !vendor.is_empty())
+            });
+            if !good {
+                diag::error(*gcc_pos, "wrong argument to ignored attributes");
+                diag::note(*gcc_pos, "valid format is 'ns::attr' or 'ns::'");
+            }
+        }
+        _ => warn(
+            *kind_pos,
+            "expected 'error', 'warning', 'ignored', 'push', 'pop', 'ignored_attributes' after '#pragma GCC diagnostic'",
+            &[],
+        ),
+    }
+}
+
 fn destringify(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars();
@@ -690,12 +874,15 @@ impl<'a> Preprocessor<'a> {
             return;
         };
         // C17 6.10.8p2: the standard's predefined names may not be the
-        // subject of `#undef`; gcc warns, and so does this. `defined` is
-        // refused outright, as it is for `#define`.
+        // subject of `#undef`; gcc warns, and so does this -- for a name
+        // the implementation has defined. An `__STDC_` name it has not is
+        // the program's (`__STDC_WANT_LIB_EXT1__`, K.3.1.1), and quiet.
+        // `defined` is refused outright, as it is for `#define`.
         if name == "defined" {
             diag::error(pos, &gettext("\"defined\" cannot be used as a macro name"));
         } else {
-            if is_standard_predefined(&name) {
+            let predefined = self.macros.get(&name).is_some_and(|m| m.predefined);
+            if predefined && is_standard_predefined(&name) {
                 let template = "undefining \"{0}\"";
                 match builtin_macro_group(&name) {
                     Some(group) => diag::group_warning_args(group, pos, template, &[&name]),
@@ -1535,6 +1722,11 @@ impl<'a> Preprocessor<'a> {
         // which needs the tokens as they were written.
         let line = self.collect_to_eol(iter);
         let verbatim = Self::directive_line_text("pragma", &line, idents);
+        // The words and strings, for `#pragma GCC diagnostic`'s checks.
+        let pieces: Vec<(DiagPiece, Position)> = line
+            .iter()
+            .map(|t| (DiagPiece::of(t, idents), self.remap_pos(t.pos)))
+            .collect();
         let emit_verbatim = |pp: &mut Self, output: &mut Vec<Token>| {
             let mut marker = Token::new(TokenType::Pragma, pp.remap_pos(hash_pos));
             marker.value = TokenValue::String(format!("{}{}", PRAGMA_TEXT_PREFIX, verbatim));
@@ -1587,7 +1779,10 @@ impl<'a> Preprocessor<'a> {
                         let body = verbatim.strip_prefix("#pragma").unwrap_or(&verbatim);
                         match parse_pragma_text(body, pos) {
                             Some(pragma) => self.push_parser_pragma(output, pragma, pos),
-                            None => emit_verbatim(self, output),
+                            None => {
+                                check_diagnostic_pragma(&pieces);
+                                emit_verbatim(self, output);
+                            }
                         }
                         return;
                     } else if name == "push_macro" || name == "pop_macro" {
@@ -1743,11 +1938,29 @@ impl<'a> Preprocessor<'a> {
             let quiet = self.preprocess_only;
             let mut act = || match parse_pragma_text(body, pos).filter(|_| !quiet) {
                 Some(pragma) => self.push_parser_pragma(output, pragma, pos),
+                None if quiet => {
+                    let mut marker = Token::new(TokenType::Pragma, pos);
+                    marker.value = TokenValue::String(format!(
+                        "{}#pragma {}",
+                        PRAGMA_TEXT_PREFIX,
+                        destringify(&payload_text(body))
+                    ));
+                    output.push(marker);
+                }
                 // Not one c17 acts on, so it travels as the directive it
                 // stands for. C99 6.10.9p1 makes `_Pragma("x")` mean
                 // `#pragma x`, and the operand is a string literal, so the
                 // escaping the lexer kept has to come back off.
                 None => {
+                    // A `GCC diagnostic` one is checked, every report at
+                    // the `_Pragma`, as gcc gives them.
+                    let text = destringify(&payload_text(body));
+                    let at = self.remap_pos(pragma_pos);
+                    let pieces: Vec<(DiagPiece, Position)> = DiagPiece::split(&text)
+                        .into_iter()
+                        .map(|p| (p, at))
+                        .collect();
+                    check_diagnostic_pragma(&pieces);
                     let mut marker = Token::new(TokenType::Pragma, pos);
                     marker.value = TokenValue::String(format!(
                         "{}#pragma {}",

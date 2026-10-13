@@ -15,15 +15,23 @@
 // disagree.
 //
 
-use crate::common::{compile_and_run, compile_and_run_aarch64, compile_and_run_everywhere};
+use crate::common::{compile_and_run_aarch64, compile_and_run_everywhere};
 
 /// Run `src` on the host at the matrix levels and at -O0 and -O2.
 #[cfg(target_arch = "x86_64")]
 fn run_host_levels(name: &str, src: &str) {
-    assert_eq!(compile_and_run(name, src, &[]), 0, "{name} at the matrix");
+    assert_eq!(
+        crate::common::compile_and_run(name, src, &[]),
+        0,
+        "{name} at the matrix"
+    );
     for opt in ["-O0", "-O2"] {
         let level = vec![opt.to_string()];
-        assert_eq!(compile_and_run(name, src, &level), 0, "{name} at {opt}");
+        assert_eq!(
+            crate::common::compile_and_run(name, src, &level),
+            0,
+            "{name} at {opt}"
+        );
     }
 }
 
@@ -223,7 +231,11 @@ int main(void) {
 "#;
     for opt in ["-O0", "-O2"] {
         let opts = vec![opt.to_string(), "-no-pie".to_string()];
-        assert_eq!(compile_and_run("asm_x86_imm", src, &opts), 0, "at {opt}");
+        assert_eq!(
+            crate::common::compile_and_run("asm_x86_imm", src, &opts),
+            0,
+            "at {opt}"
+        );
     }
     let inlined = r#"
 static inline long add_const(long a, int k) {
@@ -237,7 +249,7 @@ int main(void) {
     for opt in ["-O1", "-O2"] {
         let opts = vec![opt.to_string()];
         assert_eq!(
-            compile_and_run("asm_x86_imm_inl", inlined, &opts),
+            crate::common::compile_and_run("asm_x86_imm_inl", inlined, &opts),
             0,
             "at {opt}"
         );

@@ -29,6 +29,9 @@ mod initializers_static;
 mod initializers_strings;
 mod stdlib_headers;
 mod tgmath;
+// glibc's functions and feature tests: Linux alone.
+#[cfg(target_os = "linux")]
+mod tgmath_table;
 mod translation_limits;
 mod type_macros;
 mod types;

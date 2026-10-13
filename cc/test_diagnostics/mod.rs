@@ -23,10 +23,12 @@
 // translation units, files on disk -- stays in `tests/diagnostics`.
 //
 
+mod aarch64_builtin_types;
 mod arrays_and_initializers;
 mod asm_constraints;
 mod asm_flag_outputs;
 mod asm_operand_names;
+mod asm_pinned_registers;
 mod asm_templates;
 mod atomics_and_asm;
 mod attribute_misuse;
@@ -45,8 +47,10 @@ mod conversion_overflow;
 mod declarations;
 mod declarators_and_shifts;
 mod default_pedwarns;
+mod diagnostic_pragmas;
 mod empty_declarations;
 mod expressions;
+mod format_attributes;
 mod frame_larger_than;
 mod function_compatibility;
 mod function_pointers;

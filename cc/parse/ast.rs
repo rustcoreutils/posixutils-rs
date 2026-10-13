@@ -607,6 +607,34 @@ pub enum MachineOp {
     /// `__builtin_thread_pointer()`: the TLS ABI's thread pointer, `%fs:0`
     /// on x86-64 and `tpidr_el0` on aarch64.
     ThreadPointer,
+    /// `__builtin_aarch64_get_fpcr()` and its siblings: `mrs` of an aarch64
+    /// floating-point system register, as an `unsigned int`, or as an
+    /// `unsigned long long` for the `64` forms.
+    FpRegRead { reg: FpSysReg, wide: bool },
+    /// `__builtin_aarch64_set_fpcr(v)` and its siblings: `msr` of the
+    /// register, from an `unsigned int`, or an `unsigned long long` for the
+    /// `64` forms.
+    FpRegWrite { reg: FpSysReg, wide: bool },
+}
+
+/// An aarch64 floating-point system register a [`MachineOp`] reads or
+/// writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FpSysReg {
+    /// The control register: rounding mode, trap enables, flush-to-zero.
+    Fpcr,
+    /// The status register: the cumulative exception flags.
+    Fpsr,
+}
+
+impl FpSysReg {
+    /// The register's name in `mrs` and `msr`.
+    pub fn name(self) -> &'static str {
+        match self {
+            FpSysReg::Fpcr => "fpcr",
+            FpSysReg::Fpsr => "fpsr",
+        }
+    }
 }
 
 /// Which classification question a [`ExprKind::FpTest`] asks.
@@ -2930,6 +2958,9 @@ pub struct CallDiagnostics {
     pub error: Option<String>,
     /// `warning("msg")`: each such call is a warning, `-Wattribute-warning`.
     pub warning: Option<String>,
+    /// The function's C identifier, which the reports name, as gcc's do: a
+    /// call names the symbol, which an asm label may have renamed.
+    pub name: Option<String>,
 }
 
 impl CallDiagnostics {
@@ -2941,6 +2972,17 @@ impl CallDiagnostics {
         }
         if other.warning.is_some() {
             self.warning = other.warning.clone();
+        }
+        if other.name.is_some() {
+            self.name = other.name.clone();
+        }
+    }
+
+    /// Record `name`, the function's C identifier, when there is anything
+    /// to report of its calls.
+    pub fn name_function(&mut self, name: &str) {
+        if self.error.is_some() || self.warning.is_some() {
+            self.name = Some(name.to_string());
         }
     }
 }
@@ -3265,6 +3307,9 @@ pub struct FunctionAttrs {
     /// where its list is: a declarator that declares no function ignores
     /// them with gcc's diagnostic (`Parser::drop_fn_decl_attrs`).
     pub function_only: Vec<(&'static str, crate::diag::Position)>,
+    /// The `format` and `format_arg` attributes written, checked against
+    /// the function type once it is known (`Parser::check_format_uses`).
+    pub format_uses: Vec<crate::parse::attribute::FormatUse>,
 }
 
 impl FunctionAttrs {

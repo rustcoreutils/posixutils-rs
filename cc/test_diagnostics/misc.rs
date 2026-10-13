@@ -251,6 +251,23 @@ fn misc_attribute_declaration_is_empty() {
     );
 }
 
+/// Attributes after a label's colon are the label's even when `;` follows
+/// them: `L: __attribute__((unused));` is a label with an attribute on a
+/// null statement, not an empty declaration, and gcc says nothing. gnulib's
+/// `free_then_fail: _GL_UNUSED_LABEL;` (mountlist.c) drew c17's warning.
+#[test]
+fn misc_label_attributes_before_a_null_statement_are_quiet() {
+    let stderr = crate::test_compile::compile_accepted(
+        "label_attr_null",
+        "int f(int a) {\n  if (a) goto out;\n  return 0;\n\
+         out: __attribute__ ((__unused__));\n  return 1;\n}\n\
+         int g(void) {\n unused_lbl: __attribute__ ((__unused__));\n return 2;\n}\n",
+        &["-Wall"],
+    );
+    assert!(!stderr.contains("empty declaration"), "{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
 // ============================================================================
 // tests/misc/cleanup_attr.rs:
 // `__attribute__((cleanup(fn)))`, diagnosed in gcc's words.

@@ -14,17 +14,22 @@
 
 use crate::common::compile_and_run;
 
-/// The glibc headers take their gcc 7 paths, and the type-generic macros of
-/// both <math.h> and <tgmath.h> reach the function of each argument's type --
-/// `sqrtf32` where the C library has it, else `sqrtf`, of the same format.
+/// The glibc headers take their gcc 7 and later paths, and the type-generic
+/// macros of both <math.h> and <tgmath.h> reach the function of each
+/// argument's type -- `sqrtf32`, which glibc declares on request (TS
+/// 18661-3's `__STDC_WANT_IEC_60559_TYPES_EXT__`). Without it, or on a C
+/// library without the functions, gcc's <tgmath.h> refuses a `_FloatN`
+/// argument, and so does c17's: there is no function of its type to call.
 #[test]
+#[cfg(target_os = "linux")]
 fn float_n_through_the_c_library() {
     let src = r#"
+#define __STDC_WANT_IEC_60559_TYPES_EXT__ 1
 #include <math.h>
 #include <tgmath.h>
 #include <complex.h>
 int main(void) {
-#if __GNUC__ != 7
+#if __GNUC__ < 7
     return 1;
 #endif
     _Float32 a = 2.0f32;

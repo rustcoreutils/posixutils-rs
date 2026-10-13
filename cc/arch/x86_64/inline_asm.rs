@@ -14,9 +14,9 @@ use crate::arch::asm_constraints::{
     canonical_int, AsmOperandClass, AsmRegClass, FlagCondition, X87Slot,
 };
 use crate::arch::codegen::{impossible_constant, AsmOperandValue};
-use crate::arch::lir::{plan_parallel_moves, Directive, FpSize, MoveStep};
+use crate::arch::lir::{plan_parallel_moves, Directive, FpSize, Label, MoveStep, OperandSize};
 use crate::arch::x86_64::codegen::X86_64CodeGen;
-use crate::arch::x86_64::lir::{MemAddr, X86Inst};
+use crate::arch::x86_64::lir::{GpOperand, MemAddr, X86Inst};
 use crate::arch::x86_64::regalloc::{asm_pinned_regs, Loc, Reg, XmmReg};
 use crate::ir::{AsmConstraint, AsmData, Instruction, PseudoId};
 use crate::units::Bits;
@@ -72,6 +72,26 @@ struct AsmOperandBuild {
     /// Flag outputs, read off the flags once the template has run:
     /// (condition, destination, operand size in bits).
     flag_outputs: Vec<(FlagCondition, Loc, Bits)>,
+    /// Where the statement's frame operands past 32 bits are addressed
+    /// from, if it has any.
+    far_anchor: Option<FarAnchor>,
+}
+
+/// The frame address the function's far scratch holds while the template
+/// runs: `disp` bytes from `base`. A memory operand in the frame whose
+/// displacement no 32-bit field holds -- a far local, or a value spilled to
+/// a far slot and handed to a constraint that takes memory -- is written
+/// `d(%scratch)`, `d` its distance from this address, which fits for every
+/// operand within two gigabytes of the first.
+///
+/// The far scratch is the one register free to hold it: the allocator gives
+/// it to no value, and picks it from registers the statement neither
+/// clobbers nor pins (`far_scratch_of`). It is loaded after every input is
+/// in place, since an input moved from a far slot goes through it too.
+#[derive(Clone, Copy)]
+struct FarAnchor {
+    base: Reg,
+    disp: i64,
 }
 
 /// One operand on the x87 register stack.
@@ -190,6 +210,7 @@ impl AsmOperandBuild {
             x87_store: None,
             x87_slots: 0,
             flag_outputs: Vec::new(),
+            far_anchor: None,
         }
     }
 }
@@ -236,8 +257,37 @@ impl X86_64CodeGen {
         self.build_output_slots(insn, asm_data, &pins, &reserved_regs, &mut build);
         self.build_input_slots(insn, asm_data, &pins, &reserved_regs, &mut build);
         self.emit_asm_prologue_moves(&mut build);
-        self.emit_asm_template(insn, asm_data, &build);
-        self.emit_asm_epilogue_moves(insn, asm_data, &build);
+        let trampolines = self.asm_goto_trampolines(asm_data, &build);
+        self.emit_asm_template(insn, asm_data, &build, &trampolines);
+        self.emit_asm_epilogue_moves(insn, asm_data, &build, &trampolines);
+    }
+
+    /// For an `asm goto` with flag outputs, a label of c17's own for each
+    /// of its labels, paired with that label's block: the template jumps
+    /// there instead, and the flags are read into the outputs on the way,
+    /// as on the fall-through. Outputs are valid on every path out of an
+    /// `asm goto` (gcc's rule since gcc 11), and a flag output is written
+    /// after the template, which a jump out of it skips. Empty otherwise.
+    fn asm_goto_trampolines(
+        &mut self,
+        asm_data: &AsmData,
+        build: &AsmOperandBuild,
+    ) -> Vec<(Label, Label)> {
+        if build.flag_outputs.is_empty() {
+            return Vec::new();
+        }
+        asm_data
+            .goto_labels
+            .iter()
+            .map(|(bb, _)| {
+                let id = self.unique_label_counter;
+                self.unique_label_counter += 1;
+                (
+                    Label::internal("asm_goto_flags", id),
+                    Label::block(&self.base.current_fn, bb.0),
+                )
+            })
+            .collect()
     }
 
     /// A `Q` operand left without a register: the statement pins or
@@ -278,6 +328,7 @@ impl X86_64CodeGen {
             x87_slots,
             pseudo_to_xmm,
             flag_outputs,
+            far_anchor,
             ..
         } = build;
         // Process output operands (they go first: %0, %1, etc.)
@@ -360,6 +411,7 @@ impl X86_64CodeGen {
                             reserved_regs,
                             used_regs,
                             input_moves,
+                            far_anchor,
                             insn.pos,
                         );
                         slots.push(mk(AsmOperandValue::Mem(through_segment(output, mem_str))));
@@ -427,6 +479,18 @@ impl X86_64CodeGen {
                         output_moves.push((idx, temp, loc.clone(), op_size));
                         pseudo_to_temp.insert(output.pseudo, temp);
                     }
+                    Loc::Stack(slot) => {
+                        // A spill slot, under a constraint that takes memory.
+                        let addr = self.stack_mem(slot);
+                        let mem = self.asm_frame_operand(
+                            addr,
+                            far_anchor,
+                            reserved_regs,
+                            used_regs,
+                            insn.pos,
+                        );
+                        slots.push(mk(AsmOperandValue::Mem(mem)));
+                    }
                     _ => {
                         // Memory or other location - emit as memory operand
                         slots.push(mk(self.loc_to_asm_operand(&loc, op_size)));
@@ -458,6 +522,7 @@ impl X86_64CodeGen {
             x87_store,
             x87_slots,
             pseudo_to_xmm,
+            far_anchor,
             ..
         } = build;
         let num_outputs = asm_data.outputs.len();
@@ -626,6 +691,7 @@ impl X86_64CodeGen {
                                 reserved_regs,
                                 used_regs,
                                 input_moves,
+                                far_anchor,
                                 insn.pos,
                             );
                             slots.push(mk(AsmOperandValue::Mem(through_segment(input, mem_str))));
@@ -690,6 +756,19 @@ impl X86_64CodeGen {
                             slots.push(mk(AsmOperandValue::Reg(temp)));
                             input_moves.push((temp, loc.clone(), op_size));
                         }
+                        Loc::Stack(slot) => {
+                            // A spill slot, under a constraint that takes
+                            // memory.
+                            let addr = self.stack_mem(slot);
+                            let mem = self.asm_frame_operand(
+                                addr,
+                                far_anchor,
+                                reserved_regs,
+                                used_regs,
+                                insn.pos,
+                            );
+                            slots.push(mk(AsmOperandValue::Mem(mem)));
+                        }
                         _ => {
                             // Memory or other location
                             slots.push(mk(self.loc_to_asm_operand(&loc, op_size)));
@@ -711,6 +790,7 @@ impl X86_64CodeGen {
             remap_setup,
             sse_input_moves,
             x87_pushes,
+            far_anchor,
             ..
         } = build;
         let mut x87_pushes = std::mem::take(x87_pushes);
@@ -755,6 +835,23 @@ impl X86_64CodeGen {
                 MoveStep::Swap(a, b) => self.emit_reg_swap(a, b),
             }
         }
+
+        // Last: an input loaded from a far slot went through the far
+        // scratch.
+        if let Some(FarAnchor { base, disp }) = *far_anchor {
+            let scratch = self.far_scratch_for_asm();
+            self.push_lir(X86Inst::MovAbs {
+                imm: disp,
+                dst: scratch,
+            });
+            self.push_lir(X86Inst::Lea {
+                addr: MemAddr::BaseIndex {
+                    base,
+                    index: scratch,
+                },
+                dst: scratch,
+            });
+        }
     }
 
     /// The register `loc` is, if it is one.
@@ -777,18 +874,22 @@ impl X86_64CodeGen {
         insn: &Instruction,
         asm_data: &AsmData,
         build: &AsmOperandBuild,
+        trampolines: &[(Label, Label)],
     ) {
         let slots = &build.slots;
         // Convert goto_labels from (BasicBlockId, String) to (label_string, label_name)
         let goto_labels_formatted: Vec<(String, String)> = asm_data
             .goto_labels
             .iter()
-            .map(|(bb_id, name)| {
+            .enumerate()
+            .map(|(k, (bb_id, name))| {
                 // Through `Label` rather than a second spelling of the same
                 // format, so the quoting cannot be missed here.
-                let label_str = crate::arch::lir::Label::block(&self.base.current_fn, bb_id.0)
-                    .name(&self.base.target);
-                (label_str, name.clone())
+                let label = match trampolines.get(k) {
+                    Some((trampoline, _)) => trampoline.clone(),
+                    None => Label::block(&self.base.current_fn, bb_id.0),
+                };
+                (label.name(&self.base.target), name.clone())
             })
             .collect();
 
@@ -824,6 +925,7 @@ impl X86_64CodeGen {
         insn: &Instruction,
         asm_data: &AsmData,
         build: &AsmOperandBuild,
+        trampolines: &[(Label, Label)],
     ) {
         let AsmOperandBuild {
             output_moves,
@@ -908,6 +1010,28 @@ impl X86_64CodeGen {
         for (cond, loc, size) in flag_outputs.iter() {
             self.emit_flag_output(*cond, loc, *size);
         }
+        // An `asm goto`'s jumps read them too, each on its way to its label;
+        // no other output of one needs moving (refused above).
+        if !trampolines.is_empty() {
+            let id = self.unique_label_counter;
+            self.unique_label_counter += 1;
+            let done = Label::internal("asm_goto_done", id);
+            self.push_lir(X86Inst::Jmp {
+                target: done.clone(),
+            });
+            for (trampoline, target) in trampolines {
+                self.push_lir(X86Inst::Directive(Directive::BlockLabel(
+                    trampoline.clone(),
+                )));
+                for (cond, loc, size) in flag_outputs.iter() {
+                    self.emit_flag_output(*cond, loc, *size);
+                }
+                self.push_lir(X86Inst::Jmp {
+                    target: target.clone(),
+                });
+            }
+            self.push_lir(X86Inst::Directive(Directive::BlockLabel(done)));
+        }
 
         // Clobbers emit nothing here. A register clobber is a constraint the
         // allocator honours (`regalloc::get_constraint_info`), and a `"memory"`
@@ -960,15 +1084,12 @@ impl X86_64CodeGen {
                     mov, src_name, dest_name
                 ))));
             }
-            Loc::Stack(offset) => {
-                let mem = self.stack_mem(*offset);
-                self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                    "{} {}, %{}",
-                    mov,
-                    mem.format(&self.base.target),
-                    dest_name
-                ))));
-            }
+            // Through the legalizer, which reaches a far slot.
+            Loc::Stack(offset) => self.push_lir(X86Inst::Mov {
+                size: OperandSize::from_bits(size_bits),
+                src: GpOperand::Mem(self.stack_mem(*offset)),
+                dst: GpOperand::Reg(dest_reg),
+            }),
             Loc::Imm(v) => {
                 self.push_lir(X86Inst::Directive(Directive::Raw(format!(
                     "{} ${}, %{}",
@@ -1038,15 +1159,12 @@ impl X86_64CodeGen {
                     mov, src_name, dest_name
                 ))));
             }
-            Loc::Stack(offset) => {
-                let mem = self.stack_mem(*offset);
-                self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                    "{} %{}, {}",
-                    mov,
-                    src_name,
-                    mem.format(&self.base.target)
-                ))));
-            }
+            // Through the legalizer, which reaches a far slot.
+            Loc::Stack(offset) => self.push_lir(X86Inst::Mov {
+                size: OperandSize::from_bits(size_bits),
+                src: GpOperand::Reg(src_reg),
+                dst: GpOperand::Mem(self.stack_mem(*offset)),
+            }),
             Loc::Global(name) => {
                 self.reject_tls_operand(name);
                 if self.needs_got_access(name) {
@@ -1101,6 +1219,7 @@ impl X86_64CodeGen {
         reserved: &std::collections::HashSet<Reg>,
         used: &mut std::collections::HashSet<Reg>,
         input_moves: &mut Vec<(Reg, Loc, Bits)>,
+        far_anchor: &mut Option<FarAnchor>,
         pos: Option<crate::diag::Position>,
     ) -> String {
         let target = self.base.target.clone();
@@ -1115,14 +1234,14 @@ impl X86_64CodeGen {
             return match loc {
                 Loc::Stack(slot) => {
                     let addr = self.stack_field(*slot, offset.into());
-                    self.asm_frame_operand(addr, reserved, used, pos)
+                    self.asm_frame_operand(addr, far_anchor, reserved, used, pos)
                 }
                 Loc::IncomingArg(off) => {
                     let addr = MemAddr::BaseOffset {
                         base: Reg::Rbp,
                         offset: off + i64::from(offset),
                     };
-                    self.asm_frame_operand(addr, reserved, used, pos)
+                    self.asm_frame_operand(addr, far_anchor, reserved, used, pos)
                 }
                 Loc::Global(name) => {
                     if self.is_tls_symbol(name) || self.needs_got_access(name) {
@@ -1153,43 +1272,63 @@ impl X86_64CodeGen {
 
     /// The template text of a memory operand in the frame at `addr`: the
     /// address itself while its displacement fits the instruction, and past
-    /// 32 bits a register holding it, as the global operands above take a
-    /// register for an address the template cannot spell.
+    /// 32 bits an offset from the statement's [`FarAnchor`]. An operand more
+    /// than two gigabytes from the anchor -- in a frame past four -- takes a
+    /// temp register holding its address instead, as the global operands
+    /// above take one for an address the template cannot spell.
     fn asm_frame_operand(
         &mut self,
         addr: MemAddr,
+        far_anchor: &mut Option<FarAnchor>,
         reserved: &std::collections::HashSet<Reg>,
         used: &mut std::collections::HashSet<Reg>,
         pos: Option<crate::diag::Position>,
     ) -> String {
-        match addr {
-            MemAddr::BaseOffset { offset, .. } if !super::legalize::fits_i32(offset) => {
-                let temp = find_temp_reg(reserved, used, pos);
-                used.insert(temp);
-                self.push_lir(X86Inst::Lea { addr, dst: temp });
-                format!("({})", temp.name64())
-            }
-            addr => addr.format(&self.base.target),
+        let MemAddr::BaseOffset { base, offset } = addr else {
+            return addr.format(&self.base.target);
+        };
+        if super::legalize::fits_i32(offset) {
+            return addr.format(&self.base.target);
         }
+        let anchor = *far_anchor.get_or_insert(FarAnchor { base, disp: offset });
+        if anchor.base == base && super::legalize::fits_i32(offset - anchor.disp) {
+            let near = MemAddr::BaseOffset {
+                base: self.far_scratch_for_asm(),
+                offset: offset - anchor.disp,
+            };
+            return near.format(&self.base.target);
+        }
+        let temp = find_temp_reg(reserved, used, pos);
+        used.insert(temp);
+        self.push_lir(X86Inst::Lea { addr, dst: temp });
+        format!("({})", temp.name64())
+    }
+
+    /// The far scratch of a function with a frame operand past 32 bits,
+    /// which every such function has (`far_scratch_of`).
+    fn far_scratch_for_asm(&self) -> Reg {
+        self.far_scratch.expect(
+            "internal compiler error: a far frame operand in a function given no far scratch",
+        )
+    }
+
+    /// The text of frame slot `offset`, which is near: every operand that
+    /// can be a far one goes through [`Self::asm_frame_operand`], and every
+    /// move through the legalizer.
+    fn near_frame_text(&self, offset: i64) -> String {
+        let addr = self.stack_mem(offset);
+        debug_assert!(
+            matches!(addr, MemAddr::BaseOffset { offset, .. } if super::legalize::fits_i32(offset)),
+            "a far frame slot reached asm operand text: {addr:?}"
+        );
+        addr.format(&self.base.target)
     }
 
     /// Convert a location to an asm operand string
     fn loc_to_asm_string(&self, loc: &Loc) -> String {
         match loc {
             Loc::Reg(r) => format!("%{}", self.reg_name_64(*r)),
-            Loc::Stack(offset) => {
-                let addr = self.stack_mem(*offset);
-                if let MemAddr::BaseOffset { offset, .. } = addr {
-                    if !super::legalize::fits_i32(offset) {
-                        crate::diag::error(
-                            self.base.func_pos,
-                            "an asm operand's stack slot lies past the displacement \
-                             an instruction can hold",
-                        );
-                    }
-                }
-                addr.format(&self.base.target)
-            }
+            Loc::Stack(offset) => self.near_frame_text(*offset),
             Loc::IncomingArg(offset) => {
                 format!("{}(%rbp)", offset)
             }
@@ -1205,9 +1344,7 @@ impl X86_64CodeGen {
     fn loc_to_asm_operand(&self, loc: &Loc, size_bits: Bits) -> AsmOperandValue<Reg> {
         match loc {
             Loc::Reg(r) => AsmOperandValue::Reg(*r),
-            Loc::Stack(offset) => {
-                AsmOperandValue::Mem(self.stack_mem(*offset).format(&self.base.target))
-            }
+            Loc::Stack(offset) => AsmOperandValue::Mem(self.near_frame_text(*offset)),
             Loc::IncomingArg(offset) => AsmOperandValue::Mem(format!("{}(%rbp)", offset)),
             Loc::Imm(v) => AsmOperandValue::Int(canonical_int(*v, size_bits)),
             Loc::Xmm(xmm) => AsmOperandValue::RegName(xmm.name().to_string()),

@@ -234,6 +234,10 @@ impl Parser<'_> {
             // C17 6.5.2.2p4 assigns the argument to the parameter, which
             // needs an object of the parameter's type; a prototype may name an
             // incomplete one, but a call cannot be made through it.
+            if self.report_sve_use(param, super::target_types::SveUse::Value, arg.pos) {
+                sound = false;
+                break;
+            }
             if self.type_name_is_incomplete(param) && self.types.kind(param) != TypeKind::Void {
                 let n = (i + 1).to_string();
                 diag::error_args(arg.pos, "type of formal parameter {0} is incomplete", &[&n]);
@@ -508,7 +512,9 @@ impl Parser<'_> {
             self.types.kind(pointee),
             TypeKind::Struct | TypeKind::Union | TypeKind::Enum
         ) && !self.types.is_composite_complete(pointee);
-        if incomplete {
+        if incomplete
+            && !self.report_sve_use(pointee, super::target_types::SveUse::PointerArithmetic, pos)
+        {
             diag::error(pos, &gettext("arithmetic on pointer to an incomplete type"));
         }
         !incomplete

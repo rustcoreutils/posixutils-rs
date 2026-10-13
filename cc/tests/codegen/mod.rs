@@ -11,6 +11,7 @@
 // Tests for register allocation, inline assembly, PIC, optimization, and debug info.
 //
 
+mod aarch64_builtin_types;
 mod aarch64_offsets;
 mod aarch64_runtime;
 mod aggregate_abi;
@@ -27,6 +28,7 @@ mod asm_pinned_operands;
 pub mod asm_probe;
 mod asm_register_vars;
 mod asm_template_syntax;
+mod backend_labels;
 mod binary128;
 mod bitfield_layout;
 mod block_moves;
@@ -47,6 +49,7 @@ mod cross_abi_types;
 mod cross_abi_varargs;
 mod debug_info;
 mod determinism;
+mod devirt;
 // Thread cancellation and libgcc's forced unwind, as a glibc system has them.
 #[cfg(target_os = "linux")]
 mod exceptions;
@@ -99,4 +102,5 @@ mod unwind;
 mod varargs;
 mod vector_abi;
 mod vector_native;
+mod vector_pcs;
 mod vectors;

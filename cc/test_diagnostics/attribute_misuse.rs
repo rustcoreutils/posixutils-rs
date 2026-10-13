@@ -223,3 +223,135 @@ fn assume_aligned_is_gccs() {
         ]
     );
 }
+
+/// `malloc(dealloc, n)` and `copy(decl)` read their arguments as
+/// expressions, so an undeclared name is refused, as gcc refuses it; and
+/// `malloc`'s are checked as gcc checks them: the deallocator is a function
+/// whose first parameter is a pointer, `n` the number of a pointer
+/// parameter of it. Each case alone, with gcc 13's verdict.
+#[test]
+fn malloc_and_copy_arguments_as_gcc_reads_them() {
+    let pre = "void fr(void *);\nvoid fr2(void *, int);\nvoid fi(int);\nint v;\n\
+               void (*pf)(void *);\n";
+    for (decl, said) in [
+        (
+            "void *a(int) __attribute__((malloc(nofree, 1)));",
+            "error: 'nofree' undeclared here (not in a function)",
+        ),
+        (
+            "void *a(int) __attribute__((malloc(nofree)));",
+            "error: 'nofree' undeclared here (not in a function)",
+        ),
+        (
+            "int b __attribute__((copy(nothing)));",
+            "error: 'nothing' undeclared here (not in a function)",
+        ),
+        (
+            "void c(void) __attribute__((copy(nothing)));",
+            "error: 'nothing' undeclared here (not in a function)",
+        ),
+        (
+            "void g(void) { int y __attribute__((copy(zzz))) = 0; (void)y; }",
+            "error: 'zzz' undeclared (first use in this function)",
+        ),
+        (
+            "void *a(int) __attribute__((malloc(v, 1)));",
+            "error: 'malloc' attribute argument 1 does not name a function",
+        ),
+        (
+            "void *a(int) __attribute__((malloc(1)));",
+            "error: 'malloc' attribute argument 1 does not name a function",
+        ),
+        (
+            "void *a(int) __attribute__((malloc(pf)));",
+            "error: 'malloc' attribute argument 1 does not name a function",
+        ),
+        (
+            "void *a(int) __attribute__((malloc(fi)));",
+            "error: 'malloc' attribute argument 1 must take a pointer type as its first \
+             argument; have 'int'",
+        ),
+        (
+            "void *a(int) __attribute__((malloc(fr, 1, 2)));",
+            "error: wrong number of arguments specified for 'malloc' attribute",
+        ),
+        (
+            "void *a(int) __attribute__((malloc(fr, 2)));",
+            "warning: 'malloc' attribute argument value '2' exceeds the number of function \
+             parameters 1 [-Wattributes]",
+        ),
+        (
+            "void *a(int) __attribute__((malloc(fr, 0)));",
+            "warning: 'malloc' attribute argument value '0' does not refer to a function \
+             parameter [-Wattributes]",
+        ),
+        (
+            "void *a(int) __attribute__((malloc(fr, v)));",
+            "warning: 'malloc' attribute argument value 'v' is not an integer constant \
+             [-Wattributes]",
+        ),
+        (
+            "void *a(int) __attribute__((malloc(fr2, 2)));",
+            "warning: 'malloc' attribute argument value '2' refers to parameter type 'int' \
+             [-Wattributes]",
+        ),
+        (
+            "void *a(int) __attribute__((malloc(fr, \"1\")));",
+            "warning: 'malloc' attribute argument has type 'char[2]' [-Wattributes]",
+        ),
+    ] {
+        let got = messages("malloc_copy_args", &format!("{pre}{decl}\n"));
+        assert_eq!(
+            got.first().map(String::as_str),
+            Some(said),
+            "{decl}: {got:#?}"
+        );
+    }
+    // What gcc takes.
+    for decl in [
+        "void *a(int) __attribute__((malloc(fr, 1)));",
+        "void *a(int) __attribute__((malloc(&fr)));",
+        "void *a(int) __attribute__((malloc(fr2, 1)));",
+        "void *a(int) __attribute__((malloc));",
+        "int b __attribute__((copy(v)));",
+        "void c(void) __attribute__((copy(fr)));",
+    ] {
+        let got = messages("malloc_copy_ok", &format!("{pre}{decl}\n"));
+        assert!(got.is_empty(), "{decl}: {got:#?}");
+    }
+}
+
+/// gcc's grammar puts a function definition's attributes before its
+/// declarator: one after it is gcc's error, and an asm label there is a
+/// syntax error, as in gcc 13.
+#[test]
+fn definition_attributes_after_the_declarator() {
+    for (src, said) in [
+        (
+            "void f(void) __attribute__((noinline)) { }\n",
+            "error: attributes should be specified before the declarator in a function definition",
+        ),
+        (
+            "void f(void) __attribute__((noinline)) __attribute__((cold)) { }\n",
+            "error: attributes should be specified before the declarator in a function definition",
+        ),
+        (
+            "void (*f(void))(void) __attribute__((noinline)) { return 0; }\n",
+            "error: attributes should be specified before the declarator in a function definition",
+        ),
+        (
+            "void f(void) __asm__(\"g\") { }\n",
+            "error: expected ',' or ';' before '{' token",
+        ),
+    ] {
+        assert_eq!(messages("def_attr_after", src), [said], "{src}");
+    }
+    for src in [
+        "__attribute__((noinline)) void f(void) { }\n",
+        "void __attribute__((noinline)) f(void) { }\n",
+        "void f(int x __attribute__((unused))) { }\n",
+        "void f(void) __attribute__((noinline));\nvoid f(void) { }\n",
+    ] {
+        assert!(messages("def_attr_before", src).is_empty(), "{src}");
+    }
+}

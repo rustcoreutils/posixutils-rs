@@ -34,6 +34,7 @@ mod operand_rule;
 pub mod parser;
 mod statement;
 mod target_attr;
+mod target_types;
 mod tgmath_builtin;
 mod toplevel;
 mod typename;

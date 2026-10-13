@@ -1161,10 +1161,12 @@ fn driver_preprocess_writes_every_pragma_pack_form() {
     assert_eq!(run_exe(&exe), 0, "push/pop did not survive -E");
 }
 
-/// Preprocessing an already-preprocessed file stays stable and correct.
+/// Preprocessing preprocessed text again, as C (`-x c`), stays correct. (A
+/// `.i` read as what it is, under `-E`, is passed over, as gcc does.)
 ///
-/// The second pass must attribute the text to the file the linemarkers name,
-/// not to the `.i` it is reading, and the result must still compile and run.
+/// Each pass attributes the text to the file the linemarkers name, not to
+/// the `.i` it is reading, and every generation still compiles and runs.
+/// Each pass adds its own markers ahead of the text, as gcc's does.
 #[test]
 fn driver_preprocess_of_a_dot_i_is_stable() {
     let w = WorkDir::new("pp_idem");
@@ -1177,24 +1179,8 @@ fn driver_preprocess_of_a_dot_i_is_stable() {
     let two = w.join("q2.i");
     let three = w.join("q3.i");
     assert!(run_c17(&["-E", &s(&src), "-o", &s(&one)]).success);
-    assert!(run_c17(&["-E", &s(&one), "-o", &s(&two)]).success);
-    assert!(run_c17(&["-E", &s(&two), "-o", &s(&three)]).success);
-
-    // The first line names the file being read, so it differs by construction;
-    // everything after it has converged.
-    let skip_first = |p: &Path| {
-        std::fs::read_to_string(p)
-            .unwrap()
-            .lines()
-            .skip(1)
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    assert_eq!(
-        skip_first(&two),
-        skip_first(&three),
-        "re-preprocessing keeps changing the output"
-    );
+    assert!(run_c17(&["-E", "-x", "c", &s(&one), "-o", &s(&two)]).success);
+    assert!(run_c17(&["-E", "-x", "c", &s(&two), "-o", &s(&three)]).success);
 
     // The second-generation file names the original source, not the `.i`.
     let body = std::fs::read_to_string(&two).unwrap();

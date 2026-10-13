@@ -67,6 +67,9 @@ pub struct KnownGlobals {
     aggregates: HashMap<String, Initializer>,
     /// The objects whose every byte is known.
     bytes: ConstBytes,
+    /// The scalars whose initializer is a symbol's address, which no load
+    /// folds into a constant but `devirt` reads a function's name out of.
+    addresses: HashMap<String, String>,
 }
 
 /// Replace every load of a `const` global in `func` with its initializer,
@@ -100,7 +103,28 @@ impl KnownGlobals {
                 .map(|g| (g.name.clone(), g.init.clone()))
                 .collect(),
             bytes: ConstBytes::build(module, types),
+            addresses: module
+                .globals
+                .iter()
+                .filter(|g| qualifies(g, types))
+                .filter_map(|g| match &g.init {
+                    Initializer::SymAddr(sym) => Some((g.name.clone(), sym.clone())),
+                    _ => None,
+                })
+                .collect(),
         }
+    }
+
+    /// The symbol whose address the known global `name` holds in the
+    /// `width` bytes at `offset`: the whole of a scalar, or one whole member
+    /// or element of an aggregate, initialized with exactly that address.
+    /// What a call through `static void (*const p)(void) = f;`, or through
+    /// a member of a `const` table of them, calls.
+    pub(crate) fn address_at(&self, name: &str, offset: ByteSize, width: ByteSize) -> Option<&str> {
+        if let Some(sym) = self.addresses.get(name) {
+            return offset.is_zero().then_some(sym.as_str());
+        }
+        sym_at(self.aggregates.get(name)?, offset, width)
     }
 
     /// The objects whose every byte is known, which `libcall_fold` reads
@@ -290,6 +314,33 @@ fn int_at(init: &Initializer, offset: ByteSize, width: ByteSize) -> Option<i128>
             }
         }
         _ => None,
+    }
+}
+
+/// The symbol whose address `init` holds in exactly the `width` bytes at
+/// `offset`: an element or member that is a `SymAddr`, at any depth.
+fn sym_at(init: &Initializer, offset: ByteSize, width: ByteSize) -> Option<&str> {
+    let end = offset.checked_add(width)?;
+    let inside = |at: ByteSize, size: ByteSize| at <= offset && end <= at.offset_by(size);
+    let (at, size, part) = match init {
+        Initializer::Array {
+            elem_size,
+            elements,
+            ..
+        } => elements
+            .iter()
+            .map(|(at, e)| (*at, *elem_size, e))
+            .find(|&(at, size, _)| inside(at, size))?,
+        Initializer::Struct { fields, .. } => fields
+            .iter()
+            .map(|(at, size, f)| (*at, *size, f))
+            .find(|&(at, size, _)| inside(at, size))?,
+        Initializer::SymAddr(sym) => return offset.is_zero().then_some(sym.as_str()),
+        _ => return None,
+    };
+    match part {
+        Initializer::SymAddr(sym) => ((at, size) == (offset, width)).then_some(sym.as_str()),
+        _ => sym_at(part, offset.checked_sub(at)?, width),
     }
 }
 

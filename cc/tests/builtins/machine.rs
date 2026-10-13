@@ -8,11 +8,15 @@
 //
 // Builtins that are one machine instruction: glibc's `__builtin_ia32_rdtsc`
 // and `__builtin_ia32_rdtscp` (hp-timing.h), `__builtin_ia32_cvtpd2ps`
-// (sincosf_poly.h) and `__builtin_thread_pointer` (thread_pointer.h), each
+// (sincosf_poly.h), `__builtin_thread_pointer` (thread_pointer.h) and
+// aarch64's `__builtin_aarch64_{get,set}_{fpcr,fpsr}` (fpu_control.h), each
 // as gcc 13 has it on its targets.
 //
 
-use crate::common::{asm_for_at, compile_and_run_everywhere, compile_expect_error};
+use crate::common::{
+    asm_for_at, compile_and_run_aarch64_with, compile_and_run_everywhere, compile_expect_error,
+    compile_rejected_with, create_c_file, run_c17,
+};
 
 /// The time-stamp counter, alone and with the processor's signature: both
 /// count up, and `rdtscp` stores the signature the instruction gives.
@@ -158,4 +162,221 @@ int main(void) {
         !a64.lines().any(|l| l.trim_start().starts_with("bl ")),
         "{a64}"
     );
+}
+
+/// The instructions of function `name` in `asm`, trimmed: from its label to
+/// its `.size`, directives and labels left out.
+fn instructions_of(asm: &str, name: &str) -> Vec<String> {
+    asm.lines()
+        .skip_while(|l| *l != format!("{name}:"))
+        .skip(1)
+        .take_while(|l| !l.starts_with(".size"))
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('.') && !l.ends_with(':'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// aarch64's floating-point control and status registers: each builtin is
+/// one `mrs` or `msr` of an X register, as gcc 13 emits it, and stays where
+/// the program put it among the floating-point operations it governs --
+/// the multiply after a change of rounding mode is done in that mode, and
+/// the status read after a divide sees the divide's flags.
+#[test]
+fn builtins_aarch64_fpcr_fpsr_instructions() {
+    let src = r#"
+unsigned get(void) { return __builtin_aarch64_get_fpcr(); }
+void set(unsigned v) { __builtin_aarch64_set_fpcr(v); }
+unsigned long long get64(void) { return __builtin_aarch64_get_fpcr64(); }
+void set64(unsigned long long v) { __builtin_aarch64_set_fpcr64(v); }
+unsigned gsr(void) { return __builtin_aarch64_get_fpsr(); }
+void ssr(unsigned v) { __builtin_aarch64_set_fpsr(v); }
+unsigned long long gsr64(void) { return __builtin_aarch64_get_fpsr64(); }
+void ssr64(unsigned long long v) { __builtin_aarch64_set_fpsr64(v); }
+double around(double a, double b) {
+    __builtin_aarch64_set_fpcr(0x400000);
+    double x = a * b;
+    __builtin_aarch64_set_fpcr(0);
+    return x;
+}
+unsigned flags(double a, double b, double *out) {
+    __builtin_aarch64_set_fpsr(0);
+    *out = a / b;
+    return __builtin_aarch64_get_fpsr();
+}
+"#;
+    for opt in ["-O0", "-O2"] {
+        let asm = asm_for_at(
+            "c17_a64_fpcr_",
+            src,
+            &["--target=aarch64-unknown-linux-gnu", opt],
+        );
+        for (func, insn) in [
+            ("get", "mrs x"),
+            ("get64", "mrs x"),
+            ("gsr", "mrs x"),
+            ("gsr64", "mrs x"),
+            ("set", "msr fpcr, x"),
+            ("set64", "msr fpcr, x"),
+            ("ssr", "msr fpsr, x"),
+            ("ssr64", "msr fpsr, x"),
+        ] {
+            let body = instructions_of(&asm, func);
+            assert!(
+                body.iter().any(|l| l.starts_with(insn)),
+                "{opt}: {func} has no `{insn}`:\n{body:#?}"
+            );
+            assert!(
+                !body.iter().any(|l| l.starts_with("bl ")),
+                "{opt}: {func} calls:\n{body:#?}"
+            );
+        }
+        for (func, reg) in [("get", "fpcr"), ("get64", "fpcr"), ("gsr", "fpsr")] {
+            let body = instructions_of(&asm, func);
+            assert!(
+                body.iter()
+                    .any(|l| l.starts_with("mrs x") && l.ends_with(&format!(", {reg}"))),
+                "{opt}: {func} reads no {reg}:\n{body:#?}"
+            );
+        }
+        let order = |func: &str, wanted: &[&str]| {
+            let body = instructions_of(&asm, func);
+            let seen: Vec<&str> = body
+                .iter()
+                .filter_map(|l| wanted.iter().find(|w| l.starts_with(**w)).copied())
+                .collect();
+            assert_eq!(seen, wanted, "{opt}: {func}:\n{body:#?}");
+        };
+        order("around", &["msr fpcr", "fmul", "msr fpcr"]);
+        order("flags", &["msr fpsr", "fdiv", "mrs"]);
+    }
+}
+
+/// The names are aarch64's: gcc's x86-64 compiler has never heard of them,
+/// so a call is an implicit declaration there, and `__has_builtin` answers
+/// accordingly on each target.
+#[test]
+fn builtins_aarch64_fpcr_fpsr_are_aarch64_only() {
+    let names = [
+        "__builtin_aarch64_get_fpcr",
+        "__builtin_aarch64_set_fpcr",
+        "__builtin_aarch64_get_fpsr",
+        "__builtin_aarch64_set_fpsr",
+        "__builtin_aarch64_get_fpcr64",
+        "__builtin_aarch64_set_fpcr64",
+        "__builtin_aarch64_get_fpsr64",
+        "__builtin_aarch64_set_fpsr64",
+    ];
+    let mut src = String::new();
+    for name in names {
+        src.push_str(&format!(
+            "#if __has_builtin({name}) != defined(__aarch64__)\n#error {name}\n#endif\n"
+        ));
+    }
+    src.push_str("int x;\n");
+    for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        asm_for_at("c17_a64_fp_has_", &src, &[&format!("--target={target}")]);
+    }
+    // On x86-64 a call is any undeclared function's: an error, and gcc 13's
+    // implicit declaration under -fpermissive.
+    let call = "unsigned f(void) { return __builtin_aarch64_get_fpcr(); }\n";
+    let x86 = ["--target=x86_64-unknown-linux-gnu"];
+    let stderr = compile_rejected_with("a64_fpcr_on_x86", call, &x86);
+    assert!(stderr.contains("'__builtin_aarch64_get_fpcr'"), "{stderr}");
+    let c_file = create_c_file("a64_fpcr_permissive", call);
+    let dir = crate::common::work_dir("a64_fpcr_permissive");
+    let out = dir.path().join("out.s");
+    let run = run_c17(&[
+        x86[0],
+        "-fpermissive",
+        "-S",
+        "-o",
+        out.to_str().unwrap(),
+        c_file.path().to_str().unwrap(),
+    ]);
+    assert!(run.success, "{}", run.stderr);
+    assert!(
+        run.stderr
+            .contains("implicit declaration of function '__builtin_aarch64_get_fpcr'"),
+        "{}",
+        run.stderr
+    );
+    let asm = std::fs::read_to_string(&out).unwrap();
+    assert!(
+        asm.contains("call") && asm.contains("__builtin_aarch64_get_fpcr"),
+        "{asm}"
+    );
+    // gcc's argument checks: the plain forms take an `unsigned int`, and
+    // a read takes nothing.
+    let stderr = compile_rejected_with(
+        "a64_fpcr_args",
+        "void f(void) { __builtin_aarch64_set_fpcr(); }\n\
+         unsigned g(void) { return __builtin_aarch64_get_fpsr(1); }\n",
+        &["--target=aarch64-unknown-linux-gnu"],
+    );
+    assert!(
+        stderr.contains("too few arguments to function '__builtin_aarch64_set_fpcr'"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("too many arguments to function '__builtin_aarch64_get_fpsr'"),
+        "{stderr}"
+    );
+}
+
+/// glibc's <fpu_control.h> on aarch64 under qemu: `_FPU_GETCW` and
+/// `_FPU_SETCW` round-trip the control register and change the rounding
+/// direction `fegetround` reports and a division is done in; `_FPU_GETFPSR`
+/// and `_FPU_SETFPSR` read and clear the flag a division by zero raises;
+/// and the 64-bit forms see the same registers. Exit codes 1..=12.
+#[test]
+fn builtins_aarch64_fpu_control_h() {
+    let src = r#"
+#include <fpu_control.h>
+#include <fenv.h>
+volatile double one = 1.0, three = 3.0, zero = 0.0, sink;
+int main(void) {
+    fpu_control_t orig, cw, back;
+    _FPU_GETCW(orig);
+    if (orig != _FPU_DEFAULT) return 1;
+    double nearest = one / three;
+    cw = (orig & ~_FPU_FPCR_RM_MASK) | 0x400000;
+    _FPU_SETCW(cw);
+    _FPU_GETCW(back);
+    if (back != cw) return 2;
+    if (fegetround() != FE_UPWARD) return 3;
+    double up = one / three;
+    _FPU_SETCW((orig & ~_FPU_FPCR_RM_MASK) | 0x800000);
+    double down = one / three;
+    _FPU_SETCW(orig);
+    if (!(up > down) || (nearest != up && nearest != down)) return 4;
+    if (fegetround() != FE_TONEAREST || one / three != nearest) return 5;
+
+    fpu_fpsr_t sr;
+    _FPU_SETFPSR(0);
+    sink = one / zero;
+    _FPU_GETFPSR(sr);
+    if (!(sr & FE_DIVBYZERO)) return 6;
+    if (!fetestexcept(FE_DIVBYZERO)) return 7;
+    _FPU_SETFPSR(0);
+    _FPU_GETFPSR(sr);
+    if (sr != 0 || fetestexcept(FE_ALL_EXCEPT)) return 8;
+
+    unsigned long long c64 = __builtin_aarch64_get_fpcr64();
+    if (c64 != orig) return 9;
+    __builtin_aarch64_set_fpcr64(c64 | _FPU_FPCR_RM_MASK);
+    if (fegetround() != FE_TOWARDZERO) return 10;
+    __builtin_aarch64_set_fpcr64(c64);
+    __builtin_aarch64_set_fpsr64(FE_INEXACT);
+    if (__builtin_aarch64_get_fpsr64() != FE_INEXACT || !fetestexcept(FE_INEXACT)) return 11;
+    feclearexcept(FE_ALL_EXCEPT);
+    if (__builtin_aarch64_get_fpsr() != 0 || fegetround() != FE_TONEAREST) return 12;
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O2"] {
+        if let Some(code) = compile_and_run_aarch64_with("a64_fpu_control", src, &[opt], &["-lm"]) {
+            assert_eq!(code, 0, "{opt}");
+        }
+    }
 }

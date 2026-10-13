@@ -648,7 +648,7 @@ impl<'a> Parser<'a> {
 
     /// Parse a conditional (ternary) expression: cond ? then : else
     pub(crate) fn parse_conditional_expr(&mut self) -> ParseResult<Expr> {
-        let cond = self.parse_logical_or_expr()?;
+        let cond = self.parse_binary_expr(1)?;
 
         if self.is_special(b'?') {
             self.advance();
@@ -729,205 +729,80 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_logical_or_expr(&mut self) -> ParseResult<Expr> {
-        let mut left = self.parse_logical_and_expr()?;
-
-        while self.is_special_token(SpecialToken::LogicalOr) {
-            let op_pos = self.current_pos();
-            self.advance();
-            // Not evaluated when the left operand decides (6.5.14p4).
-            let dead = self.constant_truth(&left) == Some(true);
-            let right = self.unevaluated_if(dead, Self::parse_logical_and_expr)?;
-            left = self.make_binary(BinaryOp::LogOr, left, right, op_pos);
-        }
-
-        Ok(left)
+    /// The binary operator the current token is, with its precedence: 1 for
+    /// `||` (C17 6.5.14) up to 10 for the multiplicative operators (6.5.5).
+    /// Each test is the token's own, so `|` is not `||`, `&` not `&&`, `<`
+    /// not `<<`, and an assignment operator (`^=`, `*=`, ...) none at all.
+    fn binary_operator(&self) -> Option<(BinaryOp, u8)> {
+        use SpecialToken as T;
+        let op = if self.is_special_token(T::LogicalOr) {
+            (BinaryOp::LogOr, 1)
+        } else if self.is_special_token(T::LogicalAnd) {
+            (BinaryOp::LogAnd, 2)
+        } else if self.is_special(b'|') {
+            (BinaryOp::BitOr, 3)
+        } else if self.is_special(b'^') && !self.is_special_token(T::XorAssign) {
+            (BinaryOp::BitXor, 4)
+        } else if self.is_special(b'&') {
+            (BinaryOp::BitAnd, 5)
+        } else if self.is_special_token(T::Equal) {
+            (BinaryOp::Eq, 6)
+        } else if self.is_special_token(T::NotEqual) {
+            (BinaryOp::Ne, 6)
+        } else if self.is_special_token(T::Lte) {
+            (BinaryOp::Le, 7)
+        } else if self.is_special_token(T::Gte) {
+            (BinaryOp::Ge, 7)
+        } else if self.is_special(b'<') && !self.is_special_token(T::LeftShift) {
+            (BinaryOp::Lt, 7)
+        } else if self.is_special(b'>') && !self.is_special_token(T::RightShift) {
+            (BinaryOp::Gt, 7)
+        } else if self.is_special_token(T::LeftShift) {
+            (BinaryOp::Shl, 8)
+        } else if self.is_special_token(T::RightShift) {
+            (BinaryOp::Shr, 8)
+        } else if self.is_special(b'+') && !self.is_special_token(T::Increment) {
+            (BinaryOp::Add, 9)
+        } else if self.is_special(b'-') && !self.is_special_token(T::Decrement) {
+            (BinaryOp::Sub, 9)
+        } else if self.is_special(b'*') && !self.is_special_token(T::MulAssign) {
+            (BinaryOp::Mul, 10)
+        } else if self.is_special(b'/') && !self.is_special_token(T::DivAssign) {
+            (BinaryOp::Div, 10)
+        } else if self.is_special(b'%') && !self.is_special_token(T::ModAssign) {
+            (BinaryOp::Mod, 10)
+        } else {
+            return None;
+        };
+        Some(op)
     }
 
-    fn parse_logical_and_expr(&mut self) -> ParseResult<Expr> {
-        let mut left = self.parse_bitwise_or_expr()?;
-
-        while self.is_special_token(SpecialToken::LogicalAnd) {
-            let op_pos = self.current_pos();
-            self.advance();
-            // Not evaluated when the left operand decides (6.5.13p4).
-            let dead = self.constant_truth(&left) == Some(false);
-            let right = self.unevaluated_if(dead, Self::parse_bitwise_or_expr)?;
-            left = self.make_binary(BinaryOp::LogAnd, left, right, op_pos);
-        }
-
-        Ok(left)
-    }
-
-    fn parse_bitwise_or_expr(&mut self) -> ParseResult<Expr> {
-        let mut left = self.parse_bitwise_xor_expr()?;
-
-        // | but not ||
-        while self.is_special(b'|') && !self.is_special_token(SpecialToken::LogicalOr) {
-            let op_pos = self.current_pos();
-            self.advance();
-            let right = self.parse_bitwise_xor_expr()?;
-            left = self.make_binary(BinaryOp::BitOr, left, right, op_pos);
-        }
-
-        Ok(left)
-    }
-
-    fn parse_bitwise_xor_expr(&mut self) -> ParseResult<Expr> {
-        let mut left = self.parse_bitwise_and_expr()?;
-
-        while self.is_special(b'^') && !self.is_special_token(SpecialToken::XorAssign) {
-            let op_pos = self.current_pos();
-            self.advance();
-            let right = self.parse_bitwise_and_expr()?;
-            left = self.make_binary(BinaryOp::BitXor, left, right, op_pos);
-        }
-
-        Ok(left)
-    }
-
-    fn parse_bitwise_and_expr(&mut self) -> ParseResult<Expr> {
-        let mut left = self.parse_equality_expr()?;
-
-        // & but not &&
-        while self.is_special(b'&') && !self.is_special_token(SpecialToken::LogicalAnd) {
-            let op_pos = self.current_pos();
-            self.advance();
-            let right = self.parse_equality_expr()?;
-            left = self.make_binary(BinaryOp::BitAnd, left, right, op_pos);
-        }
-
-        Ok(left)
-    }
-
-    fn parse_equality_expr(&mut self) -> ParseResult<Expr> {
-        let mut left = self.parse_relational_expr()?;
-
-        loop {
-            let op = if self.is_special_token(SpecialToken::Equal) {
-                Some(BinaryOp::Eq)
-            } else if self.is_special_token(SpecialToken::NotEqual) {
-                Some(BinaryOp::Ne)
-            } else {
-                None
-            };
-
-            if let Some(binary_op) = op {
-                let op_pos = self.current_pos();
-                self.advance();
-                let right = self.parse_relational_expr()?;
-                left = self.make_binary(binary_op, left, right, op_pos);
-            } else {
-                break;
-            }
-        }
-
-        Ok(left)
-    }
-
-    fn parse_relational_expr(&mut self) -> ParseResult<Expr> {
-        let mut left = self.parse_shift_expr()?;
-
-        loop {
-            let op = if self.is_special_token(SpecialToken::Lte) {
-                Some(BinaryOp::Le)
-            } else if self.is_special_token(SpecialToken::Gte) {
-                Some(BinaryOp::Ge)
-            } else if self.is_special(b'<') && !self.is_special_token(SpecialToken::LeftShift) {
-                Some(BinaryOp::Lt)
-            } else if self.is_special(b'>') && !self.is_special_token(SpecialToken::RightShift) {
-                Some(BinaryOp::Gt)
-            } else {
-                None
-            };
-
-            if let Some(binary_op) = op {
-                let op_pos = self.current_pos();
-                self.advance();
-                let right = self.parse_shift_expr()?;
-                left = self.make_binary(binary_op, left, right, op_pos);
-            } else {
-                break;
-            }
-        }
-
-        Ok(left)
-    }
-
-    fn parse_shift_expr(&mut self) -> ParseResult<Expr> {
-        let mut left = self.parse_additive_expr()?;
-
-        loop {
-            let op = if self.is_special_token(SpecialToken::LeftShift) {
-                Some(BinaryOp::Shl)
-            } else if self.is_special_token(SpecialToken::RightShift) {
-                Some(BinaryOp::Shr)
-            } else {
-                None
-            };
-
-            if let Some(binary_op) = op {
-                let op_pos = self.current_pos();
-                self.advance();
-                let right = self.parse_additive_expr()?;
-                left = self.make_binary(binary_op, left, right, op_pos);
-            } else {
-                break;
-            }
-        }
-
-        Ok(left)
-    }
-
-    fn parse_additive_expr(&mut self) -> ParseResult<Expr> {
-        let mut left = self.parse_multiplicative_expr()?;
-
-        loop {
-            let op = if self.is_special(b'+') && !self.is_special_token(SpecialToken::Increment) {
-                Some(BinaryOp::Add)
-            } else if self.is_special(b'-') && !self.is_special_token(SpecialToken::Decrement) {
-                Some(BinaryOp::Sub)
-            } else {
-                None
-            };
-
-            if let Some(binary_op) = op {
-                let op_pos = self.current_pos();
-                self.advance();
-                let right = self.parse_multiplicative_expr()?;
-                left = self.make_binary(binary_op, left, right, op_pos);
-            } else {
-                break;
-            }
-        }
-
-        Ok(left)
-    }
-
-    fn parse_multiplicative_expr(&mut self) -> ParseResult<Expr> {
+    /// The logical-OR expression (C17 6.5.14) and every binary level under
+    /// it, by precedence climbing: operators of precedence `min_prec` and
+    /// up, left-associative, each right operand parsed one level tighter.
+    ///
+    /// One function for the ten levels, so a parenthesis costs one frame
+    /// here rather than one per level: an expression nested ten thousand
+    /// parentheses deep (gcc's torture test limits-exprparen) overflowed a
+    /// debug build's compiler stack through ten frames a level.
+    fn parse_binary_expr(&mut self, min_prec: u8) -> ParseResult<Expr> {
         let mut left = self.parse_unary_expr()?;
-
-        loop {
-            let op = if self.is_special(b'*') && !self.is_special_token(SpecialToken::MulAssign) {
-                Some(BinaryOp::Mul)
-            } else if self.is_special(b'/') && !self.is_special_token(SpecialToken::DivAssign) {
-                Some(BinaryOp::Div)
-            } else if self.is_special(b'%') && !self.is_special_token(SpecialToken::ModAssign) {
-                Some(BinaryOp::Mod)
-            } else {
-                None
-            };
-
-            if let Some(binary_op) = op {
-                let op_pos = self.current_pos();
-                self.advance();
-                let right = self.parse_unary_expr()?;
-                left = self.make_binary(binary_op, left, right, op_pos);
-            } else {
+        while let Some((op, prec)) = self.binary_operator() {
+            if prec < min_prec {
                 break;
             }
+            let op_pos = self.current_pos();
+            self.advance();
+            // `||` and `&&` do not evaluate their right operand when the
+            // left decides (6.5.14p4, 6.5.13p4).
+            let dead = match op {
+                BinaryOp::LogOr => self.constant_truth(&left) == Some(true),
+                BinaryOp::LogAnd => self.constant_truth(&left) == Some(false),
+                _ => false,
+            };
+            let right = self.unevaluated_if(dead, |p| p.parse_binary_expr(prec + 1))?;
+            left = self.make_binary(op, left, right, op_pos);
         }
-
         Ok(left)
     }
 
@@ -1636,7 +1511,10 @@ impl<'a> Parser<'a> {
         let Some(typ) = expr.typ else {
             return;
         };
-        if self.types.kind(typ) != TypeKind::Void && self.type_name_is_incomplete(typ) {
+        if self.types.kind(typ) != TypeKind::Void
+            && self.type_name_is_incomplete(typ)
+            && !self.report_sve_use(typ, super::target_types::SveUse::Size, pos)
+        {
             let named = self.types.format_type(typ, Some(self.idents));
             diag::error_args(
                 pos,
@@ -1665,7 +1543,7 @@ impl<'a> Parser<'a> {
     fn check_sizeof_operand_is_complete(&self, typ: TypeId, pos: Position) {
         let incomplete =
             self.types.kind(typ) != TypeKind::Void && self.type_name_is_incomplete(typ);
-        if incomplete {
+        if incomplete && !self.report_sve_use(typ, super::target_types::SveUse::Size, pos) {
             crate::diag::error(
                 pos,
                 &format!(
@@ -1707,7 +1585,14 @@ impl<'a> Parser<'a> {
                 // `void`, as an extension, and so does c17. A variable length
                 // array's extents are its own size expressions, so `int[n]`
                 // is complete.
-                if self.types.kind(typ) != TypeKind::Void && self.type_name_is_incomplete(typ) {
+                if self.types.kind(typ) != TypeKind::Void
+                    && self.type_name_is_incomplete(typ)
+                    && !self.report_sve_use(
+                        typ,
+                        super::target_types::SveUse::Alignment,
+                        alignof_pos,
+                    )
+                {
                     let named = self.types.format_type(typ, Some(self.idents));
                     diag::error_args(
                         alignof_pos,
@@ -1993,6 +1878,7 @@ impl<'a> Parser<'a> {
         // value of it to make.
         if self.types.kind(return_type) != TypeKind::Void
             && self.type_name_is_incomplete(return_type)
+            && !self.report_sve_use(return_type, super::target_types::SveUse::Value, call_pos)
         {
             let named = self.types.format_type(return_type, Some(self.idents));
             diag::error_args(call_pos, "invalid use of undefined type '{0}'", &[&named]);

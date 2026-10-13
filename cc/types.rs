@@ -435,6 +435,15 @@ bitflags::bitflags! {
         // one; see `AddressSpace`.
         const SEG_FS = 1 << 22;
         const SEG_GS = 1 << 23;
+
+        // One of gcc's AdvSIMD builtin vector types on aarch64, such as
+        // `__Float32x4_t`: laid out and operated on as the GNU vector of its
+        // lanes, but a distinct type -- gcc calls `__Float32x4_t` and
+        // `float __attribute__((vector_size(16)))` incompatible, so a pointer
+        // to one does not convert to a pointer to the other, while a value
+        // converts as between any two vectors of the same lanes (see
+        // `TypeTable::advsimd_vector`).
+        const ADVSIMD = 1 << 24;
     }
 }
 
@@ -603,6 +612,18 @@ impl FloatClass {
     }
 }
 
+/// The class of machine mode gcc gives a type, as far as
+/// [`TypeTable::integer_mode_bits`] needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MachineMode {
+    /// An integer mode of this many bits: QImode to TImode.
+    Int(u32),
+    /// A floating, complex or vector mode.
+    Other,
+    /// No mode: BLKmode.
+    Blk,
+}
+
 // Type Representation
 
 /// How many elements an array type has (C17 6.7.6.2p4): a number the
@@ -688,6 +709,13 @@ pub struct Type {
     /// calls two function types differing only here incompatible.
     pub nocf_check: bool,
 
+    /// `__attribute__((aarch64_vector_pcs))`: the function follows the
+    /// AAPCS64 vector procedure call standard, which preserves q8-q23 in
+    /// full across a call. Part of the type, as `conv` is: gcc calls two
+    /// function types differing only here incompatible. A call through it
+    /// uses the base convention (see `Parser::merge_fn_type_attrs`).
+    pub vector_pcs: bool,
+
     /// Composite type data (for struct, union, enum)
     pub composite: Option<Box<CompositeType>>,
 
@@ -714,6 +742,7 @@ impl Default for Type {
             nothrow: false,
             conv: CallingConv::C,
             nocf_check: false,
+            vector_pcs: false,
             composite: None,
             explicit_align: None,
             float_class: FloatClass::Standard,
@@ -980,8 +1009,8 @@ impl Type {
         if self.conv != other.conv {
             return false;
         }
-        // So is `nocf_check`, for the same reason.
-        if self.nocf_check != other.nocf_check {
+        // So are `nocf_check` and `aarch64_vector_pcs`, for the same reason.
+        if self.nocf_check != other.nocf_check || self.vector_pcs != other.vector_pcs {
             return false;
         }
 
@@ -1131,6 +1160,7 @@ enum TypeKey {
         nothrow: bool,
         conv: CallingConv,
         nocf_check: bool,
+        vector_pcs: bool,
         modifiers: u32,
     },
 }
@@ -1342,6 +1372,10 @@ pub struct TypeTable {
     /// `__builtin_ms_va_list`: the `char *` variant
     /// [`TypeModifiers::MS_VA_LIST`] marks.
     pub ms_va_list_id: TypeId,
+    /// gcc's SVE builtin types made so far: each name, its type, and the
+    /// [`CompositeType::anon_id`] every qualified copy of it carries too.
+    /// See [`Self::sve_type`].
+    sve_types: Vec<(&'static str, TypeId, u32)>,
 }
 
 /// Parenthesize a declarator that has reached a `*` before an array or
@@ -1438,6 +1472,7 @@ impl TypeTable {
             longdouble_ptr_id: TypeId::INVALID,
             va_list_id: TypeId::INVALID,
             ms_va_list_id: TypeId::INVALID,
+            sve_types: Vec::new(),
         };
 
         // Pre-intern common basic types
@@ -1702,6 +1737,7 @@ impl TypeTable {
                     nothrow: typ.nothrow,
                     conv: typ.conv,
                     nocf_check: typ.nocf_check,
+                    vector_pcs: typ.vector_pcs,
                     modifiers: typ.modifiers.bits(),
                 })
             }
@@ -2155,14 +2191,18 @@ impl TypeTable {
                     name.push_str(space);
                     name.push(' ');
                 }
-                let elem = typ
-                    .base
-                    .map(|b| self.format_declarator(b, String::new(), idents, style));
-                name.push_str(&format!(
-                    "__vector({}) {}",
-                    typ.extent.known().unwrap_or(0),
-                    elem.unwrap_or_default()
-                ));
+                if let Some(advsimd) = self.advsimd_name(id) {
+                    name.push_str(&advsimd);
+                } else {
+                    let elem = typ
+                        .base
+                        .map(|b| self.format_declarator(b, String::new(), idents, style));
+                    name.push_str(&format!(
+                        "__vector({}) {}",
+                        typ.extent.known().unwrap_or(0),
+                        elem.unwrap_or_default()
+                    ));
+                }
                 if !decl.is_empty() {
                     name.push(' ');
                     name.push_str(&decl);
@@ -2210,6 +2250,12 @@ impl TypeTable {
                 // function type itself as `void(void)`.
                 let decl = if typ.nocf_check && !decl.is_empty() {
                     format!("__attribute__((nocf_check)) {}", decl.trim_start())
+                } else {
+                    decl
+                };
+                // `aarch64_vector_pcs` likewise.
+                let decl = if typ.vector_pcs && !decl.is_empty() {
+                    format!("__attribute__((aarch64_vector_pcs)) {}", decl.trim_start())
                 } else {
                     decl
                 };
@@ -2285,6 +2331,9 @@ impl TypeTable {
 
                 match typ.kind {
                     _ if gcc_int.is_some() => {}
+                    TypeKind::Struct if self.sve_name(id).is_some() => {
+                        result.push_str(self.sve_name(id).unwrap_or_default());
+                    }
                     TypeKind::Struct | TypeKind::Union | TypeKind::Enum => {
                         result.push_str(&typ.kind.to_string());
                         // The tag is what tells one struct from another, and an
@@ -2652,6 +2701,73 @@ impl TypeTable {
         self.get(id).modifiers.contains(TypeModifiers::VECTOR_MASK)
     }
 
+    /// gcc's AdvSIMD builtin vector of `count` lanes of `lane` -- the type
+    /// of `__Float32x4_t` for `float` and 4. The GNU vector of those lanes,
+    /// marked [`TypeModifiers::ADVSIMD`]: the same layout, alignment and
+    /// calling convention, and the same operators, but a type of its own.
+    pub fn advsimd_vector(&mut self, lane: TypeId, count: usize) -> TypeId {
+        let vector = self.vector_of(lane, count, None);
+        let mut typ = self.get(vector).clone();
+        typ.modifiers |= TypeModifiers::ADVSIMD;
+        self.intern(typ)
+    }
+
+    /// The name gcc gives `id` when it is one of its AdvSIMD builtin vector
+    /// types: `__Float32x4_t`, `__Uint8x16_t`. The name says what the lanes
+    /// are -- signed or unsigned integers or floating -- how wide, and how
+    /// many.
+    pub fn advsimd_name(&self, id: TypeId) -> Option<String> {
+        if !self.get(id).modifiers.contains(TypeModifiers::ADVSIMD) {
+            return None;
+        }
+        let (lane, count) = self.vector_lanes(id)?;
+        let family = if self.is_float(lane) {
+            "Float"
+        } else if self.is_unsigned(lane) {
+            "Uint"
+        } else {
+            "Int"
+        };
+        let bits = self.byte_size(lane).get() * 8;
+        Some(format!("__{family}{bits}x{count}_t"))
+    }
+
+    /// The type of gcc's SVE builtin type `name` (`__SVFloat32_t`), made on
+    /// first use.
+    ///
+    /// An SVE vector's size is a run-time quantity, and c17 generates no
+    /// SVE code, so the type is an incomplete structure no definition can
+    /// complete: a declaration may name it -- glibc's `<math.h>` declares
+    /// its SVE functions with it on aarch64 -- and anything needing its size
+    /// is refused, by the incomplete-type rules or, where gcc words the
+    /// fault for SVE, by [`Self::sve_name`]'s callers in gcc's words. Each
+    /// name is a type of its own, as in gcc.
+    pub fn sve_type(&mut self, name: &'static str) -> TypeId {
+        if let Some(&(_, id, _)) = self.sve_types.iter().find(|(n, ..)| *n == name) {
+            return id;
+        }
+        let anon = self.fresh_anon_id();
+        let mut composite = CompositeType::incomplete(None);
+        composite.anon_id = Some(anon);
+        let id = self.intern(Type {
+            kind: TypeKind::Struct,
+            composite: Some(Box::new(composite)),
+            ..Default::default()
+        });
+        self.sve_types.push((name, id, anon));
+        id
+    }
+
+    /// The name of the SVE builtin type `id` is, qualifiers aside; `None`
+    /// for any other type. See [`Self::sve_type`].
+    pub fn sve_name(&self, id: TypeId) -> Option<&'static str> {
+        let anon = self.get(id).composite.as_ref()?.anon_id?;
+        self.sve_types
+            .iter()
+            .find(|&&(.., a)| a == anon)
+            .map(|&(name, ..)| name)
+    }
+
     /// Whether a vector comparison's mask of type `mask` assigns to the
     /// vector type `target`: integer lanes, as many and as wide.
     fn mask_assigns_to(&self, mask: TypeId, target: TypeId) -> bool {
@@ -2663,6 +2779,17 @@ impl TypeTable {
             && mn == tn
             && self.is_integer(tl)
             && self.value_bits(ml) == self.value_bits(tl)
+    }
+
+    /// Whether the vectors `a` and `b` have as many lanes, of compatible
+    /// types: gcc converts a value between two such vectors as by
+    /// assignment even when they are distinct types -- an AdvSIMD builtin
+    /// vector and the GNU vector of its lanes.
+    fn vector_lanes_match(&self, a: TypeId, b: TypeId) -> bool {
+        match (self.vector_lanes(a), self.vector_lanes(b)) {
+            (Some((la, na)), Some((lb, nb))) => na == nb && self.types_compatible(la, lb),
+            _ => false,
+        }
     }
 
     /// Is this `__builtin_ms_va_list`, the one pointer `__builtin_va_arg`
@@ -2782,6 +2909,93 @@ impl TypeTable {
         })
     }
 
+    /// The width of the integer machine mode gcc gives `id` -- QImode to
+    /// TImode, 8 to 128 bits -- or `None` where gcc gives it a floating,
+    /// complex or vector mode, or none (BLKmode). What gcc asks of a flag
+    /// output's operand, which may therefore be an `__int128` or a small
+    /// struct, union or array laid out as an integer.
+    ///
+    /// gcc's layout rules (`stor-layout.cc`): a struct whose one member fills
+    /// it takes that member's mode (`struct { double d; }` is DFmode), a
+    /// union only an integer one, and otherwise each is the integer mode of
+    /// its size, unless a member has no mode; an array of one element takes
+    /// the element's, and of more the integer mode of its size; a vector has
+    /// a vector mode where the target has one -- x86-64 down to two bytes,
+    /// aarch64 at eight and sixteen -- and is otherwise an integer.
+    pub fn integer_mode_bits(&self, id: TypeId) -> Option<u32> {
+        match self.machine_mode(id) {
+            MachineMode::Int(bits) => Some(bits),
+            MachineMode::Other | MachineMode::Blk => None,
+        }
+    }
+
+    /// gcc's machine mode for `id`, as far as [`Self::integer_mode_bits`]
+    /// needs it.
+    fn machine_mode(&self, id: TypeId) -> MachineMode {
+        let bits_of = |bytes: u64| match bytes {
+            1 | 2 | 4 | 8 | 16 => MachineMode::Int(bytes as u32 * 8),
+            _ => MachineMode::Blk,
+        };
+        if self.is_complex(id) || self.is_float(id) {
+            return MachineMode::Other;
+        }
+        let bytes = self.byte_size(id).get();
+        if self.is_vector(id) {
+            let vector_mode = match self.target_arch {
+                Arch::X86_64 => (2..=16).contains(&bytes),
+                Arch::Aarch64 => bytes == 8 || bytes == 16,
+            };
+            return if vector_mode {
+                MachineMode::Other
+            } else {
+                bits_of(bytes)
+            };
+        }
+        match self.kind(id) {
+            TypeKind::Array => {
+                let elem = self.base_type(id).unwrap_or(id);
+                match (self.array_extent(id), self.machine_mode(elem)) {
+                    (ArrayExtent::Known(_), MachineMode::Blk) => MachineMode::Blk,
+                    (ArrayExtent::Known(_), m) if bytes == self.byte_size(elem).get() => m,
+                    (ArrayExtent::Known(_), _) => bits_of(bytes),
+                    _ => MachineMode::Blk,
+                }
+            }
+            TypeKind::Struct | TypeKind::Union => {
+                let Some(comp) = self.composite(id).filter(|c| c.is_complete) else {
+                    return MachineMode::Blk;
+                };
+                let mut whole = None;
+                for m in &comp.members {
+                    let size = self.byte_size(m.typ).get();
+                    // A flexible array member has no size, and gcc then gives
+                    // the struct no mode.
+                    let flexible = self.kind(m.typ) == TypeKind::Array
+                        && self.array_extent(m.typ) == ArrayExtent::Unknown;
+                    let mode = self.machine_mode(m.typ);
+                    if flexible || (mode == MachineMode::Blk && size != 0) {
+                        return MachineMode::Blk;
+                    }
+                    if m.bit_width.is_none() && size == bytes {
+                        whole = Some(mode);
+                    }
+                }
+                let is_struct = self.kind(id) == TypeKind::Struct;
+                match whole {
+                    Some(m) if is_struct => m,
+                    Some(m @ MachineMode::Int(_)) => m,
+                    _ => bits_of(bytes),
+                }
+            }
+            _ if self.is_integer(id)
+                || matches!(self.kind(id), TypeKind::Pointer | TypeKind::Bool) =>
+            {
+                bits_of(bytes)
+            }
+            _ => MachineMode::Blk,
+        }
+    }
+
     /// The real type a floating complex `*` or `/` whose halves have type
     /// `base` is computed in, and the libgcc routine format that computes it;
     /// `None` if `base` is not a floating type.
@@ -2890,7 +3104,9 @@ impl TypeTable {
         if t_agg || v_agg {
             let ok = t_agg
                 && v_agg
-                && (self.types_compatible(target, value) || self.mask_assigns_to(value, target));
+                && (self.types_compatible(target, value)
+                    || self.mask_assigns_to(value, target)
+                    || self.vector_lanes_match(target, value));
             return (!ok).then_some(AssignFault::Incompatible);
         }
 

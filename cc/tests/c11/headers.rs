@@ -473,12 +473,8 @@ fn c17_tgmath_mega() {
  *  The bundled `<tgmath.h>` dispatches over float / double / long double and
  *  their complex counterparts.
  *
- *  It is bundled rather than delegated because no glibc `<tgmath.h>` is usable
- *  here: each one needs compiler internals c17 lacks (`__builtin_tgmath` for
- *  GCC >= 8, `__builtin_classify_type` and `__real__` for the older path), and
- *  every version `#error`s out before reaching them unless `__HAVE_FLOAT128`
- *  agrees with `__HAVE_FLOAT64X` -- which is decided solely by the `__GNUC__`
- *  version c17 advertises.
+ *  Every macro is a `__builtin_tgmath` call, as in glibc's own header under
+ *  gcc 13; `c99::tgmath_table` checks each against gcc's picks.
  */
         #include <tgmath.h>
 

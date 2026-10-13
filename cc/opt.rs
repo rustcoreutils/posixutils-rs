@@ -17,6 +17,7 @@ use crate::ir::asm_operand;
 use crate::ir::constglobal;
 use crate::ir::copyprop;
 use crate::ir::dce;
+use crate::ir::devirt;
 use crate::ir::dse;
 use crate::ir::ifconv;
 use crate::ir::inline;
@@ -159,6 +160,9 @@ struct PassCtx<'a> {
     fold: &'a libcall_fold::FoldCtx<'a>,
     /// The sizes of the module's named objects, for `objsize`.
     sizes: &'a ObjectSizes,
+    /// The functions with no out-of-line body, which `devirt` must not make
+    /// a call's target: see `bodiless_functions`.
+    bodiless: &'a HashSet<String>,
 }
 
 /// One per-function pass: its name, and a run that answers whether it
@@ -167,7 +171,7 @@ type Pass = (&'static str, fn(&mut Function, &PassCtx) -> bool);
 
 /// The fixed-point loop's passes, in order. The order is load-bearing: each
 /// pass hands the next one a shape it could not have seen for itself.
-const PASSES: [Pass; 13] = [
+const PASSES: [Pass; 14] = [
     // `constglobal` before anything looks at a value: a load of a `const`
     // global becomes its initializer, which every pass below treats as the
     // constant it is.
@@ -225,6 +229,13 @@ const PASSES: [Pass; 13] = [
     // `copyprop` once everything above has made its copies, so that `dce`
     // below collects the ones it leaves unused.
     ("copyprop", |f, c| copyprop::run(f, c.types)),
+    // `devirt` once `copyprop` has carried a function's address to the
+    // calls through it: each becomes a direct call, which the next round's
+    // passes see as one, and `dce` below removes the address it no longer
+    // reads.
+    ("devirt", |f, c| {
+        devirt::run(f, c.types, Some(c.known), c.bodiless)
+    }),
     // `dse` before `dce`, so the value chain feeding a killed store is swept
     // in the same iteration rather than surviving to the next one.
     ("dse", |f, c| dse::run(f, c.types, c.mi)),
@@ -248,11 +259,29 @@ const BEFORE_INLINING: [fn(&mut Function, &TypeTable) -> bool; 5] = [
     |f, _| f.simplify_cfg(),
 ];
 
-fn simplify_before_inlining(func: &mut Function, types: &TypeTable) {
+///
+/// Then a call through a known function's address becomes a direct call,
+/// which the inliner considers as gcc's does (`ir::devirt`) -- but not of a
+/// function in `elsewhere`, whose body here is an inline definition and
+/// whose address is the external definition's, which may differ.
+fn simplify_before_inlining(func: &mut Function, types: &TypeTable, elsewhere: &HashSet<String>) {
     for run in BEFORE_INLINING {
         run(func, types);
     }
+    devirt::run(func, types, None, elsewhere);
     func.remove_nops();
+}
+
+/// The functions whose body here is an inline definition only: the symbol
+/// is another unit's definition, or an alias, and a call through its
+/// address reaches that, not this body.
+fn defined_elsewhere(module: &Module) -> HashSet<String> {
+    module
+        .functions
+        .iter()
+        .filter(|f| !f.emit && !f.is_static)
+        .map(|f| f.name.clone())
+        .collect()
 }
 
 /// How a function's fixed-point loop went.
@@ -625,8 +654,9 @@ pub fn optimize_module(
     suppress_forwarding_bodies(module);
 
     if opt.optimizes() {
+        let elsewhere = defined_elsewhere(module);
         for func in &mut module.functions {
-            simplify_before_inlining(func, types);
+            simplify_before_inlining(func, types, &elsewhere);
         }
     }
     inline::run(module, opt);
@@ -668,6 +698,9 @@ pub fn optimize_module(
             dce::run(func);
             func.remove_nops();
         }
+        // Two operands pinned to one register can share it only when they
+        // hold one value, which the optimizer is what proves.
+        asm_operand::resolve_pinned_registers(func, target.arch, opt.optimizes());
     }
 
     // An address that survived everything above would reach the link as an
@@ -715,11 +748,13 @@ fn report_attribute_calls(module: &Module) {
                 continue;
             };
             let pos = insn.pos.unwrap_or_default();
+            // The C name, as gcc says it, not an asm label's.
+            let named = diags.name.as_deref().unwrap_or(callee);
             if let Some(msg) = &diags.error {
                 crate::diag::error_args(
                     pos,
                     "call to '{0}' declared with attribute error: {1}",
-                    &[callee, msg],
+                    &[named, msg],
                 );
             }
             if let Some(msg) = &diags.warning {
@@ -727,11 +762,24 @@ fn report_attribute_calls(module: &Module) {
                     "attribute-warning",
                     pos,
                     "call to '{0}' declared with attribute warning: {1}",
-                    &[callee, msg],
+                    &[named, msg],
                 );
             }
         }
     }
+}
+
+/// The functions of `module` that have no out-of-line body anywhere: a
+/// `static` one the unit does not emit, which only inlining could have
+/// called. A C99 inline definition the unit does not emit is not one of
+/// them: its external definition is another unit's.
+fn bodiless_functions(module: &Module) -> HashSet<String> {
+    module
+        .functions
+        .iter()
+        .filter(|f| !f.emit && f.is_static)
+        .map(|f| f.name.clone())
+        .collect()
 }
 
 /// Run the per-function passes over every function, each for at most
@@ -747,6 +795,7 @@ fn optimize_functions(
     let known = constglobal::KnownGlobals::collect(module, types);
     let mi = memloc::ModuleInfo::build(module, types);
     let sizes = ObjectSizes::build(module, types);
+    let bodiless = bodiless_functions(module);
     let (functions, strings, callees) = module.split_for_rewrite();
     let literals = libcall_fold::NewLiterals::new(strings);
     let fold = libcall_fold::FoldCtx {
@@ -763,6 +812,7 @@ fn optimize_functions(
         mi: &mi,
         fold: &fold,
         sizes: &sizes,
+        bodiless: &bodiless,
     };
     let mut report = OptReport::default();
     for func in functions {

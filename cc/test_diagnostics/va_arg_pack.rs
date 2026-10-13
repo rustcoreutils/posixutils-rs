@@ -54,7 +54,9 @@ const WRAP: &str = "extern int printf(const char *, ...);\n\
                     { return printf(f, __builtin_va_arg_pack()); }\n";
 
 /// The address stored in a pointer and called through it. Reported where the
-/// address is taken: that is what asks for the copy.
+/// address is taken at -O0: that is what asks for the copy. Optimizing, the
+/// call through the pointer is a call of `count` (`ir::devirt`), which is
+/// inlined and needs no copy, as gcc does from -O1.
 #[test]
 fn va_arg_pack_len_forwarder_address_taken() {
     let src = format!(
@@ -62,8 +64,9 @@ fn va_arg_pack_len_forwarder_address_taken() {
          int (*p)(const char *, ...) = count;\n\
          return p(\"x\", 1); }}\n"
     );
-    for opt in OPTS {
-        expect_invalid_use("pack_len_addr", &src, opt, "__builtin_va_arg_pack_len", 4);
+    expect_invalid_use("pack_len_addr", &src, "-O0", "__builtin_va_arg_pack_len", 4);
+    for opt in ["-O1", "-O2"] {
+        expect_accepted("pack_len_addr", &src, opt);
     }
 }
 

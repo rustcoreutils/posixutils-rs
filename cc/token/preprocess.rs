@@ -711,9 +711,9 @@ const PRAGMA_TEXT_PREFIX: &str = "text:";
 /// One value for every place the claim is made: `__GNUC__`,
 /// `__GNUC_MINOR__`, `__GNUC_PATCHLEVEL__` and `__VERSION__` here, and the
 /// driver's `-dumpversion`, `-dumpfullversion` and `-v` banner. A configure
-/// script that compares the two must find them agreeing. Why it is 7.5.0 is
-/// set out where the macros are defined.
-pub const GNUC_VERSION: [&str; 3] = ["7", "5", "0"];
+/// script that compares the two must find them agreeing. Why it is 12.4.0
+/// is set out where the macros are defined.
+pub const GNUC_VERSION: [&str; 3] = ["12", "4", "0"];
 
 /// The stream name of a bundled header, which diagnostics show.
 pub(crate) fn bundled_header_stream(name: &str) -> String {
@@ -1420,25 +1420,38 @@ impl<'a> Preprocessor<'a> {
 
         // GCC compatibility macros (required by system headers).
         //
-        // The claimed version is a statement about which header paths this
-        // compiler can take, and it is measured rather than aspirational.
-        // 7.5.0 is the highest that works against glibc 2.39:
+        // The claimed version is a statement about which code paths this
+        // compiler can take, and it is measured rather than aspirational:
+        // every version-gated path in glibc (2.39, 2.41), the Debian gate's
+        // packages and CPython that a claim up to 12.4 turns on works under
+        // c17. What each step turns on:
         //
-        //   4.3  `bits/floatn.h` turns on __HAVE_FLOAT128 and needs the
-        //        `__float128` keyword and `_Complex float` with mode(TC)
-        //   4.4  `<math.h>` switches isnan/isinf/isfinite/isnormal/fpclassify
-        //        onto the builtins -- the point of claiming any of this, since
-        //        the `sizeof` ternary it replaces calls `__isnanl`, which
-        //        answers 65535 rather than 1
-        //   4.9  __HAVE_GENERIC_SELECTION turns on, so __MATH_TG uses
-        //        `_Generic` rather than __builtin_choose_expr
-        //   6.0  `signbit` goes to __builtin_signbit*
-        //   7.0  __HAVE_FLOATN_NOT_TYPEDEF: `_Float32` .. `_Float64x` are the
-        //        compiler's own distinct types, __MATH_TG lists `_Float32`
-        //        beside `float`, and the `__builtin_*f32x` family is called
-        //        by name
-        //   8.0  <tgmath.h> needs `__builtin_tgmath`, and <sys/cdefs.h>
-        //        the `nonstring` attribute. That is the ceiling.
+        //   4.3   `bits/floatn.h`: __HAVE_FLOAT128, the `__float128` keyword
+        //         and `_Complex float` with mode(TC)
+        //   4.4   `<math.h>` puts isnan/isinf/isfinite/isnormal/fpclassify on
+        //         the builtins
+        //   4.9   __HAVE_GENERIC_SELECTION: __MATH_TG uses `_Generic`
+        //   6.0   `signbit` goes to __builtin_signbit*
+        //   7.0   `_Float32` .. `_Float64x` are the compiler's own types
+        //   8.0   the `nonstring` attribute; glibc's own <tgmath.h> would use
+        //         `__builtin_tgmath`, but the bundled <tgmath.h> is found first
+        //   9.0   `copy` attribute, one-argument `_Static_assert` (gnulib);
+        //         on aarch64, <math.h> declares its AdvSIMD functions with
+        //         `__Float32x4_t`, `__Float64x2_t` and `aarch64_vector_pcs`
+        //   10.0  the `access` attribute on ~140 glibc declarations; on
+        //         aarch64, <math.h> declares its SVE functions with
+        //         `__SVFloat32_t`, `__SVFloat64_t` and `__SVBool_t`
+        //   11.0  `malloc(dealloc, n)` on glibc's and gnulib's allocators,
+        //         `access(none)`, pthread.h's __sigsetjmp_cancel redirect,
+        //         <stdbit.h> drops its pacifying casts
+        //   12.0  `_FORTIFY_SOURCE=3`, which __builtin_dynamic_object_size
+        //         serves
+        //   12.1  gnulib's careadlinkat.c takes a pragma, where 10.1 to 12.0
+        //         emit two `#warning`s when optimizing -- a `-Werror` build
+        //         fails -- hence a minor of at least 1
+        //
+        // 13 adds nothing reachable in C17 mode but glibc's C2x <tgmath.h>
+        // path, which the bundled <tgmath.h> (gcc 13's semantics) shadows.
         let [major, minor, patchlevel] = GNUC_VERSION;
         self.define_macro(Macro::predefined("__GNUC__", Some(major)));
         self.define_macro(Macro::predefined("__GNUC_MINOR__", Some(minor)));

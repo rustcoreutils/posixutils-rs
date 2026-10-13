@@ -1145,8 +1145,8 @@ impl X86_64CodeGen {
 
         let uid = self.unique_label_counter;
         self.unique_label_counter += 1;
-        let big_label = Label::block(&self.base.current_fn, 10000 + uid * 2);
-        let done_label = Label::block(&self.base.current_fn, 10000 + uid * 2 + 1);
+        let big_label = Label::internal("x87_to_u64_big", uid);
+        let done_label = Label::internal("x87_to_u64_done", uid);
 
         self.push_lir(X86Inst::MovAbs {
             imm: TWO_POW_63_BITS,

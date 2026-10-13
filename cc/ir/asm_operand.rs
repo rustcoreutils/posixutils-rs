@@ -22,8 +22,12 @@
 // same point. Before, it accepted any operand and substituted whatever
 // register held it -- `"i"(&global)` gave `%rax` rather than `$global`.
 
-use super::{AsmConstraint, Function, Instruction, Module, Opcode, PseudoId, PseudoKind};
-use crate::arch::asm_constraints::{canonical_int, FloatImm};
+use super::{AsmConstraint, AsmData, Function, Instruction, Module, Opcode, PseudoId, PseudoKind};
+use crate::arch::asm_constraints::{
+    canonical_int, AsmOperandClass, AsmRegClass, FloatImm, PinnedGp,
+};
+use crate::target::Arch;
+use crate::units::Bits;
 use std::collections::{HashMap, HashSet};
 
 /// Follows the address arithmetic of an operand back to the object it names.
@@ -293,6 +297,295 @@ fn out_of_range(func: &Function, c: &AsmConstraint, found: &Immediate) -> Result
     } else {
         Err(int.to_string())
     }
+}
+
+/// Give each inline-asm operand pinned to one register (x86-64 `"a"` ...
+/// `"D"`, a register variable) that register, as gcc does once it has
+/// optimized, and report a statement whose pins cannot all be met, in gcc's
+/// words: "'asm' operand has impossible constraints".
+///
+/// The operands an output and its tied inputs (`"0"`, or a `"+"` output's
+/// own) share are one group, each other input a group of its own. A
+/// register can hold:
+/// - one output, and no clobber;
+/// - any number of inputs of one value: the same pseudo, or the same
+///   constant -- but only when optimizing. gcc gives every operand a pseudo
+///   of its own at -O0, so `"a"(x), "a"(x)` is refused there and accepted at
+///   -O1, and c17 decides at the same point, after its own optimizer;
+/// - an early-clobber output and inputs only of its own group.
+///
+/// Two register variables of one register are one value, the register, and
+/// two outputs of them are not refused: gcc diagnoses neither. A variable's
+/// clash with a clobber is reported by the linearizer, in gcc's own words.
+///
+/// An operand whose constraint also offers any general register (`"ar"`)
+/// goes to one when its register is taken, after every operand that has no
+/// such choice has been placed. Kept pinned, it was moved into the register
+/// another operand was also moved into, and the asm read one value twice.
+pub fn resolve_pinned_registers(func: &mut Function, arch: Arch, optimizing: bool) {
+    if !func.emit {
+        return;
+    }
+    for b in 0..func.blocks.len() {
+        for i in 0..func.blocks[b].insns.len() {
+            let insn = &func.blocks[b].insns[i];
+            let Some(asm) = insn.extra().asm_data.as_deref() else {
+                continue;
+            };
+            let (demote, impossible) = pinned_conflicts(func, (b, i), asm, arch, optimizing);
+            if impossible {
+                crate::arch::codegen::report_asm_registers_exhausted(insn.pos);
+            }
+            if demote.is_empty() {
+                continue;
+            }
+            let insn = &mut func.blocks[b].insns[i];
+            if let Some(asm) = insn.extra_mut().asm_data.as_mut() {
+                for operand in demote {
+                    // A tied input is in its output's register: moving the
+                    // output moves it.
+                    let class = match operand {
+                        PinnedOperand::Output(k) => &mut asm.outputs[k].class,
+                        PinnedOperand::Input(k) => &mut asm.inputs[k].class,
+                    };
+                    class.reg = Some(AsmRegClass::General);
+                }
+            }
+        }
+    }
+}
+
+/// The value an input puts in its register, for telling whether two inputs
+/// can share it.
+#[derive(Clone, Copy, PartialEq)]
+enum PinnedValue {
+    /// A register variable: the register itself.
+    Register,
+    /// A value, at the width the operand puts it in the register: one
+    /// value at two widths is two (`-1` and `-1L`).
+    Pseudo(PseudoId, Bits),
+}
+
+/// How many instructions deep [`ValueWalk::same`] compares two values.
+const SAME_VALUE_DEPTH: u32 = 4;
+
+/// Whether two pseudos hold one value, as gcc's value numbering finds it
+/// for two operands of one asm: copies of one pseudo, equal constants, or
+/// one pure computation of equal operands -- `"a"(x + 1), "a"(x + 1)`.
+struct ValueWalk<'w> {
+    func: &'w Function,
+    defs: &'w HashMap<PseudoId, &'w Instruction>,
+}
+
+impl ValueWalk<'_> {
+    fn same(&self, a: PseudoId, b: PseudoId, depth: u32) -> bool {
+        let (a, b) = (self.copied_from(a), self.copied_from(b));
+        if a == b {
+            return true;
+        }
+        // A constant lives in its pseudo, not in the `SetVal` that defines
+        // it: compared here, and never by that instruction's operands, which
+        // it has none of. (The caller has matched the operands' widths.)
+        let kind = |p: PseudoId| self.func.get_pseudo(p).map(|x| &x.kind);
+        match (kind(a), kind(b)) {
+            (Some(PseudoKind::Val(x)), Some(PseudoKind::Val(y))) => return x == y,
+            (Some(PseudoKind::FVal(x)), Some(PseudoKind::FVal(y))) => return x == y,
+            (Some(PseudoKind::Val(_) | PseudoKind::FVal(_)), _)
+            | (_, Some(PseudoKind::Val(_) | PseudoKind::FVal(_))) => return false,
+            _ => {}
+        }
+        let (Some(x), Some(y)) = (self.defs.get(&a), self.defs.get(&b)) else {
+            return false;
+        };
+        use Opcode::*;
+        let pure = matches!(
+            x.op,
+            Add | Sub
+                | Mul
+                | And
+                | Or
+                | Xor
+                | Shl
+                | Lsr
+                | Asr
+                | Not
+                | Neg
+                | Trunc
+                | Zext
+                | Sext
+                | SymAddr
+        );
+        depth > 0
+            && pure
+            && x.op == y.op
+            && x.size == y.size
+            && x.src_size == y.src_size
+            && x.src.len() == y.src.len()
+            && x.src
+                .iter()
+                .zip(&y.src)
+                .all(|(&p, &q)| self.same(p, q, depth - 1))
+    }
+
+    /// The pseudo a chain of copies starting at `p` reads from.
+    fn copied_from(&self, mut p: PseudoId) -> PseudoId {
+        while let Some(insn) = self.defs.get(&p).filter(|i| i.op == Opcode::Copy) {
+            match insn.src.first() {
+                Some(&src) => p = src,
+                None => break,
+            }
+        }
+        p
+    }
+}
+
+/// The operand whose class holds a group's pin.
+#[derive(Clone, Copy)]
+enum PinnedOperand {
+    Output(usize),
+    Input(usize),
+}
+
+/// One output with its tied inputs, or one untied input, pinned to `reg`.
+struct PinGroup {
+    reg: PinnedGp,
+    operand: PinnedOperand,
+    /// The values the group's inputs read into the register.
+    reads: Vec<PinnedValue>,
+    early_clobber: bool,
+    flexible: bool,
+    variable: bool,
+}
+
+/// The groups of `asm` to move to a general register, and whether a pin no
+/// operand can give up clashes.
+fn pinned_conflicts(
+    func: &Function,
+    (block, at): (usize, usize),
+    asm: &AsmData,
+    arch: Arch,
+    optimizing: bool,
+) -> (Vec<PinnedOperand>, bool) {
+    let pinned = |c: &AsmConstraint| match c.class.reg {
+        Some(AsmRegClass::Pinned(r)) if c.class.flag.is_none() => Some(r),
+        _ => None,
+    };
+    // A tied input names its output's pseudo, which a copy just before the
+    // asm loads its value into; the asm then redefines it.
+    let copied_in = |p: PseudoId| {
+        func.blocks[block].insns[..at]
+            .iter()
+            .rev()
+            .find(|insn| insn.target == Some(p))
+            .filter(|insn| insn.op == Opcode::Copy)
+            .and_then(|insn| insn.src.first().copied())
+            .unwrap_or(p)
+    };
+    let value = |c: &AsmConstraint, class: &AsmOperandClass| {
+        if class.variable_pin {
+            PinnedValue::Register
+        } else if c.matching_output.is_some() {
+            PinnedValue::Pseudo(copied_in(c.pseudo), c.size)
+        } else {
+            PinnedValue::Pseudo(c.pseudo, c.size)
+        }
+    };
+    let mut groups = Vec::new();
+    for (k, out) in asm.outputs.iter().enumerate() {
+        let Some(reg) = pinned(out) else { continue };
+        groups.push(PinGroup {
+            reg,
+            operand: PinnedOperand::Output(k),
+            reads: asm
+                .inputs
+                .iter()
+                .filter(|c| c.matching_output == Some(k))
+                .map(|c| value(c, &out.class))
+                .collect(),
+            early_clobber: out.class.early_clobber,
+            flexible: out.class.general_too,
+            variable: out.class.variable_pin,
+        });
+    }
+    for (k, input) in asm.inputs.iter().enumerate() {
+        if input.matching_output.is_some() {
+            continue;
+        }
+        let Some(reg) = pinned(input) else { continue };
+        groups.push(PinGroup {
+            reg,
+            operand: PinnedOperand::Input(k),
+            reads: vec![value(input, &input.class)],
+            early_clobber: false,
+            flexible: input.class.general_too,
+            variable: input.class.variable_pin,
+        });
+    }
+    if groups.len() < 2 && asm.clobbers.is_empty() {
+        return (Vec::new(), false);
+    }
+    let redefined = func.asm_defined_pseudos();
+    let defs: HashMap<PseudoId, &Instruction> = func
+        .blocks
+        .iter()
+        .flat_map(|bb| &bb.insns)
+        .filter_map(|insn| insn.target.map(|t| (t, insn)))
+        .filter(|(t, _)| !redefined.contains(t))
+        .collect();
+    let values = ValueWalk { func, defs: &defs };
+    let shareable = |a: PinnedValue, b: PinnedValue| match (a, b) {
+        (PinnedValue::Register, PinnedValue::Register) => true,
+        (PinnedValue::Pseudo(x, xw), PinnedValue::Pseudo(y, yw)) => {
+            optimizing && xw == yw && values.same(x, y, SAME_VALUE_DEPTH)
+        }
+        _ => false,
+    };
+    let clobbered: Vec<PinnedGp> = asm
+        .clobbers
+        .iter()
+        .filter_map(|c| PinnedGp::named(c, arch))
+        .collect();
+
+    // What the groups placed so far hold: per register, the output there
+    // (and whether it is early-clobber and a variable's), and the value
+    // the inputs there read.
+    let mut outputs: Vec<(PinnedGp, bool, bool)> = Vec::new();
+    let mut inputs: Vec<(PinnedGp, PinnedValue)> = Vec::new();
+    let mut demote = Vec::new();
+    let mut impossible = false;
+    // The groups with no other register first, so a flexible one gives way.
+    let order = groups
+        .iter()
+        .filter(|g| !g.flexible)
+        .chain(groups.iter().filter(|g| g.flexible));
+    for g in order {
+        let r = g.reg;
+        let writes = matches!(g.operand, PinnedOperand::Output(_));
+        let clash = (!g.variable && clobbered.contains(&r))
+            || (writes
+                && outputs
+                    .iter()
+                    .any(|&(o, _, variable)| o == r && !(variable && g.variable)))
+            || (g.early_clobber && inputs.iter().any(|&(i, _)| i == r))
+            || (!g.reads.is_empty() && outputs.iter().any(|&(o, early, _)| o == r && early))
+            || g.reads.iter().any(|&v| {
+                inputs
+                    .iter()
+                    .any(|&(i, held)| i == r && !shareable(held, v))
+            });
+        if clash {
+            if !g.flexible {
+                impossible = true;
+            }
+            demote.push(g.operand);
+            continue;
+        }
+        if writes {
+            outputs.push((r, g.early_clobber, g.variable));
+        }
+        inputs.extend(g.reads.iter().map(|&v| (r, v)));
+    }
+    (demote, impossible)
 }
 
 #[cfg(test)]

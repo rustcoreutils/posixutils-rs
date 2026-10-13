@@ -605,6 +605,14 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     "__builtin_ia32_rdtscp",
     "__builtin_ia32_cvtpd2ps",
     "__builtin_thread_pointer",
+    "__builtin_aarch64_get_fpcr",
+    "__builtin_aarch64_set_fpcr",
+    "__builtin_aarch64_get_fpsr",
+    "__builtin_aarch64_set_fpsr",
+    "__builtin_aarch64_get_fpcr64",
+    "__builtin_aarch64_set_fpcr64",
+    "__builtin_aarch64_get_fpsr64",
+    "__builtin_aarch64_set_fpsr64",
     // <tgmath.h>'s type-generic call
     "__builtin_tgmath",
     // Object size, with run-time answers allowed (c17 gives static ones)

@@ -14,6 +14,7 @@
 mod auto_type;
 mod cast_to_union;
 pub mod cleanup_attr;
+mod deep_nesting;
 mod enumerator_attributes;
 mod float_n;
 mod gnu_escape;

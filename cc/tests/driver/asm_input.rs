@@ -66,7 +66,8 @@ fn asm_input_stdin_assembler_with_cpp() {
     assert_eq!(r.stdout.trim(), "nop");
 }
 
-/// `-x assembler -` is assembled from standard input, and `-E` copies it.
+/// `-x assembler -` is assembled from standard input; under `-E` there is
+/// nothing to preprocess, and gcc writes nothing.
 #[test]
 fn asm_input_stdin_assembler() {
     let w = WorkDir::new("asm_stdin_plain");
@@ -77,7 +78,50 @@ fn asm_input_stdin_assembler() {
 
     let r = run_c17_stdin(&["-E", "-x", "assembler", "-"], "\tnop\n");
     assert!(r.success, "{}", r.stderr);
-    assert!(r.stdout.contains("nop"), "{:?}", r.stdout);
+    assert_eq!(r.stdout, "", "{:?}", r.stdout);
+}
+
+/// Under `-E`, `-M` and `-MM` an input that is not preprocessed -- plain
+/// assembler (`.s`, `-x assembler`) or C already preprocessed (`.i`,
+/// `-x cpp-output`) -- is passed over, as gcc 13 passes it over: nothing is
+/// written, `-o` creates no file, and the operand is not even opened. c17
+/// expanded macros in a `.s`, which is never preprocessed, and copied a
+/// `.i` out with a line marker.
+#[test]
+fn asm_input_unpreprocessed_inputs_pass_through_e_as_nothing() {
+    let w = WorkDir::new("e_unprocessed");
+    let dot_s = w.write("a.s", "#define X 1\nX\n\tmovl $X, %eax\n");
+    let dot_i = w.write("b.i", "# 1 \"x.c\"\nint x = MACRO;\n#define Y 2\nY\n");
+    for (input, lang) in [
+        (&dot_s, None),
+        (&dot_i, None),
+        (&dot_s, Some("assembler")),
+        (&dot_i, Some("cpp-output")),
+    ] {
+        for mode in ["-E", "-M", "-MM"] {
+            let mut args = vec![mode.to_string()];
+            if let Some(lang) = lang {
+                args.extend(["-x".to_string(), lang.to_string()]);
+            }
+            args.push(s(input));
+            let r = crate::common::run_c17(&args.iter().map(String::as_str).collect::<Vec<_>>());
+            assert!(r.success, "{args:?}: {}", r.stderr);
+            assert_eq!(r.stdout, "", "{args:?}");
+            assert_eq!(r.stderr, "", "{args:?}");
+        }
+    }
+    // `-o` names no file that comes into being.
+    let out = w.join("out.txt");
+    let r = crate::common::run_c17(&["-E", "-o", &s(&out), &s(&dot_s)]);
+    assert!(r.success, "{}", r.stderr);
+    assert!(!out.exists(), "-E -o made {}", s(&out));
+    // Not opened: a missing one is no error.
+    let r = crate::common::run_c17(&["-E", &s(&w.join("nosuch.s")), &s(&w.join("nosuch.i"))]);
+    assert!(r.success, "{}", r.stderr);
+    // `-x c` makes a `.s` C source, preprocessed as such.
+    let r = crate::common::run_c17(&["-E", "-P", "-x", "c", &s(&dot_s)]);
+    assert!(r.success, "{}", r.stderr);
+    assert!(r.stdout.contains('1'), "{:?}", r.stdout);
 }
 
 /// A dependency rule for standard input names the headers and nothing for

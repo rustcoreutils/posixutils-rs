@@ -780,3 +780,45 @@ int main(void) {
         );
     }
 }
+
+/// A function-type attribute inside a grouped declarator belongs to the type
+/// the group's pointer points at, as in gcc: `getfp` returns a pointer to an
+/// `ms_abi` function and is itself an ordinary one, written either way --
+/// before the `*` or after it. c17 gave the attribute to `getfp`, so `getfp`
+/// took its argument in `%rcx` and the call through what it returned passed
+/// `(10, 3)` in `%rdi` and `%rsi`. Exit codes 1..=4.
+#[test]
+fn codegen_ms_abi_in_a_grouped_declarator_is_the_pointed_functions() {
+    if !cfg!(target_arch = "x86_64") {
+        return;
+    }
+    let src = r#"
+__attribute__((ms_abi, noinline)) long target(long a, long b) { return a - b; }
+__attribute__((noinline)) long (__attribute__((ms_abi)) *getfp(long x))(long, long) {
+    return x ? target : 0;
+}
+__attribute__((noinline)) long (*__attribute__((ms_abi)) getfp2(long x))(long, long) {
+    return x ? target : 0;
+}
+__attribute__((noinline)) long (__attribute__((ms_abi)) plain)(long a, long b) {
+    return a * b;
+}
+typedef long __attribute__((ms_abi)) msfn(long, long);
+int main(void) {
+    if (getfp(1)(10, 3) != 7) return 1;
+    if (getfp2(1)(10, 4) != 6) return 2;
+    msfn *p = getfp(1);
+    if (p(5, 1) != 4) return 3;
+    msfn *volatile q = plain;
+    if (q(6, 7) != 42) return 4;
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run("ms_abi_grouped", src, &[opt.to_string()]),
+            0,
+            "{opt}"
+        );
+    }
+}

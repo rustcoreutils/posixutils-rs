@@ -176,6 +176,9 @@ impl Parser<'_> {
         // The paren comes AFTER pointers, e.g. int *(*p)[3] = pointer to (pointer to array of 3 ints)
         let mut name_pos = self.current_pos();
         let mut group_attributed = false;
+        // The function-type attributes written inside a group, which are
+        // the type's the group is derived over -- see below.
+        let mut group_fn_type = super::attribute::FnTypeAttrs::default();
         let (name, inner) = if self.is_special(b'(') {
             // Check if this looks like a function parameter list or a grouped declarator
             // A grouped declarator will have * or identifier immediately after (
@@ -188,10 +191,13 @@ impl Parser<'_> {
                 // calling-convention macro expands to -- belongs to this
                 // declaration.
                 let group_start = self.pos;
+                let outer_fn_type = std::mem::take(&mut self.pending_fn_type);
                 self.skip_extensions();
                 group_attributed = self.pos != group_start;
                 // For int (*p)[3]: we're now at *p), base_type is int
-                let inner = self.parse_declarator_level(self.types.void_id, ctx, true)?;
+                let inner = self.parse_declarator_level(self.types.void_id, ctx, true);
+                group_fn_type = std::mem::replace(&mut self.pending_fn_type, outer_fn_type);
+                let inner = inner?;
                 self.expect_special(b')')?;
                 name_pos = inner.name_pos;
                 (inner.name, Some(inner))
@@ -313,6 +319,17 @@ impl Parser<'_> {
             self.derive_suffix_arrays(result_type_id, dimensions, site, over_placeholder)?;
 
         if let Some(inner) = &inner {
+            // A function-type attribute written inside the group belongs to
+            // the type the group's declarator is derived over, as in gcc:
+            // `long (__attribute__((ms_abi)) *getfp(long))(long, long)`
+            // returns a pointer to an `ms_abi` function and is not one
+            // itself. Over a placeholder -- a group inside a group -- that
+            // type is the enclosing level's to supply, so they go up to it.
+            if placeholder && result_type_id == base_type_id {
+                self.pending_fn_type.absorb(group_fn_type);
+            } else {
+                result_type_id = self.apply_fn_type_attrs(group_fn_type, result_type_id);
+            }
             // Grouped declarator: int (*p)[3] or void (*fp)(int) or int *(*q)[3].
             // Substitute the result type into the inner declarator: for
             // `int (*p)[3]`, Pointer(Void) and Array(3, int) compose into
@@ -478,6 +495,9 @@ impl Parser<'_> {
         let Some(defect) = self.array_element_defect(elem) else {
             return;
         };
+        if self.report_sve_use(elem, super::target_types::SveUse::Element, site.name_pos) {
+            return;
+        }
         let msg = match defect {
             ElementDefect::Incomplete => format!(
                 "array type has incomplete element type '{}'",
@@ -570,6 +590,7 @@ impl Parser<'_> {
                     nothrow: decl_type.nothrow,
                     conv: decl_type.conv,
                     nocf_check: decl_type.nocf_check,
+                    vector_pcs: decl_type.vector_pcs,
                     ..Default::default()
                 };
                 func_type.base = Some(self.substitute_base_type(inner_base_id, actual_base_id));

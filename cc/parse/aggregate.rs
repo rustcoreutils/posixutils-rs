@@ -1029,6 +1029,14 @@ impl Parser<'_> {
             TypeKind::Function => "field '{0}' declared as a function",
             // An array's element type was checked by its declarator.
             TypeKind::Array => return true,
+            _ if self.report_sve_use(
+                typ,
+                super::target_types::SveUse::Field,
+                self.current_pos(),
+            ) =>
+            {
+                return false
+            }
             _ if self.type_name_is_incomplete(typ) => "field '{0}' has incomplete type",
             _ => return true,
         };

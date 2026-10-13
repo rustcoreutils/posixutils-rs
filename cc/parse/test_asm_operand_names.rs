@@ -11,7 +11,7 @@
 // parsed, as gcc does.
 //
 
-use super::asm::{resolve_operand_names, OperandNameError};
+use super::asm::{resolve_operand_names, template_name_errors, OperandNameError};
 use super::ast::{BlockItem, ExternalDecl, Stmt};
 use super::test_parser::parse_tu;
 
@@ -89,4 +89,34 @@ fn the_parsed_statement_carries_the_operand_number() {
         .expect("an asm statement");
     let constraints: Vec<&str> = inputs.iter().map(|op| op.constraint.as_str()).collect();
     assert_eq!(constraints, ["0", "r"]);
+}
+
+/// The template's `%[name]` and `%l[name]`, as gcc scans them: each one
+/// naming nothing is reported, in order; `%%[` is no reference, and a name
+/// with no `]` ends the scan.
+#[test]
+fn template_names_are_checked_as_gcc_scans_them() {
+    let e = |t| template_name_errors(t, &NAMES);
+    assert!(e("add %[b], %[sum]; jmp %l[out]").is_empty());
+    assert!(e("%%[nope] %x").is_empty());
+    assert_eq!(
+        e("%[nope] %l[bar] %w[b]"),
+        [
+            OperandNameError::Undefined("nope".to_string()),
+            OperandNameError::Undefined("bar".to_string()),
+        ]
+    );
+    assert_eq!(e("%[sum] %[b"), [OperandNameError::MissingCloseBrace]);
+}
+
+/// An unused `static inline` function's bad names are reported as it is
+/// parsed, as gcc reports them, though no code is written for it.
+#[test]
+fn template_names_are_checked_where_no_code_is_written() {
+    let src = "static inline void h(int x) {\n\
+               __asm__(\"# %[foo] %l[bar]\" : : \"r\"(x));\n\
+               }\n";
+    let before = crate::diag::error_count();
+    let _ = parse_tu(src);
+    assert_eq!(crate::diag::error_count(), before + 2);
 }

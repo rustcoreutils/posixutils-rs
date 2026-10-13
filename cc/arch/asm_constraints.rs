@@ -551,6 +551,15 @@ pub struct AsmOperandClass {
     /// constant, but the condition read off the flags the template leaves,
     /// 1 when it holds and 0 when not.
     pub flag: Option<FlagCondition>,
+    /// The constraint also offers any general register beside the one
+    /// register `reg` names (`"ar"`, `"ag"`): where another operand needs
+    /// that register, this one can go elsewhere. See
+    /// [`resolve_pinned_registers`](crate::ir::asm_operand::resolve_pinned_registers).
+    pub general_too: bool,
+    /// The pin is a register variable's (`register long x asm("rbx")` as an
+    /// `"r"` operand), not a letter's: the operand *is* the register, so two
+    /// such operands of one register are one value.
+    pub variable_pin: bool,
 }
 
 /// The condition a flag output reads (`"=@ccnz"`, `"=@cceq"`): one gcc names
@@ -619,6 +628,8 @@ impl AsmOperandClass {
             imm: AsmImm::default(),
             tied: None,
             flag: None,
+            general_too: false,
+            variable_pin: false,
         };
         let mut chars = constraint.chars().peekable();
         while let Some(c) = chars.next() {
@@ -672,6 +683,8 @@ impl AsmOperandClass {
             imm: AsmImm::default(),
             tied: None,
             flag: None,
+            general_too: false,
+            variable_pin: true,
         }
     }
 
@@ -713,6 +726,7 @@ impl AsmOperandClass {
     }
 
     fn add_reg(&mut self, r: AsmRegClass) {
+        self.general_too |= r == AsmRegClass::General;
         if self.reg.is_none_or(|have| r.rank() > have.rank()) {
             self.reg = Some(r);
         }

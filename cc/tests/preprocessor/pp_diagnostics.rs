@@ -189,6 +189,16 @@ fn pp_predefined_macro_redefinition() {
          #define _GNU_SOURCE\n#define _XOPEN_SOURCE 700\n\
          #define _POSIX_C_SOURCE 200809L\n#define _DEFAULT_SOURCE 1\n",
     );
+    // An `__STDC_` name the implementation does not define is the program's
+    // own -- `__STDC_WANT_LIB_EXT1__` (C17 K.3.1.1) is one a program defines
+    // and undefines -- and undefining it is quiet, as in gcc. gnulib's
+    // config.h does, and the warning came 486 times in one coreutils build.
+    assert_quiet(
+        "undef_program_stdc",
+        "#undef __STDC_WANT_LIB_EXT1__\n#define __STDC_WANT_LIB_EXT1__ 1\n\
+         #undef __STDC_WANT_LIB_EXT1__\n#undef __STDC_WANT_IEC_60559_EXT__\n\
+         #undef __STDC_FOO__\n",
+    );
 
     let r = preprocess_text("undef_defined", "#undef defined\n", &[]);
     assert!(!r.success);

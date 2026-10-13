@@ -75,6 +75,15 @@ default namespace: glibc's `<features.h>` turns on `_DEFAULT_SOURCE` (POSIX
 `#define _GNU_SOURCE` or `_XOPEN_SOURCE`, exactly as under gcc. `-pthread`
 defines `_REENTRANT`, as gcc's does.
 
+### `-E` passes plain assembler and preprocessed input over
+
+**Settled (user decision, 2026-10-12): c17 matches gcc.** Under `-E`, `-M`
+and `-MM`, an input that is not preprocessed -- plain assembler (`.s`,
+`-x assembler`) or C already preprocessed (`.i`, `-x cpp-output`) -- is
+passed over: nothing is written, `-o` creates no file, and the operand is not
+opened, as gcc 13 does. `.S` is preprocessed as before, and `-x c` makes any
+file C source to preprocess.
+
 ### Float constant folding stops where an operation raises
 
 Arithmetic, negation, comparison and conversion fold over float constants, at
@@ -151,7 +160,7 @@ themselves. No torture test depends on it.
 |---|---|
 | `mode` with a vector mode | `mode(V4SI)` and the other vector modes warn that they are not implemented and leave the declared type unchanged, so `sizeof` is the element's (4) where gcc's is the vector's (16). Scalar modes (`QI`..`TI`, `SF`, `DF`, ...) bind as in gcc, on a declarator, a struct member or a parameter. gcc itself deprecates vector modes in favour of `vector_size` |
 | `return` with the wrong value-ness | `return expr;` in a `void` function, and a bare `return;` in a non-`void` one, are errors, as they are by default from GCC 14 (`-Wreturn-mismatch`); GCC 13 and earlier warn. Both are C17 6.8.6.4p1 constraint violations. `-fpermissive` downgrades them, as it does implicit `int` |
-| `_FORTIFY_SOURCE` | `__builtin_object_size` is answered after inlining (`ir/objsize.rs`) and the `_chk` calls are decided as gcc decides them (`ir/libcall_fold/fortify.rs`), with four differences. The IR does not record subobjects, so type 1 of a pointer whose object only propagation finds is the whole object's remaining size, which never fires where gcc's would not, and type 3 is 0; the parser answers both exactly where the expression names the member. A `malloc` or other `alloc_size` result is an unknown object to `__builtin_object_size`; `__builtin_dynamic_object_size` gives its size, but glibc uses that only at level 3, which it grants gcc 12 and later, not c17's gcc 8. A provable overflow is left to abort at run time without gcc's compile-time `-Wstringop-overflow` warning, which c17 does not have. And gcc's strlen pass re-expresses some checks that stay -- `__strncat_chk` with a bound no shorter than its source as `__strcat_chk`, `__strcat_chk` onto a string of known length as `__strcpy_chk` or `__memcpy_chk` at its end -- where c17 keeps the call as written; the check is made either way |
+| `_FORTIFY_SOURCE` | `__builtin_object_size` is answered after inlining (`ir/objsize.rs`) and the `_chk` calls are decided as gcc decides them (`ir/libcall_fold/fortify.rs`); level 3 checks against `__builtin_dynamic_object_size`, which gives a `malloc` or other `alloc_size` result its size, as gcc does. The differences: the IR does not record subobjects, so type 1 of a pointer whose object only propagation finds is the whole object's remaining size, which never fires where gcc's would not, and type 3 is 0; the parser answers both exactly where the expression names the member. A provable overflow is left to abort at run time without gcc's compile-time `-Wstringop-overflow` warning, which c17 does not have. And gcc's strlen pass re-expresses some checks that stay -- `__strncat_chk` with a bound no shorter than its source as `__strcat_chk`, `__strcat_chk` onto a string of known length as `__strcpy_chk` or `__memcpy_chk` at its end -- where c17 keeps the call as written; the check is made either way |
 | Identifier characters U+FD3E, U+FD3F | Rejected here; GCC's binary accepts them. Ornate parentheses, which C17 Annex D excludes between its F900-FD3D and FD40-FDCF ranges -- GCC's own `ucnid.tab` does not list them and Clang's table does not either, so the table is followed rather than the binary |
 | Darwin: an over-aligned variadic aggregate | clang disagrees with itself, so no compiler satisfies this in both directions. Measured on macOS CI: its caller stacks the aggregate at the next eight-byte granule and its `va_arg` rounds the cursor up to the type's own alignment, reading somewhere else. A program built entirely with clang has the same defect. c17 follows `va_arg` -- its caller realigns the outgoing area so the argument really is that aligned -- which means a c17 caller reaches a clang callee and a clang caller does not reach a c17 callee. `codegen_over_aligned_argument_area` therefore does not put this shape through its host-compiler cross-check on Apple; the pure-c17 runs still cover it at every optimization level |
 | Darwin: a vector that is not one of the machine's widths | gcc and clang disagree about these on System V, and c17 follows gcc. A vector wider than sixteen bytes has no register class unless AVX is on, so gcc gives it memory and a hidden return pointer while clang legalizes it into a pair of SSE registers -- on every target it compiles for, Linux included. A one-lane vector (`double`, `long long` or `float` under `vector_size`, and a register-sized struct holding one) is memory to gcc and the bare scalar in its own register to clang. So a clang caller of a c17 callee returning `int __attribute__((vector_size(32)))` reads the wrong place, and `va_arg` disagrees likewise. Neither compiler is wrong -- the psABI classifies no such type -- so `vector_abi_interop_host` leaves these shapes out of its host-compiler cross-check on Apple and runs them with c17 on both sides, which `GCC_VECTORS` in its sources keys off `__APPLE__` and `C17_ALONE` to do |
@@ -189,6 +198,24 @@ three deliberate differences.
   that chain while its probes run. clang stores the record before calling
   `___chkstk_darwin` for the same reason.
 
+### Vector-PCS definitions save c17's scratch V registers
+
+A function of the AAPCS64 vector procedure call standard
+(`aarch64_vector_pcs`) preserves all of q8-q23 for its caller. c17 saves
+whole each of them its body may change: every one the allocator gives a
+value, every one an asm statement clobbers, all sixteen in a function that
+makes a call (as gcc saves them) -- and always v16-v18, the code generator's
+fixed floating-point scratch registers, where gcc saves only what it
+writes. Nearly every floating-point or vector operation passes through
+them, and which ones a function uses is known only once its code is
+emitted, after its frame is laid out; saving them costs a leaf function
+48 bytes of frame and three stores and loads. Calls the function makes are
+the base standard's, so what is live across one still takes a register
+that standard preserves; the allocator prefers v24-v31 to v19-v23, which
+would need saving. `.variant_pcs` marks a definition, as gcc's does; gcc
+also marks a vector-PCS function a unit only calls, which c17 does not:
+c17 calls it by the base standard, which a lazily bound PLT entry keeps.
+
 ### Frames past two gigabytes
 
 Frame quantities are `i64` in both back ends, and a frame may span up to
@@ -214,10 +241,16 @@ past 32 bits goes through a register, one rule in each back end's
 - **x86-64 passes a by-value argument past two gigabytes.** gcc refuses one
   ("sorry, unimplemented: passing too large argument on stack"); C sets no
   such limit, and the outgoing area is reserved and copied like any other.
-- **An inline-asm operand in a frame slot past 32 bits** is given its address
-  in a register when it is the object itself (an `m` operand of a local),
-  as a global's is; a spilled value's slot that far away is refused, since
-  its template text could only spell a displacement no instruction holds.
+- **An inline-asm memory operand in a frame slot past 32 bits** -- a local
+  under `m`, or a value spilled there under `g` or `rm` -- is written as an
+  offset from one address the x86-64 far scratch holds while the template
+  runs, loaded after the statement's inputs: no other register is free
+  there, the allocator gives the far scratch to no value, and it is chosen
+  from registers the statement neither clobbers nor pins. One more than two
+  gigabytes from the first such operand, in a frame past four, takes R10 or
+  R11 holding its address instead. On aarch64 those constraints take a
+  register, loaded through X15's legalizer, and a local's address is formed
+  in a scratch register, as everywhere.
 
 ## GNU extensions: what c17 will and will not grow
 

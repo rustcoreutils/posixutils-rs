@@ -11,7 +11,7 @@
 // they feed while a declarator is built
 //
 
-use super::ast::ExprKind;
+use super::ast::{Expr, ExprKind, UnaryOp};
 use super::parser::Parser;
 use crate::diag;
 use crate::strings::StringId;
@@ -116,6 +116,25 @@ pub enum AttributeArg {
     /// An integer constant expression, already folded: `16` in `aligned(16)`,
     /// but equally `0x40`, `16UL`, an enumerator or `sizeof(long double)`
     Int(i128),
+    /// An argument that is no integer constant, as gcc's reports give it:
+    /// its spelling, its type, and whether that is an integer type (a
+    /// variable) rather than another (a string, a floating constant, an
+    /// address).
+    Other {
+        spelled: String,
+        typ: String,
+        integral: bool,
+    },
+}
+
+/// A `format` or `format_arg` attribute as written, for
+/// `Parser::check_format_uses`.
+#[derive(Debug, Clone)]
+pub struct FormatUse {
+    /// `format` or `format_arg`.
+    pub name: &'static str,
+    pub args: Vec<AttributeArg>,
+    pub pos: Position,
 }
 
 /// The largest alignment `aligned` may request: gcc's object-file maximum,
@@ -137,9 +156,17 @@ enum AttrArgs {
     General,
     /// `cleanup(fn)`: exactly one argument, the name of a function.
     Cleanup,
+    /// Expressions only, a leading name among them: `malloc(dealloc, n)`
+    /// and `copy(decl)`, whose name must be declared -- gcc reads them as
+    /// expressions and refuses an undeclared one.
+    Expressions,
     /// Strings and integer constant expressions, a name among them read as
     /// the value it names: `patchable_function_entry(N, M)`.
     Values,
+    /// `format(archetype, n, m)` and `format_arg(n)`: a leading name for
+    /// `format`, then expressions, each kept whatever it is, for the checks
+    /// against the function's parameters (`Parser::check_format_uses`).
+    Format,
     /// An attribute c17 does not recognise, whose arguments are not read.
     Unknown,
 }
@@ -158,6 +185,8 @@ impl AttrArgs {
             | "sentinel"
             | "regparm" => AttrArgs::Integers(IntArgRole::Unused),
             "cleanup" if recognised => AttrArgs::Cleanup,
+            "malloc" | "copy" if recognised => AttrArgs::Expressions,
+            "format" | "format_arg" if recognised => AttrArgs::Format,
             "patchable_function_entry" if recognised => AttrArgs::Values,
             _ if recognised => AttrArgs::General,
             _ => AttrArgs::Unknown,
@@ -360,6 +389,7 @@ impl fmt::Display for Attribute {
                     AttributeArg::Ident(s) => write!(f, "{}", s)?,
                     AttributeArg::String(s) => write!(f, "\"{}\"", s)?,
                     AttributeArg::Int(n) => write!(f, "{}", n)?,
+                    AttributeArg::Other { spelled, .. } => write!(f, "{}", spelled)?,
                 }
             }
             write!(f, ")")?;
@@ -533,6 +563,7 @@ impl AttributeList {
             saves_all_registers: target.arch == crate::target::Arch::X86_64
                 && self.has_attr("no_caller_saved_registers"),
             function_only: Vec::new(),
+            format_uses: Vec::new(),
         }
     }
 
@@ -898,6 +929,12 @@ impl Parser<'_> {
         if grammar == AttrArgs::Cleanup {
             return self.parse_cleanup_arg(first);
         }
+        if grammar == AttrArgs::Expressions {
+            return self.parse_expression_arg(name, first);
+        }
+        if grammar == AttrArgs::Format {
+            return self.parse_format_arg(name, first);
+        }
         if grammar == AttrArgs::General && first && self.at_bare_attribute_name() {
             let ident = self.get_ident_name(self.current()).ok_or(Diagnosed)?;
             self.advance();
@@ -920,6 +957,15 @@ impl Parser<'_> {
             }
         };
         if undeclared && matches!(expr.kind, ExprKind::IntLit(0)) {
+            // `patchable_function_entry` reports the argument as gcc does,
+            // after the expression parser's error.
+            if grammar == AttrArgs::Values {
+                return Ok(Some(AttributeArg::Other {
+                    spelled: "<erroneous-expression>".to_string(),
+                    typ: String::new(),
+                    integral: true,
+                }));
+            }
             return Err(Diagnosed);
         }
         if let (AttrArgs::General | AttrArgs::Values, ExprKind::StringLit(bytes)) =
@@ -933,6 +979,9 @@ impl Parser<'_> {
                 role.report(name, pos, IntArgFault::NotConstant);
                 Err(Diagnosed)
             }
+            // Kept, so the count is the arguments written, and reported as
+            // gcc reports a value that is no integer constant.
+            (None, AttrArgs::Values) => Ok(Some(self.other_arg(&expr))),
             (None, _) => Ok(None),
         }
     }
@@ -986,7 +1035,243 @@ impl Parser<'_> {
             Self::report_cleanup_arg_count(pos);
             result = Err(Diagnosed);
         }
+        if grammar == AttrArgs::Expressions {
+            self.malloc_deallocator = None;
+            if name.trim_matches('_') == "malloc" && count > 2 {
+                diag::error_args(
+                    pos,
+                    "wrong number of arguments specified for '{0}' attribute",
+                    &["malloc"],
+                );
+                result = Err(Diagnosed);
+            }
+        }
         result.map(|()| args)
+    }
+
+    /// One argument of `malloc` or `copy`: an expression, so an undeclared
+    /// name is the expression parser's error, as in gcc. `malloc`'s are
+    /// checked as gcc checks them: the first names a deallocation function
+    /// taking a pointer first, the second is the number of a pointer
+    /// parameter of it. What gcc refuses is an error that drops the
+    /// attribute; what it ignores, a `-Wattributes` warning that does too.
+    fn parse_expression_arg(
+        &mut self,
+        name: &str,
+        first: bool,
+    ) -> Result<Option<AttributeArg>, Diagnosed> {
+        let pos = self.current_pos();
+        // A builtin function, glibc's `malloc(__builtin_free, 1)`: declared
+        // by the compiler, and a keyword here, which no expression is.
+        if self.at_bare_attribute_name() {
+            let ident = self.get_ident_name(self.current()).ok_or(Diagnosed)?;
+            if ident.starts_with("__builtin_") {
+                self.advance();
+                return Ok(Some(AttributeArg::Ident(ident)));
+            }
+        }
+        let undeclared = self.at_bare_attribute_name()
+            && self
+                .current_ident()
+                .is_some_and(|id| self.symbols.lookup_id(id, Namespace::Ordinary).is_none());
+        let expr = match self.parse_assignment_expr() {
+            Ok(expr) => expr,
+            Err(e) => {
+                diag::error(e.pos, &e.message);
+                self.skip_attribute_arg();
+                return Err(Diagnosed);
+            }
+        };
+        if undeclared {
+            return Err(Diagnosed);
+        }
+        if name.trim_matches('_') != "malloc" {
+            return Ok(match &expr.kind {
+                ExprKind::Ident(sym) => Some(AttributeArg::Ident(
+                    self.str(self.symbols.get(*sym).name).to_string(),
+                )),
+                _ => None,
+            });
+        }
+        if first {
+            return self.malloc_deallocator(&expr, pos).map(Some);
+        }
+        self.malloc_dealloc_index(&expr, pos)
+    }
+
+    /// One argument of `format` or `format_arg`: the archetype's name, or
+    /// any expression, kept as an integer, a string or what else it is.
+    fn parse_format_arg(
+        &mut self,
+        name: &str,
+        first: bool,
+    ) -> Result<Option<AttributeArg>, Diagnosed> {
+        if first && name.trim_matches('_') == "format" && self.at_bare_attribute_name() {
+            let ident = self.get_ident_name(self.current()).ok_or(Diagnosed)?;
+            self.advance();
+            return Ok(Some(AttributeArg::Ident(ident)));
+        }
+        let expr = match self.parse_assignment_expr() {
+            Ok(expr) => expr,
+            Err(e) => {
+                diag::error(e.pos, &e.message);
+                self.skip_attribute_arg();
+                return Err(Diagnosed);
+            }
+        };
+        if let Some(n) = self.eval_const_expr(&expr) {
+            return Ok(Some(AttributeArg::Int(n)));
+        }
+        Ok(Some(self.other_arg(&expr)))
+    }
+
+    /// An argument `expr` that is no integer constant, as gcc reports it.
+    fn other_arg(&self, expr: &Expr) -> AttributeArg {
+        let typ = expr.typ;
+        AttributeArg::Other {
+            spelled: self.spell_attribute_expr(expr),
+            typ: typ
+                .map(|t| self.types.format_type(t, Some(self.idents)))
+                .unwrap_or_default(),
+            integral: typ.is_some_and(|t| self.types.is_integer(t)),
+        }
+    }
+
+    /// `expr` as gcc prints an attribute argument: a name, `&name`, or a
+    /// floating constant in its `%E` form, `2.0e+0`.
+    fn spell_attribute_expr(&self, expr: &Expr) -> String {
+        let name = |sym: crate::symbol::SymbolId| self.str(self.symbols.get(sym).name).to_string();
+        match &expr.kind {
+            ExprKind::Ident(sym) => name(*sym),
+            ExprKind::Unary {
+                op: UnaryOp::AddrOf,
+                operand,
+            } => match &operand.kind {
+                ExprKind::Ident(sym) => format!("&{}", name(*sym)),
+                _ => "<expression>".to_string(),
+            },
+            ExprKind::FloatLit(v) => {
+                let text = format!("{:e}", v.to_f64());
+                let (mantissa, exp) = text.split_once('e').unwrap_or((&text, "0"));
+                let mantissa = if mantissa.contains('.') {
+                    mantissa.to_string()
+                } else {
+                    format!("{mantissa}.0")
+                };
+                let exp = if exp.starts_with('-') {
+                    exp.to_string()
+                } else {
+                    format!("+{exp}")
+                };
+                format!("{mantissa}e{exp}")
+            }
+            _ => "<expression>".to_string(),
+        }
+    }
+
+    /// `malloc`'s first argument: the deallocation function, named or
+    /// taken the address of, whose first parameter is a pointer.
+    fn malloc_deallocator(
+        &mut self,
+        expr: &Expr,
+        pos: Position,
+    ) -> Result<AttributeArg, Diagnosed> {
+        let named = match &expr.kind {
+            ExprKind::Ident(sym) => Some(sym),
+            ExprKind::Unary {
+                op: UnaryOp::AddrOf,
+                operand,
+            } => match &operand.kind {
+                ExprKind::Ident(sym) => Some(sym),
+                _ => None,
+            },
+            _ => None,
+        };
+        let func = named
+            .copied()
+            .filter(|&s| self.types.kind(self.symbols.get(s).typ) == TypeKind::Function);
+        let Some(sym) = func else {
+            diag::error(
+                pos,
+                "'malloc' attribute argument 1 does not name a function",
+            );
+            return Err(Diagnosed);
+        };
+        let typ = self.symbols.get(sym).typ;
+        let first = self
+            .types
+            .get(typ)
+            .params
+            .as_ref()
+            .and_then(|p| p.first().copied());
+        if let Some(param) = first.filter(|&p| self.types.kind(p) != TypeKind::Pointer) {
+            let have = self.types.format_type(param, Some(self.idents));
+            diag::error_args(
+                pos,
+                "'malloc' attribute argument 1 must take a pointer type as its first argument; have '{0}'",
+                &[&have],
+            );
+            return Err(Diagnosed);
+        }
+        self.malloc_deallocator = Some(typ);
+        Ok(AttributeArg::Ident(
+            self.str(self.symbols.get(sym).name).to_string(),
+        ))
+    }
+
+    /// `malloc`'s second argument: which parameter of the deallocation
+    /// function, counting from 1, takes the pointer.
+    fn malloc_dealloc_index(
+        &mut self,
+        expr: &Expr,
+        pos: Position,
+    ) -> Result<Option<AttributeArg>, Diagnosed> {
+        let warn = |template: &str, args: &[&str]| {
+            diag::group_warning_args(ATTRIBUTE_WARNING, pos, template, args);
+            Err(Diagnosed)
+        };
+        let Some(dealloc) = self.malloc_deallocator.take() else {
+            return Ok(None);
+        };
+        if let ExprKind::StringLit(_) = &expr.kind {
+            let have = expr
+                .typ
+                .map(|t| self.types.format_type(t, Some(self.idents)))
+                .unwrap_or_default();
+            return warn("'malloc' attribute argument has type '{0}'", &[&have]);
+        }
+        let Some(n) = self.eval_const_expr(expr) else {
+            let spelled = match &expr.kind {
+                ExprKind::Ident(sym) => self.str(self.symbols.get(*sym).name).to_string(),
+                _ => String::new(),
+            };
+            return warn(
+                "'malloc' attribute argument value '{0}' is not an integer constant",
+                &[&spelled],
+            );
+        };
+        let params = self.types.get(dealloc).params.clone().unwrap_or_default();
+        let value = n.to_string();
+        if n == 0 {
+            return warn(
+                "'malloc' attribute argument value '{0}' does not refer to a function parameter",
+                &[&value],
+            );
+        }
+        let Some(&param) = usize::try_from(n - 1).ok().and_then(|i| params.get(i)) else {
+            return warn(
+                "'malloc' attribute argument value '{0}' exceeds the number of function parameters {1}",
+                &[&value, &params.len().to_string()],
+            );
+        };
+        if self.types.kind(param) != TypeKind::Pointer {
+            let have = self.types.format_type(param, Some(self.idents));
+            return warn(
+                "'malloc' attribute argument value '{0}' refers to parameter type '{1}'",
+                &[&value, &have],
+            );
+        }
+        Ok(Some(AttributeArg::Int(n)))
     }
 
     /// One argument of `cleanup`. Only the first is read, and it has to be a
@@ -1138,6 +1423,7 @@ impl Parser<'_> {
                 AttributeArg::Int(n) => n.to_string(),
                 AttributeArg::String(s) => format!("\"{s}\""),
                 AttributeArg::Ident(s) => s.clone(),
+                AttributeArg::Other { spelled, .. } => spelled.clone(),
             };
             diag::group_warning_args(
                 ATTRIBUTE_WARNING,
@@ -1795,6 +2081,7 @@ impl Parser<'_> {
     /// them: `noreturn`, `returns_twice` and `nothrow`, then the rest in
     /// the order written.
     pub(super) fn drop_fn_decl_attrs(&mut self, typ: TypeId) {
+        self.check_format_uses(typ);
         let pos = self.current_pos();
         let attrs = &mut self.pending_fn_attrs;
         let dropped = [
@@ -1873,6 +2160,262 @@ impl Parser<'_> {
             Self::warn_stack_protect_conflict(kept, pos);
         }
         self.pending_fn_attrs.merge(&fn_attrs);
+        for attr in &attrs.attrs {
+            let name = match attr.name.trim_matches('_') {
+                "format" => "format",
+                "format_arg" => "format_arg",
+                _ => continue,
+            };
+            self.pending_fn_attrs.format_uses.push(FormatUse {
+                name,
+                args: attr.args.clone(),
+                pos,
+            });
+        }
+    }
+
+    /// Check each pending `format` and `format_arg` attribute against the
+    /// function type `typ` -- or the one it points to -- as gcc does, and
+    /// drop them: c17 reads them for nothing else. A function without a
+    /// prototype is not checked, as gcc does not.
+    pub(super) fn check_format_uses(&mut self, typ: TypeId) {
+        let uses = std::mem::take(&mut self.pending_fn_attrs.format_uses);
+        let func = match self.types.kind(typ) {
+            TypeKind::Function => Some(typ),
+            TypeKind::Pointer => self
+                .types
+                .base_type(typ)
+                .filter(|&f| self.types.kind(f) == TypeKind::Function),
+            _ => None,
+        };
+        let Some(func) = func else { return };
+        let t = self.types.get(func).clone();
+        let Some(params) = t.params else { return };
+        for u in uses {
+            let want = if u.name == "format" { 3 } else { 1 };
+            if u.args.len() != want {
+                diag::error_args(
+                    u.pos,
+                    "wrong number of arguments specified for '{0}' attribute",
+                    &[u.name],
+                );
+                diag::note_args(
+                    u.pos,
+                    "expected {0}, found {1}",
+                    &[&want.to_string(), &u.args.len().to_string()],
+                );
+                continue;
+            }
+            if u.name == "format_arg" {
+                self.check_format_arg(&u, &params, t.base);
+            } else {
+                self.check_format(&u, &params, t.variadic);
+            }
+        }
+    }
+
+    /// Whether `typ` is a pointer to plain `char`, however qualified, as a
+    /// format string is: not `signed char` or `unsigned char`.
+    fn is_char_pointer(&self, typ: TypeId) -> bool {
+        self.types.kind(typ) == TypeKind::Pointer
+            && self.types.base_type(typ).is_some_and(|c| {
+                self.types.kind(c) == TypeKind::Char
+                    && !self
+                        .types
+                        .modifiers(c)
+                        .intersects(TypeModifiers::SIGNED | TypeModifiers::UNSIGNED)
+            })
+    }
+
+    /// The parameter `arg` (argument `argno` of `attr`, numbered as gcc
+    /// numbers them, or none for `format_arg`) names, reported in gcc's
+    /// words when it names none: `Ok(None)` for 0 where `zero` allows it.
+    fn format_position(
+        &self,
+        attr: &str,
+        argno: Option<usize>,
+        arg: &AttributeArg,
+        params: &[TypeId],
+        zero: bool,
+        pos: Position,
+    ) -> Result<Option<i128>, ()> {
+        let which = argno
+            .map(|n| format!("argument {n}"))
+            .unwrap_or_else(|| "argument".into());
+        let warn = |template: &str, value: &str| {
+            let msg = template.replace("{w}", &which);
+            diag::group_warning_args(ATTRIBUTE_WARNING, pos, &msg, &[attr, value]);
+            Err(())
+        };
+        let n = match arg {
+            AttributeArg::Int(n) => *n,
+            AttributeArg::Other {
+                spelled,
+                typ,
+                integral,
+            } => {
+                return if *integral {
+                    warn(
+                        "'{0}' attribute {w} value '{1}' is not an integer constant",
+                        spelled,
+                    )
+                } else {
+                    warn("'{0}' attribute {w} has type '{1}'", typ)
+                };
+            }
+            AttributeArg::String(s) => {
+                let typ = format!("char[{}]", s.len() + 1);
+                return warn("'{0}' attribute {w} has type '{1}'", &typ);
+            }
+            AttributeArg::Ident(s) => {
+                return warn(
+                    "'{0}' attribute {w} value '{1}' is not an integer constant",
+                    s,
+                );
+            }
+        };
+        if n == 0 {
+            return if zero {
+                Ok(None)
+            } else {
+                warn(
+                    "'{0}' attribute {w} value '{1}' does not refer to a function parameter",
+                    "0",
+                )
+            };
+        }
+        if n < 0 || n > params.len() as i128 {
+            let msg = format!(
+                "'{{0}}' attribute {which} value '{{1}}' exceeds the number of function parameters {}",
+                params.len()
+            );
+            diag::group_warning_args(ATTRIBUTE_WARNING, pos, &msg, &[attr, &n.to_string()]);
+            return Err(());
+        }
+        Ok(Some(n))
+    }
+
+    /// `format_arg(n)`: parameter `n` is a format string, and so is what the
+    /// function returns.
+    fn check_format_arg(&self, u: &FormatUse, params: &[TypeId], ret: Option<TypeId>) {
+        let Ok(Some(n)) = self.format_position(u.name, None, &u.args[0], params, false, u.pos)
+        else {
+            return;
+        };
+        let param = params[n as usize - 1];
+        if !self.is_char_pointer(param) {
+            let have = self.types.format_type(param, Some(self.idents));
+            diag::error_args(
+                u.pos,
+                "'format_arg' attribute argument value '{0}' refers to parameter type '{1}'",
+                &[&n.to_string(), &have],
+            );
+            return;
+        }
+        if !ret.is_some_and(|r| self.is_char_pointer(r)) {
+            diag::error(u.pos, "function does not return string type");
+        }
+    }
+
+    /// `format(archetype, n, m)`: parameter `n` is the format string of the
+    /// archetype's kind, and the arguments to format begin at the `...` --
+    /// parameter `m` -- or are not checked, for `m` 0.
+    fn check_format(&self, u: &FormatUse, params: &[TypeId], variadic: bool) {
+        let archetype = match &u.args[0] {
+            AttributeArg::Ident(a) => a.trim_matches('_').to_string(),
+            _ => {
+                diag::error(u.pos, "unrecognized format specifier");
+                return;
+            }
+        };
+        const KNOWN: [&str; 14] = [
+            "printf",
+            "scanf",
+            "strftime",
+            "strfmon",
+            "gnu_printf",
+            "gnu_scanf",
+            "gnu_strftime",
+            "gnu_strfmon",
+            "gcc_diag",
+            "gcc_tdiag",
+            "gcc_cdiag",
+            "gcc_cxxdiag",
+            "gcc_dump_printf",
+            "asm_fprintf",
+        ];
+        if archetype == "NSString" {
+            diag::group_warning_args(
+                "format",
+                u.pos,
+                "'{0}' is only allowed in Objective-C dialects",
+                &[&archetype],
+            );
+            return;
+        }
+        if !KNOWN.contains(&archetype.as_str()) {
+            let spelled = match &u.args[0] {
+                AttributeArg::Ident(a) => a.clone(),
+                _ => archetype.clone(),
+            };
+            diag::group_warning_args(
+                "format",
+                u.pos,
+                "'{0}' is an unrecognized format function type",
+                &[&spelled],
+            );
+            return;
+        }
+        let Ok(Some(n)) = self.format_position(u.name, Some(2), &u.args[1], params, false, u.pos)
+        else {
+            return;
+        };
+        let param = params[n as usize - 1];
+        if !self.is_char_pointer(param) {
+            let have = self.types.format_type(param, Some(self.idents));
+            diag::error_args(
+                u.pos,
+                "'format' attribute argument 2 value '{0}' refers to parameter type '{1}'",
+                &[&n.to_string(), &have],
+            );
+            return;
+        }
+        let first = match &u.args[2] {
+            AttributeArg::Int(m) if *m > 0 && (!variadic || *m <= params.len() as i128) => {
+                diag::error_args(
+                    u.pos,
+                    "'format' attribute argument 3 value '{0}' does not refer to a variable argument list",
+                    &[&m.to_string()],
+                );
+                return;
+            }
+            AttributeArg::Int(m) if *m > 0 => *m,
+            AttributeArg::Int(m) if *m < 0 => {
+                let msg = format!(
+                    "'{{0}}' attribute argument 3 value '{{1}}' exceeds the number of function parameters {}",
+                    params.len()
+                );
+                diag::group_warning_args(
+                    ATTRIBUTE_WARNING,
+                    u.pos,
+                    &msg,
+                    &["format", &m.to_string()],
+                );
+                return;
+            }
+            AttributeArg::Int(_) => 0,
+            other => {
+                let _ = self.format_position(u.name, Some(3), other, params, true, u.pos);
+                return;
+            }
+        };
+        if first != 0 && first != params.len() as i128 + 1 {
+            diag::error(u.pos, "argument to be formatted is not '...'");
+            return;
+        }
+        if first != 0 && matches!(archetype.as_str(), "strftime" | "gnu_strftime") {
+            diag::error(u.pos, "strftime formats cannot format arguments");
+        }
     }
 
     /// gcc's warning for a function given both `stack_protect` and
@@ -1896,10 +2439,14 @@ impl Parser<'_> {
 
     /// Hold the function-type attributes `attrs` names for the declarator
     /// being parsed: a calling convention, refusing a second one that
-    /// disagrees with it -- in the same list or another -- as gcc does; and
+    /// disagrees with it -- in the same list or another -- as gcc does;
     /// `nocf_check`, which only branch protection gives a meaning, gcc
-    /// warning that it is ignored otherwise.
+    /// warning that it is ignored otherwise; and aarch64's
+    /// `aarch64_vector_pcs`.
     fn merge_fn_type_attrs(&mut self, attrs: &AttributeList, pos: Position) {
+        if self.types.target().arch == crate::target::Arch::Aarch64 {
+            self.merge_vector_pcs(attrs, pos);
+        }
         if attrs.has_attr("nocf_check") {
             if self.cf_branch {
                 self.pending_fn_type.nocf_check = Some(pos);
@@ -1928,6 +2475,35 @@ impl Parser<'_> {
         }
     }
 
+    /// Hold `aarch64_vector_pcs` for the declarator being parsed, refusing
+    /// an argument as gcc does.
+    ///
+    /// The AAPCS64 vector procedure call standard differs from the base one
+    /// only in what a callee preserves: all 128 bits of v8-v23, where the
+    /// base standard preserves the low 64 bits of v8-v15 alone. Arguments
+    /// and results travel in the same registers and the same stack slots,
+    /// and a caller written for the base standard already assumes every
+    /// register the vector one lets a callee change -- v0-v7 and v24-v31 --
+    /// changed, and more besides. So a call to such a function is compiled
+    /// with the base convention and is correct, merely saving what it need
+    /// not; gcc's own calls keep values in v16-v23 across one, which c17's
+    /// do not. A *definition* is the side that would have to keep the
+    /// stronger promise, and `bind` refuses one.
+    fn merge_vector_pcs(&mut self, attrs: &AttributeList, pos: Position) {
+        let Some(attr) = attrs.find("aarch64_vector_pcs") else {
+            return;
+        };
+        if !attr.args.is_empty() {
+            diag::error_args(
+                pos,
+                "wrong number of arguments specified for '{0}' attribute",
+                &["aarch64_vector_pcs"],
+            );
+            return;
+        }
+        self.pending_fn_type.vector_pcs = Some(pos);
+    }
+
     /// Give the declared type the function-type attributes its declaration
     /// names.
     ///
@@ -1939,7 +2515,14 @@ impl Parser<'_> {
     /// so it changes nothing but is placed by the same rule.
     fn apply_pending_fn_type_attrs(&mut self, typ: TypeId) -> TypeId {
         let pending = std::mem::take(&mut self.pending_fn_type);
-        if pending.conv.is_none() && pending.nocf_check.is_none() {
+        self.apply_fn_type_attrs(pending, typ)
+    }
+
+    /// [`Self::apply_pending_fn_type_attrs`] for the attributes `pending`,
+    /// by the same placement rule: what a grouped declarator holds is
+    /// placed on the type the group is derived over.
+    pub(super) fn apply_fn_type_attrs(&mut self, pending: FnTypeAttrs, typ: TypeId) -> TypeId {
+        if pending.conv.is_none() && pending.nocf_check.is_none() && pending.vector_pcs.is_none() {
             return typ;
         }
         let func = match self.types.kind(typ) {
@@ -1959,7 +2542,8 @@ impl Parser<'_> {
                 (name, pos)
             });
             let nocf = pending.nocf_check.map(|pos| ("nocf_check", pos));
-            for (name, pos) in conv.into_iter().chain(nocf) {
+            let vpcs = pending.vector_pcs.map(|pos| ("aarch64_vector_pcs", pos));
+            for (name, pos) in conv.into_iter().chain(nocf).chain(vpcs) {
                 diag::group_warning_args(
                     ATTRIBUTE_WARNING,
                     pos,
@@ -1974,6 +2558,7 @@ impl Parser<'_> {
             changed.conv = conv;
         }
         changed.nocf_check |= pending.nocf_check.is_some();
+        changed.vector_pcs |= pending.vector_pcs.is_some();
         let changed = self.types.intern(changed);
         if func == typ {
             return changed;
@@ -2310,6 +2895,19 @@ pub(super) struct FnTypeAttrs {
     conv: Option<(crate::abi::CallingConv, Position)>,
     /// `nocf_check`, under branch protection.
     nocf_check: Option<Position>,
+    /// `aarch64_vector_pcs` (aarch64 only).
+    vector_pcs: Option<Position>,
+}
+
+impl FnTypeAttrs {
+    /// Take on `inner`'s attributes, which a group nested in this
+    /// declarator wrote, for the type this level will place them on; one
+    /// written here first is kept.
+    pub(super) fn absorb(&mut self, inner: FnTypeAttrs) {
+        self.conv = self.conv.or(inner.conv);
+        self.nocf_check = self.nocf_check.or(inner.nocf_check);
+        self.vector_pcs = self.vector_pcs.or(inner.vector_pcs);
+    }
 }
 
 /// Every slot an attribute list writes for the declaration being parsed.

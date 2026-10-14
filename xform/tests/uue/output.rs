@@ -138,3 +138,19 @@ fn uudecode_reports_write_error_on_standard_output() {
         1,
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn uuencode_write_error_on_full_device() {
+    // A failed write to standard output is "uuencode: write error: REASON",
+    // with the system's text for the error and exit status 1.
+    plib::testing::assert_write_error_message_on_full_device("uuencode", &["-"], b"x", 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn uuencode_base64_write_error_on_full_device() {
+    // A failed write to standard output is "uuencode: write error: REASON",
+    // with the system's text for the error and exit status 1.
+    plib::testing::assert_write_error_message_on_full_device("uuencode", &["-m", "-"], b"x", 1);
+}

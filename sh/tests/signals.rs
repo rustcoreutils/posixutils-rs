@@ -111,3 +111,20 @@ fn sigchld_ignored_on_entry_does_not_break_wait() {
         "1\n0\n",
     );
 }
+
+// Without job control (`set -m` off, as in every script), the commands of a
+// pipeline stay in the shell's process group and the shell never touches the
+// terminal's foreground group (XCU 2.11). The shell used to put each
+// pipeline in a group of its own and hand it the terminal, and panicked
+// when tcsetpgrp failed: DejaGnu runs binutils' tests under expect on a pty
+// that goes away, and ~40 strip/objcopy/ar tests failed that way.
+#[test]
+fn pipeline_without_job_control_stays_in_the_shell_process_group() {
+    sh_c(
+        &format!(
+            "a=$(ps -o pgid= -p $$); b=$({SH} -c 'ps -o pgid= -p $$' | cat); \
+             [ $a = $b ] && echo same || echo \"differ $a $b\""
+        ),
+        "same\n",
+    );
+}

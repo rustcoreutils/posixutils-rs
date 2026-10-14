@@ -19,8 +19,8 @@ use crate::nonempty::NonEmpty;
 use crate::os::errno::Errno;
 use crate::os::signals::{kill, Signal, SignalManager};
 use crate::os::{
-    close, dup2, dup_cloexec, exec, find_command, fork, getpgid, getpgrp, is_process_in_foreground,
-    pipe, setpgid, tcsetpgrp, waitpid, ExecError, ForkResult, OsError, OsResult, Pid, WaitStatus,
+    dup2, exec, find_command, fork, getpgid, getpgrp, is_process_in_foreground, pipe, setpgid,
+    tcsetpgrp, waitpid, ExecError, ForkResult, OsError, OsResult, Pid, WaitStatus,
 };
 use crate::parse::command::{
     Assignment, CaseItem, Command, CommandType, CompleteCommand, CompoundCommand, Conjunction,
@@ -43,7 +43,7 @@ use std::ffi::OsString;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::Read;
-use std::os::fd::{AsRawFd, IntoRawFd};
+use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::rc::Rc;
 use std::{env, io};
@@ -312,6 +312,18 @@ fn is_assignment_shaped(word: &[u8]) -> bool {
         Some(pos) => std::str::from_utf8(&word[..pos]).is_ok_and(is_valid_name),
         None => false,
     }
+}
+
+/// Puts `fd` on descriptor `target` and closes the original. A pipe end can
+/// already be `target` when the shell was started with that descriptor
+/// closed; then it is kept as it is.
+fn move_fd_to(fd: OwnedFd, target: RawFd) -> OsResult<()> {
+    if fd.as_raw_fd() == target {
+        let _ = fd.into_raw_fd();
+        return Ok(());
+    }
+    dup2(fd.as_raw_fd(), target)?;
+    Ok(())
 }
 
 impl Shell {
@@ -1168,148 +1180,13 @@ impl Shell {
                     CommandType::CompoundCommand { command, .. }
                         if !matches!(command, CompoundCommand::Subshell(_))
                 );
+        } else if self.job_control_active() {
+            pipeline_exit_status = self.run_pipeline_as_job(pipeline)?;
         } else {
-            match fork()? {
-                ForkResult::Child => {
-                    self.become_subshell();
-                    // this should never fail as both arguments are valid
-                    setpgid(0, 0).expect("failed to create new process group");
-                    let pipeline_pgid = getpgrp();
-                    // wait for the parent process to put the subshell in the foreground
-                    if let Err(err) = kill(0, Some(Signal::SigStop)) {
-                        self.eprint(&format!("sh: internal call to kill failed ({err})"));
-                        self.exit(1);
-                    }
-
-                    // Keep a copy of the real stdin: after the last command has
-                    // run, fd 0 still holds the final pipe's read end, and the
-                    // writers upstream would never see EPIPE while this process
-                    // waits for them (`yes | head` would hang forever). It is
-                    // close-on-exec so the pipeline's utilities never see it,
-                    // and an `OwnedFd` so the error paths below cannot leak it.
-                    let saved_stdin = dup_cloexec(libc::STDIN_FILENO).ok();
-                    let mut current_stdin = libc::STDIN_FILENO;
-                    let mut head_pids = Vec::new();
-                    for command in pipeline.commands.head() {
-                        let (read_pipe, write_pipe) = pipe()?;
-                        match fork()? {
-                            ForkResult::Child => {
-                                // should never fail as `pipeline_pgid` is a valid process group
-                                setpgid(0, pipeline_pgid)
-                                    .expect("failed to set process group for pipeline subcommand");
-                                drop(read_pipe);
-                                let write_stdout = write_pipe.into_raw_fd();
-                                // The first command reads the shell's own
-                                // standard input; every later one, its pipe.
-                                if current_stdin != libc::STDIN_FILENO {
-                                    self.opened_files.take_over_standard_fd(StandardFd::Stdin)?;
-                                }
-                                self.opened_files
-                                    .take_over_standard_fd(StandardFd::Stdout)?;
-                                dup2(current_stdin, libc::STDIN_FILENO)?;
-                                dup2(write_stdout, libc::STDOUT_FILENO)?;
-                                // fds 0 and 1 now hold both ends; the extra
-                                // copies must go before the command runs, or
-                                // it inherits descriptors it never asked for
-                                // (and upstream writers never see EPIPE).
-                                if current_stdin != libc::STDIN_FILENO {
-                                    close(current_stdin)?;
-                                }
-                                if write_stdout != libc::STDOUT_FILENO {
-                                    close(write_stdout)?;
-                                }
-                                self.exits_after_command = true;
-                                let return_status = self.interpret_command(command, false);
-                                self.exit(return_status);
-                            }
-                            ForkResult::Parent { child } => {
-                                head_pids.push(child);
-                                if current_stdin != libc::STDIN_FILENO {
-                                    close(current_stdin)?;
-                                }
-                                current_stdin = read_pipe.into_raw_fd();
-                            }
-                        }
-                    }
-                    self.opened_files.take_over_standard_fd(StandardFd::Stdin)?;
-                    dup2(current_stdin, libc::STDIN_FILENO)?;
-                    if current_stdin != libc::STDIN_FILENO {
-                        close(current_stdin)?;
-                    }
-                    let return_status = self.interpret_command(pipeline.commands.last(), false);
-                    // Drop the pipe's read end from fd 0 as well, so that the
-                    // upstream writers can be signalled and reaped below.
-                    if let Some(saved_stdin) = saved_stdin {
-                        dup2(saved_stdin.as_raw_fd(), libc::STDIN_FILENO)?;
-                    }
-                    // Wait for every command in the pipeline to finish (POSIX
-                    // requires it), reaping the head commands so they are not
-                    // left running as orphans (e.g. `sleep 5 | true`).
-                    let mut statuses: Vec<i32> = head_pids
-                        .into_iter()
-                        .map(|pid| self.wait_child_process(pid).unwrap_or(0))
-                        .collect();
-                    statuses.push(return_status);
-                    // With `pipefail`, the pipeline status is that of the
-                    // rightmost command that exited non-zero (else 0); otherwise
-                    // it is the status of the last command only.
-                    let exit_status = if self.set_options.pipefail {
-                        statuses
-                            .iter()
-                            .rev()
-                            .find(|&&s| s != 0)
-                            .copied()
-                            .unwrap_or(0)
-                    } else {
-                        return_status
-                    };
-                    self.exit(exit_status);
-                }
-                ForkResult::Parent { child } => {
-                    loop {
-                        // Blocking; a signal interrupts with EINTR and is
-                        // handled below rather than being polled for.
-                        match waitpid(child, false, true)? {
-                            WaitStatus::Exited { .. } => {
-                                // the only way this happened is if there was an error before going
-                                // the child went to sleep
-                                return Ok(1);
-                            }
-                            WaitStatus::Signaled { .. } => {
-                                self.eprint("sh: unsynchronised pipeline was terminated by another process\n");
-                                return Ok(1);
-                            }
-                            WaitStatus::Stopped { .. } => {
-                                if is_process_in_foreground() {
-                                    // should never fail as child is a valid process id and
-                                    // in the same session as the current shell
-                                    let child_gpid = getpgid(child)
-                                        .expect("failed to get process id of child process");
-                                    // should never fail as stdin is a valid file descriptor and
-                                    // child gpid is valid and in the same session
-                                    tcsetpgrp(io::stdin().as_raw_fd(), child_gpid)
-                                        .expect("failed to set pipeline in foreground");
-                                    kill(child, Some(Signal::SigCont))
-                                        .expect("failed to start pipeline");
-                                    pipeline_exit_status = self.wait_child_process(child)?;
-                                    // should never fail
-                                    tcsetpgrp(io::stdin().as_raw_fd(), getpgrp())
-                                        .expect("failed to reset foreground process");
-                                    break;
-                                } else {
-                                    kill(child, Some(Signal::SigCont))
-                                        .expect("failed start pipeline");
-                                    pipeline_exit_status = self.wait_child_process(child)?;
-                                    break;
-                                }
-                            }
-                            WaitStatus::StillAlive | WaitStatus::Interrupted => {
-                                self.handle_async_events();
-                            }
-                        }
-                    }
-                }
-            }
+            // XCU 2.11: without job control the commands of a pipeline
+            // run in the shell's own process group, and the terminal's
+            // foreground group is left alone.
+            pipeline_exit_status = self.run_pipeline_commands(pipeline)?;
         }
         // A `!` pipeline is always exempt from -e; so is any pipeline while
         // -e is being ignored, which is what makes the failure an ignored one
@@ -1326,6 +1203,177 @@ impl Shell {
         self.last_pipeline_exit_status = status;
         self.last_status_from_ignored_failure = status != 0 && ignored;
         Ok(status)
+    }
+
+    /// Whether this shell runs its jobs under job control: `set -m` is on
+    /// and this is not a subshell, which, as for `can_replace_process`,
+    /// runs its commands in the process group it was started in.
+    fn job_control_active(&self) -> bool {
+        self.set_options.monitor && !self.is_subshell
+    }
+
+    /// Runs a pipeline of two or more commands as one job (`set -m`): a
+    /// wrapper subshell leads a process group of its own holding every
+    /// command, and is given the terminal while it runs if the shell has it.
+    fn run_pipeline_as_job(&mut self, pipeline: &Pipeline) -> OsResult<i32> {
+        match fork()? {
+            ForkResult::Child => {
+                self.become_subshell();
+                // this should never fail as both arguments are valid
+                setpgid(0, 0).expect("failed to create new process group");
+                // wait for the parent process to put the subshell in the foreground
+                if let Err(err) = kill(0, Some(Signal::SigStop)) {
+                    self.eprint(&format!("sh: internal call to kill failed ({err})"));
+                    self.exit(1);
+                }
+                let status = match self.run_pipeline_commands(pipeline) {
+                    Ok(status) => status,
+                    Err(err) => {
+                        self.eprint(&format!("{err}\n"));
+                        1
+                    }
+                };
+                self.exit(status);
+            }
+            ForkResult::Parent { child } => loop {
+                // Blocking; a signal interrupts with EINTR and is
+                // handled below rather than being polled for.
+                match waitpid(child, false, true)? {
+                    WaitStatus::Exited { .. } => {
+                        // the only way this happened is if there was an error before going
+                        // the child went to sleep
+                        return Ok(1);
+                    }
+                    WaitStatus::Signaled { .. } => {
+                        self.eprint(
+                            "sh: unsynchronised pipeline was terminated by another process\n",
+                        );
+                        return Ok(1);
+                    }
+                    WaitStatus::Stopped { .. } => {
+                        if is_process_in_foreground() {
+                            // should never fail as child is a valid process id and
+                            // in the same session as the current shell
+                            let child_gpid =
+                                getpgid(child).expect("failed to get process id of child process");
+                            // should never fail as stdin is a valid file descriptor and
+                            // child gpid is valid and in the same session
+                            tcsetpgrp(io::stdin().as_raw_fd(), child_gpid)
+                                .expect("failed to set pipeline in foreground");
+                            kill(child, Some(Signal::SigCont)).expect("failed to start pipeline");
+                            let status = self.wait_child_process(child)?;
+                            // should never fail
+                            tcsetpgrp(io::stdin().as_raw_fd(), getpgrp())
+                                .expect("failed to reset foreground process");
+                            return Ok(status);
+                        } else {
+                            kill(child, Some(Signal::SigCont)).expect("failed start pipeline");
+                            return self.wait_child_process(child);
+                        }
+                    }
+                    WaitStatus::StillAlive | WaitStatus::Interrupted => {
+                        self.handle_async_events();
+                    }
+                }
+            },
+        }
+    }
+
+    /// Runs each command of a pipeline of two or more in a child process of
+    /// its own, every command's standard output piped to the next one's
+    /// standard input, and waits for all of them: POSIX requires the wait,
+    /// and it leaves no command running as an orphan (`sleep 5 | true`).
+    /// With `pipefail` the status is that of the rightmost command that
+    /// exited non-zero (else 0); otherwise it is the last command's.
+    fn run_pipeline_commands(&mut self, pipeline: &Pipeline) -> OsResult<i32> {
+        let mut pids = Vec::with_capacity(pipeline.commands.len());
+        let started = self.start_pipeline_commands(pipeline, &mut pids);
+        // Reap what did start even when a later pipe or fork failed.
+        let statuses: Vec<i32> = pids
+            .into_iter()
+            .map(|pid| self.wait_child_process(pid).unwrap_or(0))
+            .collect();
+        started?;
+        let last_status = statuses.last().copied().unwrap_or(0);
+        if self.set_options.pipefail {
+            Ok(statuses
+                .iter()
+                .rev()
+                .find(|&&s| s != 0)
+                .copied()
+                .unwrap_or(0))
+        } else {
+            Ok(last_status)
+        }
+    }
+
+    /// Forks one child per pipeline command, recording each in `pids`.
+    fn start_pipeline_commands(
+        &mut self,
+        pipeline: &Pipeline,
+        pids: &mut Vec<Pid>,
+    ) -> OsResult<()> {
+        let count = pipeline.commands.len();
+        // The read end of the pipe from the previous command; the first
+        // command reads the shell's own standard input.
+        let mut previous_read: Option<OwnedFd> = None;
+        for (index, command) in pipeline.commands.as_ref().iter().enumerate() {
+            let next_pipe = if index + 1 < count {
+                Some(pipe()?)
+            } else {
+                None
+            };
+            match fork()? {
+                ForkResult::Child => {
+                    self.become_subshell();
+                    let stdout = next_pipe.map(|(read, write)| {
+                        drop(read);
+                        write
+                    });
+                    let status = match self.run_pipeline_command(command, previous_read, stdout) {
+                        Ok(status) => status,
+                        Err(err) => {
+                            self.eprint(&format!("{err}\n"));
+                            1
+                        }
+                    };
+                    self.exit(status);
+                }
+                ForkResult::Parent { child } => {
+                    pids.push(child);
+                    // Replacing the previous read end closes it: only the
+                    // commands may hold the pipes, or a reader never sees
+                    // end-of-file and a writer never sees EPIPE.
+                    previous_read = next_pipe.map(|(read, write)| {
+                        drop(write);
+                        read
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// In the child for one pipeline command: puts the pipe ends on standard
+    /// input and output, then runs the command as the last thing this
+    /// process does.
+    fn run_pipeline_command(
+        &mut self,
+        command: &Command,
+        stdin: Option<OwnedFd>,
+        stdout: Option<OwnedFd>,
+    ) -> OsResult<i32> {
+        if let Some(stdin) = stdin {
+            self.opened_files.take_over_standard_fd(StandardFd::Stdin)?;
+            move_fd_to(stdin, libc::STDIN_FILENO)?;
+        }
+        if let Some(stdout) = stdout {
+            self.opened_files
+                .take_over_standard_fd(StandardFd::Stdout)?;
+            move_fd_to(stdout, libc::STDOUT_FILENO)?;
+        }
+        self.exits_after_command = true;
+        Ok(self.interpret_command(command, false))
     }
 
     fn interpret_and_or_list(
@@ -1376,10 +1424,12 @@ impl Shell {
         if conjunction.is_async {
             match fork() {
                 Ok(ForkResult::Child) => {
+                    let job_control = self.job_control_active();
                     self.become_subshell();
-                    // should never fail
-                    setpgid(0, 0).expect("failed to create process group for background job");
-                    if !self.set_options.monitor {
+                    if job_control {
+                        // should never fail
+                        setpgid(0, 0).expect("failed to create process group for background job");
+                    } else {
                         // POSIX 2.11: without job control, an asynchronous list
                         // ignores SIGINT and SIGQUIT and reads from /dev/null,
                         // so it neither competes for the terminal nor dies with

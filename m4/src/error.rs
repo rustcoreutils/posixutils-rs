@@ -93,7 +93,12 @@ impl std::fmt::Display for Error {
         if f.alternate() {
             if let Some(source) = &self.source {
                 write!(f, "\n\nSource:\n  ")?;
-                source.fmt(f)?
+                // An I/O error is shown as the system names it, without the
+                // " (os error N)" that its own Display appends.
+                match source.downcast_ref::<std::io::Error>() {
+                    Some(e) => f.write_str(&plib::diag::io_error_text(e))?,
+                    None => source.fmt(f)?,
+                }
             }
         }
 

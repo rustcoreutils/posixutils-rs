@@ -600,3 +600,18 @@ fn m4_partial_line_write_error_on_full_device() {
 fn help_write_error_on_full_device() {
     plib::testing::assert_write_error_message_on_full_device("m4", &["--help"], b"", 1);
 }
+
+/// A failed read of an input file is reported with the system's text for the
+/// error, without Rust's "(os error N)" suffix.
+#[cfg(target_os = "linux")]
+#[test]
+fn m4_read_error_names_the_system_error() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap().to_string();
+    let read_error = plib::diag::io_error_text(&std::fs::read(&path).unwrap_err());
+    let out = plib::testing::run_test_base("m4", std::slice::from_ref(&path), b"");
+    assert_ne!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(&read_error), "{stderr:?}");
+    assert!(!stderr.contains("(os error"), "{stderr:?}");
+}

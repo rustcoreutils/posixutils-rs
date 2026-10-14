@@ -61,7 +61,10 @@ impl Source {
 
         match result {
             Ok(us) => Ok(us),
-            Err(er) => Err(Box::from(format!("{source_description}: {er}"))),
+            Err(er) => Err(Box::from(format!(
+                "{source_description}: {}",
+                plib::diag::io_error_text(&er)
+            ))),
         }
     }
 }
@@ -243,8 +246,9 @@ fn open_source(
         ))),
         "" => Ok(None),
         st => {
-            let fi = File::open(st)
-                .map_err(|er| -> Box<dyn Error> { Box::from(format!("{st}: {er}")) })?;
+            let fi = File::open(st).map_err(|er| -> Box<dyn Error> {
+                Box::from(format!("{st}: {}", plib::diag::io_error_text(&er)))
+            })?;
             Ok(Some(Source::File {
                 buf_reader: BufReader::new(fi),
                 file_description: format!("File: {st}"),

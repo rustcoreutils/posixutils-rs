@@ -182,3 +182,17 @@ fn cmp_rejects_a_bad_skip() {
     assert_eq!(out.status.code(), Some(2), "{out:?}");
     assert!(out.stdout.is_empty(), "{out:?}");
 }
+
+/// An operand that cannot be opened is named with the system's text for the
+/// error, without Rust's "(os error N)" suffix.
+#[test]
+fn test_cmp_open_error_names_the_system_error() {
+    let missing = "/nonexistent/cmp-input";
+    let open_error = plib::diag::io_error_text(&std::fs::File::open(missing).unwrap_err());
+    let out = plib::testing::run_test_base("cmp", &[missing.into(), "/dev/null".into()], b"");
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("cmp: {missing}: {open_error}\n")
+    );
+}

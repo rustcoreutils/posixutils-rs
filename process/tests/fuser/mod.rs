@@ -223,3 +223,61 @@ fn fuser_write_error_message_on_full_device() {
         "{stderr:?}"
     );
 }
+
+// With no file operand fuser says so and writes its usage to standard
+// output; a failed write of that usage is "fuser: write error: REASON",
+// not a panic.
+#[cfg(target_os = "linux")]
+#[test]
+fn fuser_usage_write_error_on_full_device() {
+    use std::io::Write;
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let enospc = {
+        let mut probe = full.try_clone().unwrap();
+        plib::diag::io_error_text(&probe.write_all(b"x").unwrap_err())
+    };
+    let out = std::process::Command::new(plib::testing::get_binary_path("fuser"))
+        .env("LC_ALL", "C")
+        .stdout(full)
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert_eq!(
+        stderr,
+        format!("fuser: no process specification given\nfuser: write error: {enospc}\n")
+    );
+}
+
+// The usage written after "no process specification given" names fuser,
+// not the crate the binary was built from.
+#[test]
+fn fuser_missing_file_usage_names_fuser() {
+    let out = std::process::Command::new(plib::testing::get_binary_path("fuser"))
+        .env("LC_ALL", "C")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert_eq!(stderr, "fuser: no process specification given\n");
+    assert!(stdout.contains("Usage: fuser "), "{stdout:?}");
+}
+
+// An unknown option is reported as one, not as a missing file operand.
+#[test]
+fn fuser_unknown_option_is_not_missing_file() {
+    let out = std::process::Command::new(plib::testing::get_binary_path("fuser"))
+        .args(["-x", "file"])
+        .env("LC_ALL", "C")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("'-x'"), "{stderr:?}");
+    assert!(!stderr.contains("no process specification"), "{stderr:?}");
+}

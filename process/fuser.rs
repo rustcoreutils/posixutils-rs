@@ -1637,6 +1637,21 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// With no file operand, say so, write the usage to standard output and exit
+/// 1. A failed write of the usage is `fuser: write error: REASON`.
+fn no_process_specification() -> ! {
+    diag::error(&gettext("no process specification given"));
+    let mut stdout = io::stdout();
+    let written = Args::command()
+        .bin_name("fuser")
+        .write_help(&mut stdout)
+        .and_then(|()| stdout.flush());
+    if let Err(e) = written {
+        diag::write_error(&e);
+    }
+    std::process::exit(1);
+}
+
 fn fuser_main() -> Result<(), Box<dyn std::error::Error>> {
     let Args {
         mount,
@@ -1644,18 +1659,9 @@ fn fuser_main() -> Result<(), Box<dyn std::error::Error>> {
         user,
         file,
     } = plib::optarg::try_parse::<Args>().unwrap_or_else(|err| match err.kind() {
-        // `--help` and `--version` are a successful request for information,
-        // not an error: clap writes the text itself and the status is 0.
-        clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
-            plib::optarg::exit(err)
-        }
-        _ => {
-            let mut stdout = std::io::stdout();
-            let mut cmd = Args::command();
-            diag::error(&gettext("no process specification given"));
-            cmd.write_help(&mut stdout).unwrap();
-            std::process::exit(1);
-        }
+        clap::error::ErrorKind::MissingRequiredArgument => no_process_specification(),
+        // `--help`, `--version` and every other usage error are clap's.
+        _ => plib::optarg::exit(err),
     });
 
     #[cfg(target_os = "linux")]

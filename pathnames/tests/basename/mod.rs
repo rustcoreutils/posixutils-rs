@@ -178,3 +178,11 @@ fn basename_non_utf8_suffix() {
         expected_exit_code: 0,
     });
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn basename_write_error_on_full_device() {
+    // A failed write to standard output is "basename: write error: REASON",
+    // with the system's text for the error and exit status 1.
+    plib::testing::assert_write_error_message_on_full_device("basename", &["/a/b"], b"", 1);
+}

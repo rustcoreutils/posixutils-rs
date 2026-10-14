@@ -50,7 +50,11 @@ fn show_dirname(args: &Args) {
         .write_all(result.as_bytes())
         .and_then(|_| out.write_all(b"\n"))
     {
-        diag::error(&format!("{}: {}", gettext("write error"), e));
+        diag::error(&format!(
+            "{}: {}",
+            gettext("write error"),
+            diag::io_error_text(&e)
+        ));
     }
 }
 

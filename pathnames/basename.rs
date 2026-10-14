@@ -80,7 +80,11 @@ fn show_basename(args: &Args) {
 
     let mut out = io::stdout().lock();
     if let Err(e) = out.write_all(&result).and_then(|_| out.write_all(b"\n")) {
-        diag::error(&format!("{}: {}", gettext("write error"), e));
+        diag::error(&format!(
+            "{}: {}",
+            gettext("write error"),
+            diag::io_error_text(&e)
+        ));
     }
 }
 

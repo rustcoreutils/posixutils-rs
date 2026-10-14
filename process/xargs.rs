@@ -343,7 +343,11 @@ impl<'a> Runner<'a> {
                     ));
                     ExecResult::NotFound
                 } else {
-                    diag::error(&format!("{}: {}", util.to_string_lossy(), e));
+                    diag::error(&format!(
+                        "{}: {}",
+                        util.to_string_lossy(),
+                        plib::diag::io_error_text(&e)
+                    ));
                     ExecResult::CannotInvoke
                 };
                 self.record(result);
@@ -394,7 +398,7 @@ impl<'a> Runner<'a> {
     fn finish(&mut self, status: i32) -> i32 {
         while !self.running.is_empty() {
             if let Err(e) = self.reap_one() {
-                diag::error(&e.to_string());
+                diag::error(&plib::diag::io_error_text(&e));
                 self.running.clear();
                 self.stop.get_or_insert(1);
             }
@@ -1032,7 +1036,7 @@ fn main() {
     let status = match read_and_spawn(&args, &mut runner) {
         Ok(code) => code,
         Err(e) => {
-            diag::error(&e.to_string());
+            diag::error(&plib::diag::io_error_text(&e));
             1
         }
     };

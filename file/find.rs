@@ -217,6 +217,9 @@ enum Primary {
     /// `-delete`: GNU extension, forced by debhelper (dh_doxygen,
     /// dh_autotools-dev_restoreconfig)
     Delete,
+    /// `-quit`: GNU extension, forced by util-linux (its Debian rules test
+    /// whether a bash completion exists with `find PATH -quit`)
+    Quit,
     Exec(ExecMode),
     Ok {
         utility: String,
@@ -322,6 +325,9 @@ struct FindState {
     /// One entry per `-exec ... {} +` primary, in source order; index is the
     /// primary's stamped `id`.
     exec_batches: Vec<ExecBatch>,
+    /// `-quit` was reached: evaluate nothing more, visit no further file and
+    /// walk no further starting point
+    quit: bool,
 }
 
 impl FindState {
@@ -338,6 +344,7 @@ impl FindState {
             symlink_mode: SymlinkMode::Never,
             init_time: SystemTime::now(),
             exec_batches: Vec::new(),
+            quit: false,
         }
     }
 }
@@ -623,6 +630,7 @@ fn parse_primary(tokens: &[&OsStr], idx: &mut usize) -> Result<Expr, String> {
         "-false" => Ok(Expr::Primary(Primary::Const(false))),
         "-empty" => Ok(Expr::Primary(Primary::Empty)),
         "-executable" => Ok(Expr::Primary(Primary::Executable)),
+        "-quit" => Ok(Expr::Primary(Primary::Quit)),
         "-regex" => {
             let pattern = get_arg(tokens, idx, "-regex")?;
             let ere = emacs_regex_to_ere(pattern)?;
@@ -1136,7 +1144,8 @@ fn evaluate(expr: &Expr, ctx: &EvalContext, state: &mut FindState) -> EvalResult
         }
         Expr::And(l, r) => {
             let left_result = evaluate(l, ctx, state);
-            if !left_result.matched {
+            // `-quit` ends the evaluation too: nothing after it runs.
+            if !left_result.matched || state.quit {
                 // Short-circuit: left is false, whole AND is false
                 return left_result;
             }
@@ -1149,7 +1158,7 @@ fn evaluate(expr: &Expr, ctx: &EvalContext, state: &mut FindState) -> EvalResult
         }
         Expr::Or(l, r) => {
             let left_result = evaluate(l, ctx, state);
-            if left_result.matched {
+            if left_result.matched || state.quit {
                 // Short-circuit: left is true, whole OR is true
                 return left_result;
             }
@@ -1229,6 +1238,10 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
         Primary::Newer(ref_time) => EvalResult::new(modified(ctx.metadata) > *ref_time),
         Primary::Const(value) => EvalResult::new(*value),
         Primary::Empty => EvalResult::new(is_empty(ctx, state)),
+        Primary::Quit => {
+            state.quit = true;
+            EvalResult::new(true)
+        }
         Primary::Executable => {
             // access(2) as GNU find asks it -- real user, final symlink
             // followed -- but on the name in the directory the walk holds.
@@ -1495,6 +1508,11 @@ impl Walk<'_> {
     /// ftw's `file_handler`: act on `entry` now unless -depth puts it after
     /// its contents, and say whether to descend into it.
     fn enter(&mut self, entry: &ftw::Entry) -> bool {
+        // After `-quit` the walk winds down: ftw finishes the directories it
+        // has open, but nothing more is acted on or descended into.
+        if self.state.quit {
+            return false;
+        }
         let path = entry.path().as_inner().to_path_buf();
         let depth = self.depth_of(&path);
         // Normally a no-op: `leave` pops each level. ftw skips `leave` for a
@@ -1560,7 +1578,7 @@ impl Walk<'_> {
         let path = entry.path().as_inner().to_path_buf();
         let depth = self.depth_of(&path);
         self.ancestors.truncate(depth);
-        if self.state.depth_first {
+        if self.state.depth_first && !self.state.quit {
             if let Some(md) = entry.metadata() {
                 self.visit(entry, &path, md, depth);
             }
@@ -1596,6 +1614,10 @@ impl Walk<'_> {
 
     /// ftw's `err_reporter`.
     fn report(&mut self, entry: &ftw::Entry, error: ftw::Error) {
+        // A file met while the walk winds down after `-quit` was not visited.
+        if self.state.quit {
+            return;
+        }
         let path = entry.path();
         let kind = error.kind();
         let text = plib::diag::io_error_text(&error.inner());
@@ -1758,10 +1780,13 @@ fn find(args: Vec<OsString>) -> Result<i32, String> {
     register_exec_batches(&mut expr, &mut state.exec_batches);
 
     for path in paths {
+        if state.quit {
+            break;
+        }
         walk_operand(&path, &expr, &mut state);
     }
 
-    // Execute any pending batched commands
+    // Execute any pending batched commands, also after `-quit`, as GNU find does
     execute_batches(&mut state);
 
     // A final partial line (`-print0`, `-printf` without `\n`) is still in the

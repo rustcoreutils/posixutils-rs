@@ -11,6 +11,7 @@ mod bytes;
 mod debhelper;
 mod debian_perl;
 mod newermt;
+mod quit;
 mod race;
 
 use std::fs::{remove_file, File};

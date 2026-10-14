@@ -565,6 +565,11 @@ table is present.
    bracket terms are an error.  No `-regextype` or `-iregex`.  Forced by
    debhelper (`dh_md5sums`, `dh_fixperms`, and the `-X` exclusions of every
    dh_* tool).
+ * `-quit` — always true, and find stops there: nothing after it in the
+   expression runs, no further file or starting point is visited, and the
+   exit status is what it is so far.  Pending `-exec ... {} +` sets are still
+   run.  Forced by util-linux, whose Debian rules install a bash completion
+   only if `find "debian/tmp/$BCNAME" -quit` succeeds.
 
 ### gettext / ngettext
 

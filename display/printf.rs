@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+use gettextrs::gettext;
 use plib::diag;
 use plib::printf::{printf, split_operands, usage, USAGE_STATUS};
 use std::{io, process::ExitCode};
@@ -30,7 +31,16 @@ fn main() -> ExitCode {
                     }
                 }
                 Err(er) => {
-                    diag::error(&er.to_string());
+                    // An `io::Error` can only have come from writing the
+                    // output; anything else is the format's own error.
+                    match er.downcast_ref::<io::Error>() {
+                        Some(e) => diag::error(&format!(
+                            "{}: {}",
+                            gettext("write error"),
+                            diag::io_error_text(e)
+                        )),
+                        None => diag::error(&er.to_string()),
+                    }
                     ExitCode::FAILURE
                 }
             }

@@ -8,8 +8,6 @@
 //
 
 use plib::testing::{get_binary_path, run_test, run_test_u8, TestPlan, TestPlanU8};
-use std::fs::File;
-use std::path::Path;
 use std::process::Command;
 
 fn echo_test(args: &[&str], expected_output: &str) {
@@ -241,35 +239,13 @@ fn test_echo_non_utf8_operand_mixed() {
     assert_eq!(output.stdout, b"a\xffb \tc\xfe".to_vec());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn test_echo_write_error_exit_status() {
     // Audit #E2: a failed write must be diagnosed and must not exit 0, even
-    // when the output does not end in a <newline> (the buffered case).
-    if !Path::new("/dev/full").exists() {
-        return;
-    }
-
+    // when the output does not end in a <newline> (the buffered case). The
+    // message is the shell built-in's, with the system's text for the error.
     for args in [&["hello"][..], &["-n", "hello"][..]] {
-        let devfull = File::options()
-            .write(true)
-            .open("/dev/full")
-            .expect("failed to open /dev/full");
-
-        let output = Command::new(get_binary_path("echo"))
-            .args(args)
-            .stdout(devfull)
-            .output()
-            .expect("failed to run echo");
-
-        assert_eq!(
-            output.status.code(),
-            Some(1),
-            "echo {args:?} > /dev/full should exit 1"
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.starts_with("echo: "),
-            "diagnostic should be prefixed with the utility name, got {stderr:?}"
-        );
+        plib::testing::assert_write_error_message_on_full_device("echo", args, b"", 1);
     }
 }

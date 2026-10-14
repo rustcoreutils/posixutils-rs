@@ -24,7 +24,11 @@ fn main() -> ExitCode {
 
     let mut stdout = io::stdout().lock();
     if let Err(e) = stdout.write_all(&echo_bytes).and_then(|()| stdout.flush()) {
-        diag::error(&format!("{}: {e}", gettext("write error")));
+        diag::error(&format!(
+            "{}: {}",
+            gettext("write error"),
+            diag::io_error_text(&e)
+        ));
         return ExitCode::FAILURE;
     }
 

@@ -8,8 +8,6 @@
 //
 
 use plib::testing::{get_binary_path, run_test, TestPlan};
-use std::fs::File;
-use std::path::Path;
 use std::process::Command;
 
 fn printf_test(args: &[&str], expected_out: &str) {
@@ -937,36 +935,14 @@ fn test_audit_p16_diagnostics_are_prefixed() {
     assert!(output.stderr.ends_with(b"\n"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn test_audit_p5_write_error_exit_status() {
     // #P5: a failed write must be diagnosed and must not exit 0, even when
-    // the output does not end in a <newline> (the buffered case).
-    if !Path::new("/dev/full").exists() {
-        return;
-    }
-
+    // the output does not end in a <newline> (the buffered case). The
+    // message is the shell built-in's, with the system's text for the error.
     for args in [&["hello\\n"][..], &["hello"][..], &["%s", "hello"][..]] {
-        let devfull = File::options()
-            .write(true)
-            .open("/dev/full")
-            .expect("failed to open /dev/full");
-
-        let output = Command::new(get_binary_path("printf"))
-            .args(args)
-            .stdout(devfull)
-            .output()
-            .expect("failed to run printf");
-
-        assert_eq!(
-            output.status.code(),
-            Some(1),
-            "printf {args:?} > /dev/full should exit 1"
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.starts_with("printf: "),
-            "diagnostic should be prefixed with the utility name, got {stderr:?}"
-        );
+        plib::testing::assert_write_error_message_on_full_device("printf", args, b"", 1);
     }
 }
 

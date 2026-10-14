@@ -661,9 +661,61 @@ pub fn assert_epipe_when_sigpipe_ignored(cmd: &str, args: &[&str], status: i32) 
 /// buffer is flushed at exit, where the runtime discards the error. Hosts
 /// without `/dev/full` (macOS) skip the check.
 pub fn assert_write_error_on_full_device(cmd: &str, args: &[&str], stdin: &[u8], status: i32) {
-    let Ok(full) = std::fs::OpenOptions::new().write(true).open("/dev/full") else {
+    let Some((code, stderr, enospc)) = run_on_full_device(cmd, args, stdin) else {
         return;
     };
+    assert_eq!(
+        code,
+        Some(status),
+        "{cmd} {args:?} >/dev/full: wrong exit status; stderr {stderr:?}"
+    );
+    assert!(
+        stderr.contains(&enospc) && !stderr.contains("panicked"),
+        "{cmd} {args:?} >/dev/full: expected a write-error diagnostic, got {stderr:?}"
+    );
+}
+
+/// Assert that a utility whose standard output is `/dev/full` exits with
+/// `status` and says exactly `CMD: write error: REASON` on standard error,
+/// where `REASON` is the system's text for `ENOSPC` -- the diagnostic every
+/// utility gives for a failed write to standard output, with no
+/// `(os error 28)` from Rust's formatting of the error.
+///
+/// The same input advice as [`assert_write_error_on_full_device`] applies.
+/// Hosts without `/dev/full` (macOS) skip the check.
+pub fn assert_write_error_message_on_full_device(
+    cmd: &str,
+    args: &[&str],
+    stdin: &[u8],
+    status: i32,
+) {
+    let Some((code, stderr, enospc)) = run_on_full_device(cmd, args, stdin) else {
+        return;
+    };
+    assert_eq!(
+        code,
+        Some(status),
+        "{cmd} {args:?} >/dev/full: wrong exit status; stderr {stderr:?}"
+    );
+    assert_eq!(
+        stderr,
+        format!("{cmd}: write error: {enospc}\n"),
+        "{cmd} {args:?} >/dev/full: wrong diagnostic"
+    );
+}
+
+/// Run `cmd` with `stdin` as its input and `/dev/full` as its standard
+/// output. Returns its exit code, its standard error and the system's text
+/// for `ENOSPC`, or `None` on a host without `/dev/full`.
+fn run_on_full_device(
+    cmd: &str,
+    args: &[&str],
+    stdin: &[u8],
+) -> Option<(Option<i32>, String, String)> {
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .ok()?;
     let enospc = {
         let mut probe = full.try_clone().expect("dup /dev/full");
         crate::diag::io_error_text(&probe.write_all(b"x").unwrap_err())
@@ -680,17 +732,8 @@ pub fn assert_write_error_on_full_device(cmd: &str, args: &[&str], stdin: &[u8],
     input.write_all(stdin).expect("write stdin");
     drop(input);
     let out = child.wait_with_output().expect("wait");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-
-    assert_eq!(
-        out.status.code(),
-        Some(status),
-        "{cmd} {args:?} >/dev/full: wrong exit status; stderr {stderr:?}"
-    );
-    assert!(
-        stderr.contains(&enospc) && !stderr.contains("panicked"),
-        "{cmd} {args:?} >/dev/full: expected a write-error diagnostic, got {stderr:?}"
-    );
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    Some((out.status.code(), stderr, enospc))
 }
 
 /// A file a test wrote, alone in a temporary directory of its own.

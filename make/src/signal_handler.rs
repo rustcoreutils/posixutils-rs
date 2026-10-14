@@ -66,7 +66,11 @@ fn delete_if_partial(info: &InterruptInfo) {
         info.target
     );
     if let Err(err) = remove_file(&info.target) {
-        eprintln!("{}: {}", gettext("Error deleting file"), err);
+        eprintln!(
+            "{}: {}",
+            gettext("Error deleting file"),
+            plib::diag::io_error_text(&err)
+        );
     }
 }
 

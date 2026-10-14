@@ -327,7 +327,7 @@ fn f_shell(command: &str) -> Result<String, String> {
     let output = std::process::Command::new("sh")
         .args(["-c", command])
         .output()
-        .map_err(|e| format!("shell: {e}"))?;
+        .map_err(|e| format!("shell: {}", plib::diag::io_error_text(&e)))?;
     let text = String::from_utf8_lossy(&output.stdout);
     // Same convention as the `!=` operator: trailing newline dropped, the rest
     // turned into spaces.

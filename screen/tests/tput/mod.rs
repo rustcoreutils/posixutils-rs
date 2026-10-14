@@ -326,6 +326,32 @@ fn test_tput_unreadable_reset_file_still_falls_back() {
     );
 }
 
+// A padding specification `$<N>` is a delay for tputs(3) to provide, not
+// text: like ncurses' tput, write none of it. Text that only resembles one
+// is ordinary output.
+#[test]
+fn test_tput_padding_is_not_output() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let ti = dir.path().join("terminfo");
+    write_terminfo(
+        &ti,
+        "synthpad",
+        &[(cap::CLEAR_SCREEN, "A$<50>B$<5*>C$<5/>D$<2.5*/>E$<x>F$G$<>H")],
+    );
+    let (code, stdout, stderr) = run_tput_with_terminfo(&ti, &["-T", "synthpad", "clear"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&stdout), "ABCDE$<x>F$G$<>H");
+}
+
+// vt100's clear is `\E[H\E[J$<50>`; ncurses' `tput -T vt100 clear` writes
+// the six bytes of the two escape sequences.
+#[test]
+fn test_tput_clear_vt100_has_no_padding_text() {
+    let (exit_code, stdout, stderr) = run_tput(&["-T", "vt100", "clear"]);
+    assert_eq!(exit_code, 0, "{stderr}");
+    assert_eq!(stdout, "\x1b[H\x1b[J");
+}
+
 // XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
 // below used to have the word after it refused as an unknown option.
 #[test]

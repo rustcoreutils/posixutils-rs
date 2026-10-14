@@ -55,12 +55,60 @@ fn run_cap_prog(path_bytes: &[u8]) {
     let _ = std::process::Command::new(path).status();
 }
 
+/// The length of the terminfo padding specification at the start of `s`,
+/// if there is one: `$<`, a delay in milliseconds that begins with a digit
+/// or `.` (digits, then optionally `.` and more digits), any number of `*`
+/// (proportional to the lines affected) and `/` (mandatory) flags, and `>`.
+fn padding_len(s: &[u8]) -> Option<usize> {
+    let rest = s.strip_prefix(b"$<")?;
+    if !matches!(rest.first(), Some(b'0'..=b'9' | b'.')) {
+        return None;
+    }
+    let mut i = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    if rest.get(i) == Some(&b'.') {
+        i += 1;
+        i += rest[i..].iter().take_while(|b| b.is_ascii_digit()).count();
+    }
+    i += rest[i..]
+        .iter()
+        .take_while(|&&b| b == b'*' || b == b'/')
+        .count();
+    (rest.get(i) == Some(&b'>')).then_some(2 + i + 1)
+}
+
+/// Remove the padding specifications from an expanded capability.
+///
+/// Padding is a delay the terminal needs, which tputs(3) provides by sending
+/// pad characters at the line's speed, or by waiting, never as the text of
+/// the specification. tput's output is commonly captured or redirected, where
+/// there is no line speed to pad for, so like ncurses' tput it writes none.
+/// Text that only looks like the start of one is ordinary output.
+fn strip_padding(expanded: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(expanded.len());
+    let mut i = 0;
+    while i < expanded.len() {
+        match padding_len(&expanded[i..]) {
+            Some(len) => i += len,
+            None => {
+                out.push(expanded[i]);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Write an expanded capability to standard output, without its padding.
+fn put(expanded: Vec<u8>) -> io::Result<()> {
+    io::stdout().write_all(&strip_padding(&expanded))
+}
+
 fn tput_init(info: &Database) -> terminfo::Result<()> {
     if let Some(cap) = info.get::<cap::Init1String>() {
-        cap.expand().to(io::stdout())?;
+        put(cap.expand().to_vec()?)?;
     }
     if let Some(cap) = info.get::<cap::Init2String>() {
-        cap.expand().to(io::stdout())?;
+        put(cap.expand().to_vec()?)?;
     }
     if let Some(cap) = info.get::<cap::InitFile>() {
         emit_cap_file(cap.as_ref());
@@ -70,7 +118,7 @@ fn tput_init(info: &Database) -> terminfo::Result<()> {
         run_cap_prog(cap.as_ref());
     }
     if let Some(cap) = info.get::<cap::Init3String>() {
-        cap.expand().to(io::stdout())?;
+        put(cap.expand().to_vec()?)?;
     }
 
     Ok(())
@@ -79,11 +127,11 @@ fn tput_init(info: &Database) -> terminfo::Result<()> {
 fn tput_reset(info: &Database) -> terminfo::Result<()> {
     let mut emitted = false;
     if let Some(cap) = info.get::<cap::Reset1String>() {
-        cap.expand().to(io::stdout())?;
+        put(cap.expand().to_vec()?)?;
         emitted = true;
     }
     if let Some(cap) = info.get::<cap::Reset2String>() {
-        cap.expand().to(io::stdout())?;
+        put(cap.expand().to_vec()?)?;
         emitted = true;
     }
     if let Some(cap) = info.get::<cap::ResetFile>() {
@@ -92,7 +140,7 @@ fn tput_reset(info: &Database) -> terminfo::Result<()> {
         emitted |= emit_cap_file(cap.as_ref());
     }
     if let Some(cap) = info.get::<cap::Reset3String>() {
-        cap.expand().to(io::stdout())?;
+        put(cap.expand().to_vec()?)?;
         emitted = true;
     }
 
@@ -107,7 +155,7 @@ fn tput_reset(info: &Database) -> terminfo::Result<()> {
 
 fn tput_clear(info: &Database) -> terminfo::Result<()> {
     if let Some(clear) = info.get::<cap::ClearScreen>() {
-        clear.expand().to(io::stdout())?;
+        put(clear.expand().to_vec()?)?;
     }
 
     Ok(())

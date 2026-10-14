@@ -27,6 +27,45 @@ use std::io;
 use std::io::{BufRead, IsTerminal, Read, Write};
 use std::os::fd::AsRawFd;
 
+/// `eprint!` that ignores a failed write. The std macros panic when the
+/// write fails (stderr on a full disk, a closed pipe with SIGPIPE ignored),
+/// and a shell must not die because it could not report something.
+macro_rules! stderr_print {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = std::io::stderr().write_fmt(format_args!($($arg)*));
+    }};
+}
+
+/// `eprintln!` that ignores a failed write; see `stderr_print!`.
+macro_rules! stderr_println {
+    () => {
+        stderr_print!("\n")
+    };
+    ($($arg:tt)*) => {
+        // One write, so the line is not split from its newline.
+        stderr_print!("{}\n", format_args!($($arg)*))
+    };
+}
+
+/// `print!` that ignores a failed write; see `stderr_print!`.
+macro_rules! stdout_print {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = std::io::stdout().write_fmt(format_args!($($arg)*));
+    }};
+}
+
+/// `println!` that ignores a failed write; see `stderr_print!`.
+macro_rules! stdout_println {
+    () => {
+        stdout_print!("\n")
+    };
+    ($($arg:tt)*) => {
+        stdout_print!("{}\n", format_args!($($arg)*))
+    };
+}
+
 mod builtin;
 mod cli;
 mod jobs;
@@ -83,9 +122,10 @@ fn execute_string(string: &[u8], shell: &mut Shell, is_command_string: bool) {
     match result {
         Ok(_) => {}
         Err(syntax_err) => {
-            eprintln!(
+            stderr_println!(
                 "sh({}): syntax error: {}",
-                syntax_err.lineno, syntax_err.message
+                syntax_err.lineno,
+                syntax_err.message
             );
             // both bash and sh use 2 as the exit code for a syntax error
             std::process::exit(2);
@@ -96,7 +136,7 @@ fn execute_string(string: &[u8], shell: &mut Shell, is_command_string: bool) {
 /// Writes any pending mail notifications to stderr before a prompt.
 fn report_mail(shell: &mut Shell) {
     for message in shell.check_mail() {
-        eprintln!("{message}");
+        stderr_println!("{message}");
     }
 }
 
@@ -131,7 +171,7 @@ fn standard_repl(shell: &mut Shell) {
     clear_line();
     flush_terminal();
     report_mail(shell);
-    eprint!("{}", shell.get_ps1());
+    stderr_print!("{}", shell.get_ps1());
     loop {
         while let Some(c) = read_nonblocking_char() {
             match c {
@@ -163,7 +203,7 @@ fn standard_repl(shell: &mut Shell) {
                         }
                         Err(syntax_err) => {
                             if !syntax_err.could_be_resolved_with_more_input {
-                                eprintln!("sh: syntax error: {}", syntax_err.message);
+                                stderr_println!("sh: syntax error: {}", syntax_err.message);
                                 program_buffer.clear();
                                 print_ps2 = false;
                             } else {
@@ -195,7 +235,7 @@ fn standard_repl(shell: &mut Shell) {
             line_buffer.clear();
             let _ = writeln!(io::stderr());
             report_mail(shell);
-            eprint!("{}", shell.get_ps1());
+            stderr_print!("{}", shell.get_ps1());
         }
         if shell.set_options.vi {
             return;
@@ -210,7 +250,7 @@ fn vi_repl(shell: &mut Shell) {
     clear_line();
     flush_terminal();
     report_mail(shell);
-    eprint!("{}", shell.get_ps1());
+    stderr_print!("{}", shell.get_ps1());
     loop {
         while let Some(c) = read_nonblocking_char() {
             match editor.process_new_input(c, shell) {
@@ -231,7 +271,7 @@ fn vi_repl(shell: &mut Shell) {
                         }
                         Err(syntax_err) => {
                             if !syntax_err.could_be_resolved_with_more_input {
-                                eprintln!("sh: syntax error: {}", syntax_err.message);
+                                stderr_println!("sh: syntax error: {}", syntax_err.message);
                                 program_buffer.clear();
                             } else {
                                 print_ps2 = true;
@@ -246,7 +286,7 @@ fn vi_repl(shell: &mut Shell) {
                 }
                 Ok(Action::None) => {}
                 Err(_) => {
-                    print!("\x07");
+                    stdout_print!("\x07");
                 }
             }
             let mut cursor_position = editor.cursor_position();
@@ -266,7 +306,7 @@ fn vi_repl(shell: &mut Shell) {
             editor.reset_current_line();
             let _ = writeln!(io::stderr());
             report_mail(shell);
-            eprint!("{}", shell.get_ps1());
+            stderr_print!("{}", shell.get_ps1());
         }
         if !shell.set_options.vi {
             return;
@@ -284,9 +324,9 @@ fn non_terminal_repl(shell: &mut Shell) -> ! {
     loop {
         report_mail(shell);
         if program_buffer.is_empty() {
-            eprint!("{}", shell.get_ps1());
+            stderr_print!("{}", shell.get_ps1());
         } else {
-            eprint!("{}", shell.get_ps2());
+            stderr_print!("{}", shell.get_ps2());
         }
         let mut line = String::new();
         match io::stdin().read_line(&mut line) {
@@ -300,9 +340,10 @@ fn non_terminal_repl(shell: &mut Shell) -> ! {
             Ok(_) => program_buffer.clear(),
             Err(syntax_err) => {
                 if !syntax_err.could_be_resolved_with_more_input {
-                    eprintln!(
+                    stderr_println!(
                         "sh({}): syntax error: {}",
-                        syntax_err.lineno, syntax_err.message
+                        syntax_err.lineno,
+                        syntax_err.message
                     );
                     program_buffer.clear();
                 }
@@ -333,7 +374,7 @@ fn interactive_shell(shell: &mut Shell) {
         if ids_match {
             if let Ok(contents) = std::fs::read_to_string(&env_file) {
                 if let Err(err) = shell.execute_program(contents.as_bytes()) {
-                    eprintln!("sh: {env_file}: {}", err.message);
+                    stderr_println!("sh: {env_file}: {}", err.message);
                 }
             }
         }
@@ -361,7 +402,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     ) {
         Ok(args) => args,
         Err(err) => {
-            eprintln!("{err}");
+            stderr_println!("{err}");
             std::process::exit(1);
         }
     };
@@ -397,9 +438,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                     Err(syntax_err) => {
                         if !syntax_err.could_be_resolved_with_more_input {
-                            eprintln!(
+                            stderr_println!(
                                 "sh({}): syntax error: {}",
-                                syntax_err.lineno, syntax_err.message
+                                syntax_err.lineno,
+                                syntax_err.message
                             );
                             std::process::exit(2);
                         }
@@ -408,9 +450,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             if let Some(syntax_err) = incomplete {
-                eprintln!(
+                stderr_println!(
                     "sh({}): syntax error: {}",
-                    syntax_err.lineno, syntax_err.message
+                    syntax_err.lineno,
+                    syntax_err.message
                 );
                 std::process::exit(2);
             }
@@ -422,7 +465,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             ExecutionMode::ReadFromFile(file) => match read_command_file(&file) {
                 Ok(file_contents) => execute_string(&file_contents, &mut shell, false),
                 Err((err, status)) => {
-                    eprintln!(
+                    stderr_println!(
                         "sh: {}: {}",
                         file.display(),
                         plib::diag::io_error_text(&err)

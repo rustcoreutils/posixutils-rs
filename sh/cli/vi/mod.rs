@@ -412,9 +412,9 @@ impl ViEditor {
                     if expansions.is_empty() {
                         return Err(CommandError);
                     }
-                    println!();
+                    stdout_println!();
                     for (i, e) in expansions.into_iter().enumerate() {
-                        println!(
+                        stdout_println!(
                             "{i}) {}",
                             add_terminating_slash_if_directory(e.display().to_string())
                         );

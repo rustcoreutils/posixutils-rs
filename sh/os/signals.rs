@@ -341,7 +341,7 @@ fn get_pending_signal() -> Option<Signal> {
                 Err(err) if err.errno == Errno::EINTR => {}
                 Err(err) if err.errno == Errno::EAGAIN => break,
                 Err(err) => {
-                    eprintln!("{err}");
+                    stderr_println!("{err}");
                     break;
                 }
             }

@@ -277,3 +277,30 @@ fn exec_failure_with_an_unnamed_errno_is_reported() {
     assert!(output.status.success());
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+// A diagnostic that cannot be written (stderr on a full device) is lost,
+// but the shell goes on as if it had been written: a syntax error still
+// exits 2 and a bad trap action does not stop the script, as in bash. The
+// std print macros panicked instead (status 101).
+#[cfg(target_os = "linux")]
+#[test]
+fn unwritable_diagnostics_do_not_panic() {
+    use std::process::{Command, Stdio};
+
+    let run = |script: &str| {
+        let full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        Command::new(env!("CARGO_BIN_EXE_sh"))
+            .args(["-c", script])
+            .stderr(Stdio::from(full))
+            .output()
+            .unwrap()
+    };
+    let syntax = run("if");
+    assert_eq!(syntax.status.code(), Some(2));
+    let trap = run("trap 'if' USR1; kill -USR1 $$; /bin/true; echo ok");
+    assert_eq!(String::from_utf8_lossy(&trap.stdout), "ok\n");
+    assert_eq!(trap.status.code(), Some(0));
+}

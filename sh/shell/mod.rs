@@ -459,7 +459,7 @@ impl Shell {
             let last_pipeline_exit_status_before_trap = self.last_pipeline_exit_status;
             let ignored_before_trap = self.last_status_from_ignored_failure;
             if let Err(err) = self.run_program(commands.as_bytes(), false, false) {
-                eprintln!("sh: error parsing action: {}", err.message);
+                stderr_println!("sh: error parsing action: {}", err.message);
             }
             self.last_pipeline_exit_status = last_pipeline_exit_status_before_trap;
             self.last_status_from_ignored_failure = ignored_before_trap;
@@ -1655,7 +1655,7 @@ impl Shell {
             None => match env::current_dir() {
                 Ok(path) => path.into_os_string(),
                 Err(err) => {
-                    eprintln!(
+                    stderr_println!(
                         "sh: failed to determine the current working directory ({})",
                         err
                     );
@@ -1745,7 +1745,7 @@ impl Shell {
                 }
             },
             Err(err) => {
-                eprintln!("sh: error parsing contents of {var}: {}", err.message);
+                stderr_println!("sh: error parsing contents of {var}: {}", err.message);
                 if !self.is_interactive {
                     self.exit(1)
                 }

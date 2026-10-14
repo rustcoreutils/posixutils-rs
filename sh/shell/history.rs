@@ -181,7 +181,7 @@ fn read_history_from_file(path: &Path, max_entries: u32) -> History {
         }
         Err(err) if err.kind() == ErrorKind::NotFound => {}
         Err(err) => {
-            eprintln!(
+            stderr_println!(
                 "sh: failed to open history file at {}, details: {err}",
                 path.to_string_lossy()
             );
@@ -196,7 +196,7 @@ pub fn write_history_to_file(history: &History, env: &Environment) {
     } else if let Some(home) = env.get_str_value("HOME") {
         format!("{home}/.sh_history")
     } else {
-        eprintln!("sh: HISTFILE or HOME not set, history not saved");
+        stderr_println!("sh: HISTFILE or HOME not set, history not saved");
         return;
     };
     let mut content = String::new();
@@ -205,14 +205,14 @@ pub fn write_history_to_file(history: &History, env: &Environment) {
         content.push('\n');
     }
     if let Err(err) = std::fs::write(&path, content) {
-        eprintln!("sh: failed to open history file at {} ({err})", path);
+        stderr_println!("sh: failed to open history file at {} ({err})", path);
     }
 }
 
 pub fn initialize_history_from_system(env: &Environment) -> History {
     let histsize = if let Some(histsize) = env.get_str_value("HISTSIZE") {
         histsize.parse().unwrap_or_else(|_| {
-            eprintln!("sh: invalid HISTSIZE value, using default value 32767");
+            stderr_println!("sh: invalid HISTSIZE value, using default value 32767");
             32767
         })
     } else {

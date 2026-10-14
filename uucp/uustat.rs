@@ -78,7 +78,12 @@ fn main() -> ExitCode {
                 }
 
                 if let Err(e) = job.delete() {
-                    eprintln!("uustat: {} {}: {}", gettext("failed to delete job"), jid, e);
+                    eprintln!(
+                        "uustat: {} {}: {}",
+                        gettext("failed to delete job"),
+                        jid,
+                        plib::diag::io_error_text(&e)
+                    );
                     return ExitCode::from(1);
                 }
             }

@@ -439,3 +439,23 @@ fn test_uucp_remote_to_remote_ignores_a_planted_temp_name() {
 fn option_argument_may_begin_with_hyphen() {
     plib::testing::assert_hyphen_option_argument("uucp", &["-n", "-zq", "--help"]);
 }
+
+/// A local copy that fails is reported with the system's text for the
+/// error, without Rust's "(os error N)" suffix.
+#[test]
+fn uucp_local_copy_failure_names_the_system_error() {
+    let missing = "/nonexistent/uucp-source";
+    let open_error = plib::diag::io_error_text(&std::fs::File::open(missing).unwrap_err());
+    let dir = plib::tmp::tempdir().unwrap();
+    let dest = dir.path().join("dest");
+    let out = plib::testing::run_test_base(
+        "uucp",
+        &[missing.into(), dest.to_str().unwrap().into()],
+        b"",
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("uucp: {open_error}\n")
+    );
+}

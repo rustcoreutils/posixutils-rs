@@ -275,7 +275,12 @@ struct WorkDir {
 
 impl WorkDir {
     fn create(exec_host: &str, exec_local: bool) -> Result<WorkDir, String> {
-        let fail = |e: io::Error| format!("failed to create work dir: {}", e);
+        let fail = |e: io::Error| {
+            format!(
+                "failed to create work dir: {}",
+                plib::diag::io_error_text(&e)
+            )
+        };
         let local = private_temp_dir("uux.").map_err(fail)?;
         let local_path = path_text(local.path()).map_err(fail)?;
         let remote = if exec_local {
@@ -326,8 +331,8 @@ impl RemoteDir {
         let script = format!(
             "d={dir} && mkdir -m 700 \"$d\" && printf '\\n%s\\n%s' {REMOTE_DIR_SENTINEL} \"$d\""
         );
-        let (code, stdout, stderr) =
-            ssh_exec(host, &script, None).map_err(|e| format!("ssh failed: {}", e))?;
+        let (code, stdout, stderr) = ssh_exec(host, &script, None)
+            .map_err(|e| format!("ssh failed: {}", plib::diag::io_error_text(&e)))?;
         let fail = || {
             format!(
                 "failed to create remote work dir: {}",
@@ -400,7 +405,13 @@ fn fetch_inputs(parsed: &ParsedCommand, work: &WorkDir, exec_local: bool) -> Res
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or(file.path.clone());
-        let fetch_err = |e: io::Error| format!("failed to fetch {}: {}", file.path, e);
+        let fetch_err = |e: io::Error| {
+            format!(
+                "failed to fetch {}: {}",
+                file.path,
+                plib::diag::io_error_text(&e)
+            )
+        };
 
         if exec_local {
             // Fetch from remote to local work dir
@@ -417,7 +428,12 @@ fn fetch_inputs(parsed: &ParsedCommand, work: &WorkDir, exec_local: bool) -> Res
                 &work.exec_file(&basename),
                 false,
             )
-            .map_err(|e| format!("failed to send to exec host: {}", e))?;
+            .map_err(|e| {
+                format!(
+                    "failed to send to exec host: {}",
+                    plib::diag::io_error_text(&e)
+                )
+            })?;
             let _ = std::fs::remove_file(&temp_path);
         }
     }
@@ -461,7 +477,7 @@ fn execute_uux(parsed: &ParsedCommand, stdin_data: Option<&[u8]>) -> Result<(), 
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| format!("failed to spawn: {}", e))?;
+            .map_err(|e| format!("failed to spawn: {}", plib::diag::io_error_text(&e)))?;
 
         // As `common::ssh_command`: the remote command may not read its input.
         let _sigpipe = plib::io::SigPipeIgnored::new();
@@ -475,7 +491,7 @@ fn execute_uux(parsed: &ParsedCommand, stdin_data: Option<&[u8]>) -> Result<(), 
 
         let output = child
             .wait_with_output()
-            .map_err(|e| format!("failed to wait: {}", e))?;
+            .map_err(|e| format!("failed to wait: {}", plib::diag::io_error_text(&e)))?;
 
         (
             output.status.code().unwrap_or(1),
@@ -485,7 +501,7 @@ fn execute_uux(parsed: &ParsedCommand, stdin_data: Option<&[u8]>) -> Result<(), 
     } else {
         // Remote execution
         ssh_exec(&parsed.exec_host, &full_cmd, stdin_data)
-            .map_err(|e| format!("ssh exec failed: {}", e))?
+            .map_err(|e| format!("ssh exec failed: {}", plib::diag::io_error_text(&e)))?
     };
 
     // Print the command's standard error.
@@ -596,8 +612,13 @@ fn deliver(d: &Delivery, exec_host: &str, tmp: &str) -> Result<(), String> {
         })
     } else {
         // Local exec → remote target system.
-        ssh_send_file(&d.system, tmp, &d.path, true)
-            .map_err(|e| format!("{}: {}", gettext("failed to send output file to remote"), e))
+        ssh_send_file(&d.system, tmp, &d.path, true).map_err(|e| {
+            format!(
+                "{}: {}",
+                gettext("failed to send output file to remote"),
+                plib::diag::io_error_text(&e)
+            )
+        })
     }
 }
 

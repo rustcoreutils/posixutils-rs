@@ -132,8 +132,13 @@ fn expand_simple_parameter_into(
                         expanded_word.note_quoted_at_expanded_to_nothing();
                     }
                     if !field_splitting_will_be_performed {
+                        // Unspecified by POSIX; joined as `$*` is, as dash
+                        // does (`IFS=-; v=$@` is `a-b-c`).
                         expanded_word.append(
-                            join_parameters(&shell.positional_parameters, b" "),
+                            join_parameters(
+                                &shell.positional_parameters,
+                                dollar_star_separator(shell).as_bytes(),
+                            ),
                             inside_double_quotes,
                             true,
                         );
@@ -153,21 +158,11 @@ fn expand_simple_parameter_into(
                             false,
                         );
                     } else {
-                        // POSIX: `$*` joins with the *first character* of IFS.
-                        // Slicing one byte split a multi-byte character and
-                        // panicked (`IFS=é`); IFS may also hold bytes that are
-                        // not characters at all, and the first of those is
-                        // still the separator.
-                        let separator = match shell.environment.get_value("IFS") {
-                            Some(ifs) => match ifs.chars_lossless().next() {
-                                Some(CharOrByte::Char(c)) => ShString::from(&ifs[..c.len_utf8()]),
-                                Some(CharOrByte::Byte(b)) => ShString::from(vec![b]),
-                                None => ShString::new(),
-                            },
-                            None => ShString::from(" "),
-                        };
                         expanded_word.append(
-                            join_parameters(&shell.positional_parameters, separator.as_bytes()),
+                            join_parameters(
+                                &shell.positional_parameters,
+                                dollar_star_separator(shell).as_bytes(),
+                            ),
                             inside_double_quotes,
                             true,
                         );
@@ -279,7 +274,13 @@ pub fn expand_parameter_into(
             if parameter_type.is_unset() || (*default_on_null && parameter_type.is_null()) {
                 // The default *replaces* the parameter, so its own expansion
                 // must not be appended as well.
-                simple_word_expansion_into(expanded_word, default, TildeMode::Word, shell)?;
+                simple_word_expansion_into(
+                    expanded_word,
+                    default,
+                    TildeMode::Word,
+                    field_splitting_will_be_performed,
+                    shell,
+                )?;
             } else {
                 expanded_word.extend(expanded_parameter);
             }
@@ -356,7 +357,13 @@ pub fn expand_parameter_into(
             if !parameter_type.is_unset()
                 && (!parameter_type.is_null() || *substitute_null_with_word)
             {
-                simple_word_expansion_into(expanded_word, word, TildeMode::Word, shell)?
+                simple_word_expansion_into(
+                    expanded_word,
+                    word,
+                    TildeMode::Word,
+                    field_splitting_will_be_performed,
+                    shell,
+                )?
             }
         }
         ParameterExpansion::StrLen(parameter) => {

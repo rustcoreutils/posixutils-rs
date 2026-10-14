@@ -121,6 +121,39 @@ fn unquoted_star_in_assignment_joins_with_ifs() {
         "set a b; case $* in 'a b') echo yes;; *) echo no;; esac",
         "yes\n",
     );
+    sh("unset IFS; set a b c; v=$*; echo \"[$v]\"", "[a b c]\n");
+    sh("IFS=-; set a b c; v=x$*y; echo \"[$v]\"", "[xa-b-cy]\n");
+    sh(
+        "IFS=-; set a b c; case $* in a-b-c) echo yes;; *) echo no;; esac",
+        "yes\n",
+    );
+    sh(
+        "IFS=-; set a b c; case a-b-c in $*) echo yes;; *) echo no;; esac",
+        "yes\n",
+    );
+    // The word of `${u:-word}`, `${u+word}` and `${x=word}` is expanded in the
+    // context of the whole expansion.
+    sh(
+        "IFS=-; set a b c; v=${u:-$*}; w=${v+$*}; echo \"[$v][$w]\"",
+        "[a-b-c][a-b-c]\n",
+    );
+    sh(
+        "IFS=-; set a 'b c'; v=${x=$*}; echo \"[$v][$x]\"",
+        "[a-b c][a-b c]\n",
+    );
+    sh("IFS=-; set a b c; v=${*#a}; echo \"[$v]\"", "[-b-c]\n");
+    // Where field splitting is performed, `$*` still splits.
+    sh("IFS=-; set a b c; echo $*; echo ${u:-$*}", "a b c\na b c\n");
+}
+
+// Unquoted `$@` in an assignment is unspecified by POSIX; it joins as `$*`
+// does, as in dash.
+#[test]
+fn unquoted_at_in_assignment_joins_like_star() {
+    sh("IFS=-; set a b c; v=$@; echo \"[$v]\"", "[a-b-c]\n");
+    sh("IFS=; set a b c; v=$@; echo \"[$v]\"", "[abc]\n");
+    sh("unset IFS; set a b c; v=$@; echo \"[$v]\"", "[a b c]\n");
+    sh("IFS=-; set a b c; v=${@%c}; echo \"[$v]\"", "[a-b-]\n");
 }
 
 // In a here-document with an unquoted delimiter, quotes are ordinary

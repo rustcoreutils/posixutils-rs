@@ -111,3 +111,41 @@ fn tee_continues_after_unopenable_file() {
 fn tee_reports_write_error_on_final_partial_line() {
     plib::testing::assert_write_error_on_full_device("tee", &[], b"x", 1);
 }
+
+// A failed write to standard output is "tee: write error: REASON", reported
+// once however many blocks follow, while the files still get every byte.
+#[cfg(target_os = "linux")]
+#[test]
+fn write_error_message_on_full_device() {
+    plib::testing::assert_write_error_message_on_full_device("tee", &[], b"x\ny\n", 1);
+
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let dir = plib::tmp::tempdir().unwrap();
+    let copy = dir.path().join("copy");
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let mut child = Command::new(plib::testing::get_binary_path("tee"))
+        .arg(&copy)
+        .env("LC_ALL", "C")
+        .stdin(Stdio::piped())
+        .stdout(full)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    // Several separate reads, each of which tee copies on its own.
+    for _ in 0..3 {
+        stdin.write_all(b"block\n").unwrap();
+        stdin.flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert_eq!(stderr.matches("write error").count(), 1, "{stderr}");
+    assert_eq!(std::fs::read(&copy).unwrap(), b"block\nblock\nblock\n");
+}

@@ -362,3 +362,14 @@ fn finds_identification_in_an_elf_object() {
         String::from_utf8_lossy(&out.stdout)
     );
 }
+
+// A failed write to standard output is "what: write error: REASON", with the
+// system's text for the error, and ends the run.
+#[cfg(target_os = "linux")]
+#[test]
+fn what_write_error_on_full_device() {
+    let file = test_file_path("single_identification.txt");
+    let file = file.to_str().unwrap();
+    plib::testing::assert_write_error_message_on_full_device("what", &[file], b"", 1);
+    plib::testing::assert_write_error_message_on_full_device("what", &["-s", file, file], b"", 1);
+}

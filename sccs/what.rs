@@ -28,6 +28,20 @@ struct Args {
     files: Vec<PathBuf>,
 }
 
+/// Why scanning a file failed: reading it, which is reported against the
+/// file, or writing standard output, which is a write error.
+enum Failure {
+    Input(io::Error),
+    Output(io::Error),
+}
+
+/// Every write is to standard output; reads are mapped to `Input` by hand.
+impl From<io::Error> for Failure {
+    fn from(e: io::Error) -> Self {
+        Failure::Output(e)
+    }
+}
+
 /// Scan a byte stream for `@(#)` identification strings. Operates on bytes
 /// (never UTF-8-decodes) so it works on any file type, including large binaries
 /// — the primary use case for `what`. The input is consumed through a buffered
@@ -35,7 +49,11 @@ struct Args {
 /// peak memory is bounded by the longest ident rather than the file size. Each
 /// identification string runs from after the `@(#)` marker up to (but not
 /// including) a terminator byte: `"`, `>`, `<newline>`, `\`, or NUL.
-fn process_file<R: BufRead>(mut reader: R, single: bool, out: &mut impl Write) -> io::Result<bool> {
+fn process_file<R: BufRead>(
+    mut reader: R,
+    single: bool,
+    out: &mut impl Write,
+) -> Result<bool, Failure> {
     const MARKER: &[u8] = b"@(#)";
     let is_terminator = |b: u8| matches!(b, b'"' | b'>' | b'\n' | b'\\' | 0);
 
@@ -45,7 +63,7 @@ fn process_file<R: BufRead>(mut reader: R, single: bool, out: &mut impl Write) -
     let mut ident: Vec<u8> = Vec::new();
 
     loop {
-        let chunk = reader.fill_buf()?;
+        let chunk = reader.fill_buf().map_err(Failure::Input)?;
         if chunk.is_empty() {
             break; // EOF
         }
@@ -98,7 +116,7 @@ fn process_file<R: BufRead>(mut reader: R, single: bool, out: &mut impl Write) -
     Ok(found)
 }
 
-fn main() -> io::Result<()> {
+fn main() {
     plib::diag::init_locale("what");
 
     let args = plib::optarg::parse::<Args>();
@@ -112,10 +130,27 @@ fn main() -> io::Result<()> {
         match File::open(path) {
             Ok(f) => {
                 // Print the pathname first per POSIX format.
-                writeln!(out, "{}:", file.display())?;
-                let reader = BufReader::new(f);
-                if process_file(reader, args.single, &mut out)? {
-                    any_found = true;
+                let result = writeln!(out, "{}:", file.display())
+                    .map_err(Failure::Output)
+                    .and_then(|()| process_file(BufReader::new(f), args.single, &mut out));
+                match result {
+                    Ok(found) => any_found |= found,
+                    Err(Failure::Input(e)) => {
+                        eprintln!(
+                            "what: {}: {}",
+                            file.display(),
+                            plib::diag::io_error_text(&e)
+                        );
+                    }
+                    Err(Failure::Output(e)) => {
+                        // Every later file would fail the same way.
+                        eprintln!(
+                            "what: {}: {}",
+                            gettext("write error"),
+                            plib::diag::io_error_text(&e)
+                        );
+                        std::process::exit(1);
+                    }
                 }
             }
             Err(_) => {

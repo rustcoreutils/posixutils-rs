@@ -556,7 +556,11 @@ pub fn setpgid(pid: Pid, pgid: Pid) -> OsResult<()> {
 }
 
 pub fn chdir(path: &OsStr) -> LibcResult<()> {
-    let path = CString::new(path.as_bytes()).expect("path contains null characters");
+    // A shell value can hold a NUL byte (one `read` from a file, say), which
+    // no pathname can: an invalid argument, as std::fs reports it.
+    let Ok(path) = CString::new(path.as_bytes()) else {
+        return Err(Errno::EINVAL);
+    };
     let result = unsafe { libc::chdir(path.as_ptr()) };
     if result < 0 {
         return Err(get_current_errno_value());

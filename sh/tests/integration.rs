@@ -1808,6 +1808,19 @@ mod audit_regressions {
         });
     }
 
+    // A value `read` from a file can hold a NUL byte, which no pathname can;
+    // `cd` to it fails like any other bad directory (status 1, as in bash)
+    // instead of panicking the shell.
+    #[test]
+    fn cd_to_a_value_holding_a_nul_byte_fails() {
+        run_successfully_and(
+            "printf 'a\\000b\\n' | { read x; cd \"$x\" 2>/dev/null; echo rc=$?; }\n",
+            |out| {
+                assert_eq!(out, "rc=1\n");
+            },
+        );
+    }
+
     // POSIX 88722: "The following options shall be supported by the
     // implementation", and 88723-88725 defines `-e`: with `-P` in effect, if
     // the directory changed but the correct value of PWD cannot be determined,

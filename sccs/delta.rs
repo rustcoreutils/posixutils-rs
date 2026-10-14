@@ -509,7 +509,12 @@ fn gather_mrs(
                     return Ok(None);
                 }
                 Err(e) => {
-                    eprintln!("delta: {}: {}: {}", sfile_path.display(), prog, e);
+                    eprintln!(
+                        "delta: {}: {}: {}",
+                        sfile_path.display(),
+                        prog,
+                        plib::diag::io_error_text(&e)
+                    );
                     return Ok(None);
                 }
             }
@@ -759,7 +764,11 @@ fn main() -> ExitCode {
             Ok(true) => {}
             Ok(false) => exit_code = ExitCode::FAILURE,
             Err(e) => {
-                eprintln!("delta: {}: {}", file_path.display(), e);
+                eprintln!(
+                    "delta: {}: {}",
+                    file_path.display(),
+                    plib::diag::io_error_text(&e)
+                );
                 exit_code = ExitCode::FAILURE;
             }
         }

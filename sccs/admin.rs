@@ -546,14 +546,22 @@ fn main() -> ExitCode {
                 Ok(true) => {}
                 Ok(false) => exit_code = ExitCode::FAILURE,
                 Err(e) => {
-                    eprintln!("admin: {}: {}", file_path.display(), e);
+                    eprintln!(
+                        "admin: {}: {}",
+                        file_path.display(),
+                        plib::diag::io_error_text(&e)
+                    );
                     exit_code = ExitCode::FAILURE;
                 }
             }
         } else if args.recompute_checksum {
             // -z: recompute checksum
             if let Err(e) = recompute_checksum(file_path) {
-                eprintln!("admin: {}: {}", file_path.display(), e);
+                eprintln!(
+                    "admin: {}: {}",
+                    file_path.display(),
+                    plib::diag::io_error_text(&e)
+                );
                 exit_code = ExitCode::FAILURE;
             }
         } else if creating_new {
@@ -580,7 +588,7 @@ fn main() -> ExitCode {
             let content = match content {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("admin: {}", e);
+                    eprintln!("admin: {}", plib::diag::io_error_text(&e));
                     exit_code = ExitCode::FAILURE;
                     continue;
                 }
@@ -595,7 +603,7 @@ fn main() -> ExitCode {
             let desc_text = match desc_text {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("admin: {}", e);
+                    eprintln!("admin: {}", plib::diag::io_error_text(&e));
                     exit_code = ExitCode::FAILURE;
                     continue;
                 }
@@ -632,7 +640,11 @@ fn main() -> ExitCode {
                     mr_numbers: mr_numbers.clone(),
                 },
             ) {
-                eprintln!("admin: {}: {}", file_path.display(), e);
+                eprintln!(
+                    "admin: {}: {}",
+                    file_path.display(),
+                    plib::diag::io_error_text(&e)
+                );
                 exit_code = ExitCode::FAILURE;
             }
         } else {
@@ -658,7 +670,7 @@ fn main() -> ExitCode {
             let desc_text = match desc_text {
                 Some(Ok(t)) => Some(t),
                 Some(Err(e)) => {
-                    eprintln!("admin: {}", e);
+                    eprintln!("admin: {}", plib::diag::io_error_text(&e));
                     exit_code = ExitCode::FAILURE;
                     continue;
                 }
@@ -673,7 +685,11 @@ fn main() -> ExitCode {
                 args.add_users.clone(),
                 args.erase_users.clone(),
             ) {
-                eprintln!("admin: {}: {}", file_path.display(), e);
+                eprintln!(
+                    "admin: {}: {}",
+                    file_path.display(),
+                    plib::diag::io_error_text(&e)
+                );
                 exit_code = ExitCode::FAILURE;
             }
         }

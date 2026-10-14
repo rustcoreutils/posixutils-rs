@@ -20,8 +20,8 @@ use crate::os::errno::Errno;
 use crate::os::signals::{kill, PendingSignal, Signal, SignalManager, TermSignal};
 use crate::os::{
     exec, find_command, fork, getpgrp, give_terminal_to, job_control_tty, pipe,
-    set_job_control_tty, setpgid, tcgetpgrp, waitpid, ExecError, ForkResult, OsError, OsResult,
-    Pid, WaitOptions, WaitStatus,
+    set_job_control_tty, set_tty_modes, setpgid, tcgetpgrp, tty_modes, waitpid, ExecError,
+    ForkResult, OsError, OsResult, Pid, TtyModes, WaitOptions, WaitStatus,
 };
 use crate::parse::command::{
     Assignment, CaseItem, Command, CommandType, CompleteCommand, CompoundCommand, Conjunction,
@@ -404,10 +404,28 @@ impl PipelineKind {
 }
 
 /// Makes the shell's process group the terminal's foreground group again,
-/// once a foreground job has terminated or stopped (XCU 2.11).
-pub(crate) fn take_terminal_back() {
+/// once a foreground job has terminated or stopped (XCU 2.11), and gives
+/// the terminal `shell_modes`, the modes the shell had saved, if any.
+pub(crate) fn take_terminal_back(shell_modes: Option<TtyModes>) {
     if let Some(terminal) = job_control_tty() {
         let _ = give_terminal_to(terminal, getpgrp());
+        if let Some(modes) = shell_modes {
+            set_tty_modes(terminal, &modes);
+        }
+    }
+}
+
+/// The shell's saved modes `shell_modes` if a foreground job that ended in
+/// `ended` leaves the terminal to be put back to them: as in bash, one that
+/// stopped or was killed by a signal (an editor in raw mode, say), but not
+/// one that exited, whose changes are meant to stay (`stty`).
+pub(crate) fn modes_to_restore(
+    ended: &OsResult<JobState>,
+    shell_modes: Option<TtyModes>,
+) -> Option<TtyModes> {
+    match ended {
+        Ok(JobState::Done(_) | JobState::Running) => None,
+        Ok(JobState::Stopped(_) | JobState::Signaled(_)) | Err(_) => shell_modes,
     }
 }
 
@@ -561,13 +579,15 @@ impl Shell {
     /// Waits for a job running in the foreground until all of its processes
     /// have terminated, or, under job control, until one of them stops: the
     /// job then goes (back) into the job table as a suspended job, keeping
-    /// its job number if it had one (`fg`). Returns the job's status.
-    pub fn wait_for_job(&mut self, mut job: Job) -> OsResult<i32> {
+    /// its job number if it had one (`fg`), and an interactive shell keeps
+    /// the terminal's modes in it for `fg` to give back. Returns the state
+    /// the job ended in.
+    pub fn wait_for_job(&mut self, mut job: Job) -> OsResult<JobState> {
         let untraced = self.job_control_active();
         loop {
             let state = job.state();
             if state.is_terminated() {
-                return Ok(state.exit_status());
+                return Ok(state);
             }
             if let JobState::Stopped(_) = state {
                 // The others were stopped by the same signal, most likely;
@@ -578,16 +598,19 @@ impl Shell {
                     }
                 }
                 job.state_should_be_reported = true;
+                if job.process_group.is_some() && self.saves_tty_modes() {
+                    job.tty_modes = job_control_tty().and_then(tty_modes);
+                }
                 if job.number == 0 {
                     self.background_jobs.add_job(job);
                 } else {
                     self.background_jobs.reinsert_job(job);
                 }
-                return Ok(state.exit_status());
+                return Ok(state);
             }
             // Running and not terminated, so some process is still alive.
             let Some(pid) = job.live_pids().first().copied() else {
-                return Ok(state.exit_status());
+                return Ok(state);
             };
             let status = match waitpid(pid, WaitOptions::blocking(untraced)) {
                 Ok(status) => status,
@@ -607,17 +630,38 @@ impl Shell {
 
     /// Waits for the foreground job of the processes `pids` (job control),
     /// whose process group is the first one's, then takes the terminal back
-    /// (XCU 2.11).
-    fn wait_for_foreground_job(&mut self, pids: &[Pid]) -> OsResult<i32> {
+    /// (XCU 2.11), with `shell_modes`, the modes the shell saved before
+    /// starting the job, if the job left the terminal to be put back.
+    fn wait_for_foreground_job(
+        &mut self,
+        pids: &[Pid],
+        shell_modes: Option<TtyModes>,
+    ) -> OsResult<i32> {
         let job = Job::new(
             pids,
             pids.first().copied(),
             self.last_pipeline_command.clone(),
             self.set_options.pipefail,
         );
-        let status = self.wait_for_job(job);
-        take_terminal_back();
-        status
+        let ended = self.wait_for_job(job);
+        take_terminal_back(modes_to_restore(&ended, shell_modes));
+        ended.map(JobState::exit_status)
+    }
+
+    /// Whether this shell keeps the terminal's modes across its foreground
+    /// jobs, as bash does: an interactive shell under job control, which
+    /// a job that stops or dies must not leave with a broken terminal.
+    fn saves_tty_modes(&self) -> bool {
+        self.is_interactive && self.job_control_active()
+    }
+
+    /// The terminal's modes, saved before the terminal goes to a
+    /// foreground job (see `saves_tty_modes`).
+    pub(crate) fn save_tty_modes(&self) -> Option<TtyModes> {
+        if !self.saves_tty_modes() {
+            return None;
+        }
+        job_control_tty().and_then(tty_modes)
     }
 
     pub fn handle_async_events(&mut self) {
@@ -779,6 +823,7 @@ impl Shell {
 
     pub fn fork_and_exec(&mut self, command: OsString, args: &[ShString]) -> OsResult<i32> {
         let job_control = self.job_control_active();
+        let shell_modes = self.save_tty_modes();
         match fork()? {
             ForkResult::Child => {
                 if job_control {
@@ -790,7 +835,7 @@ impl Shell {
             ForkResult::Parent { child } => {
                 let status = if job_control {
                     job_process_started(child, child, true);
-                    self.wait_for_foreground_job(&[child])
+                    self.wait_for_foreground_job(&[child], shell_modes)
                 } else {
                     self.wait_child_process(child)
                 };
@@ -1322,6 +1367,7 @@ impl Shell {
         // Under job control a subshell is a foreground job of its own, as in
         // dash: ^Z stops it, and everything it runs, as one job.
         let job_control = self.job_control_active();
+        let shell_modes = self.save_tty_modes();
         match fork()? {
             ForkResult::Child => {
                 if job_control {
@@ -1335,7 +1381,7 @@ impl Shell {
             ForkResult::Parent { child } => {
                 let status = if job_control {
                     job_process_started(child, child, true);
-                    self.wait_for_foreground_job(&[child])
+                    self.wait_for_foreground_job(&[child], shell_modes)
                 } else {
                     self.wait_child_process(child)
                 };
@@ -1569,13 +1615,14 @@ impl Shell {
     /// the job runs, and records every process, so that ^Z makes all of
     /// them one suspended job and `fg` and `bg` resume all of them.
     fn run_pipeline_as_job(&mut self, pipeline: &Pipeline) -> OsResult<i32> {
+        let shell_modes = self.save_tty_modes();
         let mut pids = Vec::with_capacity(pipeline.commands.len());
         let started = self.start_pipeline_commands(pipeline, &mut pids, PipelineKind::Foreground);
         // Wait for what did start even when a later pipe or fork failed.
         let status = if pids.is_empty() {
             Ok(0)
         } else {
-            self.wait_for_foreground_job(&pids)
+            self.wait_for_foreground_job(&pids, shell_modes)
         };
         started?;
         status

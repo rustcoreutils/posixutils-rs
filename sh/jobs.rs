@@ -9,7 +9,7 @@
 
 use crate::os::errno::Errno;
 use crate::os::signals::{Signal, TermSignal};
-use crate::os::{waitpid, OsResult, Pid, WaitOptions, WaitStatus};
+use crate::os::{waitpid, OsResult, Pid, TtyModes, WaitOptions, WaitStatus};
 use std::collections::VecDeque;
 use std::fmt::{Display, Formatter, Write};
 
@@ -117,6 +117,9 @@ pub struct Job {
     /// `set -o pipefail` was on when the job started, so its status is that
     /// of the rightmost process that failed rather than the last one's.
     pub pipefail: bool,
+    /// The terminal's modes when the job last stopped in the foreground,
+    /// which `fg` gives back to it (an interactive shell only).
+    pub tty_modes: Option<TtyModes>,
     pub number: u64,
     pub position: JobPosition,
     pub state_should_be_reported: bool,
@@ -136,6 +139,7 @@ impl Job {
                 })
                 .collect(),
             pipefail,
+            tty_modes: None,
             number: 0,
             position: JobPosition::Other,
             state_should_be_reported: false,

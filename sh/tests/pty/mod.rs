@@ -684,3 +684,34 @@ fn bg_resumes_a_suspended_job_in_the_background() {
     assert_eq!(read_result(&dir.path().join("status")).trim(), "0");
     assert_eq!(read_result(&dir.path().join("out")), "done\n");
 }
+
+// The terminal's modes follow the foreground job, as in bash: one that
+// stops or is killed leaves the terminal as the shell had it, and the
+// shell keeps a stopped job's modes for `fg` to give back to it (as zsh
+// and ksh do; bash does not). One that exits normally keeps what it set,
+// as `stty` must. Modes are compared as `stty -g` writes them, which is
+// portable where the flag names of `stty -a` are not.
+#[test]
+fn terminal_modes_follow_the_foreground_job() {
+    let mut sh = ShPtySession::new();
+    sh.line("stty -g > before");
+    sh.line(
+        "sh -c 'stty -echo; stty -g > noecho; kill -STOP $$; stty -g > job'; stty -g > stopped",
+    );
+    wait_for_file(&sh.path("stopped"));
+    sh.line("fg > /dev/null; stty -g > after");
+    wait_for_file(&sh.path("after"));
+    sh.line("sh -c 'stty -echo; kill -KILL $$'; stty -g > killed");
+    wait_for_file(&sh.path("killed"));
+    sh.line("sh -c 'stty -echo'; stty -g > exited");
+    wait_for_file(&sh.path("exited"));
+    let dir = sh.exit();
+    let modes = |name: &str| read_result(&dir.path().join(name));
+    let (before, noecho) = (modes("before"), modes("noecho"));
+    assert_ne!(before, noecho, "stty -echo changed nothing");
+    assert_eq!(modes("stopped"), before, "a stopped job's modes stayed");
+    assert_eq!(modes("job"), noecho, "fg did not give the job its modes");
+    assert_eq!(modes("after"), noecho, "a job's exit undid its modes");
+    assert_eq!(modes("killed"), before, "a killed job's modes stayed");
+    assert_eq!(modes("exited"), noecho, "stty's change was undone");
+}

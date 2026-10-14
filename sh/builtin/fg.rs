@@ -10,9 +10,9 @@
 use crate::builtin::{args_as_str, skip_option_terminator, BuiltinResult, BuiltinUtility};
 use crate::jobs::{parse_job_id, Job, JobId, JobState};
 use crate::os::signals::{kill, Signal};
-use crate::os::{give_terminal_to, job_control_tty};
+use crate::os::{give_terminal_to, job_control_tty, set_tty_modes};
 use crate::shell::opened_files::OpenedFiles;
-use crate::shell::{take_terminal_back, Shell};
+use crate::shell::{modes_to_restore, take_terminal_back, Shell};
 use crate::shstr::ShString;
 use gettextrs::gettext;
 
@@ -30,8 +30,15 @@ fn run_foreground_job(
     opened_files.write_out(format!("{}\n", job.command));
     // XCU 2.11: the job's process group becomes the terminal's foreground
     // group, before it is resumed, so that it can read the terminal at once.
+    // An interactive shell saves its own modes first and gives the job back
+    // the ones it stopped with (an editor's raw mode, say).
     let terminal = job.process_group.zip(job_control_tty());
+    let mut shell_modes = None;
     if let Some((pgid, terminal)) = terminal {
+        shell_modes = shell.save_tty_modes();
+        if let Some(modes) = job.tty_modes {
+            set_tty_modes(terminal, &modes);
+        }
         let _ = give_terminal_to(terminal, pgid);
     }
     // As in dash, the whole group is continued whatever state it was last
@@ -40,7 +47,7 @@ fn run_foreground_job(
     let resumed = kill(job.signal_target(), Some(Signal::SigCont));
     if let (Err(err), JobState::Stopped(_)) = (resumed, job.state()) {
         if terminal.is_some() {
-            take_terminal_back();
+            take_terminal_back(shell_modes);
         }
         let message = format!("fg: failed to resume {arg} ({err})\n");
         shell.background_jobs.reinsert_job(job);
@@ -48,11 +55,13 @@ fn run_foreground_job(
     }
     job.mark_continued();
     // The exit status of fg is the exit status of the job it waited for.
-    let status = shell.wait_for_job(job).map_err(|err| format!("{err}\n"));
+    let ended = shell.wait_for_job(job);
     if terminal.is_some() {
-        take_terminal_back();
+        take_terminal_back(modes_to_restore(&ended, shell_modes));
     }
-    status
+    ended
+        .map(JobState::exit_status)
+        .map_err(|err| format!("{err}\n"))
 }
 pub struct Fg;
 

@@ -477,6 +477,11 @@ pub fn tcsetpgrp(fd: RawFd, pgid: Pid) -> OsResult<()> {
 /// job, is otherwise stopped by SIGTTOU instead (XSH tcsetpgrp()); blocking
 /// the signal lets the call go ahead without one being sent.
 pub fn give_terminal_to(fd: RawFd, pgid: Pid) -> OsResult<()> {
+    with_sigttou_blocked(|| tcsetpgrp(fd, pgid))
+}
+
+/// Runs `f` with SIGTTOU blocked, for a call that changes the terminal.
+fn with_sigttou_blocked<T>(f: impl FnOnce() -> T) -> T {
     // SAFETY: both sets are initialised (sigemptyset, sigprocmask) before
     // they are read.
     unsafe {
@@ -485,10 +490,36 @@ pub fn give_terminal_to(fd: RawFd, pgid: Pid) -> OsResult<()> {
         libc::sigemptyset(&mut block);
         libc::sigaddset(&mut block, libc::SIGTTOU);
         libc::sigprocmask(libc::SIG_BLOCK, &block, &mut previous);
-        let result = tcsetpgrp(fd, pgid);
+        let result = f();
         libc::sigprocmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
         result
     }
+}
+
+/// A terminal's modes, as `tcgetattr` reports them.
+#[derive(Clone, Copy)]
+pub struct TtyModes(libc::termios);
+
+/// The modes of the terminal open on `fd`, or `None` when they cannot be
+/// read (not a terminal, or EIO once it has hung up).
+pub fn tty_modes(fd: RawFd) -> Option<TtyModes> {
+    // SAFETY: zeroed is a valid termios (some systems have members beyond
+    // the POSIX ones), and tcgetattr fills it in or fails.
+    let mut modes = unsafe { std::mem::zeroed::<libc::termios>() };
+    if unsafe { libc::tcgetattr(fd, &mut modes) } < 0 {
+        return None;
+    }
+    Some(TtyModes(modes))
+}
+
+/// Gives the terminal open on `fd` the modes `modes`, once the output
+/// already written has gone out, as bash does. A failure (the terminal
+/// may have hung up) changes nothing and is ignored. SIGTTOU is blocked,
+/// as for `give_terminal_to`, in case the shell is not the foreground
+/// process group after all.
+pub fn set_tty_modes(fd: RawFd, modes: &TtyModes) {
+    // SAFETY: `modes` came from tcgetattr.
+    with_sigttou_blocked(|| unsafe { libc::tcsetattr(fd, libc::TCSADRAIN, &modes.0) });
 }
 
 /// The shell's own descriptor for the terminal job control hands to jobs,

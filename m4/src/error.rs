@@ -60,6 +60,8 @@ pub enum ErrorKind {
     Evaluation,
     Parsing,
     Io,
+    /// Writing standard output failed; see [`WriteFailed`].
+    Write,
     InvalidDivertNumber(i64),
     NotEnoughArguments,
     UnclosedQuote,
@@ -80,6 +82,7 @@ impl std::fmt::Display for Error {
             ErrorKind::Evaluation => write!(f, "Error evaluating input"),
             ErrorKind::Parsing => write!(f, "Error parsing input"),
             ErrorKind::Io => write!(f, "Error processing io"),
+            ErrorKind::Write => write!(f, "write error"),
             ErrorKind::InvalidDivertNumber(i) => write!(f, "Invalid divert number: {i}"),
             ErrorKind::NotEnoughArguments => write!(f, "The macro doesn't have enough arguments"),
             ErrorKind::Exit(code) => write!(f, "Program requested an exit with code {code}"),
@@ -109,9 +112,35 @@ impl std::error::Error for Error {
 
 impl From<std::io::Error> for Error {
     fn from(value: std::io::Error) -> Self {
-        Self::new(ErrorKind::Io).with_source(value)
+        let kind = match value.get_ref() {
+            Some(inner) if inner.is::<WriteFailed>() => ErrorKind::Write,
+            _ => ErrorKind::Io,
+        };
+        Self::new(kind).with_source(value)
     }
 }
+
+/// A failed write to standard output, marked so that it is reported as
+/// `m4: write error: REASON` and not as a failure processing the input. It
+/// travels inside an [`std::io::Error`] through the [`std::io::Write`] layers
+/// between the real output and the [`Error`] it ends up in.
+#[derive(Debug)]
+pub struct WriteFailed(pub std::io::Error);
+
+impl WriteFailed {
+    /// Wrap `error`, from a write to standard output, for the trip up.
+    pub fn mark(error: std::io::Error) -> std::io::Error {
+        std::io::Error::new(error.kind(), WriteFailed(error))
+    }
+}
+
+impl std::fmt::Display for WriteFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&plib::diag::io_error_text(&self.0))
+    }
+}
+
+impl std::error::Error for WriteFailed {}
 
 impl From<nom::Err<nom::error::Error<&[u8]>>> for Error {
     fn from(error: nom::Err<nom::error::Error<&[u8]>>) -> Self {

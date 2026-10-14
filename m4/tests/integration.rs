@@ -577,3 +577,19 @@ fn m4_option_argument_may_begin_with_hyphen() {
 fn m4_reports_write_error_on_final_partial_line() {
     plib::testing::assert_write_error_on_full_device("m4", &[], b"x", 1);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn m4_write_error_on_full_device() {
+    // A failed write to standard output is "m4: write error: REASON",
+    // with the system's text for the error and exit status 1.
+    plib::testing::assert_write_error_message_on_full_device("m4", &[], b"x\n", 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn m4_partial_line_write_error_on_full_device() {
+    // A failed write to standard output is "m4: write error: REASON",
+    // with the system's text for the error and exit status 1.
+    plib::testing::assert_write_error_message_on_full_device("m4", &[], b"x", 1);
+}

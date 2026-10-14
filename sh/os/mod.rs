@@ -285,11 +285,15 @@ pub fn here_document_fd(contents: &[u8]) -> OsResult<OwnedFd> {
     }
     let writer = unsafe { OwnedFd::from_raw_fd(fd) };
     // The reading descriptor is a second open of the same file, made before
-    // the name goes away; it has its own offset, still at the start.
+    // the name goes away; it has its own offset, still at the start. Where
+    // others can rename entries in TMPDIR, the name may no longer be ours
+    // by now: never follow a symbolic link, block on a FIFO or take a
+    // terminal while finding out, and the identity check below refuses
+    // whatever it was.
     let fd = unsafe {
         libc::open(
             template.as_ptr() as *const libc::c_char,
-            libc::O_RDONLY | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY,
         )
     };
     let reader = if fd < 0 {
@@ -311,6 +315,11 @@ pub fn here_document_fd(contents: &[u8]) -> OsResult<OwnedFd> {
             command: "open",
             errno: Errno::EEXIST,
         });
+    }
+    // It is our regular file: the command gets an ordinary blocking
+    // descriptor.
+    if unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, libc::O_RDONLY) } < 0 {
+        return Err(OsError::from_current_errno("fcntl"));
     }
     write_all(writer.as_raw_fd(), contents)?;
     Ok(reader)

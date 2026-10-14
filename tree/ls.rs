@@ -1168,7 +1168,10 @@ fn process_single_dir(
                     config,
                     path.as_inner(),
                 )
-                .map_err(|e| io::Error::other(format!("'{path_str}': {e}")))?;
+                .map_err(|e| {
+                    let text = plib::diag::io_error_text(&e);
+                    io::Error::other(format!("'{path_str}': {text}"))
+                })?;
 
                 let mut include_entry = false;
 

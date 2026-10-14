@@ -280,3 +280,18 @@ fn test_ln_single_operand() {
 
     fs::remove_dir_all(&d).unwrap();
 }
+
+/// A link that cannot be made is reported with the system's text for the
+/// error, without Rust's "(os error N)" suffix.
+#[test]
+fn test_ln_failure_names_the_system_error() {
+    let source = "/nonexistent/ln-source";
+    let dest = "/nonexistent/ln-dest";
+    let enoent = plib::diag::io_error_text(&std::fs::File::open(source).unwrap_err());
+    let out = plib::testing::run_test_base("ln", &[source.into(), dest.into()], b"");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("ln: '{dest}' -> '{source}': {enoent}\n")
+    );
+}

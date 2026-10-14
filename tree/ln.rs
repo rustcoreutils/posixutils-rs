@@ -218,7 +218,12 @@ fn make_link(args: &Args, source: &Path, dest: &Path) -> io::Result<()> {
 fn report(source: &Path, dest: &Path, e: &io::Error) {
     eprintln!(
         "ln: {}",
-        gettext!("'{}' -> '{}': {}", dest.display(), source.display(), e)
+        gettext!(
+            "'{}' -> '{}': {}",
+            dest.display(),
+            source.display(),
+            plib::diag::io_error_text(e)
+        )
     );
 }
 

@@ -24,7 +24,7 @@ use crate::os::{
 };
 use crate::parse::command::{
     Assignment, CaseItem, Command, CommandType, CompleteCommand, CompoundCommand, Conjunction,
-    FunctionDefinition, If, LogicalOp, Name, Pipeline, Redirection, SimpleCommand,
+    FunctionBody, FunctionDefinition, If, LogicalOp, Name, Pipeline, Redirection, SimpleCommand,
 };
 use crate::parse::command_parser::{is_valid_name, CommandParser};
 use crate::parse::word::WordPair;
@@ -160,7 +160,7 @@ pub struct Shell {
     pub program_name: ShString,
     pub positional_parameters: Vec<ShString>,
     pub opened_files: OpenedFiles,
-    pub functions: HashMap<Name, Rc<CompoundCommand>>,
+    pub functions: HashMap<Name, Rc<FunctionBody>>,
     pub last_pipeline_exit_status: i32,
     pub last_command_substitution_status: i32,
     pub shell_pid: i32,
@@ -547,7 +547,7 @@ impl Shell {
         &mut self,
         simple_command: &SimpleCommand,
         expanded_words: &[ShString],
-        function_body: &CompoundCommand,
+        function_body: &FunctionBody,
         ignore_errexit: bool,
     ) -> CommandExecutionResult<i32> {
         self.environment.push_scope();
@@ -572,11 +572,14 @@ impl Shell {
         // unaffected by the function body.
         let saved_lineno = self.last_lineno;
         self.function_call_depth += 1;
-        let result = self.interpret_compound_command(
-            function_body,
-            &simple_command.redirections,
-            ignore_errexit,
-        );
+        // The redirections of the call surround those of the definition.
+        let result = self.with_redirections(&simple_command.redirections, |shell| {
+            shell.interpret_compound_command(
+                &function_body.command,
+                &function_body.redirections,
+                ignore_errexit,
+            )
+        });
 
         if self.control_flow_state == ControlFlowState::Return {
             self.control_flow_state = ControlFlowState::None;
@@ -935,32 +938,42 @@ impl Shell {
         redirections: &[Redirection],
         ignore_errexit: bool,
     ) -> CommandExecutionResult<i32> {
-        let mut prev_opened_files = self.opened_files.clone();
-        prev_opened_files.redirect(redirections, self)?;
-        std::mem::swap(&mut self.opened_files, &mut prev_opened_files);
-        let result = match compound_command {
-            CompoundCommand::BraceGroup(command) => Ok(self.interpret(command, ignore_errexit)),
-            CompoundCommand::Subshell(commands) => self.interpret_subshell(commands),
+        self.with_redirections(redirections, |shell| match compound_command {
+            CompoundCommand::BraceGroup(command) => Ok(shell.interpret(command, ignore_errexit)),
+            CompoundCommand::Subshell(commands) => shell.interpret_subshell(commands),
             CompoundCommand::ForClause {
                 iter_var,
                 words,
                 body,
-            } => self.interpret_for_clause(iter_var.clone(), words, body, ignore_errexit),
+            } => shell.interpret_for_clause(iter_var.clone(), words, body, ignore_errexit),
             CompoundCommand::CaseClause { arg, cases } => {
-                self.interpret_case_clause(arg, cases, ignore_errexit)
+                shell.interpret_case_clause(arg, cases, ignore_errexit)
             }
             CompoundCommand::IfClause {
                 if_chain,
                 else_body,
-            } => Ok(self.interpret_if_clause(if_chain, else_body, ignore_errexit)),
+            } => Ok(shell.interpret_if_clause(if_chain, else_body, ignore_errexit)),
             CompoundCommand::WhileClause { condition, body } => {
-                Ok(self.interpret_loop_clause(condition, body, true, ignore_errexit))
+                Ok(shell.interpret_loop_clause(condition, body, true, ignore_errexit))
             }
             CompoundCommand::UntilClause { condition, body } => {
-                Ok(self.interpret_loop_clause(condition, body, false, ignore_errexit))
+                Ok(shell.interpret_loop_clause(condition, body, false, ignore_errexit))
             }
-        };
-        std::mem::swap(&mut self.opened_files, &mut prev_opened_files);
+        })
+    }
+
+    /// Runs `run` with `redirections` applied to the shell's descriptor
+    /// table, and puts the previous table back afterwards.
+    fn with_redirections<T>(
+        &mut self,
+        redirections: &[Redirection],
+        run: impl FnOnce(&mut Self) -> CommandExecutionResult<T>,
+    ) -> CommandExecutionResult<T> {
+        let mut previous = self.opened_files.clone();
+        previous.redirect(redirections, self)?;
+        std::mem::swap(&mut self.opened_files, &mut previous);
+        let result = run(self);
+        std::mem::swap(&mut self.opened_files, &mut previous);
         result
     }
 

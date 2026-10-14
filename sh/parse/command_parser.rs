@@ -10,8 +10,8 @@
 use crate::nonempty::NonEmpty;
 use crate::parse::command::{
     Assignment, CaseItem, Command, CommandType, CompleteCommand, CompoundCommand, Conjunction,
-    FunctionDefinition, IORedirectionKind, If, LogicalOp, Name, Pipeline, Redirection,
-    RedirectionKind, SimpleCommand,
+    FunctionBody, FunctionDefinition, IORedirectionKind, If, LogicalOp, Name, Pipeline,
+    Redirection, RedirectionKind, SimpleCommand,
 };
 use crate::parse::lexer::command_lexer::{CommandLexer, CommandToken};
 use crate::parse::lexer::is_blank;
@@ -709,10 +709,18 @@ impl<'src> CommandParser<'src> {
         self.match_token(CommandToken::RParen)?;
         // POSIX grammar allows a linebreak between `()` and the function body.
         self.skip_linebreak()?;
-        if let Some(body) = self.parse_compound_command(alias_table)? {
+        if let Some(command) = self.parse_compound_command(alias_table)? {
+            // function_body : compound_command redirect_list?
+            let mut redirections = Vec::new();
+            while let Some(redirection) = self.parse_redirection_opt()? {
+                redirections.push(redirection);
+            }
             Ok(FunctionDefinition {
                 name,
-                body: Rc::from(body),
+                body: Rc::new(FunctionBody {
+                    command,
+                    redirections,
+                }),
             })
         } else {
             Err(ParserError::new(
@@ -1713,9 +1721,13 @@ mod tests {
             parse_command("function_name() { cmd; }"),
             CommandType::FunctionDefinition(FunctionDefinition {
                 name: Rc::from("function_name"),
-                body: Rc::from(CompoundCommand::BraceGroup(
-                    complete_command_from_word_pair(unquoted_literal_pair("cmd"), false)
-                ))
+                body: Rc::new(FunctionBody {
+                    command: CompoundCommand::BraceGroup(complete_command_from_word_pair(
+                        unquoted_literal_pair("cmd"),
+                        false
+                    )),
+                    redirections: Vec::new(),
+                })
             })
         );
 
@@ -1723,12 +1735,15 @@ mod tests {
             parse_command("function_name() ( cmd1 )"),
             CommandType::FunctionDefinition(FunctionDefinition {
                 name: Rc::from("function_name"),
-                body: Rc::from(CompoundCommand::Subshell(CompleteCommand {
-                    commands: NonEmpty::new(conjunction_from_word_pair(
-                        unquoted_literal_pair("cmd1"),
-                        false
-                    ))
-                }))
+                body: Rc::new(FunctionBody {
+                    command: CompoundCommand::Subshell(CompleteCommand {
+                        commands: NonEmpty::new(conjunction_from_word_pair(
+                            unquoted_literal_pair("cmd1"),
+                            false
+                        ))
+                    }),
+                    redirections: Vec::new(),
+                })
             })
         );
     }

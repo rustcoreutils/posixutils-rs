@@ -1085,6 +1085,13 @@ mod commands {
         );
     }
     #[test]
+    fn function_definition_redirections() {
+        test_script(
+            include_str!("sh/commands/function_definition_redirections.sh"),
+            include_str!("sh/commands/function_definition_redirections.out"),
+        );
+    }
+    #[test]
     fn if_construct() {
         test_script(
             include_str!("sh/commands/if_construct.sh"),

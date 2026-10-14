@@ -13,6 +13,7 @@ use crate::builtin::cd::Cd;
 use crate::builtin::command::Command;
 use crate::builtin::control_flow::{Break, Continue, Return};
 use crate::builtin::dot::Dot;
+use crate::builtin::echo::Echo;
 use crate::builtin::eval::Eval;
 use crate::builtin::exec::Exec;
 use crate::builtin::exit::Exit;
@@ -52,6 +53,7 @@ mod cd;
 mod command;
 mod control_flow;
 mod dot;
+mod echo;
 mod eval;
 mod exec;
 mod exit;
@@ -198,6 +200,9 @@ pub fn get_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
         "pwd" => Some(&Pwd),
         "true" => Some(&True),
         "false" => Some(&False),
+        // Printing is the commonest thing a script does; dash and bash both
+        // build echo in rather than fork for every line.
+        "echo" => Some(&Echo),
         // A conditional is the most frequently executed command in a script;
         // forking one per `[ ... ]` makes every loop pay for a process.
         "test" => Some(&Test {

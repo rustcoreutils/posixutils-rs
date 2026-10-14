@@ -2241,7 +2241,8 @@ mod audit_regressions {
         // A backslash only escapes $ ` \" \\ and <newline> inside double quotes.
         test_script("echo \"\\$(echo hi)\"\n", "$(echo hi)\n");
         test_script("echo \"a\\\nb\"\n", "ab\n");
-        test_script("echo \"a\\nb\"\n", "a\\nb\n");
+        // printf, not echo: echo itself expands `\n`.
+        test_script("printf '%s\\n' \"a\\nb\"\n", "a\\nb\n");
     }
 
     // ----- Phase 3: declaration-utility assignment expansion (POSIX 2.9.1) --

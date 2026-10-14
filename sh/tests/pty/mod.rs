@@ -443,3 +443,60 @@ fn ignored_sigint_stays_ignored_for_commands() {
     let dir = sh.exit();
     assert_eq!(read_result(&dir.path().join("out")), "survived\n");
 }
+
+/// The `sh` under test, quoted for a command line.
+fn sh_binary() -> String {
+    format!("'{}'", plib::testing::get_binary_path("sh").display())
+}
+
+/// Splits a line of numbers written by the shell.
+fn numbers(text: &str) -> Vec<i64> {
+    text.split_whitespace()
+        .map(|field| field.parse().unwrap())
+        .collect()
+}
+
+// XCU 2.11: an interactive shell leads a process group of its own and makes
+// it the terminal's foreground group; when it exits, the terminal goes back
+// to the group that had it. The session's shell is already a group leader,
+// so a second interactive shell is started inside it.
+#[test]
+fn interactive_shell_takes_the_terminal_and_gives_it_back() {
+    let mut sh = ShPtySession::new();
+    sh.line(&format!("{} -i", sh_binary()));
+    sh.line("echo $$ $(ps -o pgid= -p $$) $(ps -o tpgid= -p $$) > inner");
+    wait_for_file(&sh.path("inner"));
+    sh.line("exit");
+    sh.line("echo $$ $(ps -o pgid= -p $$) $(ps -o tpgid= -p $$) > outer");
+    let dir = sh.exit();
+    let inner = numbers(&read_result(&dir.path().join("inner")));
+    assert_eq!(inner.len(), 3, "got {inner:?}");
+    assert!(
+        inner[0] == inner[1] && inner[1] == inner[2],
+        "pid, process group and terminal group differ: {inner:?}"
+    );
+    let outer = numbers(&read_result(&dir.path().join("outer")));
+    assert_eq!(outer.len(), 3, "got {outer:?}");
+    assert_eq!(outer[1], outer[2], "the terminal did not come back");
+}
+
+// A job-control shell ignores SIGTSTP, SIGTTIN and SIGTTOU for itself only:
+// the commands it runs get the default actions back, but a signal ignored
+// when the shell started stays ignored for them.
+#[test]
+fn job_control_stop_signals_are_the_shells_own() {
+    let mut sh = ShPtySession::new();
+    sh.line(&format!("{} -c trap > default", sh_binary()));
+    sh.line(&format!("trap '' TSTP; {} -i", sh_binary()));
+    sh.line(&format!("{} -c trap > inherited", sh_binary()));
+    wait_for_file(&sh.path("inherited"));
+    sh.line("exit");
+    let dir = sh.exit();
+    let default = read_result(&dir.path().join("default"));
+    for signal in ["TSTP", "TTIN", "TTOU"] {
+        assert!(!default.contains(signal), "{signal} not reset: {default:?}");
+    }
+    let inherited = read_result(&dir.path().join("inherited"));
+    assert!(inherited.contains("TSTP"), "got {inherited:?}");
+    assert!(!inherited.contains("TTIN"), "got {inherited:?}");
+}

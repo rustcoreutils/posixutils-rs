@@ -17,10 +17,11 @@ use crate::cli::terminal::Terminal;
 use crate::jobs::{Job, JobManager, JobState};
 use crate::nonempty::NonEmpty;
 use crate::os::errno::Errno;
-use crate::os::signals::{PendingSignal, Signal, SignalManager, TermSignal};
+use crate::os::signals::{kill, PendingSignal, Signal, SignalManager, TermSignal};
 use crate::os::{
-    exec, find_command, fork, getpgrp, give_terminal_to, is_process_in_foreground, pipe, setpgid,
-    waitpid, ExecError, ForkResult, OsError, OsResult, Pid, WaitOptions, WaitStatus,
+    exec, find_command, fork, getpgrp, give_terminal_to, is_process_in_foreground, job_control_tty,
+    pipe, set_job_control_tty, setpgid, tcgetpgrp, waitpid, ExecError, ForkResult, OsError,
+    OsResult, Pid, WaitOptions, WaitStatus,
 };
 use crate::parse::command::{
     Assignment, CaseItem, Command, CommandType, CompleteCommand, CompoundCommand, Conjunction,
@@ -42,7 +43,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
 use std::rc::Rc;
@@ -248,6 +249,10 @@ pub struct Shell {
     /// `$!`: the process id of the most recent asynchronous command. It stays
     /// set once the job has been waited for and removed from the job table.
     pub last_background_pid: Option<Pid>,
+    /// Under job control with a terminal: the process group the shell was
+    /// in before it made one of its own and took the terminal, given the
+    /// terminal back when job control ends.
+    pub job_control_initial_pgrp: Option<Pid>,
 }
 
 #[derive(Default, Clone)]
@@ -385,6 +390,10 @@ impl Shell {
         self.execute_action(exit_action);
         if self.is_interactive && !self.is_subshell {
             write_history_to_file(&self.history, &self.environment);
+        }
+        // The terminal goes back to the process group that had it.
+        if !self.is_subshell {
+            self.release_terminal();
         }
         // POSIX 2.15: `exit n` for 0 <= n <= 255 exits *normally* with status
         // n. The shell must not re-raise the signal a `128+signo` status would
@@ -1375,6 +1384,78 @@ impl Shell {
         self.set_options.monitor && !self.is_subshell
     }
 
+    /// Turns job control on or off, at the start of a shell with `-m` (every
+    /// interactive one) and on `set -m` / `set +m`. With it on, the shell
+    /// ignores the terminal's stop signals and, if its standard input is
+    /// its controlling terminal, leads a process group of its own that has
+    /// the terminal (XCU 2.11), as dash does. Without a terminal, jobs
+    /// still get process groups of their own, as in bash.
+    pub fn set_job_control(&mut self, on: bool) {
+        if self.is_subshell {
+            return;
+        }
+        if on {
+            self.take_terminal();
+            self.signal_manager.set_job_control(true);
+        } else {
+            self.release_terminal();
+            self.signal_manager.set_job_control(false);
+        }
+    }
+
+    /// XCU 2.11: waits until the shell's process group is the terminal's
+    /// foreground group (a job-control shell started in the background
+    /// stops itself with SIGTTIN until it is brought to the foreground),
+    /// then makes a process group of its own and gives it the terminal.
+    fn take_terminal(&mut self) {
+        let terminal = libc::STDIN_FILENO;
+        if self.job_control_initial_pgrp.is_some() || !io::stdin().is_terminal() {
+            return;
+        }
+        // An orphaned process group is not stopped by SIGTTIN, and an
+        // ignored one stops nothing, so the wait is bounded.
+        let mut attempts = 0;
+        loop {
+            let Ok(foreground) = tcgetpgrp(terminal) else {
+                return;
+            };
+            if foreground == getpgrp() {
+                break;
+            }
+            if attempts == 100 || self.signal_manager.is_ignored_on_entry(Signal::SigTtin) {
+                return;
+            }
+            let _ = kill(0, Some(Signal::SigTtin));
+            attempts += 1;
+        }
+        let initial = getpgrp();
+        let pid = unsafe { libc::getpid() };
+        // Fails only for a session leader, whose group is already its own.
+        let _ = setpgid(0, pid);
+        if give_terminal_to(terminal, getpgrp()).is_err()
+            || set_job_control_tty(Some(terminal)).is_err()
+        {
+            let _ = setpgid(0, initial);
+            return;
+        }
+        self.job_control_initial_pgrp = Some(initial);
+    }
+
+    /// Gives the terminal back to the process group the shell came from,
+    /// and rejoins it, as dash does when job control ends.
+    fn release_terminal(&mut self) {
+        let Some(initial) = self.job_control_initial_pgrp.take() else {
+            return;
+        };
+        if let Some(terminal) = job_control_tty() {
+            let _ = give_terminal_to(terminal, initial);
+        }
+        if initial != getpgrp() {
+            let _ = setpgid(0, initial);
+        }
+        let _ = set_job_control_tty(None);
+    }
+
     /// Runs a pipeline of two or more commands as one job (`set -m`): a
     /// wrapper subshell leads a process group of its own holding every
     /// command, and is given the terminal while it runs if the shell has it.
@@ -2006,6 +2087,7 @@ impl Default for Shell {
             mail_check: MailCheck::default(),
             terminal: Terminal::default(),
             last_background_pid: None,
+            job_control_initial_pgrp: None,
         }
     }
 }

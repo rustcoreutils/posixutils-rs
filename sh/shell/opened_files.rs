@@ -28,7 +28,10 @@
 
 use crate::os::errno::Errno;
 use crate::os::signals::{is_signal_pipe_fd, move_signal_pipe_fd};
-use crate::os::{close, dup2, dup_private, here_document_fd, OsError, OsResult};
+use crate::os::{
+    close, dup2, dup_private, here_document_fd, is_job_control_tty_fd, move_job_control_tty_fd,
+    OsError, OsResult,
+};
 use crate::parse::command::{IORedirectionKind, Redirection, RedirectionKind};
 use crate::shell::{CommandExecutionError, Shell};
 use crate::shstr::ShStr;
@@ -168,7 +171,7 @@ impl RedirectionFrames {
     /// Whether `fd` is one of the shell's own descriptors, which no
     /// redirection may read: a saved copy or the signal pipe.
     fn is_private(&self, fd: RawFd) -> bool {
-        self.holds_copy(fd) || is_signal_pipe_fd(fd)
+        self.holds_copy(fd) || is_signal_pipe_fd(fd) || is_job_control_tty_fd(fd)
     }
 
     /// Moves the shell's own descriptor numbered `fd`, if there is one, to
@@ -182,6 +185,8 @@ impl RedirectionFrames {
             let _ = close(fd);
         } else if is_signal_pipe_fd(fd) {
             move_signal_pipe_fd(fd)?;
+        } else if is_job_control_tty_fd(fd) {
+            move_job_control_tty_fd(fd)?;
         }
         Ok(())
     }

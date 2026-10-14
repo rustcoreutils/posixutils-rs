@@ -18,6 +18,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 pub mod errno;
 pub mod signals;
@@ -489,6 +490,45 @@ pub fn give_terminal_to(fd: RawFd, pgid: Pid) -> OsResult<()> {
         libc::sigprocmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
         result
     }
+}
+
+/// The shell's own descriptor for the terminal job control hands to jobs,
+/// -1 when it has none. A private copy, so that redirections of the
+/// standard descriptors do not change which terminal that is.
+static JOB_CONTROL_TTY: AtomicI32 = AtomicI32::new(-1);
+
+/// The terminal job control hands to foreground jobs, if any.
+pub fn job_control_tty() -> Option<RawFd> {
+    let fd = JOB_CONTROL_TTY.load(Ordering::SeqCst);
+    (fd >= 0).then_some(fd)
+}
+
+/// Makes a private copy of `fd`, a terminal, the one job control uses, or
+/// with `None` closes the copy.
+pub fn set_job_control_tty(fd: Option<RawFd>) -> OsResult<()> {
+    let copy = match fd {
+        Some(fd) => dup_private(fd)?,
+        None => -1,
+    };
+    let previous = JOB_CONTROL_TTY.swap(copy, Ordering::SeqCst);
+    if previous >= 0 {
+        let _ = close(previous);
+    }
+    Ok(())
+}
+
+/// Whether `fd` is the job-control terminal's private descriptor.
+pub fn is_job_control_tty_fd(fd: RawFd) -> bool {
+    fd >= 0 && JOB_CONTROL_TTY.load(Ordering::SeqCst) == fd
+}
+
+/// Moves the job-control terminal's descriptor off `fd`, so that a
+/// redirection can have that number.
+pub fn move_job_control_tty_fd(fd: RawFd) -> OsResult<()> {
+    let copy = dup_private(fd)?;
+    let _ = JOB_CONTROL_TTY.compare_exchange(fd, copy, Ordering::SeqCst, Ordering::SeqCst);
+    let _ = close(fd);
+    Ok(())
 }
 
 pub fn is_process_in_foreground() -> bool {

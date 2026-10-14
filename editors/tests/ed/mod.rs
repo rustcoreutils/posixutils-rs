@@ -2396,3 +2396,10 @@ fn failed_read_still_remembers_the_pathname() {
 fn help_write_error_on_full_device() {
     plib::testing::assert_write_error_message_on_full_device("ed", &["--help"], b"", 1);
 }
+
+// A failed write to standard output is "ed: write error: REASON".
+#[cfg(target_os = "linux")]
+#[test]
+fn write_error_message_on_full_device() {
+    plib::testing::assert_write_error_message_on_full_device("ed", &[], b"a\nhello\n.\np\nQ\n", 1);
+}

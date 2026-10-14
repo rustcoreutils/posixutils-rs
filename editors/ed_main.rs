@@ -16,7 +16,7 @@ mod ed;
 use clap::Parser;
 use gettextrs::gettext;
 use std::ffi::OsString;
-use std::io::{self, BufReader, BufWriter};
+use std::io::{self, BufReader, BufWriter, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Global flag for SIGINT received
@@ -24,6 +24,22 @@ pub static SIGINT_RECEIVED: AtomicBool = AtomicBool::new(false);
 
 /// Global flag for SIGHUP received
 pub static SIGHUP_RECEIVED: AtomicBool = AtomicBool::new(false);
+
+/// Standard output, with each failure marked as a [`plib::diag::WriteError`]
+/// so that main can tell it from a failed read of the commands.
+struct Stdout<W: Write>(W);
+
+impl<W: Write> Write for Stdout<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0
+            .write(buf)
+            .map_err(|e| plib::diag::WriteError(e).into())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush().map_err(|e| plib::diag::WriteError(e).into())
+    }
+}
 
 /// ed - edit text
 #[derive(Parser, Debug)]
@@ -125,7 +141,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let reader = BufReader::new(stdin.lock());
-    let writer = BufWriter::new(stdout.lock());
+    let writer = BufWriter::new(Stdout(stdout.lock()));
 
     let mut editor = ed::Editor::new(reader, writer);
 
@@ -153,7 +169,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run the editor loop
     if let Err(e) = editor.run() {
-        eprintln!("ed: {}", plib::diag::io_error_text(&e));
+        eprintln!("ed: {}", plib::diag::error_text(&e));
         std::process::exit(1);
     }
 

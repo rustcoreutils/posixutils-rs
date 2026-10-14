@@ -2154,3 +2154,24 @@ fn awk_attached_field_separator_may_begin_with_equals() {
     }
     plib::testing::assert_equals_option_argument("awk", "-F", &["{print $2}"], b"a=b\n");
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn awk_write_error_on_full_device() {
+    // A failed write to standard output is "awk: write error: REASON",
+    // with the system's text for the error and exit status 1.
+    plib::testing::assert_write_error_message_on_full_device("awk", &["{ print }"], b"x\n", 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn awk_begin_print_write_error_on_full_device() {
+    // A failed write to standard output is "awk: write error: REASON",
+    // with the system's text for the error and exit status 1.
+    plib::testing::assert_write_error_message_on_full_device(
+        "awk",
+        &["BEGIN { print \"x\" }"],
+        b"",
+        1,
+    );
+}

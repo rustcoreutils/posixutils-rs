@@ -76,6 +76,13 @@ impl<'src> CommandParser<'src> {
         self.lookahead_lineno + self.start_lineno
     }
 
+    /// How many bytes of the source have been read: after
+    /// [`Self::parse_next_command`], the end of the line that ends the
+    /// command (its terminating newline is the lookahead).
+    pub fn source_offset(&self) -> usize {
+        self.lexer.source_offset()
+    }
+
     /// POSIX 2.4: a reserved word is only recognized as such when it is the
     /// first word of a command, or the first word following a reserved word
     /// other than `case`, `for` or `in`. Anywhere else it is an ordinary word,

@@ -77,3 +77,21 @@ fn verbose_echoes_input_as_read() {
         });
     }
 }
+
+// Each command's text, here-document bodies and multi-line compound
+// commands included, is echoed whole; the commands of a command
+// substitution are not input read by the shell and are not echoed again.
+#[test]
+fn verbose_echoes_whole_commands() {
+    let script = "set -v\nx=$(echo s)\ncat <<E\n$x\nE\nif true; then\n  :\nfi\n# end\n";
+    let path = concat!(env!("CARGO_TARGET_TMPDIR"), "/set_verbose_whole.sh");
+    std::fs::write(path, script).unwrap();
+    run_test(TestPlan {
+        cmd: "sh".to_string(),
+        args: vec![path.to_string()],
+        stdin_data: String::new(),
+        expected_out: "s\n".to_string(),
+        expected_err: script["set -v\n".len()..].to_string(),
+        expected_exit_code: 0,
+    });
+}

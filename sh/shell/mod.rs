@@ -377,7 +377,7 @@ impl Shell {
     pub fn execute_action(&mut self, action: TrapAction) {
         if let TrapAction::Commands(commands) = action {
             let last_pipeline_exit_status_before_trap = self.last_pipeline_exit_status;
-            if let Err(err) = self.execute_program(commands.as_bytes()) {
+            if let Err(err) = self.run_program(commands.as_bytes(), false) {
                 eprintln!("sh: error parsing action: {}", err.message);
             }
             self.last_pipeline_exit_status = last_pipeline_exit_status_before_trap;
@@ -1286,23 +1286,45 @@ impl Shell {
     pub fn execute_nested_program(&mut self, program: &[u8]) -> Result<i32, ParserError> {
         let saved_lineno = self.last_lineno;
         self.last_lineno = self.command_lineno.saturating_sub(1);
-        let result = self.execute_program(program);
+        let result = self.run_program(program, false);
         self.last_lineno = saved_lineno;
         result
     }
 
+    /// Executes input the shell has read: a script, a line of standard input
+    /// or a `-c` string.
     pub fn execute_program(&mut self, program: &[u8]) -> Result<i32, ParserError> {
-        if self.set_options.verbose {
-            self.eprint(&String::from_utf8_lossy(program))
-        }
+        self.run_program(program, true)
+    }
+
+    /// `echo_input` says whether `program` is input read by the shell, which
+    /// `set -v` writes to standard error as it is read: each command's text
+    /// just before the command runs, so the option takes effect from the
+    /// next command on. The operands of `eval`, a command substitution and a
+    /// trap action are not read input (as in dash).
+    fn run_program(&mut self, program: &[u8], echo_input: bool) -> Result<i32, ParserError> {
         if let Err(err) = self.background_jobs.update_jobs() {
             self.eprint(&format!("sh: error updating background jobs ({err})"));
         }
         self.process_signals();
         let mut parser = CommandParser::new(program, self.last_lineno)?;
         let mut result = 0;
+        // the end of the input already echoed (or passed while not verbose)
+        let mut echoed = 0;
         loop {
             let command = parser.parse_next_command(&self.alias_table)?;
+            if echo_input {
+                // At the end of input, what is left is blank lines and comments.
+                let end = if command.is_some() {
+                    parser.source_offset()
+                } else {
+                    program.len()
+                };
+                if self.set_options.verbose && end > echoed {
+                    self.opened_files.write_err(&program[echoed..end]);
+                }
+                echoed = echoed.max(end);
+            }
             if !self.is_interactive && self.set_options.noexec {
                 // `set -n` reads and parses without executing, so the whole
                 // input must be parsed: returning here checked only the first

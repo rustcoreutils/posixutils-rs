@@ -279,10 +279,25 @@ pub fn flush_stdout() -> bool {
     match io::stdout().flush() {
         Ok(()) => true,
         Err(e) => {
-            error(&format!("write error: {}", io_error_text(&e)));
+            write_error(&e);
             false
         }
     }
+}
+
+/// Report a failed write to standard output as `UTILITY: write error: REASON`,
+/// counted like any [`error`].
+pub fn write_error(e: &io::Error) {
+    error(&format!(
+        "{}: {}",
+        gettextrs::gettext("write error"),
+        io_error_text(e)
+    ));
+}
+
+/// Whether [`init`] (or [`init_locale`]) has named the utility on this thread.
+pub(crate) fn is_initialized() -> bool {
+    UTIL_NAME.with(|s| !s.borrow().is_empty())
 }
 
 /// Render an `io::Error` the way a system utility reports one.

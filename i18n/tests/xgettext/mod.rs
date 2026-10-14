@@ -249,3 +249,13 @@ fn option_argument_may_begin_with_hyphen() {
         plib::testing::assert_hyphen_option_argument("xgettext", &[opt, "-zq", "--help"]);
     }
 }
+
+// A failed write of the help or version text is a write error, as for any
+// other output, not a silent success.
+#[cfg(target_os = "linux")]
+#[test]
+fn help_write_error_on_full_device() {
+    for opt in ["--help", "--version"] {
+        plib::testing::assert_write_error_message_on_full_device("xgettext", &[opt], b"", 1);
+    }
+}

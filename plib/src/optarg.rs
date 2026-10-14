@@ -29,6 +29,7 @@
 
 use clap::{Command, CommandFactory, Parser};
 use std::ffi::{OsStr, OsString};
+use std::io::Write;
 
 /// The options of a command whose argument may be the next word.
 pub struct OptionArguments {
@@ -198,7 +199,54 @@ pub fn spell_optional_argument(
 /// Parse the command line as `T`, keeping an attached option-argument that
 /// begins with '=' whole (see [`keep_leading_equals`]).
 pub fn parse<T: Parser>() -> T {
-    T::parse_from(args_os::<T>())
+    parse_from(args_os::<T>())
+}
+
+/// Parse `argv` as `T`, exiting through [`exit`] on an error or a request for
+/// help or the version.
+pub fn parse_from<T, I, A>(argv: I) -> T
+where
+    T: Parser,
+    I: IntoIterator<Item = A>,
+    A: Into<OsString> + Clone,
+{
+    T::try_parse_from(argv).unwrap_or_else(|e| exit(e))
+}
+
+/// Print clap's message for `e` and exit, as [`clap::Error::exit`] does,
+/// except that a failed write of the help or version text to standard output
+/// is `UTILITY: write error: REASON` with status 1. clap discards that
+/// failure and exits 0, so `UTILITY --help >/dev/full` claimed success.
+pub fn exit(e: clap::Error) -> ! {
+    if e.use_stderr() {
+        e.exit();
+    }
+    // Help and version text end in a <newline>, but flush anyway: a partial
+    // line left in the buffer would be written, and its error lost, at exit.
+    let written = e.print().and_then(|()| std::io::stdout().flush());
+    if let Err(failure) = written {
+        if !crate::diag::is_initialized() {
+            crate::diag::init(&program_name());
+        }
+        crate::diag::write_error(&failure);
+        std::process::exit(1);
+    }
+    std::process::exit(e.exit_code());
+}
+
+/// The name this program was run as, for a diagnostic issued before the
+/// utility named itself.
+fn program_name() -> String {
+    std::env::args_os()
+        .next()
+        .map(|arg0| {
+            std::path::Path::new(&arg0)
+                .file_name()
+                .unwrap_or(&arg0)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .unwrap_or_default()
 }
 
 /// [`parse`], returning clap's error instead of exiting with it.

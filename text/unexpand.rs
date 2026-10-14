@@ -89,9 +89,16 @@ fn parse_tablist(s: &str) -> Result<TabStops, String> {
     Ok(TabStops::List(v))
 }
 
-fn unexpand(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+/// Why the run failed: a bad option or an unreadable input, whose message is
+/// complete, or a failed write to standard output.
+enum Failure {
+    Input(String),
+    Output(io::Error),
+}
+
+fn unexpand(args: &Args) -> Result<(), Failure> {
     let tabs = match &args.tablist {
-        Some(s) => parse_tablist(s)?,
+        Some(s) => parse_tablist(s).map_err(Failure::Input)?,
         None => TabStops::Uniform(8),
     };
     // -t implies -a (POSIX): conversion is not limited to leading blanks.
@@ -110,7 +117,7 @@ fn unexpand(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         // Name the operand at the origin: the diagnostic runs in main after
         // this loop, where the source that failed is no longer known.
         let mut reader = io::BufReader::new(input_stream_dashed(source).map_err(|e| {
-            io::Error::other(format!(
+            Failure::Input(format!(
                 "{}: {}",
                 source.display(),
                 plib::diag::io_error_text(&e)
@@ -121,7 +128,10 @@ fn unexpand(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         let mut buf: Vec<u8> = Vec::new();
         loop {
             buf.clear();
-            if reader.read_until(b'\n', &mut buf)? == 0 {
+            let n = reader
+                .read_until(b'\n', &mut buf)
+                .map_err(|e| Failure::Input(plib::diag::io_error_text(&e)))?;
+            if n == 0 {
                 break;
             }
             let had_newline = buf.last() == Some(&b'\n');
@@ -130,10 +140,16 @@ fn unexpand(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 &buf[..]
             };
-            stdout.write_all(&unexpand_line(content, &tabs, all_mode))?;
-            if had_newline {
-                stdout.write_all(b"\n")?;
-            }
+            stdout
+                .write_all(&unexpand_line(content, &tabs, all_mode))
+                .and_then(|()| {
+                    if had_newline {
+                        stdout.write_all(b"\n")
+                    } else {
+                        Ok(())
+                    }
+                })
+                .map_err(Failure::Output)?;
         }
     }
 
@@ -263,9 +279,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut exit_code = 0;
 
-    if let Err(err) = unexpand(&args) {
-        exit_code = 1;
-        plib::diag::error(&plib::diag::error_text(err.as_ref()));
+    match unexpand(&args) {
+        Ok(()) => {}
+        Err(Failure::Input(msg)) => {
+            exit_code = 1;
+            plib::diag::error(&msg);
+        }
+        Err(Failure::Output(e)) => {
+            // Reported once: what is left in the buffer would only fail again.
+            plib::diag::error(&format!(
+                "{}: {}",
+                gettext("write error"),
+                plib::diag::io_error_text(&e)
+            ));
+            std::process::exit(1);
+        }
     }
 
     if !plib::diag::flush_stdout() {

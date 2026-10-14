@@ -181,3 +181,11 @@ fn expand_multiple_files_and_a_missing_one() {
 fn option_argument_may_begin_with_hyphen() {
     plib::testing::assert_hyphen_option_argument("expand", &["-t", "-zq", "--help"]);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn expand_write_error_on_full_device() {
+    // A failed write to standard output is "expand: write error: REASON",
+    // with the system's text for the error and exit status 1.
+    plib::testing::assert_write_error_message_on_full_device("expand", &[], b"a\tb\n", 1);
+}

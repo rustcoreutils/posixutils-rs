@@ -85,9 +85,16 @@ fn next_stop(tablist: &TabList, p: usize) -> usize {
     }
 }
 
-fn expand_file(tablist: &TabList, pathname: &Path) -> io::Result<()> {
+/// Why expanding one file failed: reading the input, which is reported
+/// against the file, or writing standard output, which is a write error.
+enum Failure {
+    Input(io::Error),
+    Output(io::Error),
+}
+
+fn expand_file(tablist: &TabList, pathname: &Path) -> Result<(), Failure> {
     // open file, or stdin ("-" or no operand)
-    let mut reader = BufReader::new(input_stream_dashed(pathname)?);
+    let mut reader = BufReader::new(input_stream_dashed(pathname).map_err(Failure::Input)?);
 
     let mut writer = BufWriter::new(io::stdout());
     // 0-based column = number of column positions consumed on the current line.
@@ -99,46 +106,60 @@ fn expand_file(tablist: &TabList, pathname: &Path) -> io::Result<()> {
     let mut data: Vec<u8> = Vec::new();
     loop {
         data.clear();
-        if reader.read_until(b'\n', &mut data)? == 0 {
+        if reader
+            .read_until(b'\n', &mut data)
+            .map_err(Failure::Input)?
+            == 0
+        {
             break;
         }
-        for ch in mb_char_slices(&data) {
-            match ch {
-                b"\t" => {
-                    let stop = next_stop(tablist, p);
-                    for _ in p..stop {
-                        writer.write_all(b" ")?;
-                    }
-                    p = stop;
+        expand_line(tablist, &data, &mut p, &mut writer).map_err(Failure::Output)?;
+    }
+
+    writer.flush().map_err(Failure::Output)
+}
+
+/// Write one line of input with its tabs expanded, tracking the 0-based
+/// column `p` across calls.
+fn expand_line(
+    tablist: &TabList,
+    data: &[u8],
+    p: &mut usize,
+    writer: &mut impl Write,
+) -> io::Result<()> {
+    for ch in mb_char_slices(data) {
+        match ch {
+            b"\t" => {
+                let stop = next_stop(tablist, *p);
+                for _ in *p..stop {
+                    writer.write_all(b" ")?;
                 }
-                b"\x08" => {
-                    // backspace: column count decrements, never below zero
-                    writer.write_all(ch)?;
-                    p = p.saturating_sub(1);
-                }
-                b"\r" | b"\n" => {
-                    writer.write_all(ch)?;
-                    p = 0;
-                }
-                _ => {
-                    writer.write_all(ch)?;
-                    // Advance by the character's display width under LC_CTYPE.
-                    // Non-printable / undecodable bytes do not advance the column.
-                    let w = std::str::from_utf8(ch)
-                        .ok()
-                        .and_then(|s| s.chars().next())
-                        .map(wcwidth_char)
-                        .unwrap_or(1);
-                    if w > 0 {
-                        p += w as usize;
-                    }
+                *p = stop;
+            }
+            b"\x08" => {
+                // backspace: column count decrements, never below zero
+                writer.write_all(ch)?;
+                *p = p.saturating_sub(1);
+            }
+            b"\r" | b"\n" => {
+                writer.write_all(ch)?;
+                *p = 0;
+            }
+            _ => {
+                writer.write_all(ch)?;
+                // Advance by the character's display width under LC_CTYPE.
+                // Non-printable / undecodable bytes do not advance the column.
+                let w = std::str::from_utf8(ch)
+                    .ok()
+                    .and_then(|s| s.chars().next())
+                    .map(wcwidth_char)
+                    .unwrap_or(1);
+                if w > 0 {
+                    *p += w as usize;
                 }
             }
         }
     }
-
-    writer.flush()?;
-
     Ok(())
 }
 
@@ -169,9 +190,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut exit_code = 0;
 
     for filename in &args.files {
-        if let Err(e) = expand_file(&tablist, filename) {
-            exit_code = 1;
-            eprintln!("{}: {}", filename.display(), plib::diag::io_error_text(&e));
+        match expand_file(&tablist, filename) {
+            Ok(()) => {}
+            Err(Failure::Input(e)) => {
+                exit_code = 1;
+                eprintln!("{}: {}", filename.display(), plib::diag::io_error_text(&e));
+            }
+            Err(Failure::Output(e)) => {
+                // Every later file would fail the same way.
+                eprintln!(
+                    "expand: {}: {}",
+                    gettext("write error"),
+                    plib::diag::io_error_text(&e)
+                );
+                std::process::exit(1);
+            }
         }
     }
 

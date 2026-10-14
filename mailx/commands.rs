@@ -717,7 +717,8 @@ fn cmd_cd(args: &str) -> Result<CommandResult, String> {
         args.to_string()
     };
 
-    env::set_current_dir(&dir).map_err(|e| format!("{}: {}", dir, e))?;
+    env::set_current_dir(&dir)
+        .map_err(|e| format!("{}: {}", dir, plib::diag::io_error_text(&e)))?;
     Ok(CommandResult::Continue)
 }
 
@@ -895,9 +896,10 @@ fn cmd_file(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
     // would record a byte length taken before `quit` rewrote the file, and if
     // the two are the same mailbox everything `quit` appended would then look
     // like newly delivered mail and be copied through a second time.
-    fs::File::open(&path).map_err(|e| format!("{}: {}", path, e))?;
+    fs::File::open(&path).map_err(|e| format!("{}: {}", path, plib::diag::io_error_text(&e)))?;
     mb.quit(vars)?;
-    let mut new_mb = Mailbox::load(&path).map_err(|e| format!("{}: {}", path, e))?;
+    let mut new_mb =
+        Mailbox::load(&path).map_err(|e| format!("{}: {}", path, plib::diag::io_error_text(&e)))?;
     new_mb.prev_path = Some(leaving);
 
     *mb = new_mb;
@@ -1374,7 +1376,8 @@ fn cmd_size(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
 /// conditional in a sourced file was silently ignored.
 fn cmd_source(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult, String> {
     let path = expand_filename(args.trim(), vars);
-    let content = fs::read_to_string(&path).map_err(|e| format!("{}: {}", path, e))?;
+    let content = fs::read_to_string(&path)
+        .map_err(|e| format!("{}: {}", path, plib::diag::io_error_text(&e)))?;
     run_script(&content, &path, mb, vars);
     Ok(CommandResult::Continue)
 }
@@ -1519,7 +1522,7 @@ fn cmd_write(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comma
         .create(true)
         .append(true)
         .open(&filename)
-        .map_err(|e| format!("{}: {}", filename, e))?;
+        .map_err(|e| format!("{}: {}", filename, plib::diag::io_error_text(&e)))?;
 
     let mut total_size = 0;
     for num in &msg_nums {

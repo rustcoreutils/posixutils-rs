@@ -97,7 +97,7 @@ fn run_headers_only(args: &Args) -> i32 {
     let mb = match Mailbox::load(&mailbox_path) {
         Ok(mb) => mb,
         Err(e) => {
-            eprintln!("mailx: {}: {}", mailbox_path, e);
+            eprintln!("mailx: {}: {}", mailbox_path, plib::diag::io_error_text(&e));
             return 1;
         }
     };
@@ -128,7 +128,7 @@ fn run_receive_mode(args: &Args) -> i32 {
         Ok(mb) => mb,
         Err(e) => {
             if args.file.is_some() || !args.read_mbox {
-                eprintln!("mailx: {}: {}", mailbox_path, e);
+                eprintln!("mailx: {}: {}", mailbox_path, plib::diag::io_error_text(&e));
                 return 1;
             }
             // For mbox, create empty if doesn't exist
@@ -179,7 +179,11 @@ fn run_receive_mode(args: &Args) -> i32 {
                 continue;
             }
             Err(e) => {
-                eprintln!("mailx: {}: {}", gettext("read error"), e);
+                eprintln!(
+                    "mailx: {}: {}",
+                    gettext("read error"),
+                    plib::diag::io_error_text(&e)
+                );
                 return 1;
             }
         }

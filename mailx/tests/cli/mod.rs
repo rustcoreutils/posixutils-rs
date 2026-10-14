@@ -183,6 +183,13 @@ fn opt_f_nonexistent_file() {
         },
         |_plan, output| {
             assert!(!output.status.success(), "Should fail for nonexistent file");
+            // The system's text for the error, without Rust's "(os error N)".
+            let missing = "/nonexistent/path/to/mbox";
+            let open_error = plib::diag::io_error_text(&std::fs::File::open(missing).unwrap_err());
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr),
+                format!("mailx: {missing}: {open_error}\n")
+            );
         },
     );
 }

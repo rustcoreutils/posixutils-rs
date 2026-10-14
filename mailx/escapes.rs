@@ -251,7 +251,7 @@ pub fn handle_escape(
                         println!("\"{}\" {} bytes", path, content.len());
                     }
                     Err(e) => {
-                        println!("{}: {}", path, e);
+                        println!("{}: {}", path, plib::diag::io_error_text(&e));
                     }
                 }
             }
@@ -285,7 +285,7 @@ pub fn handle_escape(
                 .and_then(|mut f| f.write_all(msg.body.as_bytes()));
             match result {
                 Ok(_) => println!("\"{}\" {} bytes", path, msg.body.len()),
-                Err(e) => println!("{}: {}", path, e),
+                Err(e) => println!("{}: {}", path, plib::diag::io_error_text(&e)),
             }
             Ok(EscapeResult::continue_input())
         }
@@ -555,7 +555,12 @@ fn pipe_through_command(input: &str, cmd: &str, vars: &Variables) -> Result<Stri
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("Failed to execute command: {}", e))?;
+        .map_err(|e| {
+            format!(
+                "Failed to execute command: {}",
+                plib::diag::io_error_text(&e)
+            )
+        })?;
 
     // Feed the body from a separate thread. Writing it all before reading the
     // filter's output deadlocked as soon as that output exceeded one pipe
@@ -569,16 +574,24 @@ fn pipe_through_command(input: &str, cmd: &str, vars: &Variables) -> Result<Stri
     let body = input.to_string();
     let writer = std::thread::spawn(move || stdin.write_all(body.as_bytes()));
 
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("Failed to wait for command: {}", e))?;
+    let output = child.wait_with_output().map_err(|e| {
+        format!(
+            "Failed to wait for command: {}",
+            plib::diag::io_error_text(&e)
+        )
+    })?;
 
     match writer.join() {
         Ok(Ok(())) => {}
         // A filter that exits without reading its input (`~| head`) closes the
         // pipe early; that is not an error in the message.
         Ok(Err(e)) if e.kind() == io::ErrorKind::BrokenPipe => {}
-        Ok(Err(e)) => return Err(format!("Failed to write to command: {}", e)),
+        Ok(Err(e)) => {
+            return Err(format!(
+                "Failed to write to command: {}",
+                plib::diag::io_error_text(&e)
+            ))
+        }
         Err(_) => return Err("Failed to write to command".to_string()),
     }
 

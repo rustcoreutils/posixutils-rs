@@ -383,7 +383,7 @@ impl Mailbox {
             let mbox_path = crate::util::mbox_path(vars);
             let append = vars.get_bool("append");
             migrate_to_mbox(&mbox_path, &mbox_messages, append)
-                .map_err(|e| format!("{}: {}", mbox_path, e))?;
+                .map_err(|e| format!("{}: {}", mbox_path, plib::diag::io_error_text(&e)))?;
         }
 
         // Rewrite the current mailbox only when its set of messages actually
@@ -401,7 +401,7 @@ impl Mailbox {
         // `Status:` header the mailbox should now carry.
         if keep_messages.len() != self.messages.len() || self.state_differs_from_disk() {
             rewrite_mailbox(&self.path, &keep_messages, self.loaded_len, keep)
-                .map_err(|e| format!("{}: {}", self.path, e))?;
+                .map_err(|e| format!("{}: {}", self.path, plib::diag::io_error_text(&e)))?;
         }
 
         Ok(())
@@ -423,7 +423,7 @@ impl Mailbox {
 
         let msgs: Vec<Message> = messages.iter().map(|m| (*m).clone()).collect();
         append_messages_to_file(path, &msgs, include_from_line)
-            .map_err(|e| format!("{}: {}", path, e))
+            .map_err(|e| format!("{}: {}", path, plib::diag::io_error_text(&e)))
     }
 }
 

@@ -147,3 +147,23 @@ fn cd_and_dot_failures_name_the_operand() {
         1,
     );
 }
+
+// A built-in utility that cannot write its output reports it once and
+// exits 1, as dash and bash do, rather than reporting every failed write
+// and exiting 0.
+#[test]
+fn builtin_write_error_is_reported_once_with_status_1() {
+    sh_c(
+        "pwd >&-; echo $?",
+        "1\n",
+        "pwd: write error: Bad file descriptor\n",
+        0,
+    );
+    sh_c(
+        "export A=1 B=2; export -p >&-; echo $?",
+        "1\n",
+        "export: write error: Bad file descriptor\n",
+        0,
+    );
+    sh_c("pwd 2>&- >/dev/null; echo $?", "0\n", "", 0);
+}

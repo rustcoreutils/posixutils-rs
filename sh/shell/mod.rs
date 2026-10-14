@@ -106,6 +106,23 @@ impl Display for CommandExecutionError {
 
 type CommandExecutionResult<T> = Result<T, CommandExecutionError>;
 
+/// A built-in utility that could not write its output has failed: report
+/// the first failed write once, naming the utility, and make the status
+/// non-zero, as dash and bash do.
+pub fn report_write_error(name: &str, status: i32, opened_files: &OpenedFiles) -> i32 {
+    match opened_files.take_write_error() {
+        Some(err) => {
+            opened_files.write_err(format!(
+                "{name}: {}: {}\n",
+                gettext("write error"),
+                plib::diag::io_error_text(&err)
+            ));
+            status.max(1)
+        }
+        None => status,
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ControlFlowState {
     Break(u32),
@@ -522,6 +539,7 @@ impl Shell {
 
     fn exec_special_builtin(
         &mut self,
+        name: &str,
         simple_command: &SimpleCommand,
         args: &[ShString],
         special_builtin_utility: &dyn SpecialBuiltinUtility,
@@ -537,8 +555,9 @@ impl Shell {
             }
             return Err(err);
         }
+        opened_files.take_write_error();
         match special_builtin_utility.exec(args, self, &mut opened_files) {
-            Ok(status) => Ok(status),
+            Ok(status) => Ok(report_write_error(name, status, &opened_files)),
             Err(err) => {
                 opened_files.write_err(format!("{err}\n"));
                 if !self.is_interactive {
@@ -600,6 +619,7 @@ impl Shell {
 
     fn exec_builtin_utility(
         &mut self,
+        name: &str,
         simple_command: &SimpleCommand,
         args: &[ShString],
         builtin_utility: &dyn BuiltinUtility,
@@ -612,10 +632,11 @@ impl Shell {
         // exports every local scope, so a leaked one would put the variable in
         // the environment of every later child.
         self.environment.push_scope();
+        opened_files.take_write_error();
         let result =
             self.assign_locals(&simple_command.assignments).map(|_| {
                 match builtin_utility.exec(args, self, &mut opened_files) {
-                    Ok(status) => status,
+                    Ok(status) => report_write_error(name, status, &opened_files),
                     Err(err) => {
                         opened_files.write_err(format!("{err}\n"));
                         1
@@ -745,6 +766,7 @@ impl Shell {
         let command_name = expanded_words[0].display().to_string();
         if let Some(special_builtin_utility) = get_special_builtin_utility(&command_name) {
             self.exec_special_builtin(
+                &command_name,
                 simple_command,
                 &expanded_words[1..],
                 special_builtin_utility,
@@ -757,7 +779,12 @@ impl Shell {
                 ignore_errexit,
             )
         } else if let Some(builtin_utility) = get_builtin_utility(&command_name) {
-            self.exec_builtin_utility(simple_command, &expanded_words[1..], builtin_utility)
+            self.exec_builtin_utility(
+                &command_name,
+                simple_command,
+                &expanded_words[1..],
+                builtin_utility,
+            )
         } else {
             self.environment.push_scope();
             let result = self

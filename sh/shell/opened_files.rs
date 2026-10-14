@@ -12,7 +12,7 @@ use crate::parse::command::{IORedirectionKind, Redirection, RedirectionKind};
 use crate::shell::{CommandExecutionError, Shell};
 use crate::shstr::{ShStr, ShString};
 use crate::wordexp::expand_word_to_string;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
@@ -125,6 +125,8 @@ impl StandardFd {
 #[derive(Clone)]
 pub struct OpenedFiles {
     pub opened_files: HashMap<u32, OpenedFile>,
+    /// The errno of the first failed `write_out`/`write_err`, until taken.
+    write_error: Cell<Option<i32>>,
 }
 
 impl OpenedFiles {
@@ -317,12 +319,21 @@ impl OpenedFiles {
                 .map_err(|_| std::io::Error::last_os_error())
                 .map(|_| ()),
         };
-        match result {
-            Ok(_) => {}
-            Err(err) => {
-                eprintln!("sh: io error ({})", err);
+        // A failed write is remembered rather than reported here: the
+        // utility doing the writing reports it once, by name, and fails.
+        if let Err(err) = result {
+            if self.write_error.get().is_none() {
+                self.write_error
+                    .set(Some(err.raw_os_error().unwrap_or(libc::EIO)));
             }
         }
+    }
+
+    /// The first write that failed since the last call, if any.
+    pub fn take_write_error(&self) -> Option<std::io::Error> {
+        self.write_error
+            .take()
+            .map(std::io::Error::from_raw_os_error)
     }
 
     /// Takes bytes: output such as `export -p` is meant to be read back by the
@@ -434,6 +445,9 @@ impl Default for OpenedFiles {
             (STDOUT_FILENO, OpenedFile::Stdout),
             (STDERR_FILENO, OpenedFile::Stderr),
         ]);
-        Self { opened_files }
+        Self {
+            opened_files,
+            write_error: Cell::new(None),
+        }
     }
 }

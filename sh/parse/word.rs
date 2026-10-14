@@ -142,15 +142,6 @@ pub mod test_utils {
         }
     }
 
-    pub fn special_parameter(param: SpecialParameter) -> Word {
-        Word {
-            parts: vec![WordPart::ParameterExpansion {
-                expansion: ParameterExpansion::Simple(Parameter::Special(param)),
-                inside_double_quotes: false,
-            }],
-        }
-    }
-
     impl PartialEq<Word> for WordPair {
         fn eq(&self, other: &Word) -> bool {
             self.word.eq(other)

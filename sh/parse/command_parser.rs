@@ -15,9 +15,7 @@ use crate::parse::command::{
 };
 use crate::parse::lexer::command_lexer::{CommandLexer, CommandToken};
 use crate::parse::lexer::is_blank;
-use crate::parse::word::{
-    Parameter, ParameterExpansion, SpecialParameter, Word, WordPair, WordPart,
-};
+use crate::parse::word::WordPair;
 use crate::parse::word_parser::{parse_here_document, parse_word_pair};
 use crate::parse::{AliasTable, ParseResult, ParserError};
 use crate::shstr::ShString;
@@ -510,7 +508,12 @@ impl<'src> CommandParser<'src> {
     }
 
     fn parse_do_group(&mut self, alias_table: &AliasTable) -> ParseResult<CompleteCommand> {
-        self.match_token(CommandToken::Do)?;
+        // `for name do` has no separator before `do`, so the lexer has read
+        // it as a word (POSIX 2.4: `do` is reserved as the third word of a
+        // `for`).
+        if !self.match_reserved_word(CommandToken::Do)? {
+            self.match_token(CommandToken::Do)?;
+        }
         let inner = self.parse_compound_list(alias_table)?;
         self.match_token(CommandToken::Done)?;
         Ok(inner)
@@ -528,13 +531,9 @@ impl<'src> CommandParser<'src> {
                 words.push(parse_word_pair(&word, self.lookahead_lineno)?);
             }
         } else {
-            let default_iterable_word = Word {
-                parts: vec![WordPart::ParameterExpansion {
-                    expansion: ParameterExpansion::Simple(Parameter::Special(SpecialParameter::At)),
-                    inside_double_quotes: false,
-                }],
-            };
-            words.push(WordPair::new(default_iterable_word, "$@"))
+            // Without `in`, the loop is `for name in "$@"` (XCU 2.9.4.2):
+            // each positional parameter is one field, not split or globbed.
+            words.push(parse_word_pair(b"\"$@\"", self.lookahead_lineno)?);
         }
         match self.lookahead {
             CommandToken::SemiColon | CommandToken::Newline => {
@@ -918,10 +917,7 @@ impl<'src> CommandParser<'src> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parse::word::test_utils::{
-        quoted_literal, special_parameter, unquoted_literal, unquoted_literal_pair,
-    };
-    use crate::parse::word::SpecialParameter;
+    use crate::parse::word::test_utils::{quoted_literal, unquoted_literal, unquoted_literal_pair};
     use crate::shstr::ShString;
 
     fn parse_complete_command(
@@ -1495,7 +1491,7 @@ mod tests {
             parse_compound_command("for i; do\ncmd\ndone").0,
             CompoundCommand::ForClause {
                 iter_var: Rc::from("i"),
-                words: vec![WordPair::new(special_parameter(SpecialParameter::At), "$@")],
+                words: vec![parse_word_pair(b"\"$@\"", 1).unwrap()],
                 body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false),
             }
         );

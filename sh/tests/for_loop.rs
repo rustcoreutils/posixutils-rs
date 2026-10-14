@@ -61,3 +61,35 @@ fn continue_n_and_break_with_expanded_list() {
 fn list_is_expanded_before_the_first_iteration() {
     sh_c("x=1; for i in a $x; do x=9; echo $i; done", "a\n1\n");
 }
+
+// `for name` with no `in` list is `for name in "$@"`: each positional
+// parameter is one field, unsplit. autoconf parses its options with
+// `for ac_option`, so binutils' `--with-pkgversion="GNU Binutils for Debian"`
+// became four arguments and "Binutils" the target.
+#[test]
+fn for_without_in_iterates_positional_parameters_unsplit() {
+    sh_c(
+        "set -- 'a b' c; for x; do echo \"[$x]\"; done",
+        "[a b]\n[c]\n",
+    );
+    sh_c(
+        "set -- 'a b' c; for x\ndo echo \"[$x]\"; done",
+        "[a b]\n[c]\n",
+    );
+    sh_c(
+        "f() { for x; do echo \"[$x]\"; done; }; f '*' ''",
+        "[*]\n[]\n",
+    );
+    sh_c("set --; for x; do echo y; done; echo end", "end\n");
+}
+
+// `do` may follow the name directly, with no `;` or newline (XCU 2.9.4.2
+// grammar: `For name linebreak do_group`); it is still the reserved word.
+#[test]
+fn for_name_do_without_separator() {
+    sh_c(
+        "set -- 'a b' c; for x do echo \"[$x]\"; done",
+        "[a b]\n[c]\n",
+    );
+    sh_c("for do in a; do echo $do; done", "a\n");
+}

@@ -1456,3 +1456,19 @@ fn get_write_error_on_full_device() {
         1,
     );
 }
+
+// An SCCS file that cannot be read is reported with the system's text,
+// without Rust's "(os error N)" suffix.
+#[test]
+fn missing_sccs_file_names_the_system_error() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let sfile = dir.path().join("s.missing");
+    let sfile = sfile.to_str().unwrap();
+    let reason = plib::diag::io_error_text(&std::fs::File::open(sfile).unwrap_err());
+    let out = plib::testing::run_test_base("get", &[sfile.to_string()], b"");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("get: {sfile}: I/O error: {reason}\n")
+    );
+}

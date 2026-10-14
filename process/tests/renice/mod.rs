@@ -174,3 +174,21 @@ fn renice_user_id_type_accepts_a_name() {
         },
     );
 }
+
+/// A process whose priority cannot be read is reported with the system's
+/// text for the error, without Rust's "(os error N)" suffix. No process has a
+/// PID this large.
+#[test]
+fn renice_failure_names_the_system_error() {
+    let esrch = plib::diag::io_error_text(&std::io::Error::from_raw_os_error(libc::ESRCH));
+    let out = plib::testing::run_test_base(
+        "renice",
+        &["-n".into(), "1".into(), "-p".into(), "2147483646".into()],
+        b"",
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("renice: getpriority: 2147483646: {esrch}\n")
+    );
+}

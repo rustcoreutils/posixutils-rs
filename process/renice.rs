@@ -121,7 +121,12 @@ fn main() {
         let prio = match getpriority(which, id) {
             Ok(p) => p,
             Err(e) => {
-                diag::error(&format!("{}: {}: {}", gettext("getpriority"), id_str, e));
+                diag::error(&format!(
+                    "{}: {}: {}",
+                    gettext("getpriority"),
+                    id_str,
+                    plib::diag::io_error_text(&e)
+                ));
                 continue;
             }
         };
@@ -129,7 +134,12 @@ fn main() {
         let newprio = (prio + args.niceval).clamp(PRIO_MIN, PRIO_MAX);
 
         if let Err(e) = setpriority(which, id, newprio) {
-            diag::error(&format!("{}: {}: {}", gettext("setpriority"), id_str, e));
+            diag::error(&format!(
+                "{}: {}: {}",
+                gettext("setpriority"),
+                id_str,
+                plib::diag::io_error_text(&e)
+            ));
         }
     }
 

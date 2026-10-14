@@ -103,7 +103,11 @@ fn main() {
     let nohup_out = if need_nohup_out {
         match get_nohup_out_file() {
             Ok(f) => Some(f),
-            Err(e) => fatal(format!("{}: {}", gettext("cannot open nohup.out"), e)),
+            Err(e) => fatal(format!(
+                "{}: {}",
+                gettext("cannot open nohup.out"),
+                plib::diag::io_error_text(&e)
+            )),
         }
     } else {
         None

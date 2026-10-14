@@ -106,7 +106,7 @@ fn send_signal(prog_cfg: &Config, sig_no: i32) -> u32 {
         let res = unsafe { libc::kill(*pid as libc::pid_t, sig_no) };
         if res != 0 {
             let err = std::io::Error::last_os_error();
-            diag::error(&format!("{}: {}", pid, err));
+            diag::error(&format!("{}: {}", pid, plib::diag::io_error_text(&err)));
             exit_code = 1;
         }
     }

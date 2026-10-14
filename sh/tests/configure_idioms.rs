@@ -98,6 +98,32 @@ fn heredoc_body_keeps_quotes_literal() {
     );
     sh("v=X; cat <<EOF\n'${v}' \"`echo $v`\"\nEOF", "'X' \"X\"\n");
     sh("cat <<'EOF'\na='$v' \\$\nEOF", "a='$v' \\$\n");
+    // `$'...'` is not special there either, and a backslash before anything
+    // else stays.
+    sh("cat <<EOF\n$'a\\tb' \\x\nEOF", "$'a\\tb' \\x\n");
+    // The word of `${v-word}` is parsed as inside double quotes: `"` quotes,
+    // `'` is ordinary. A pattern's quotes are still quotes.
+    sh(
+        "u= v=X; cat <<EOF\n${u:-'a'} ${u:-\"b\"} ${u:-\\\"c\\\"} [${v#'X'}] [${v#\"X\"}]\nEOF",
+        "'a' b \"c\" [] []\n",
+    );
+}
+
+// Inside double quotes, the word of `${v-word}` is double-quoted too, so a
+// single quote in it is an ordinary character (dash and bash agree), while
+// the pattern of `${v#pattern}` keeps its quoting.
+#[test]
+fn single_quotes_in_parameter_word_inside_double_quotes() {
+    sh("u=; echo \"${u:-'a'}\"", "'a'\n");
+    sh(
+        "u=; echo \"${u:-\"x\"'y'\"z\"}\" ${u:-'p'\"q\"}",
+        "x'y'z pq\n",
+    );
+    sh(
+        "u=; printf '%s\\n' \"${u:-\\'d\\'}\" \"${u:-a\\\\b}\"",
+        "\\'d\\'\na\\b\n",
+    );
+    sh("v=X; echo \"[${v#'X'}]\"", "[]\n");
 }
 
 // "not found" belongs to the command, so its own `2>/dev/null` hides it;

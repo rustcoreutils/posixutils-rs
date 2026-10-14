@@ -18,7 +18,7 @@ use crate::parse::lexer::is_blank;
 use crate::parse::word::{
     Parameter, ParameterExpansion, SpecialParameter, Word, WordPair, WordPart,
 };
-use crate::parse::word_parser::parse_word_pair;
+use crate::parse::word_parser::{parse_here_document, parse_word_pair};
 use crate::parse::{AliasTable, ParseResult, ParserError};
 use crate::shstr::ShString;
 use std::borrow::Cow;
@@ -46,7 +46,7 @@ fn try_into_assignment(word: &[u8], line_no: u32) -> ParseResult<Result<Assignme
             let (name, value) = word.split_at(pos);
             // Safe: every byte of `name` passed the ASCII test above.
             let name = Rc::from(std::str::from_utf8(name).expect("a name is ASCII"));
-            parse_word_pair(&value[1..], line_no, false).map(|value| Ok(Assignment { name, value }))
+            parse_word_pair(&value[1..], line_no).map(|value| Ok(Assignment { name, value }))
         } else {
             Ok(Err(word))
         }
@@ -198,7 +198,7 @@ impl<'src> CommandParser<'src> {
         let line_no = self.lookahead_lineno;
         let token = self.advance()?;
         if let Some(word) = token.as_word_bytes() {
-            parse_word_pair(word, line_no, false)
+            parse_word_pair(word, line_no)
         } else {
             Err(ParserError::new(
                 line_no,
@@ -236,7 +236,7 @@ impl<'src> CommandParser<'src> {
                 delimiter,
                 contents,
             } => {
-                let contents = parse_word_pair(contents.as_ref(), self.lookahead_lineno, true)?;
+                let contents = parse_here_document(contents.as_ref(), self.lookahead_lineno)?;
                 let delimiter = ShString::from(delimiter.to_vec());
                 self.advance()?;
                 return Ok(Some(RedirectionKind::HereDocument {
@@ -267,7 +267,7 @@ impl<'src> CommandParser<'src> {
         self.advance()?;
         match self.advance()? {
             CommandToken::Word(word) => {
-                let file = parse_word_pair(&word, line_no, false)?;
+                let file = parse_word_pair(&word, line_no)?;
                 Ok(Some(RedirectionKind::IORedirection { kind, file }))
             }
             other => Err(ParserError::new(
@@ -327,10 +327,10 @@ impl<'src> CommandParser<'src> {
         loop {
             // An alias name is text; a word that is not cannot name one.
             let Some(name) = std::str::from_utf8(next_substitution.as_ref()).ok() else {
-                return parse_word_pair(&next_substitution, self.lookahead_lineno, false).map(Some);
+                return parse_word_pair(&next_substitution, self.lookahead_lineno).map(Some);
             };
             if self.is_currently_processing_substitution(name) {
-                return parse_word_pair(&next_substitution, self.lookahead_lineno, false).map(Some);
+                return parse_word_pair(&next_substitution, self.lookahead_lineno).map(Some);
             }
             if let Some(alias) = alias_table.get(name) {
                 *apply_alias_substitution_to_next_word =
@@ -353,7 +353,7 @@ impl<'src> CommandParser<'src> {
                 if !performed_one_substitution {
                     *apply_alias_substitution_to_next_word = false;
                 }
-                return parse_word_pair(next_substitution.as_ref(), self.lookahead_lineno, false)
+                return parse_word_pair(next_substitution.as_ref(), self.lookahead_lineno)
                     .map(Some);
             }
         }
@@ -392,11 +392,9 @@ impl<'src> CommandParser<'src> {
                                 }
                                 command.words.extend(next_word);
                             } else {
-                                command.words.push(parse_word_pair(
-                                    word,
-                                    self.lookahead_lineno,
-                                    false,
-                                )?);
+                                command
+                                    .words
+                                    .push(parse_word_pair(word, self.lookahead_lineno)?);
                             }
                         }
                     };
@@ -425,7 +423,7 @@ impl<'src> CommandParser<'src> {
                     } else {
                         command
                             .words
-                            .push(parse_word_pair(word, self.lookahead_lineno, false)?);
+                            .push(parse_word_pair(word, self.lookahead_lineno)?);
                     }
                     self.advance()?;
                 }
@@ -520,7 +518,7 @@ impl<'src> CommandParser<'src> {
         if self.match_reserved_word(CommandToken::In)? {
             while self.lookahead.as_word_bytes().is_some() {
                 let word = self.advance()?.into_word_cow().unwrap();
-                words.push(parse_word_pair(&word, self.lookahead_lineno, false)?);
+                words.push(parse_word_pair(&word, self.lookahead_lineno)?);
             }
         } else {
             let default_iterable_word = Word {

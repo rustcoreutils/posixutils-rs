@@ -258,7 +258,7 @@ pub fn expand_parameter_into(
                     Parameter::Variable(var) => var.as_ref().to_string(),
                     Parameter::Special(_) => String::new(),
                 };
-                return Err(CommandExecutionError::ExpansionError(format!(
+                return Err(CommandExecutionError::Expansion(format!(
                     "{name}: parameter not set"
                 )));
             }
@@ -336,7 +336,7 @@ pub fn expand_parameter_into(
                         .display()
                         .to_string()
                 };
-                return Err(CommandExecutionError::ExpansionError(message));
+                return Err(CommandExecutionError::Expansion(message));
             }
             expanded_word.extend(expanded_parameter);
         }
@@ -369,7 +369,7 @@ pub fn expand_parameter_into(
                 shell,
             );
             if parameter_type.is_unset() && shell.set_options.nounset {
-                return Err(CommandExecutionError::ExpansionError(
+                return Err(CommandExecutionError::Expansion(
                     "sh: parameter is unset".to_string(),
                 ));
             }
@@ -399,7 +399,7 @@ pub fn expand_parameter_into(
                 shell,
             );
             if parameter_type.is_unset() && shell.set_options.nounset {
-                return Err(CommandExecutionError::ExpansionError(
+                return Err(CommandExecutionError::Expansion(
                     "sh: parameter is unset".to_string(),
                 ));
             }

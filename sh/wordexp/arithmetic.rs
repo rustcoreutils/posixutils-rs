@@ -562,7 +562,7 @@ fn binary_operation(
         BinaryOperator::Mul => lhs_value.wrapping_mul(rhs_value),
         BinaryOperator::Div => {
             if rhs_value == 0 {
-                return Err(CommandExecutionError::ExpansionError(
+                return Err(CommandExecutionError::Expansion(
                     "division by zero".to_string(),
                 ));
             }
@@ -570,7 +570,7 @@ fn binary_operation(
         }
         BinaryOperator::Mod => {
             if rhs_value == 0 {
-                return Err(CommandExecutionError::ExpansionError(
+                return Err(CommandExecutionError::Expansion(
                     "division by zero".to_string(),
                 ));
             }
@@ -610,7 +610,7 @@ fn interpret_expression(expr: &Expr, shell: &mut Shell, depth: u32) -> Expansion
             match value {
                 None => {
                     if shell.set_options.nounset {
-                        return Err(CommandExecutionError::ExpansionError(format!(
+                        return Err(CommandExecutionError::Expansion(format!(
                             "{var}: parameter not set"
                         )));
                     }
@@ -623,12 +623,12 @@ fn interpret_expression(expr: &Expr, shell: &mut Shell, depth: u32) -> Expansion
                     } else if let Ok(n) = trimmed.parse::<i64>() {
                         Ok(n)
                     } else if depth >= MAX_ARITH_RECURSION {
-                        Err(CommandExecutionError::ExpansionError(
+                        Err(CommandExecutionError::Expansion(
                             "expression recursion level exceeded".to_string(),
                         ))
                     } else {
-                        let inner = parse_expression(trimmed)
-                            .map_err(CommandExecutionError::ExpansionError)?;
+                        let inner =
+                            parse_expression(trimmed).map_err(CommandExecutionError::Expansion)?;
                         interpret_expression(&inner, shell, depth + 1)
                     }
                 }
@@ -712,9 +712,9 @@ pub fn expand_arithmetic_expression_into(
     // An arithmetic expression is a numeric expression: bytes that are not text
     // cannot be part of one.
     let expr = expr.to_str().ok_or_else(|| {
-        CommandExecutionError::ExpansionError("arithmetic expression is not valid text".to_string())
+        CommandExecutionError::Expansion("arithmetic expression is not valid text".to_string())
     })?;
-    let expr = parse_expression(expr).map_err(CommandExecutionError::ExpansionError)?;
+    let expr = parse_expression(expr).map_err(CommandExecutionError::Expansion)?;
     let value = interpret_expression(&expr, shell, 0)?;
     expanded_word.append(value.to_string(), inside_double_quotes, true);
     Ok(())

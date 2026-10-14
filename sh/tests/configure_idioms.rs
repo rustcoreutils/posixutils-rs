@@ -172,6 +172,12 @@ fn command_not_found_message_obeys_redirection() {
         "missing\n",
     );
     sh("{ no_such_command_xyz; } 2>/dev/null; echo $?", "127\n");
+    sh(
+        "exec 2>&1; no_such_command_xyz 2>/dev/null; echo $?",
+        "127\n",
+    );
+    // Likewise a utility that is found but cannot be executed.
+    sh("exec 2>&1; /dev/null 2>/dev/null; echo $?", "126\n");
 }
 
 // A PATH assignment in front of a command is the PATH the command is

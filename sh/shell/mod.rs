@@ -57,45 +57,41 @@ pub mod opened_files;
 
 #[derive(Clone, Debug)]
 pub enum CommandExecutionError {
-    RedirectionError(String),
-    VariableAssignmentError(CannotModifyReadonly),
-    ExpansionError(String),
-    CommandNotFound(String),
-    OsError(OsError),
-    ParseError(ParserError),
+    Redirection(String),
+    VariableAssignment(CannotModifyReadonly),
+    Expansion(String),
+    Os(OsError),
+    Parse(ParserError),
 }
 
 impl From<OsError> for CommandExecutionError {
     fn from(value: OsError) -> Self {
-        Self::OsError(value)
+        Self::Os(value)
     }
 }
 
 impl From<CannotModifyReadonly> for CommandExecutionError {
     fn from(value: CannotModifyReadonly) -> Self {
-        CommandExecutionError::VariableAssignmentError(value)
+        CommandExecutionError::VariableAssignment(value)
     }
 }
 
 impl Display for CommandExecutionError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            CommandExecutionError::RedirectionError(err) => {
+            CommandExecutionError::Redirection(err) => {
                 writeln!(f, "{err}")
             }
-            CommandExecutionError::VariableAssignmentError(err) => {
+            CommandExecutionError::VariableAssignment(err) => {
                 writeln!(f, "{err}")
             }
-            CommandExecutionError::ExpansionError(err) => {
+            CommandExecutionError::Expansion(err) => {
                 writeln!(f, "{err}")
             }
-            CommandExecutionError::CommandNotFound(command_name) => {
-                writeln!(f, "sh: '{command_name}' {}", gettext("not found"))
-            }
-            CommandExecutionError::OsError(err) => {
+            CommandExecutionError::Os(err) => {
                 writeln!(f, "{err}")
             }
-            CommandExecutionError::ParseError(err) => {
+            CommandExecutionError::Parse(err) => {
                 writeln!(
                     f,
                     "sh: {} {}: {}",
@@ -393,12 +389,10 @@ impl Shell {
     fn handle_error(&mut self, err: CommandExecutionError) -> i32 {
         self.eprint(&err.to_string());
         match err {
-            CommandExecutionError::CommandNotFound(_) => 127,
-            CommandExecutionError::OsError(_) => self.exit(1),
+            CommandExecutionError::Os(_) => self.exit(1),
             // POSIX §2.8.1: an expansion error or a variable-assignment error
             // shall cause a non-interactive shell to exit.
-            CommandExecutionError::ExpansionError(_)
-            | CommandExecutionError::VariableAssignmentError(_)
+            CommandExecutionError::Expansion(_) | CommandExecutionError::VariableAssignment(_)
                 if !self.is_interactive =>
             {
                 self.exit(1)
@@ -458,7 +452,9 @@ impl Shell {
 
     pub fn exec(&mut self, command: OsString, args: &[ShString], opened_files: &OpenedFiles) -> ! {
         let (message, status) = self.try_exec(command, args, opened_files);
-        self.eprint(&message);
+        // The failure belongs to the command, so it goes to the command's
+        // standard error (`./not-executable 2>/dev/null` is silent).
+        opened_files.write_err(message);
         self.exit(status)
     }
 
@@ -758,13 +754,22 @@ impl Shell {
             let result = self
                 .assign_locals(&simple_command.assignments)
                 .and_then(|_| {
-                    let command = self
-                        .search_for_utility(&expanded_words[0], &simple_command.assignments)
-                        .ok_or(CommandExecutionError::CommandNotFound(
-                            expanded_words[0].display().to_string(),
-                        ))?;
+                    // XCU 2.9.1.1: the redirections are performed before
+                    // the command is searched for, so a failed search is
+                    // reported on the command's own standard error
+                    // (`cmd 2>/dev/null` is silent).
                     let mut opened_files = self.opened_files.clone();
                     opened_files.redirect(&simple_command.redirections, self)?;
+                    let Some(command) =
+                        self.search_for_utility(&expanded_words[0], &simple_command.assignments)
+                    else {
+                        opened_files.write_err(format!(
+                            "sh: '{}' {}\n",
+                            expanded_words[0].display(),
+                            gettext("not found")
+                        ));
+                        return Ok(127);
+                    };
                     self.fork_and_exec(command, &expanded_words, &opened_files)
                         .map_err(|err| err.into())
                 });
@@ -1261,7 +1266,7 @@ impl Shell {
                     .take_over_standard_fd(StandardFd::Stdout)?;
                 dup2(write_pipe.as_raw_fd(), libc::STDOUT_FILENO)?;
                 self.execute_nested_program(program)
-                    .map_err(CommandExecutionError::ParseError)?;
+                    .map_err(CommandExecutionError::Parse)?;
                 self.exit(self.last_pipeline_exit_status);
             }
             ForkResult::Parent { child } => {
@@ -1273,9 +1278,7 @@ impl Shell {
                 File::from(read_pipe)
                     .read_to_end(&mut bytes)
                     .map_err(|err| {
-                        CommandExecutionError::ExpansionError(format!(
-                            "command substitution: {err}"
-                        ))
+                        CommandExecutionError::Expansion(format!("command substitution: {err}"))
                     })?;
                 // POSIX 2.9.1: when a command consists only of substitutions,
                 // its exit status is that of the last one, so the status has

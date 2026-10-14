@@ -50,7 +50,7 @@ pub enum OpenedFile {
 }
 
 fn io_err_to_redirection_err(err: std::io::Error) -> CommandExecutionError {
-    CommandExecutionError::RedirectionError(format!("sh: io error ({})", err))
+    CommandExecutionError::Redirection(format!("sh: io error ({})", err))
 }
 
 /// A standard descriptor that a pipeline or command substitution replaces
@@ -117,7 +117,7 @@ impl OpenedFiles {
                                 .map(|m| m.is_file())
                                 .unwrap_or(true);
                             if is_regular {
-                                return Err(CommandExecutionError::RedirectionError(format!(
+                                return Err(CommandExecutionError::Redirection(format!(
                                     "sh: redirection would overwrite existing file {}",
                                     target.display()
                                 )));
@@ -161,7 +161,7 @@ impl OpenedFiles {
                         .to_str()
                         .and_then(|t| t.parse::<u32>().ok())
                         .ok_or_else(|| {
-                            CommandExecutionError::RedirectionError(format!(
+                            CommandExecutionError::Redirection(format!(
                                 "sh: invalid file descriptor {}",
                                 target.display()
                             ))
@@ -172,7 +172,7 @@ impl OpenedFiles {
                         | Some(OpenedFile::Stderr)
                             if duplicate_input =>
                         {
-                            return Err(CommandExecutionError::RedirectionError(format!(
+                            return Err(CommandExecutionError::Redirection(format!(
                                 "sh: '{source_fd}' is not opened for reading"
                             )));
                         }
@@ -181,12 +181,12 @@ impl OpenedFiles {
                         | Some(OpenedFile::HereDocument(_))
                             if !duplicate_input =>
                         {
-                            return Err(CommandExecutionError::RedirectionError(format!(
+                            return Err(CommandExecutionError::Redirection(format!(
                                 "sh: '{source_fd}' is not opened for writing"
                             )));
                         }
                         None => {
-                            return Err(CommandExecutionError::RedirectionError(format!(
+                            return Err(CommandExecutionError::Redirection(format!(
                                 "sh: cannot duplicate unopened file descriptor '{source_fd}'"
                             )))
                         }

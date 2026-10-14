@@ -9,27 +9,20 @@
 
 use gettextrs::gettext;
 use plib::diag;
-use plib::printf::printf;
+use plib::printf::{printf, split_operands};
 use std::{io, process::ExitCode};
 
 fn main() -> ExitCode {
     diag::init_locale("printf");
 
-    let args = std::env::args_os().collect::<Vec<_>>();
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let args: Vec<&[u8]> = args.iter().map(|os| os.as_encoded_bytes()).collect();
 
-    match args.as_slice() {
-        &[ref _program_file_name, ref format, ref arguments @ ..] => {
-            let arguments_vec: Vec<&[u8]> =
-                arguments.iter().map(|os| os.as_encoded_bytes()).collect();
-
+    match split_operands(&args) {
+        Some((format, arguments)) => {
             let mut stdout = io::stdout().lock();
             let mut report = |msg: &str| diag::error(msg);
-            match printf(
-                &mut stdout,
-                format.as_encoded_bytes(),
-                &arguments_vec,
-                &mut report,
-            ) {
+            match printf(&mut stdout, format, arguments, &mut report) {
                 Ok(had_error) => {
                     if had_error {
                         ExitCode::FAILURE
@@ -43,7 +36,7 @@ fn main() -> ExitCode {
                 }
             }
         }
-        _ => {
+        None => {
             diag::error(&gettext("not enough arguments"));
             ExitCode::FAILURE
         }

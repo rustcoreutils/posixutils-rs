@@ -36,6 +36,27 @@ fn test_string_no_args() {
     printf_test(&["Hello World"], "Hello World");
 }
 
+// XCU 1.4: a utility with no options that takes operands discards "--" as
+// its first argument.  Only the first one, and only an exact "--".
+#[test]
+fn test_leading_double_dash_is_discarded() {
+    printf_test(&["--", "x%s\n", "a"], "xa\n");
+    printf_test(&["--", "--"], "--");
+    printf_test(&["x%s\n", "--"], "x--\n");
+}
+
+#[test]
+fn test_double_dash_alone_is_not_enough_arguments() {
+    run_test(TestPlan {
+        cmd: String::from("printf"),
+        args: vec![String::from("--")],
+        expected_out: String::new(),
+        expected_err: String::from("printf: not enough arguments\n"),
+        stdin_data: String::new(),
+        expected_exit_code: 1,
+    });
+}
+
 #[test]
 fn test_string_multiple_args() {
     printf_test(&["%s %s %s", "one", "two", "three"], "one two three");

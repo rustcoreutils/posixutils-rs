@@ -1288,6 +1288,20 @@ fn format_arg(
     })
 }
 
+/// Split the utility's arguments into the format and the operands after it,
+/// or `None` if there is no format.
+///
+/// XCU 1.4: a utility that accepts no options but does accept operands
+/// recognizes "--" as a first argument to be discarded, so `printf -- '-x'`
+/// prints `-x`.  Only an exact first "--" is discarded.
+pub fn split_operands<A: AsRef<[u8]>>(args: &[A]) -> Option<(&A, &[A])> {
+    let args = match args.split_first() {
+        Some((first, rest)) if first.as_ref() == b"--" => rest,
+        _ => args,
+    };
+    args.split_first()
+}
+
 /// Write `format` applied to `arguments` (the operands after the format) to
 /// `output`, reusing the format while operands remain.
 ///
@@ -1402,7 +1416,16 @@ pub fn printf(
 
 #[cfg(test)]
 mod tests {
-    use super::printf;
+    use super::{printf, split_operands};
+
+    #[test]
+    fn leading_double_dash_is_discarded() {
+        assert_eq!(split_operands(&["--", "f", "a"]), Some((&"f", &["a"][..])));
+        assert_eq!(split_operands(&["--", "--"]), Some((&"--", &[][..])));
+        assert_eq!(split_operands(&["f", "--"]), Some((&"f", &["--"][..])));
+        assert_eq!(split_operands(&["--"]), None);
+        assert_eq!(split_operands::<&str>(&[]), None);
+    }
 
     /// Run the engine, returning (output, diagnostics, result).
     fn run(format: &str, args: &[&str]) -> (String, Vec<String>, Result<bool, String>) {

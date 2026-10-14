@@ -14,10 +14,10 @@ use crate::shstr::{ShStr, ShString};
 use crate::wordexp::expand_word_to_string;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::fs::File;
 use std::io::Write;
-use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::rc::Rc;
 
 pub const STDIN_FILENO: u32 = libc::STDIN_FILENO as u32;
@@ -71,6 +71,40 @@ impl OpenedFile {
 /// so that they can be undone when the command completes.
 #[must_use = "the redirections must be undone with OpenedFiles::restore"]
 pub struct SavedDescriptors(Vec<(u32, Option<OpenedFile>)>);
+
+/// Opens `target` for a redirection, with `flags` and O_CLOEXEC (the
+/// shell places the descriptor itself). Opening a FIFO waits for the other
+/// end; ^C in an interactive shell ends that wait with EINTR, as in dash,
+/// and any other signal lets it go on. std's `open` always retried EINTR,
+/// so `read x < fifo` at the prompt could not be interrupted.
+fn open_for_redirection(
+    target: &ShStr,
+    flags: libc::c_int,
+    shell: &Shell,
+) -> std::io::Result<File> {
+    let path = CString::new(target.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "file name contained an unexpected NUL byte",
+        )
+    })?;
+    loop {
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                flags | libc::O_CLOEXEC,
+                FILE_CREATION_MODE as libc::c_int,
+            )
+        };
+        if fd >= 0 {
+            return Ok(unsafe { File::from_raw_fd(fd) });
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINTR) || shell.signal_manager.interrupt_pending() {
+            return Err(err);
+        }
+    }
+}
 
 /// Whether a failed redirection was opening a file to read or creating one.
 #[derive(Clone, Copy)]
@@ -149,12 +183,11 @@ impl OpenedFiles {
                 let file = if noclobber_active {
                     // Atomically create the file with O_CREAT|O_EXCL so the
                     // existence check and creation cannot race.
-                    match File::options()
-                        .mode(FILE_CREATION_MODE)
-                        .write(true)
-                        .create_new(true)
-                        .open(target.as_os_str())
-                    {
+                    match open_for_redirection(
+                        target,
+                        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                        shell,
+                    ) {
                         Ok(file) => file,
                         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                             // noclobber only forbids overwriting an existing
@@ -168,23 +201,18 @@ impl OpenedFiles {
                                     target.display()
                                 )));
                             }
-                            File::options()
-                                .mode(FILE_CREATION_MODE)
-                                .write(true)
-                                .create(true)
-                                .open(target.as_os_str())
+                            open_for_redirection(target, libc::O_WRONLY | libc::O_CREAT, shell)
                                 .map_err(|err| open_failure(OpenPurpose::Create, target, &err))?
                         }
                         Err(err) => return Err(open_failure(OpenPurpose::Create, target, &err)),
                     }
                 } else {
-                    File::options()
-                        .mode(FILE_CREATION_MODE)
-                        .write(true)
-                        .truncate(!append)
-                        .append(append)
-                        .create(true)
-                        .open(target.as_os_str())
+                    let mode = if append {
+                        libc::O_APPEND
+                    } else {
+                        libc::O_TRUNC
+                    };
+                    open_for_redirection(target, libc::O_WRONLY | libc::O_CREAT | mode, shell)
                         .map_err(|err| open_failure(OpenPurpose::Create, target, &err))?
                 };
 
@@ -225,22 +253,14 @@ impl OpenedFiles {
                 }
             }
             IORedirectionKind::RedirectInput => {
-                let file = File::options()
-                    .mode(FILE_CREATION_MODE)
-                    .read(true)
-                    .open(target.as_os_str())
+                let file = open_for_redirection(target, libc::O_RDONLY, shell)
                     .map_err(|err| open_failure(OpenPurpose::Read, target, &err))?;
                 let source_fd = file_descriptor.unwrap_or(STDIN_FILENO);
                 self.opened_files
                     .insert(source_fd, OpenedFile::ReadFile(Rc::new(file)));
             }
             IORedirectionKind::OpenRW => {
-                let file = File::options()
-                    .mode(FILE_CREATION_MODE)
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .open(target.as_os_str())
+                let file = open_for_redirection(target, libc::O_RDWR | libc::O_CREAT, shell)
                     .map_err(|err| open_failure(OpenPurpose::Create, target, &err))?;
                 let source_fd = file_descriptor.unwrap_or(STDIN_FILENO);
                 self.opened_files

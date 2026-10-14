@@ -196,7 +196,7 @@ fn standard_repl(shell: &mut Shell) {
                     // The line goes to the shell as the bytes that were typed:
                     // the lexer takes bytes, so decoding it here would only
                     // reject a line the shell can otherwise run.
-                    match shell.execute_program(&program_buffer) {
+                    match shell.execute_interactive_input(&program_buffer) {
                         Ok(_) => {
                             program_buffer.clear();
                             print_ps2 = false;
@@ -230,6 +230,8 @@ fn standard_repl(shell: &mut Shell) {
         let _ = wait_for_input(io::stdin().as_raw_fd());
         shell.signal_manager.reset_sigint_count();
         shell.handle_async_events();
+        // ^C at the prompt discards the line and leaves `$?` 130 (dash).
+        shell.take_interrupt();
         if shell.signal_manager.get_sigint_count() > 0 {
             program_buffer.clear();
             line_buffer.clear();
@@ -264,7 +266,7 @@ fn vi_repl(shell: &mut Shell) {
                     // The line goes to the shell as the bytes that were typed:
                     // the lexer takes bytes, so decoding it here would only
                     // reject a line the shell can otherwise run.
-                    match shell.execute_program(&program_buffer) {
+                    match shell.execute_interactive_input(&program_buffer) {
                         Ok(_) => {
                             program_buffer.clear();
                             print_ps2 = false;
@@ -301,6 +303,8 @@ fn vi_repl(shell: &mut Shell) {
         let _ = wait_for_input(io::stdin().as_raw_fd());
         shell.signal_manager.reset_sigint_count();
         shell.handle_async_events();
+        // ^C at the prompt discards the line and leaves `$?` 130 (dash).
+        shell.take_interrupt();
         if shell.signal_manager.get_sigint_count() > 0 {
             program_buffer.clear();
             editor.reset_current_line();
@@ -336,7 +340,7 @@ fn non_terminal_repl(shell: &mut Shell) -> ! {
             Err(_) => shell.exit(128),
         }
         program_buffer.push_str(&line);
-        match shell.execute_program(program_buffer.as_bytes()) {
+        match shell.execute_interactive_input(program_buffer.as_bytes()) {
             Ok(_) => program_buffer.clear(),
             Err(syntax_err) => {
                 if !syntax_err.could_be_resolved_with_more_input {
@@ -350,6 +354,7 @@ fn non_terminal_repl(shell: &mut Shell) -> ! {
             }
         }
         shell.handle_async_events();
+        shell.take_interrupt();
     }
 }
 
@@ -373,7 +378,7 @@ fn interactive_shell(shell: &mut Shell) {
             unsafe { libc::getuid() == libc::geteuid() && libc::getgid() == libc::getegid() };
         if ids_match {
             if let Ok(contents) = std::fs::read_to_string(&env_file) {
-                if let Err(err) = shell.execute_program(contents.as_bytes()) {
+                if let Err(err) = shell.execute_interactive_input(contents.as_bytes()) {
                     stderr_println!("sh: {env_file}: {}", err.message);
                 }
             }

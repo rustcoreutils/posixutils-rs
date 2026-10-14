@@ -305,3 +305,141 @@ fn job_control_pipeline_survives_the_terminal_going_away() {
     assert_eq!(read_result(&dir.path().join("out2")), "a\n");
     assert!(ok, "the shell exited unsuccessfully");
 }
+
+// Ctrl-C at an interactive prompt stops a running loop of built-ins and
+// returns to the prompt, as in dash (the user's choice, 2026-10-14): the
+// shell's SIGINT handling only recorded the signal, so `while :; do :; done`
+// could never be interrupted.
+#[test]
+fn ctrl_c_interrupts_a_loop_of_builtins() {
+    let mut sh = ShPtySession::new();
+    let out = sh.path("back");
+    sh.line("while :; do :; done");
+    thread::sleep(Duration::from_millis(300));
+    sh.keys("\x03");
+    thread::sleep(Duration::from_millis(300));
+    sh.line(&format!("echo back > '{}'", out.display()));
+    let dir = sh.exit();
+    assert_eq!(read_result(&dir.path().join("back")).trim(), "back");
+}
+
+/// Waits for the shell to create `path`, which a test command does once it
+/// is running; generous, for a slow CI machine.
+fn wait_for_file(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !path.exists() {
+        if Instant::now() >= deadline {
+            panic!("{} was never created", path.display());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Types ^C once the command running at the prompt has created `started`,
+/// then has `$?` written to `status`.
+fn interrupt_once_started(sh: &mut ShPtySession) {
+    wait_for_file(&sh.path("started"));
+    // let a foreground utility, if any, get going
+    thread::sleep(Duration::from_millis(300));
+    sh.keys("\x03");
+    thread::sleep(Duration::from_millis(300));
+    sh.line("echo $? > status");
+}
+
+/// Runs `command` at the prompt and interrupts it once started.
+fn interrupt_at_the_prompt(command: &str) -> TempDir {
+    let mut sh = ShPtySession::new();
+    sh.line(command);
+    interrupt_once_started(&mut sh);
+    sh.exit()
+}
+
+// ^C abandons the whole command line, not just the loop, and leaves `$?`
+// 130, as in dash.
+#[test]
+fn ctrl_c_abandons_the_command_line_with_status_130() {
+    let dir = interrupt_at_the_prompt("while :; do : > started; done; echo no > after");
+    assert_eq!(read_result(&dir.path().join("status")).trim(), "130");
+    assert!(!dir.path().join("after").exists());
+}
+
+// A foreground utility has the terminal and gets the SIGINT itself; the
+// shell then abandons the rest of the line, as dash does.
+#[test]
+fn ctrl_c_stops_a_foreground_utility_and_the_rest_of_the_line() {
+    let dir = interrupt_at_the_prompt(": > started; sleep 30; echo no > after");
+    assert_eq!(read_result(&dir.path().join("status")).trim(), "130");
+    assert!(!dir.path().join("after").exists());
+}
+
+// The same inside a function, an `eval` and a loop's condition.
+#[test]
+fn ctrl_c_leaves_functions_eval_and_conditions() {
+    let dir = interrupt_at_the_prompt(
+        "f() { eval 'while : > started; do :; done'; echo no > f; }; f; echo no > after",
+    );
+    assert_eq!(read_result(&dir.path().join("status")).trim(), "130");
+    assert!(!dir.path().join("f").exists());
+    assert!(!dir.path().join("after").exists());
+}
+
+// `read` from the terminal is interrupted and assigns nothing.
+#[test]
+fn ctrl_c_interrupts_read() {
+    let mut sh = ShPtySession::new();
+    sh.line("x=old; : > started; if read x; then echo no > then; fi; echo no > after");
+    interrupt_once_started(&mut sh);
+    sh.line("echo \"$x\" > x");
+    let dir = sh.exit();
+    assert_eq!(read_result(&dir.path().join("status")).trim(), "130");
+    assert_eq!(read_result(&dir.path().join("x")), "old\n");
+    assert!(!dir.path().join("then").exists());
+    assert!(!dir.path().join("after").exists());
+}
+
+// `wait` for a background job is interrupted; the job runs on.
+#[test]
+fn ctrl_c_interrupts_wait() {
+    let mut sh = ShPtySession::new();
+    sh.line("sleep 30 & : > started; wait; echo no > after");
+    interrupt_once_started(&mut sh);
+    sh.line("jobs > jobs; kill %1");
+    let dir = sh.exit();
+    assert_eq!(read_result(&dir.path().join("status")).trim(), "130");
+    assert!(read_result(&dir.path().join("jobs")).contains("Running"));
+    assert!(!dir.path().join("after").exists());
+}
+
+// ^C while a line is being typed discards it.
+#[test]
+fn ctrl_c_discards_the_line_being_typed() {
+    let mut sh = ShPtySession::new();
+    sh.keys("echo no > typed");
+    sh.keys("\x03");
+    thread::sleep(Duration::from_millis(300));
+    sh.line("echo $? > status");
+    let dir = sh.exit();
+    assert_eq!(read_result(&dir.path().join("status")).trim(), "130");
+    assert!(!dir.path().join("typed").exists());
+}
+
+// A trapped SIGINT runs its trap, and the command goes on.
+#[test]
+fn trapped_ctrl_c_runs_the_trap_and_goes_on() {
+    let dir = interrupt_at_the_prompt(
+        "trap 't=1' INT; t=0; while [ $t = 0 ]; do : > started; done; echo \"after $?\" > after",
+    );
+    assert_eq!(read_result(&dir.path().join("after")), "after 0\n");
+    assert_eq!(read_result(&dir.path().join("status")).trim(), "0");
+}
+
+// An ignored SIGINT is ignored by the commands the shell runs too, though
+// the interactive shell itself catches it, and a caught signal is reset to
+// its default by exec.
+#[test]
+fn ignored_sigint_stays_ignored_for_commands() {
+    let mut sh = ShPtySession::new();
+    sh.line("trap '' INT; sh -c 'kill -INT $$; echo survived' > out");
+    let dir = sh.exit();
+    assert_eq!(read_result(&dir.path().join("out")), "survived\n");
+}

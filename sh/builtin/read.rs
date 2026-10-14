@@ -42,13 +42,25 @@ fn read_byte_non_blocking(fd: RawFd) -> Result<Option<u8>, BuiltinError> {
     }
 }
 
-fn read_byte(fd: RawFd) -> Result<Option<u8>, BuiltinError> {
+/// Reads one byte, or None at the end of the input or once an interrupt
+/// (^C in an interactive shell) abandons the command. A signal that
+/// interrupts the read has its trap run, and the read goes on, as when
+/// reading from the terminal.
+fn read_byte(shell: &mut Shell, fd: RawFd) -> Result<Option<u8>, BuiltinError> {
     let mut buffer = [0u8; 1];
-    match read(fd, &mut buffer) {
-        Ok(0) => Ok(None),
-        Ok(1) => Ok(Some(buffer[0])),
-        Ok(_) => unreachable!(),
-        Err(err) => Err(read_error(err.errno)),
+    loop {
+        match read(fd, &mut buffer) {
+            Ok(0) => return Ok(None),
+            Ok(1) => return Ok(Some(buffer[0])),
+            Ok(_) => unreachable!(),
+            Err(err) if err.errno == Errno::EINTR => {
+                shell.handle_async_events();
+                if shell.is_interrupted() {
+                    return Ok(None);
+                }
+            }
+            Err(err) => return Err(read_error(err.errno)),
+        }
     }
 }
 
@@ -113,6 +125,9 @@ fn read_until_from_non_blocking_fd(
         }
         // might receive signals while reading
         shell.handle_async_events();
+        if shell.is_interrupted() {
+            break;
+        }
         // Wait for the next byte instead of sleeping a tick between polls; the
         // signal pipe is watched too, so a trap is still handled promptly.
         crate::os::wait_for_input(fd)?;
@@ -128,6 +143,7 @@ fn read_until_from_non_blocking_fd(
 }
 
 fn read_until_from_file(
+    shell: &mut Shell,
     fd: RawFd,
     delimiter: u8,
     backslash_escape: bool,
@@ -137,7 +153,7 @@ fn read_until_from_file(
     let mut result = ExpandedWord::default();
     let mut escape_next = false;
     let mut reached_eof = true;
-    while let Some(next) = read_byte(fd)? {
+    while let Some(next) = read_byte(shell, fd)? {
         if escape_next {
             escape_next = false;
             if next == delimiter {
@@ -199,6 +215,7 @@ fn read_from_stdin(
         result
     } else {
         read_until_from_file(
+            shell,
             std::io::stdin().as_raw_fd(),
             delimiter,
             backslash_escape,
@@ -281,6 +298,7 @@ fn read_until(
             read_from_stdin(shell, delimiter, backslash_escape, continuation_prompt)
         }
         OpenedFile::ReadFile(file) => read_until_from_file(
+            shell,
             file.as_raw_fd(),
             delimiter,
             backslash_escape,
@@ -290,18 +308,21 @@ fn read_until(
         // `read <&1`) is read like any other: the system decides whether it
         // can be, and a write-only one fails with EBADF.
         OpenedFile::ReadWriteFile(file) | OpenedFile::WriteFile(file) => read_until_from_file(
+            shell,
             file.as_raw_fd(),
             delimiter,
             backslash_escape,
             continuation_prompt,
         ),
         OpenedFile::Stdout => read_until_from_file(
+            shell,
             libc::STDOUT_FILENO,
             delimiter,
             backslash_escape,
             continuation_prompt,
         ),
         OpenedFile::Stderr => read_until_from_file(
+            shell,
             libc::STDERR_FILENO,
             delimiter,
             backslash_escape,
@@ -381,6 +402,10 @@ impl BuiltinUtility for BuiltinRead {
             backslash_escape,
             opened_files,
         )?;
+        // An interrupted `read` assigns nothing (dash).
+        if shell.is_interrupted() {
+            return Ok(128 + libc::SIGINT);
+        }
 
         let fields = split_fields(
             input.contents,

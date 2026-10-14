@@ -306,3 +306,17 @@ fn shell_runs_without_descriptors_for_its_signal_pipe() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), "hi\ngot\n");
     assert!(output.status.success());
 }
+
+// Only an interactive shell abandons a command on SIGINT: a script with no
+// trap for it dies of it, and a trapped one runs the trap and goes on.
+#[test]
+fn sigint_in_a_script_kills_it_or_runs_its_trap() {
+    sh_c(
+        &format!("{SH} -c 'while :; do kill -INT $$; done; echo no'; echo $?"),
+        "130\n",
+    );
+    sh_c(
+        "trap 'echo trapped' INT; kill -INT $$; echo after",
+        "trapped\nafter\n",
+    );
+}

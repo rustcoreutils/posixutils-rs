@@ -426,6 +426,14 @@ pub unsafe fn handle_signal_write_to_signal_buffer(signal: Signal) {
     )
 }
 
+/// What the shell does about a signal that has arrived.
+pub enum PendingSignal {
+    /// Runs its trap action (or nothing, for an ignored or default one).
+    Action(TrapAction),
+    /// Abandons the command being run and returns to the prompt.
+    Interrupt,
+}
+
 #[derive(Clone)]
 pub struct SignalManager {
     actions: [TrapAction; Signal::Count as usize],
@@ -434,6 +442,8 @@ pub struct SignalManager {
     /// cannot trap or reset it (silently, as in bash and dash). Its default
     /// action, for this shell and its children, is to stay ignored.
     ignored_on_entry: [bool; Signal::Count as usize],
+    /// The shell is interactive and this is not a subshell of it: SIGINT
+    /// is always caught, and untrapped it abandons the command being run.
     is_interactive: bool,
     sigint_count: u32,
     /// Trap actions are running. Signals that arrive meanwhile wait until
@@ -488,6 +498,9 @@ impl SignalManager {
     pub fn reset(&mut self) {
         // A subshell started from a trap action runs its own traps.
         self.running_traps = false;
+        // A subshell of an interactive shell is not interactive: an
+        // untrapped SIGINT takes its default action there (as in dash).
+        self.is_interactive = false;
         for signal in SIGNALS {
             let signal = *signal;
             if signal == Signal::SigKill || signal == Signal::SigStop {
@@ -502,7 +515,9 @@ impl SignalManager {
                     *action = TrapAction::Default;
                     self.install_default(signal);
                 }
-                TrapAction::Ignore => {}
+                // An interactive shell catches an ignored SIGINT, and a
+                // caught signal is reset to its default by `exec`.
+                TrapAction::Ignore => unsafe { handle_signal_ignore(signal) },
             }
         }
     }
@@ -511,6 +526,7 @@ impl SignalManager {
     /// not to be followed by replacing the process (a failed `exec`).
     pub fn restore(&mut self, saved: Self) {
         self.running_traps = saved.running_traps;
+        self.is_interactive = saved.is_interactive;
         for signal in SIGNALS {
             let signal = *signal;
             if signal == Signal::SigKill || signal == Signal::SigStop {
@@ -557,24 +573,45 @@ impl SignalManager {
             .any(|action| matches!(action, TrapAction::Commands(_)))
     }
 
-    pub fn get_pending_action(&mut self) -> Option<&TrapAction> {
-        if let Some(signal) = get_pending_signal() {
-            if signal == Signal::SigInt {
-                self.sigint_count += 1;
+    /// Takes a signal that has arrived, with what the shell is to do about
+    /// it.
+    pub fn take_pending_signal(&mut self) -> Option<PendingSignal> {
+        let signal = get_pending_signal()?;
+        if signal == Signal::SigInt {
+            self.sigint_count += 1;
+            if self.sigint_interrupts() {
+                return Some(PendingSignal::Interrupt);
             }
-            Some(&self.actions[signal as usize])
-        } else {
-            None
         }
+        Some(PendingSignal::Action(self.actions[signal as usize].clone()))
     }
 
-    /// A signal that has arrived and has a trap action, left pending for
-    /// `get_pending_action` to take.
-    pub fn pending_trapped_signal(&self) -> Option<Signal> {
+    /// Whether SIGINT abandons the command being run: in an interactive
+    /// shell (not a subshell of one) that has no trap for it, as in dash.
+    fn sigint_interrupts(&self) -> bool {
+        self.is_interactive && self.actions[Signal::SigInt as usize] == TrapAction::Default
+    }
+
+    /// A signal that has arrived and that ends a wait of the `wait` utility,
+    /// left pending for `take_pending_signal` to take: one with a trap
+    /// action, or a SIGINT that abandons the command being run.
+    pub fn pending_signal_ending_wait(&self) -> Option<Signal> {
         SIGNALS.iter().copied().find(|&signal| {
-            matches!(self.actions[signal as usize], TrapAction::Commands(_))
+            (matches!(self.actions[signal as usize], TrapAction::Commands(_))
+                || (signal == Signal::SigInt && self.sigint_interrupts()))
                 && PENDING[i32::from(signal) as usize].load(Ordering::SeqCst)
         })
+    }
+
+    /// Whether a SIGINT that abandons the command being run has arrived.
+    pub fn interrupt_pending(&self) -> bool {
+        self.sigint_interrupts() && PENDING[libc::SIGINT as usize].load(Ordering::SeqCst)
+    }
+
+    /// Whether SIGINT, delivered now, would be the shell's to act on: true
+    /// for the interactive shell, which catches it whatever its trap.
+    pub fn catches_sigint_interactively(&self) -> bool {
+        self.is_interactive
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (Signal, &TrapAction)> {

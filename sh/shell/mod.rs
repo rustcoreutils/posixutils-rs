@@ -17,7 +17,7 @@ use crate::cli::terminal::Terminal;
 use crate::jobs::{JobManager, JobState};
 use crate::nonempty::NonEmpty;
 use crate::os::errno::Errno;
-use crate::os::signals::{Signal, SignalManager, TermSignal};
+use crate::os::signals::{PendingSignal, Signal, SignalManager, TermSignal};
 use crate::os::{
     dup2, exec, find_command, fork, getpgrp, give_terminal_to, is_process_in_foreground, pipe,
     setpgid, waitpid, ExecError, ForkResult, OsError, OsResult, Pid, WaitStatus,
@@ -137,6 +137,9 @@ pub enum ControlFlowState {
     Break(u32),
     Continue(u32),
     Return,
+    /// SIGINT in an interactive shell: everything being run is abandoned
+    /// and the shell returns to the prompt (see `take_interrupt`).
+    Interrupted,
     None,
 }
 
@@ -408,7 +411,7 @@ impl Shell {
             // A signal that arrived just before the wait began did not
             // interrupt it, so it is looked for first.
             if trap_interrupts {
-                if let Some(signal) = self.signal_manager.pending_trapped_signal() {
+                if let Some(signal) = self.signal_manager.pending_signal_ending_wait() {
                     return Ok(ChildWait::Interrupted(
                         TermSignal(signal.into()).exit_status(),
                     ));
@@ -425,7 +428,17 @@ impl Shell {
                     return Ok(ChildWait::Terminated(exit_status))
                 }
                 WaitStatus::Signaled { signal, .. } => {
-                    return Ok(ChildWait::Terminated(signal.exit_status()))
+                    // Under job control a foreground job has the terminal,
+                    // so the ^C that killed it never reached the shell; as
+                    // in dash, the shell takes it as its own interrupt.
+                    if !trap_interrupts
+                        && signal.is(Signal::SigInt)
+                        && self.job_control_active()
+                        && self.signal_manager.catches_sigint_interactively()
+                    {
+                        unsafe { libc::raise(libc::SIGINT) };
+                    }
+                    return Ok(ChildWait::Terminated(signal.exit_status()));
                 }
                 WaitStatus::Stopped { signal } => {
                     // Only register the job if it is not one already, or the
@@ -492,8 +505,16 @@ impl Shell {
         if let TrapAction::Commands(commands) = action {
             let last_pipeline_exit_status_before_trap = self.last_pipeline_exit_status;
             let ignored_before_trap = self.last_status_from_ignored_failure;
+            // A trap taken along with an interrupt still runs in full.
+            let interrupted = self.is_interrupted();
+            if interrupted {
+                self.control_flow_state = ControlFlowState::None;
+            }
             if let Err(err) = self.run_program(commands.as_bytes(), false, false) {
                 stderr_println!("sh: error parsing action: {}", err.message);
+            }
+            if interrupted {
+                self.control_flow_state = ControlFlowState::Interrupted;
             }
             self.last_pipeline_exit_status = last_pipeline_exit_status_before_trap;
             self.last_status_from_ignored_failure = ignored_before_trap;
@@ -504,10 +525,28 @@ impl Shell {
         if !self.signal_manager.begin_running_traps() {
             return;
         }
-        while let Some(action) = self.signal_manager.get_pending_action().cloned() {
-            self.execute_action(action)
+        while let Some(pending) = self.signal_manager.take_pending_signal() {
+            match pending {
+                PendingSignal::Action(action) => self.execute_action(action),
+                PendingSignal::Interrupt => self.control_flow_state = ControlFlowState::Interrupted,
+            }
         }
         self.signal_manager.end_running_traps();
+    }
+
+    /// Ends an interrupt (^C in an interactive shell): the command it
+    /// abandoned leaves `$?` 130, as in dash.
+    pub fn take_interrupt(&mut self) {
+        if self.is_interrupted() {
+            self.control_flow_state = ControlFlowState::None;
+            self.last_pipeline_exit_status = 128 + libc::SIGINT;
+            self.last_status_from_ignored_failure = false;
+        }
+    }
+
+    /// Whether an interrupt is abandoning the command being run.
+    pub fn is_interrupted(&self) -> bool {
+        self.control_flow_state == ControlFlowState::Interrupted
     }
 
     fn handle_error(&mut self, err: CommandExecutionError) -> i32 {
@@ -957,8 +996,8 @@ impl Shell {
                         break;
                     }
                 }
-                ControlFlowState::Return => break,
-                _ => {}
+                ControlFlowState::Return | ControlFlowState::Interrupted => break,
+                ControlFlowState::None => {}
             }
         }
         self.loop_depth -= 1;
@@ -1082,10 +1121,10 @@ impl Shell {
                         continue;
                     }
                 }
-                ControlFlowState::Return => {
+                ControlFlowState::Return | ControlFlowState::Interrupted => {
                     break;
                 }
-                _ => {}
+                ControlFlowState::None => {}
             }
         }
         self.last_status_from_ignored_failure = status_from_ignored_failure;
@@ -1598,6 +1637,14 @@ impl Shell {
         self.run_program(program, true, false)
     }
 
+    /// Executes input an interactive shell has read at its prompt (or from
+    /// $ENV): the end of it also ends an interrupt that abandoned it.
+    pub fn execute_interactive_input(&mut self, program: &[u8]) -> Result<i32, ParserError> {
+        let result = self.execute_program(program);
+        self.take_interrupt();
+        result
+    }
+
     /// Executes a `-c` command string, after which the shell exits.
     pub fn execute_command_string(&mut self, program: &[u8]) -> Result<i32, ParserError> {
         let then_exit = !self.is_interactive;
@@ -1654,11 +1701,19 @@ impl Shell {
                 if self.is_interactive {
                     self.history.add_entry(command.to_string());
                 }
+                // Nothing more of an interrupted program runs, not even a
+                // command of an `eval` or `.` script after it.
+                if self.is_interrupted() {
+                    return Ok(result);
+                }
                 self.exits_after_command =
                     then_exit && is_blank_or_comments(&program[parser.source_offset()..]);
                 result = self.interpret(&command, false);
                 if self.control_flow_state == ControlFlowState::Return {
                     self.control_flow_state = ControlFlowState::None;
+                    return Ok(result);
+                }
+                if self.is_interrupted() {
                     return Ok(result);
                 }
             } else {

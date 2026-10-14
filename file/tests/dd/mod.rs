@@ -570,6 +570,36 @@ fn test_w_multiplier_rejected() {
     );
 }
 
+// A rejected operand is reported once, as one "dd: ..." line, and dd exits 1
+// without copying anything.
+#[test]
+fn test_operand_errors_are_reported_once() {
+    for args in [
+        &["bs=x"][..],
+        &["bs=2w"],
+        &["bs=0"],
+        &["bs=abc"],
+        &["skip=abc"],
+        &["count=-1"],
+        &["conv=bogus"],
+        &["iflags=bogus"],
+        &["status=bogus"],
+        &["bogus=1"],
+        &["noequals"],
+        &["conv=block"],
+    ] {
+        let (stdout, stderr, code) = run_dd(args, b"abcd");
+        assert_eq!(code, Some(1), "{args:?}: {stderr:?}");
+        assert!(stdout.is_empty(), "{args:?}: {stdout:?}");
+        assert_eq!(stderr.lines().count(), 1, "{args:?}: {stderr:?}");
+        assert!(stderr.starts_with("dd: "), "{args:?}: {stderr:?}");
+    }
+    let (_, stderr, _) = run_dd(&["bs=x"], b"");
+    assert_eq!(stderr, "dd: invalid number: 'x'\n");
+    let (_, stderr, _) = run_dd(&["skip=abc"], b"");
+    assert_eq!(stderr, "dd: invalid number: 'abc'\n");
+}
+
 // DD-2: on SIGINT dd writes its statistics and then terminates *as if by the
 // default action*, so the parent observes a signal death (WIFSIGNALED), not a
 // plain non-zero exit.

@@ -673,8 +673,7 @@ fn parse_conv_list(config: &mut Config, s: &str) -> Result<(), Box<dyn std::erro
                 continue;
             }
             _ => {
-                eprintln!("{}: {}", gettext("invalid conv option"), convstr);
-                return Err("invalid conv option".into());
+                return Err(format!("{}: {}", gettext("invalid conv option"), convstr).into());
             }
         };
         config.conversions.push(conversion);
@@ -682,10 +681,22 @@ fn parse_conv_list(config: &mut Config, s: &str) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-/// Parse a single component of a block size expression (number with optional suffix)
-fn parse_block_size_component(s: &str) -> Result<usize, Box<dyn std::error::Error>> {
+/// The diagnostic for an operand that is not a number.
+fn invalid_number(s: &str) -> Box<dyn std::error::Error> {
+    format!("{}: '{}'", gettext("invalid number"), s).into()
+}
+
+/// Parse a non-negative decimal operand such as `skip=` or `count=`.
+fn parse_number(s: &str) -> Result<usize, Box<dyn std::error::Error>> {
+    s.parse::<usize>().map_err(|_| invalid_number(s))
+}
+
+/// Parse a single component of a block size expression (number with optional
+/// suffix). A component that is empty or not a number makes the whole
+/// `operand` an invalid number, as GNU dd reports it.
+fn parse_block_size_component(s: &str, operand: &str) -> Result<usize, Box<dyn std::error::Error>> {
     if s.is_empty() {
-        return Err("empty block size".into());
+        return Err(invalid_number(operand));
     }
 
     let mut chars: Vec<char> = s.chars().collect();
@@ -704,16 +715,20 @@ fn parse_block_size_component(s: &str) -> Result<usize, Box<dyn std::error::Erro
                 'm' | 'M' => scale = 1024 * 1024,
                 'g' | 'G' => scale = 1024 * 1024 * 1024,
                 _ => {
-                    eprintln!("{}: {}", gettext("invalid block size suffix"), last);
-                    return Err("invalid block size suffix".into());
+                    return Err(
+                        format!("{}: {}", gettext("invalid block size suffix"), last).into(),
+                    );
                 }
             }
         }
     }
 
     let num_str: String = chars.into_iter().collect();
-    let size = num_str.parse::<usize>()?;
-    Ok(size * scale)
+    let size = num_str
+        .parse::<usize>()
+        .map_err(|_| invalid_number(operand))?;
+    size.checked_mul(scale)
+        .ok_or_else(|| gettext("block size overflow").into())
 }
 
 /// Parse block size expression with 'x' multiplier support
@@ -723,12 +738,14 @@ fn parse_block_size(s: &str) -> Result<usize, Box<dyn std::error::Error>> {
 
     let mut result: usize = 1;
     for part in parts {
-        let component = parse_block_size_component(part)?;
-        result = result.checked_mul(component).ok_or("block size overflow")?;
+        let component = parse_block_size_component(part, s)?;
+        result = result
+            .checked_mul(component)
+            .ok_or_else(|| gettext("block size overflow"))?;
     }
 
     if result == 0 {
-        return Err("block size cannot be zero".into());
+        return Err(gettext("block size cannot be zero").into());
     }
 
     Ok(result)
@@ -744,7 +761,6 @@ fn parse_cmdline(args: &[OsString]) -> Result<Config, Box<dyn std::error::Error>
         let bytes = arg.as_bytes();
         let Some(eq) = bytes.iter().position(|&b| b == b'=') else {
             let msg = format!("{}: {}", gettext("invalid option"), arg.to_string_lossy());
-            eprintln!("{}", msg);
             return Err(msg.into());
         };
         let op = String::from_utf8_lossy(&bytes[..eq]);
@@ -765,9 +781,9 @@ fn parse_cmdline(args: &[OsString]) -> Result<Config, Box<dyn std::error::Error>
                 config.bs_mode = true;
             }
             "cbs" => config.cbs = parse_block_size(&oparg)?,
-            "skip" => config.skip = oparg.parse::<usize>()?,
-            "seek" => config.seek = oparg.parse::<usize>()?,
-            "count" => config.count = Some(oparg.parse::<usize>()?),
+            "skip" => config.skip = parse_number(&oparg)?,
+            "seek" => config.seek = parse_number(&oparg)?,
+            "count" => config.count = Some(parse_number(&oparg)?),
 
             "conv" => parse_conv_list(&mut config, &oparg)?,
 
@@ -776,7 +792,6 @@ fn parse_cmdline(args: &[OsString]) -> Result<Config, Box<dyn std::error::Error>
                 "none" => config.quiet = true,
                 _ => {
                     let msg = format!("{}: '{}'", gettext("invalid status level"), oparg);
-                    eprintln!("dd: {}", msg);
                     return Err(msg.into());
                 }
             },
@@ -787,16 +802,15 @@ fn parse_cmdline(args: &[OsString]) -> Result<Config, Box<dyn std::error::Error>
                         "fullblock" => config.iflags_fullblock = true,
                         "" => {}
                         _ => {
-                            eprintln!("{}: {}", gettext("invalid iflags option"), flag);
-                            return Err(format!("invalid iflags option: {}", flag).into());
+                            let msg = format!("{}: {}", gettext("invalid iflags option"), flag);
+                            return Err(msg.into());
                         }
                     }
                 }
             }
 
             _ => {
-                eprintln!("{}: {}", gettext("invalid option"), op);
-                return Err(format!("invalid option: {}", op).into());
+                return Err(format!("{}: {}", gettext("invalid option"), op).into());
             }
         }
     }
@@ -804,7 +818,6 @@ fn parse_cmdline(args: &[OsString]) -> Result<Config, Box<dyn std::error::Error>
     // block/unblock are unspecified without a non-zero cbs; treat as an error.
     if config.cbs == 0 && config.has_block_unblock() {
         let msg = gettext("conv=block/unblock requires a non-zero cbs=");
-        eprintln!("dd: {}", msg);
         return Err(msg.into());
     }
 

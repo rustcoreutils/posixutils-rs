@@ -71,8 +71,15 @@ fn read_command_file(path: &ShStr) -> Result<Vec<u8>, (io::Error, i32)> {
     }
 }
 
-fn execute_string(string: &[u8], shell: &mut Shell) {
-    match shell.execute_program(string) {
+/// Runs a whole program: a `-c` command string (`is_command_string`) or the
+/// contents of a script file.
+fn execute_string(string: &[u8], shell: &mut Shell, is_command_string: bool) {
+    let result = if is_command_string {
+        shell.execute_command_string(string)
+    } else {
+        shell.execute_program(string)
+    };
+    match result {
         Ok(_) => {}
         Err(syntax_err) => {
             eprintln!(
@@ -412,10 +419,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         other => match other {
             ExecutionMode::ReadCommandsFromString(command_string) => {
-                execute_string(command_string.as_bytes(), &mut shell);
+                execute_string(command_string.as_bytes(), &mut shell, true);
             }
             ExecutionMode::ReadFromFile(file) => match read_command_file(&file) {
-                Ok(file_contents) => execute_string(&file_contents, &mut shell),
+                Ok(file_contents) => execute_string(&file_contents, &mut shell, false),
                 Err((err, status)) => {
                     eprintln!(
                         "sh: {}: {}",

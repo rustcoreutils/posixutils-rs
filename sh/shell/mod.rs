@@ -208,6 +208,13 @@ pub struct Shell {
     pub umask: u32,
     pub saved_command_locations: HashMap<Vec<u8>, OsString>,
     pub is_subshell: bool,
+    /// Set just before a command when this process exits as soon as that
+    /// command finishes, with its status: the last command of a subshell, an
+    /// asynchronous list, a pipeline element, a command substitution or a
+    /// `-c` string. Every command takes (clears) it on entry and hands it on
+    /// only to the part of itself that runs last, so it can never reach a
+    /// command that has something after it. See `can_replace_process`.
+    pub exits_after_command: bool,
     pub last_pipeline_command: String,
     pub terminal: Terminal,
     /// `getopts` keeps `OPTIND` a plain integer; the within-argument position
@@ -279,6 +286,23 @@ impl DeclarationUtility {
     }
 }
 
+/// True when `text` holds no command: only blanks, newlines and comments.
+/// What follows the command just parsed decides whether it is the last one.
+fn is_blank_or_comments(text: &[u8]) -> bool {
+    let mut in_comment = false;
+    text.iter().all(|&b| {
+        if in_comment {
+            in_comment = b != b'\n';
+            true
+        } else if b == b'#' {
+            in_comment = true;
+            true
+        } else {
+            matches!(b, b' ' | b'\t' | b'\n')
+        }
+    })
+}
+
 /// True for a word of the form `name=…`, whose value a declaration utility
 /// expands as if it were an assignment.
 fn is_assignment_shaped(word: &[u8]) -> bool {
@@ -298,6 +322,28 @@ impl Shell {
         self.signal_manager.reset();
         self.exit_action = TrapAction::Default;
         self.is_subshell = true;
+    }
+
+    /// Takes the "exits after this command" mark (see `exits_after_command`)
+    /// for the command starting now, so that nothing it runs before its last
+    /// part (expansions, conditions, trap actions) can see it.
+    fn take_exits_after_command(&mut self) -> bool {
+        std::mem::take(&mut self.exits_after_command)
+    }
+
+    /// Whether a command that is the last thing this process runs before
+    /// exiting may replace the process instead of running in a child of it,
+    /// as dash and bash do: then `$!` of `cmd &` is `cmd` itself, and
+    /// `kill $!` reaches it rather than a shell left waiting for it.
+    ///
+    /// That is only invisible while the shell has nothing left to do once
+    /// the command finishes: no EXIT trap to run, and no trap action that a
+    /// signal arriving meanwhile would have to run. A job-control shell keeps
+    /// forking at top level, where each job needs a process group of its own.
+    fn can_replace_process(&self) -> bool {
+        !matches!(self.exit_action, TrapAction::Commands(_))
+            && !self.signal_manager.catches_any()
+            && (self.is_subshell || !self.set_options.monitor)
     }
 
     fn eprint(&self, message: &str) {
@@ -400,7 +446,7 @@ impl Shell {
         if let TrapAction::Commands(commands) = action {
             let last_pipeline_exit_status_before_trap = self.last_pipeline_exit_status;
             let ignored_before_trap = self.last_status_from_ignored_failure;
-            if let Err(err) = self.run_program(commands.as_bytes(), false) {
+            if let Err(err) = self.run_program(commands.as_bytes(), false, false) {
                 eprintln!("sh: error parsing action: {}", err.message);
             }
             self.last_pipeline_exit_status = last_pipeline_exit_status_before_trap;
@@ -722,6 +768,7 @@ impl Shell {
         simple_command: &SimpleCommand,
         ignore_errexit: bool,
     ) -> CommandExecutionResult<i32> {
+        let exits_after = self.take_exits_after_command();
         let mut expanded_words = Vec::new();
         // reset
         self.last_command_substitution_status = 0;
@@ -811,6 +858,10 @@ impl Shell {
                         ));
                         return Ok(127);
                     };
+                    if exits_after && self.can_replace_process() {
+                        self.become_subshell();
+                        self.exec(command, &expanded_words, &opened_files)
+                    }
                     self.fork_and_exec(command, &expanded_words, &opened_files)
                         .map_err(|err| err.into())
                 });
@@ -866,7 +917,10 @@ impl Shell {
         arg: &WordPair,
         cases: &[CaseItem],
         ignore_errexit: bool,
+        exits_after: bool,
     ) -> CommandExecutionResult<i32> {
+        // Only a body that does not fall through to the next one runs last.
+        let runs_last = |idx: usize| !(cases[idx].fallthrough && idx + 1 < cases.len());
         let arg = expand_word_to_string(&arg.word, false, self)?;
         for (index, case) in cases.iter().enumerate() {
             let mut matched = false;
@@ -880,6 +934,7 @@ impl Shell {
             if !matched {
                 continue;
             }
+            self.exits_after_command = exits_after && runs_last(index);
             let mut result = match &case.body {
                 Some(body) => self.interpret(body, ignore_errexit),
                 None => 0,
@@ -893,6 +948,7 @@ impl Shell {
                 && self.control_flow_state == ControlFlowState::None
             {
                 idx += 1;
+                self.exits_after_command = exits_after && runs_last(idx);
                 result = match &cases[idx].body {
                     Some(body) => self.interpret(body, ignore_errexit),
                     None => 0,
@@ -908,13 +964,16 @@ impl Shell {
         if_chain: &NonEmpty<If>,
         else_body: &Option<CompleteCommand>,
         ignore_errexit: bool,
+        exits_after: bool,
     ) -> i32 {
         for if_ in if_chain {
             if self.interpret(&if_.condition, true) == 0 {
+                self.exits_after_command = exits_after;
                 return self.interpret(&if_.body, ignore_errexit);
             }
         }
         if let Some(else_body) = else_body {
+            self.exits_after_command = exits_after;
             self.interpret(else_body, ignore_errexit)
         } else {
             0
@@ -966,10 +1025,22 @@ impl Shell {
         status
     }
 
-    fn interpret_subshell(&mut self, commands: &CompleteCommand) -> CommandExecutionResult<i32> {
+    fn interpret_subshell(
+        &mut self,
+        commands: &CompleteCommand,
+        exits_after: bool,
+    ) -> CommandExecutionResult<i32> {
+        if exits_after && self.can_replace_process() {
+            // Nothing runs after the subshell, so this process can be it.
+            self.become_subshell();
+            self.exits_after_command = true;
+            let status = self.interpret(commands, false);
+            self.exit(status);
+        }
         match fork()? {
             ForkResult::Child => {
                 self.become_subshell();
+                self.exits_after_command = true;
                 let status = self.interpret(commands, false);
                 self.exit(status);
             }
@@ -985,21 +1056,27 @@ impl Shell {
         redirections: &[Redirection],
         ignore_errexit: bool,
     ) -> CommandExecutionResult<i32> {
+        // A loop runs its parts again, so only a brace group, a subshell, and
+        // the chosen branch of an `if` or `case` can hand the mark on.
+        let exits_after = self.take_exits_after_command();
         self.with_redirections(redirections, |shell| match compound_command {
-            CompoundCommand::BraceGroup(command) => Ok(shell.interpret(command, ignore_errexit)),
-            CompoundCommand::Subshell(commands) => shell.interpret_subshell(commands),
+            CompoundCommand::BraceGroup(command) => {
+                shell.exits_after_command = exits_after;
+                Ok(shell.interpret(command, ignore_errexit))
+            }
+            CompoundCommand::Subshell(commands) => shell.interpret_subshell(commands, exits_after),
             CompoundCommand::ForClause {
                 iter_var,
                 words,
                 body,
             } => shell.interpret_for_clause(iter_var.clone(), words, body, ignore_errexit),
             CompoundCommand::CaseClause { arg, cases } => {
-                shell.interpret_case_clause(arg, cases, ignore_errexit)
+                shell.interpret_case_clause(arg, cases, ignore_errexit, exits_after)
             }
             CompoundCommand::IfClause {
                 if_chain,
                 else_body,
-            } => Ok(shell.interpret_if_clause(if_chain, else_body, ignore_errexit)),
+            } => Ok(shell.interpret_if_clause(if_chain, else_body, ignore_errexit, exits_after)),
             CompoundCommand::WhileClause { condition, body } => {
                 Ok(shell.interpret_loop_clause(condition, body, true, ignore_errexit))
             }
@@ -1050,6 +1127,7 @@ impl Shell {
                 redirections,
             } => self.interpret_compound_command(command, redirections, ignore_errexit),
             CommandType::FunctionDefinition(function) => {
+                self.exits_after_command = false;
                 self.define_function(function);
                 Ok(0)
             }
@@ -1075,9 +1153,12 @@ impl Shell {
         // call, a subshell, a pipeline of several commands, a redirection
         // error) starts afresh.
         let mut inherited_ignored_failure = false;
+        let exits_after = self.take_exits_after_command();
         if pipeline.commands.len() == 1 {
             let command = pipeline.commands.first();
             self.last_status_from_ignored_failure = false;
+            // `! cmd` still has to invert the status once cmd has finished.
+            self.exits_after_command = exits_after && !pipeline.negate_status;
             pipeline_exit_status = self.interpret_command(command, ignore_errexit);
             inherited_ignored_failure = self.last_status_from_ignored_failure
                 && matches!(
@@ -1135,6 +1216,7 @@ impl Shell {
                                 if write_stdout != libc::STDOUT_FILENO {
                                     close(write_stdout)?;
                                 }
+                                self.exits_after_command = true;
                                 let return_status = self.interpret_command(command, false);
                                 self.exit(return_status);
                             }
@@ -1249,6 +1331,7 @@ impl Shell {
         list: &NonEmpty<(Pipeline, LogicalOp)>,
         ignore_errexit: bool,
     ) -> i32 {
+        let exits_after = self.take_exits_after_command();
         let mut status = 0;
         for i in 0..list.len() {
             let (pipeline, _) = &list[i];
@@ -1271,6 +1354,7 @@ impl Shell {
             // except the last, since the earlier ones' failure is what the
             // operators are testing.
             let ignore_errexit = i != list.len() - 1 || ignore_errexit;
+            self.exits_after_command = exits_after && i == list.len() - 1;
             status = match self.interpret_pipeline(pipeline, ignore_errexit) {
                 Ok(status) => status,
                 Err(err) => {
@@ -1286,6 +1370,7 @@ impl Shell {
     }
 
     fn interpret_conjunction(&mut self, conjunction: &Conjunction, ignore_errexit: bool) -> i32 {
+        let exits_after = self.take_exits_after_command();
         if conjunction.is_async {
             match fork() {
                 Ok(ForkResult::Child) => {
@@ -1303,6 +1388,7 @@ impl Shell {
                             .set_action(Signal::SigQuit, TrapAction::Ignore);
                         self.opened_files.redirect_stdin_to_dev_null();
                     }
+                    self.exits_after_command = true;
                     let status = self.interpret_and_or_list(&conjunction.elements, false);
                     self.exit(status);
                 }
@@ -1326,13 +1412,17 @@ impl Shell {
                 }
             }
         } else {
+            self.exits_after_command = exits_after;
             self.interpret_and_or_list(&conjunction.elements, ignore_errexit)
         }
     }
 
     fn interpret(&mut self, command: &CompleteCommand, ignore_errexit: bool) -> i32 {
+        let exits_after = self.take_exits_after_command();
         let mut status = 0;
-        for conjunction in &command.commands {
+        let count = command.commands.len();
+        for (index, conjunction) in (&command.commands).into_iter().enumerate() {
+            self.exits_after_command = exits_after && index + 1 == count;
             status = self.interpret_conjunction(conjunction, ignore_errexit);
             if self.control_flow_state != ControlFlowState::None {
                 return status;
@@ -1350,7 +1440,11 @@ impl Shell {
                 self.opened_files
                     .take_over_standard_fd(StandardFd::Stdout)?;
                 dup2(write_pipe.as_raw_fd(), libc::STDOUT_FILENO)?;
-                self.execute_nested_program(program)
+                // The write end must not stay open in this process once fd 1
+                // holds it: the last command may replace the process, and the
+                // reader would then wait for a descriptor nobody closes.
+                drop(write_pipe);
+                self.run_nested_program(program, true)
                     .map_err(CommandExecutionError::Parse)?;
                 self.exit(self.last_pipeline_exit_status);
             }
@@ -1399,9 +1493,15 @@ impl Shell {
     /// of `eval` or a command substitution: its lines are numbered from the
     /// line of that command, so LINENO keeps counting the script's lines.
     pub fn execute_nested_program(&mut self, program: &[u8]) -> Result<i32, ParserError> {
+        self.run_nested_program(program, false)
+    }
+
+    /// `execute_nested_program`; `then_exit` says the process exits once the
+    /// program has run (a command substitution).
+    fn run_nested_program(&mut self, program: &[u8], then_exit: bool) -> Result<i32, ParserError> {
         let saved_lineno = self.last_lineno;
         self.last_lineno = self.command_lineno.saturating_sub(1);
-        let result = self.run_program(program, false);
+        let result = self.run_program(program, false, then_exit);
         self.last_lineno = saved_lineno;
         result
     }
@@ -1409,7 +1509,13 @@ impl Shell {
     /// Executes input the shell has read: a script, a line of standard input
     /// or a `-c` string.
     pub fn execute_program(&mut self, program: &[u8]) -> Result<i32, ParserError> {
-        self.run_program(program, true)
+        self.run_program(program, true, false)
+    }
+
+    /// Executes a `-c` command string, after which the shell exits.
+    pub fn execute_command_string(&mut self, program: &[u8]) -> Result<i32, ParserError> {
+        let then_exit = !self.is_interactive;
+        self.run_program(program, true, then_exit)
     }
 
     /// `echo_input` says whether `program` is input read by the shell, which
@@ -1417,7 +1523,15 @@ impl Shell {
     /// just before the command runs, so the option takes effect from the
     /// next command on. The operands of `eval`, a command substitution and a
     /// trap action are not read input (as in dash).
-    fn run_program(&mut self, program: &[u8], echo_input: bool) -> Result<i32, ParserError> {
+    ///
+    /// `then_exit` says the process exits once the program has run, so its
+    /// last command is the last thing this process runs.
+    fn run_program(
+        &mut self,
+        program: &[u8],
+        echo_input: bool,
+        then_exit: bool,
+    ) -> Result<i32, ParserError> {
         if let Err(err) = self.background_jobs.update_jobs() {
             self.eprint(&format!("sh: error updating background jobs ({err})"));
         }
@@ -1454,6 +1568,8 @@ impl Shell {
                 if self.is_interactive {
                     self.history.add_entry(command.to_string());
                 }
+                self.exits_after_command =
+                    then_exit && is_blank_or_comments(&program[parser.source_offset()..]);
                 result = self.interpret(&command, false);
                 if self.control_flow_state == ControlFlowState::Return {
                     self.control_flow_state = ControlFlowState::None;
@@ -1656,6 +1772,7 @@ impl Default for Shell {
             umask: !crate::os::get_umask() & 0o777,
             saved_command_locations: HashMap::with_capacity(DEFAULT_COMMAND_CACHE_CAPACITY),
             is_subshell: false,
+            exits_after_command: false,
             last_pipeline_command: String::new(),
             getopts_state: (0, 0),
             mail_check: MailCheck::default(),

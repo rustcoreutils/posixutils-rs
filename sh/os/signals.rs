@@ -398,6 +398,14 @@ impl SignalManager {
         self.actions[signal as usize] = action;
     }
 
+    /// Whether any signal has a trap action (commands) set. Ignored signals
+    /// do not count: an ignored disposition survives `exec`.
+    pub fn catches_any(&self) -> bool {
+        self.actions
+            .iter()
+            .any(|action| matches!(action, TrapAction::Commands(_)))
+    }
+
     pub fn get_pending_action(&mut self) -> Option<&TrapAction> {
         if let Some(signal) = get_pending_signal() {
             if signal == Signal::SigInt {

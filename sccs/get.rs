@@ -528,7 +528,7 @@ fn write_lfile(
 ) -> io::Result<()> {
     let table = render_lfile(sccs, applied_set);
     if to_stdout {
-        io::stdout().write_all(table.as_bytes())?;
+        Stdout.write_all(table.as_bytes())?;
     } else {
         // The l-file is read-only, so it must be replaced rather than
         // reopened: writing it a second time in the same directory otherwise
@@ -545,7 +545,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
         let output_stream: &mut dyn Write = if args.to_stdout || args.lfile_stdout {
             &mut io::stderr()
         } else {
-            &mut io::stdout()
+            &mut Stdout
         };
         writeln!(output_stream, "\n{}:", sfile_path.display())?;
     }
@@ -730,7 +730,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
         let output_stream: &mut dyn Write = if info_to_stderr {
             &mut io::stderr()
         } else {
-            &mut io::stdout()
+            &mut Stdout
         };
 
         writeln!(output_stream, "{}", target_sid)?;
@@ -801,7 +801,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
         let raw = plib::sccsfile::uudecode_sccs(&encoded_lines);
 
         if args.to_stdout {
-            io::stdout().write_all(&raw)?;
+            Stdout.write_all(&raw)?;
         } else {
             let gfile_path = paths::gfile_from_sfile(sfile_path).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, gettext("Invalid s-file name"))
@@ -815,7 +815,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
             let output_stream: &mut dyn Write = if info_to_stderr {
                 &mut io::stderr()
             } else {
-                &mut io::stdout()
+                &mut Stdout
             };
             writeln!(output_stream, "{} {}", line_count, gettext("lines"))?;
         }
@@ -911,10 +911,8 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
 
     // Write output
     if args.to_stdout {
-        let stdout = io::stdout();
-        let mut handle = stdout.lock();
         for line in &lines {
-            writeln!(handle, "{}", line)?;
+            writeln!(Stdout, "{}", line)?;
         }
     } else {
         // Write to g-file
@@ -939,13 +937,46 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
         let output_stream: &mut dyn Write = if info_to_stderr {
             &mut io::stderr()
         } else {
-            &mut io::stdout()
+            &mut Stdout
         };
         writeln!(output_stream, "{} {}", line_count, gettext("lines"))?;
     }
 
     Ok(true)
 }
+
+/// Standard output, whose write failures are marked as [`StdoutWriteError`]
+/// so that `main` reports them as write errors rather than against the
+/// s-file being processed.
+struct Stdout;
+
+impl Write for Stdout {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        io::stdout().write(buf).map_err(StdoutWriteError::mark)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::stdout().flush().map_err(StdoutWriteError::mark)
+    }
+}
+
+/// A failed write to standard output, carried inside an [`io::Error`].
+#[derive(Debug)]
+struct StdoutWriteError(io::Error);
+
+impl StdoutWriteError {
+    fn mark(e: io::Error) -> io::Error {
+        io::Error::new(e.kind(), StdoutWriteError(e))
+    }
+}
+
+impl std::fmt::Display for StdoutWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&plib::diag::io_error_text(&self.0))
+    }
+}
+
+impl std::error::Error for StdoutWriteError {}
 
 fn main() -> ExitCode {
     plib::diag::init_locale("get");
@@ -970,6 +1001,14 @@ fn main() -> ExitCode {
         match process_file(&args, file_path, multiple_files) {
             Ok(true) => {}
             Ok(false) => exit_code = ExitCode::FAILURE,
+            // Every later file would fail the same way.
+            Err(e)
+                if e.get_ref()
+                    .is_some_and(|inner| inner.is::<StdoutWriteError>()) =>
+            {
+                diag::error("get", &format!("{}: {e}", gettext("write error")));
+                return ExitCode::FAILURE;
+            }
             Err(e) => {
                 diag::error_path("get", file_path, &e.to_string());
                 exit_code = ExitCode::FAILURE;

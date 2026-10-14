@@ -1440,3 +1440,19 @@ fn option_argument_may_begin_with_hyphen() {
         plib::testing::assert_hyphen_option_argument("get", &[opt, "-zq", "--help"]);
     }
 }
+
+// A failed write of the retrieved text to standard output is "get: write
+// error: REASON", not an error against the s-file.
+#[cfg(target_os = "linux")]
+#[test]
+fn get_write_error_on_full_device() {
+    let sfile = fixture_path("s.simple");
+    let sfile = sfile.to_str().unwrap();
+    plib::testing::assert_write_error_message_on_full_device("get", &["-p", "-s", sfile], b"", 1);
+    plib::testing::assert_write_error_message_on_full_device(
+        "get",
+        &["-p", "-s", sfile, sfile],
+        b"",
+        1,
+    );
+}

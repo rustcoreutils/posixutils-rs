@@ -65,3 +65,15 @@ fn exec_in_subshell_does_not_persist() {
         "subshell-ok\n",
     );
 }
+
+// A here-document is standard input like any other, so `. /dev/stdin`
+// reads it.
+#[test]
+fn heredoc_is_readable_as_dev_stdin() {
+    sh_c(". /dev/stdin <<EOF\necho dot\nEOF", "dot\n");
+    sh_c(". /dev/fd/3 3<<EOF\necho fd3\nEOF", "fd3\n");
+    sh_c("{ . /dev/stdin; } <<EOF\necho braced\nEOF", "braced\n");
+    sh_c("echo 'echo piped' | . /dev/stdin", "piped\n");
+    // A script need not be valid text.
+    sh_c("printf 'echo ok\\n#\\377\\n' | . /dev/stdin", "ok\n");
+}

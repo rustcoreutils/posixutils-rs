@@ -134,24 +134,30 @@ impl ControlFlowState {
 
 pub enum ScriptExecutionError {
     ParsingError(ParserError),
-    IoError(std::io::Error),
+    /// The file could not be opened or read.
+    Unreadable,
 }
 
 pub fn execute_file_as_script(shell: &mut Shell, path: &Path) -> Result<i32, ScriptExecutionError> {
     let mut file = File::options()
         .read(true)
         .open(path)
-        .map_err(ScriptExecutionError::IoError)?;
+        .map_err(|_| ScriptExecutionError::Unreadable)?;
 
-    let mut source = String::new();
-    file.read_to_string(&mut source)
-        .map_err(ScriptExecutionError::IoError)?;
+    // A script is bytes: it need not be valid text.
+    let mut source = Vec::new();
+    file.read_to_end(&mut source)
+        .map_err(|_| ScriptExecutionError::Unreadable)?;
+    execute_script_source(shell, &source).map_err(ScriptExecutionError::ParsingError)
+}
 
+/// Runs the text of a script, numbering its lines from 1.
+pub fn execute_script_source(shell: &mut Shell, source: &[u8]) -> Result<i32, ParserError> {
     let lineno = shell.last_lineno;
     shell.last_lineno = 0;
-    let execution_result = shell.execute_program(source.as_bytes());
+    let execution_result = shell.execute_program(source);
     shell.last_lineno = lineno;
-    execution_result.map_err(ScriptExecutionError::ParsingError)
+    execution_result
 }
 
 #[derive(Clone)]
@@ -430,7 +436,7 @@ impl Shell {
                                 ));
                                 self.exit(2)
                             }
-                            Err(ScriptExecutionError::IoError(_)) => {
+                            Err(ScriptExecutionError::Unreadable) => {
                                 // fallthrough to the default error
                             }
                         }

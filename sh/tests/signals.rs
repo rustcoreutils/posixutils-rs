@@ -12,6 +12,8 @@
 
 use plib::testing::{run_test, TestPlan};
 
+const SH: &str = env!("CARGO_BIN_EXE_sh");
+
 fn sh_c(script: &str, expected_out: &str) {
     run_test(TestPlan {
         cmd: "sh".to_string(),
@@ -53,4 +55,49 @@ fn last_command_runs_in_place_only_when_nothing_follows() {
     sh_c("( (/bin/echo a); /bin/echo b)", "a\nb\n");
     sh_c("(f() { /bin/echo f; }; f; /bin/echo after)", "f\nafter\n");
     sh_c("/bin/echo a\n/bin/echo b # comment\n", "a\nb\n");
+}
+
+// A signal ignored when the shell starts stays ignored, for the shell and
+// for every command it runs (XCU 2.11): `trap '' HUP; sh -c cmd` keeps cmd
+// safe from SIGHUP, as nohup-style wrappers rely on.
+#[test]
+fn signals_ignored_on_entry_stay_ignored_for_children() {
+    sh_c(
+        &format!("trap '' HUP; {SH} -c \"{SH} -c 'kill -HUP \\$\\$; echo survived'\""),
+        "survived\n",
+    );
+    sh_c(
+        &format!("trap '' TERM; {SH} -c \"{SH} -c 'kill -TERM \\$\\$; echo survived'\""),
+        "survived\n",
+    );
+    // gzip's pipe-output test: gunzip and zcat are #!/bin/sh scripts that
+    // exec gzip, which must see EPIPE (exit 1 or 2), not die of SIGPIPE.
+    sh_c(
+        &format!("trap '' PIPE; {SH} -c \"{SH} -c 'kill -PIPE \\$\\$; echo survived'\""),
+        "survived\n",
+    );
+    // The same when the middle shell forks for the command instead of
+    // replacing itself with it.
+    sh_c(
+        &format!("trap '' HUP; {SH} -c \"{SH} -c 'kill -HUP \\$\\$; echo survived'; :\""),
+        "survived\n",
+    );
+    sh_c(
+        &format!("trap '' INT; {SH} -c \"({SH} -c 'kill -INT \\$\\$; echo survived'); :\""),
+        "survived\n",
+    );
+}
+
+// A non-interactive shell cannot trap or reset a signal ignored on entry, and
+// says nothing when asked to (bash, dash). `trap` lists it as ignored (XCU
+// `trap`: "including signals that were ignored on entry").
+#[test]
+fn signals_ignored_on_entry_cannot_be_trapped_or_reset() {
+    sh_c(
+        &format!(
+            "trap '' HUP; {SH} -c 'trap \"echo caught\" HUP; kill -HUP $$; trap - HUP; \
+             kill -HUP $$; trap 1 HUP; kill -HUP $$; echo survived; trap'"
+        ),
+        "survived\ntrap -- '' HUP\n",
+    );
 }

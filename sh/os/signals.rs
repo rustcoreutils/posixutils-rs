@@ -317,6 +317,13 @@ pub unsafe fn handle_signal_default(signal: Signal) {
     handle_signal(signal, libc::SIG_DFL);
 }
 
+/// Whether `signal` is ignored right now, as when the shell starts.
+fn is_ignored(signal: Signal) -> bool {
+    let mut current = unsafe { std::mem::zeroed::<libc::sigaction>() };
+    let result = unsafe { libc::sigaction(signal.into(), std::ptr::null(), &mut current) };
+    result == 0 && current.sa_sigaction == libc::SIG_IGN
+}
+
 pub unsafe fn handle_signal_write_to_signal_buffer(signal: Signal) {
     handle_signal(
         signal,
@@ -327,16 +334,43 @@ pub unsafe fn handle_signal_write_to_signal_buffer(signal: Signal) {
 #[derive(Clone)]
 pub struct SignalManager {
     actions: [TrapAction; Signal::Count as usize],
+    /// XCU 2.11 and `trap`: a signal ignored when the shell started stays
+    /// ignored in every command the shell runs, and a non-interactive shell
+    /// cannot trap or reset it (silently, as in bash and dash). Its default
+    /// action, for this shell and its children, is to stay ignored.
+    ignored_on_entry: [bool; Signal::Count as usize],
     is_interactive: bool,
     sigint_count: u32,
 }
 
 impl SignalManager {
+    /// Records the dispositions the shell inherited, so it must be created
+    /// before the shell changes any of them.
     pub fn new(is_interactive: bool) -> Self {
+        let mut ignored_on_entry = [false; Signal::Count as usize];
+        let mut actions = [const { TrapAction::Default }; Signal::Count as usize];
+        for &signal in SIGNALS {
+            if signal != Signal::SigKill && signal != Signal::SigStop && is_ignored(signal) {
+                ignored_on_entry[signal as usize] = true;
+                // `trap` lists it as ignored (XCU `trap`).
+                actions[signal as usize] = TrapAction::Ignore;
+            }
+        }
         Self {
-            actions: [const { TrapAction::Default }; Signal::Count as usize],
+            actions,
+            ignored_on_entry,
             is_interactive,
             sigint_count: 0,
+        }
+    }
+
+    /// Installs the default action of `signal`: SIG_DFL, or SIG_IGN for a
+    /// signal ignored on entry.
+    fn install_default(&self, signal: Signal) {
+        if self.ignored_on_entry[signal as usize] {
+            unsafe { handle_signal_ignore(signal) };
+        } else {
+            unsafe { handle_signal_default(signal) };
         }
     }
 
@@ -352,8 +386,8 @@ impl SignalManager {
                 // set at startup for an interactive shell, but its not registered
                 // as a trap action
                 TrapAction::Commands(_) | TrapAction::Default => {
-                    unsafe { handle_signal_default(signal) };
                     *action = TrapAction::Default;
+                    self.install_default(signal);
                 }
                 TrapAction::Ignore => {}
             }
@@ -375,6 +409,9 @@ impl SignalManager {
     pub fn set_action(&mut self, signal: Signal, action: TrapAction) {
         assert!(signal != Signal::SigKill && signal != Signal::SigStop);
 
+        if self.ignored_on_entry[signal as usize] && !self.is_interactive {
+            return;
+        }
         if self.is_interactive
             && signal == Signal::SigInt
             && (action == TrapAction::Ignore || action == TrapAction::Default)
@@ -386,7 +423,7 @@ impl SignalManager {
         }
         match action {
             TrapAction::Default => {
-                unsafe { handle_signal_default(signal) };
+                self.install_default(signal);
             }
             TrapAction::Ignore => {
                 unsafe { handle_signal_ignore(signal) };

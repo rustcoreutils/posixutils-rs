@@ -1020,7 +1020,13 @@ impl Shell {
         exits_after: bool,
     ) -> i32 {
         for if_ in if_chain {
-            if self.interpret(&if_.condition, true) == 0 {
+            let condition = self.interpret(&if_.condition, true);
+            // A `break`, `continue` or `return` in a condition takes effect
+            // at once, as in dash and bash: no branch runs.
+            if self.control_flow_state != ControlFlowState::None {
+                return condition;
+            }
+            if condition == 0 {
                 self.exits_after_command = exits_after;
                 return self.interpret(&if_.body, ignore_errexit);
             }
@@ -1047,13 +1053,21 @@ impl Shell {
         // `last_status_from_ignored_failure`, which goes with `status`.
         let mut status_from_ignored_failure = false;
         loop {
-            let condition = self.interpret(condition, true);
-            if (condition == 0 && !continue_if_zero) || (condition != 0 && continue_if_zero) {
-                break;
-            }
+            // The condition is part of the loop: a `break` or `continue` in
+            // it applies to this loop, and one there, or a `return`, takes
+            // effect at once (as in dash and bash).
             self.loop_depth += 1;
-            status = self.interpret(body, ignore_errexit);
-            status_from_ignored_failure = self.last_status_from_ignored_failure;
+            let condition = self.interpret(condition, true);
+            if self.control_flow_state != ControlFlowState::None {
+                status = condition;
+                status_from_ignored_failure = self.last_status_from_ignored_failure;
+            } else if (condition == 0) != continue_if_zero {
+                self.loop_depth -= 1;
+                break;
+            } else {
+                status = self.interpret(body, ignore_errexit);
+                status_from_ignored_failure = self.last_status_from_ignored_failure;
+            }
             self.loop_depth -= 1;
             match self.control_flow_state {
                 ControlFlowState::Break(_) => {

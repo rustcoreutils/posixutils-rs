@@ -112,7 +112,9 @@ impl From<OsError> for BuiltinError {
 impl Display for BuiltinError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            BuiltinError::CustomError(err) => f.write_str(err),
+            // The caller ends the diagnostic with a newline; a message that
+            // brings its own would leave a blank line after it.
+            BuiltinError::CustomError(err) => f.write_str(err.trim_end_matches('\n')),
             BuiltinError::AssignmentError(err) => {
                 write!(f, "{}", err)
             }

@@ -185,6 +185,9 @@ pub struct Shell {
     pub opened_files: OpenedFiles,
     pub functions: HashMap<Name, Rc<FunctionBody>>,
     pub last_pipeline_exit_status: i32,
+    /// Whether `last_pipeline_exit_status`, if nonzero, is the result of a
+    /// failure while `set -e` was being ignored (see `interpret_pipeline`).
+    pub last_status_from_ignored_failure: bool,
     pub last_command_substitution_status: i32,
     pub shell_pid: i32,
     pub current_directory: OsString,
@@ -396,10 +399,12 @@ impl Shell {
     pub fn execute_action(&mut self, action: TrapAction) {
         if let TrapAction::Commands(commands) = action {
             let last_pipeline_exit_status_before_trap = self.last_pipeline_exit_status;
+            let ignored_before_trap = self.last_status_from_ignored_failure;
             if let Err(err) = self.run_program(commands.as_bytes(), false) {
                 eprintln!("sh: error parsing action: {}", err.message);
             }
             self.last_pipeline_exit_status = last_pipeline_exit_status_before_trap;
+            self.last_status_from_ignored_failure = ignored_before_trap;
         }
     }
 
@@ -926,6 +931,9 @@ impl Shell {
         // POSIX: a loop's exit status is that of the last command executed in
         // its body, or zero if the body never ran.
         let mut status = 0;
+        // The condition runs after the body, and must not replace the body's
+        // `last_status_from_ignored_failure`, which goes with `status`.
+        let mut status_from_ignored_failure = false;
         loop {
             let condition = self.interpret(condition, true);
             if (condition == 0 && !continue_if_zero) || (condition != 0 && continue_if_zero) {
@@ -933,6 +941,7 @@ impl Shell {
             }
             self.loop_depth += 1;
             status = self.interpret(body, ignore_errexit);
+            status_from_ignored_failure = self.last_status_from_ignored_failure;
             self.loop_depth -= 1;
             match self.control_flow_state {
                 ControlFlowState::Break(_) => {
@@ -953,6 +962,7 @@ impl Shell {
                 _ => {}
             }
         }
+        self.last_status_from_ignored_failure = status_from_ignored_failure;
         status
     }
 
@@ -1047,16 +1057,34 @@ impl Shell {
 
         match execution_result {
             Ok(result) => result,
-            Err(err) => self.handle_error(err),
+            Err(err) => {
+                self.last_status_from_ignored_failure = false;
+                self.handle_error(err)
+            }
         }
     }
 
     fn interpret_pipeline(&mut self, pipeline: &Pipeline, ignore_errexit: bool) -> OsResult<i32> {
         self.last_pipeline_command = pipeline.to_string();
         let pipeline_exit_status;
+        // XCU `set`, -e: "If the exit status of a compound command other than
+        // a subshell command was the result of a failure while -e was being
+        // ignored, then -e shall not apply to this command." A compound
+        // command's status is that of the last pipeline it ran, so it inherits
+        // that pipeline's flag; anything else (a simple command, a function
+        // call, a subshell, a pipeline of several commands, a redirection
+        // error) starts afresh.
+        let mut inherited_ignored_failure = false;
         if pipeline.commands.len() == 1 {
             let command = pipeline.commands.first();
+            self.last_status_from_ignored_failure = false;
             pipeline_exit_status = self.interpret_command(command, ignore_errexit);
+            inherited_ignored_failure = self.last_status_from_ignored_failure
+                && matches!(
+                    &command.type_,
+                    CommandType::CompoundCommand { command, .. }
+                        if !matches!(command, CompoundCommand::Subshell(_))
+                );
         } else {
             match fork()? {
                 ForkResult::Child => {
@@ -1199,15 +1227,21 @@ impl Shell {
                 }
             }
         }
-        self.last_pipeline_exit_status = if pipeline.negate_status {
+        // A `!` pipeline is always exempt from -e; so is any pipeline while
+        // -e is being ignored, which is what makes the failure an ignored one
+        // for the compound commands around it.
+        let status = if pipeline.negate_status {
             (pipeline_exit_status == 0) as i32
         } else {
-            if pipeline_exit_status != 0 && !ignore_errexit && self.set_options.errexit {
-                self.exit(pipeline_exit_status)
-            }
             pipeline_exit_status
         };
-        Ok(self.last_pipeline_exit_status)
+        let ignored = pipeline.negate_status || ignore_errexit || inherited_ignored_failure;
+        if status != 0 && !ignored && self.set_options.errexit {
+            self.exit(status)
+        }
+        self.last_pipeline_exit_status = status;
+        self.last_status_from_ignored_failure = status != 0 && ignored;
+        Ok(status)
     }
 
     fn interpret_and_or_list(
@@ -1600,6 +1634,7 @@ impl Default for Shell {
             opened_files: OpenedFiles::default(),
             functions: HashMap::default(),
             last_pipeline_exit_status: 0,
+            last_status_from_ignored_failure: false,
             last_command_substitution_status: 0,
             shell_pid: 0,
             current_directory: OsString::from("/"),

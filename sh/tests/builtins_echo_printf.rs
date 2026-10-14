@@ -208,6 +208,15 @@ fn printf_width_above_int_max_is_rejected() {
     );
 }
 
+// Not POSIX, but dash and bash agree on `*`.
+#[test]
+fn printf_star_width_and_precision() {
+    sh_c(
+        "printf '%*d|%-*d|%*d|%.*f|\\n' 3 1 3 2 -3 3 -1 1.5",
+        "  1|2  |3  |1.500000|\n",
+    );
+}
+
 #[test]
 fn printf_lookup_order() {
     sh_c("command printf '%s\\n' cmd", "cmd\n");

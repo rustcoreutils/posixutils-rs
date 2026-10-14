@@ -42,6 +42,7 @@ fn apply_radix_char(formatted: String) -> String {
 }
 
 // the following structure is a printf format conversion specifier
+#[derive(Clone, Copy)]
 struct ConvSpec {
     // the conversion specifier character
     spec: char,
@@ -50,8 +51,13 @@ struct ConvSpec {
     arg_number: Option<usize>,
     // the minimum field width
     width: Option<usize>,
+    // the width is a "*", taken from the next operand (an extension, as in
+    // dash and bash; POSIX 112045-112048 permits it)
+    width_from_arg: bool,
     // the precision
     precision: Option<usize>,
+    // the precision is a "*", taken from the next operand
+    precision_from_arg: bool,
     // the conversion specifier flags
     left_justify: bool,
     sign: bool,
@@ -72,6 +78,8 @@ impl Default for ConvSpec {
             space: Default::default(),
             alt_form: Default::default(),
             zero_pad: Default::default(),
+            width_from_arg: false,
+            precision_from_arg: false,
         }
     }
 }
@@ -315,7 +323,12 @@ fn tokenize_format_str(format: &[u8]) -> Result<Vec<Token>, Box<dyn Error>> {
                     done_with_char = true;
                 }
                 ParseState::Width => {
-                    if current_byte.is_ascii_digit() {
+                    if current_byte == b'*' && width.is_empty() {
+                        conv_spec.width_from_arg = true;
+                        state = ParseState::Precision;
+
+                        done_with_char = true;
+                    } else if current_byte.is_ascii_digit() {
                         width.push(char::from(current_byte));
 
                         done_with_char = true;
@@ -344,7 +357,12 @@ fn tokenize_format_str(format: &[u8]) -> Result<Vec<Token>, Box<dyn Error>> {
                     }
                 }
                 ParseState::PrecisionValue => {
-                    if current_byte.is_ascii_digit() {
+                    if current_byte == b'*' && precision.is_empty() {
+                        conv_spec.precision_from_arg = true;
+                        state = ParseState::Specifier;
+
+                        done_with_char = true;
+                    } else if current_byte.is_ascii_digit() {
                         precision.push(char::from(current_byte));
 
                         done_with_char = true;
@@ -1371,6 +1389,17 @@ pub fn split_operands<A: AsRef<[u8]>>(args: &[A]) -> Option<(&A, &[A])> {
     args.split_first()
 }
 
+/// Evaluate the operand of a "*" field width or precision, as an integer
+/// operand with the usual diagnostics.  A value that is not a C int is an
+/// error, as for a width written in the format.
+fn star_operand(arg: &[u8], diag: &mut DiagSink) -> Result<(i64, bool), Box<dyn Error>> {
+    let (operand, had_error) = eval_integer_arg(arg, diag);
+    if operand.value.unsigned_abs() > FIELD_NUMBER_MAX as u128 {
+        return Err(field_number_too_large(&String::from_utf8_lossy(arg)));
+    }
+    Ok((operand.value as i64, had_error))
+}
+
 /// Write `format` applied to `arguments` (the operands after the format) to
 /// `output`, reusing the format while operands remain.
 ///
@@ -1418,6 +1447,27 @@ pub fn printf(
 
             match token {
                 Token::Conversion(co) => {
+                    // A "*" width, then a "*" precision, each consume the
+                    // next operand, before the value does.
+                    let mut co = *co;
+                    if co.width_from_arg {
+                        let arg = arguments.get(next_unnumbered).copied().unwrap_or(&[]);
+                        next_unnumbered += 1;
+                        let (width, star_error) = star_operand(arg, diag)?;
+                        had_error |= star_error;
+                        // A negative width is the '-' flag and its magnitude.
+                        co.left_justify |= width < 0;
+                        co.width = Some(width.unsigned_abs() as usize);
+                    }
+                    if co.precision_from_arg {
+                        let arg = arguments.get(next_unnumbered).copied().unwrap_or(&[]);
+                        next_unnumbered += 1;
+                        let (precision, star_error) = star_operand(arg, diag)?;
+                        had_error |= star_error;
+                        // A negative precision is taken as if omitted.
+                        co.precision = usize::try_from(precision).ok();
+                    }
+
                     // %% doesn't consume an argument
                     let arg_str = if co.spec == '%' {
                         &[][..]
@@ -1441,7 +1491,7 @@ pub fn printf(
                         arg
                     };
 
-                    let result = format_arg(co, arg_str, diag)?;
+                    let result = format_arg(&co, arg_str, diag)?;
                     write_pieces(output, &result.pieces)?;
 
                     if result.had_error {
@@ -1643,6 +1693,44 @@ mod tests {
                 "{format}: {err}"
             );
         }
+    }
+
+    /// `*` takes a field width or precision from the operands, as in dash
+    /// and bash: a negative width left-justifies, a negative precision is
+    /// as if omitted.
+    #[test]
+    fn star_width_and_precision() {
+        assert_eq!(run("%*d|", &["5", "1"]).0, "    1|");
+        assert_eq!(run("%*d|", &["-5", "1"]).0, "1    |");
+        assert_eq!(run("%-*d|", &["5", "1"]).0, "1    |");
+        assert_eq!(run("%.*d|", &["3", "1"]).0, "001|");
+        assert_eq!(run("%.*f|", &["-3", "1.5"]).0, "1.500000|");
+        assert_eq!(run("%*.*s|", &["4", "2", "abc"]).0, "  ab|");
+        // A missing operand is zero; the format is reused while operands
+        // remain, each `*` consuming one.
+        assert_eq!(run("%*d|", &[]).0, "0|");
+        assert_eq!(run("%*d|", &["2", "1", "3", "4"]).0, " 1|  4|");
+    }
+
+    #[test]
+    fn star_operand_must_be_a_number_and_an_int() {
+        let (out, diags, result) = run("%*d|", &["x", "1"]);
+        assert_eq!(out, "1|");
+        assert_eq!(diags, ["x: expected numeric value"]);
+        assert_eq!(result, Ok(true));
+
+        for width in ["2147483648", "-2147483648", "99999999999"] {
+            let (out, _, result) = run("a%*d|", &[width, "1"]);
+            assert_eq!(out, "a", "{width}");
+            assert_eq!(
+                result,
+                Err(format!("{width}: field width or precision too large"))
+            );
+        }
+        let (sink, result) = run_counting("%*d", &["-10000000", "1"]);
+        assert_eq!(result, Ok(false));
+        assert_eq!(sink.total, 10_000_000);
+        assert!(sink.max_write <= MAX_WRITE);
     }
 
     #[test]

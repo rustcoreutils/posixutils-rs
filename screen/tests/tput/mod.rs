@@ -332,3 +332,29 @@ fn test_tput_unreadable_reset_file_still_falls_back() {
 fn option_argument_may_begin_with_hyphen() {
     plib::testing::assert_hyphen_option_argument("tput", &["-T", "-zq", "--help"]);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn tput_write_error_on_full_device() {
+    // A failed write to standard output is "tput: write error: REASON",
+    // with the system's text for the error and exit status 5.
+    plib::testing::assert_write_error_message_on_full_device(
+        "tput",
+        &["-T", "xterm", "clear"],
+        b"",
+        5,
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn tput_two_operands_write_error_on_full_device() {
+    // A failed write to standard output is "tput: write error: REASON",
+    // with the system's text for the error and exit status 5.
+    plib::testing::assert_write_error_message_on_full_device(
+        "tput",
+        &["-T", "xterm", "clear", "clear"],
+        b"",
+        5,
+    );
+}

@@ -118,31 +118,44 @@ fn is_valid_operand(operand: &str) -> bool {
     matches!(operand, "clear" | "init" | "reset")
 }
 
+/// How processing an operand failed.
+enum Failure {
+    /// Exit with this status; any diagnostic has been written.
+    Status(u8),
+    /// Writing standard output failed, which every later operand would too.
+    Write(io::Error),
+}
+
+/// Map a capability's result to the operand's: a failed write is a write
+/// error, any other failure is silent with the "other error" status.
+fn cap_result(result: terminfo::Result<()>) -> Result<(), Failure> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(terminfo::Error::Io(e)) => Err(Failure::Write(e)),
+        Err(_) => Err(Failure::Status(EXIT_OTHER_ERROR)),
+    }
+}
+
 /// Process a single operand
-/// Returns true on success, false on failure
-fn process_operand(info: &Database, operand: &str) -> Result<(), u8> {
+fn process_operand(info: &Database, operand: &str) -> Result<(), Failure> {
     match operand {
-        "clear" => {
-            if let Err(_e) = tput_clear(info) {
-                return Err(EXIT_OTHER_ERROR);
-            }
-        }
-        "init" => {
-            if let Err(_e) = tput_init(info) {
-                return Err(EXIT_OTHER_ERROR);
-            }
-        }
-        "reset" => {
-            if let Err(_e) = tput_reset(info) {
-                return Err(EXIT_OTHER_ERROR);
-            }
-        }
+        "clear" => cap_result(tput_clear(info)),
+        "init" => cap_result(tput_init(info)),
+        "reset" => cap_result(tput_reset(info)),
         _ => {
             eprintln!("{}: {}", gettext("Invalid operand"), operand);
-            return Err(EXIT_INVALID_OPERAND);
+            Err(Failure::Status(EXIT_INVALID_OPERAND))
         }
     }
-    Ok(())
+}
+
+/// Report a failed write to standard output.
+fn report_write_error(e: &io::Error) {
+    plib::diag::error(&format!(
+        "{}: {}",
+        gettext("write error"),
+        plib::diag::io_error_text(e)
+    ));
 }
 
 fn main() -> ExitCode {
@@ -193,10 +206,22 @@ fn main() -> ExitCode {
     let mut exit_code = EXIT_SUCCESS;
 
     for operand in &args.operands {
-        if let Err(code) = process_operand(&info, operand) {
-            exit_code = code;
+        match process_operand(&info, operand) {
+            Ok(()) => {}
             // Continue processing remaining operands per POSIX
+            Err(Failure::Status(code)) => exit_code = code,
+            Err(Failure::Write(e)) => {
+                report_write_error(&e);
+                return ExitCode::from(EXIT_OTHER_ERROR);
+            }
         }
+    }
+
+    // The sequences end without a <newline>, so they are still in standard
+    // output's line buffer, where the flush at exit would lose a write error.
+    if let Err(e) = io::stdout().flush() {
+        report_write_error(&e);
+        exit_code = exit_code.max(EXIT_OTHER_ERROR);
     }
 
     ExitCode::from(exit_code)

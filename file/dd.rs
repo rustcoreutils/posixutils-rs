@@ -361,7 +361,9 @@ enum OutputFile {
 impl Write for OutputFile {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
-            OutputFile::Stdout(s) => s.write(buf),
+            // Standard output is line-buffered; a block is written out whole,
+            // so that a failure belongs to the block that met it.
+            OutputFile::Stdout(s) => s.write(buf).and_then(|n| s.flush().map(|()| n)),
             OutputFile::File(f) => f.write(buf),
         }
     }
@@ -443,6 +445,18 @@ fn output_name(config: &Config) -> String {
     format!("'{}'", name)
 }
 
+/// A failed write to the output ends the copy: write the statistics gathered
+/// so far, as a read error does, and return the diagnostic.
+fn write_failed(stats: &Stats, e: io::Error) -> Box<dyn std::error::Error> {
+    stats.print();
+    format!(
+        "{}: {}",
+        gettext("write error"),
+        plib::diag::io_error_text(&e)
+    )
+    .into()
+}
+
 /// Copy input to output.  Returns the statistics and whether the copy
 /// succeeded; a failure already reported here (a failed conv=fsync) still
 /// leaves the statistics to be written.
@@ -513,7 +527,9 @@ fn copy_convert_file(config: &Config) -> Result<(Stats, bool), Box<dyn std::erro
             // Non-seekable: write null bytes
             let zeros = vec![0u8; config.obs];
             for _ in 0..config.seek {
-                ofile.write_all(&zeros)?;
+                ofile
+                    .write_all(&zeros)
+                    .map_err(|e| write_failed(&stats, e))?;
             }
         }
     }
@@ -583,31 +599,37 @@ fn copy_convert_file(config: &Config) -> Result<(Stats, bool), Box<dyn std::erro
 
         if use_passthrough {
             // bs= mode: write each input block as separate output block
+            ofile
+                .write_all(&data)
+                .map_err(|e| write_failed(&stats, e))?;
             if data.len() == config.obs {
                 stats.out_full += 1;
             } else {
                 stats.out_partial += 1;
             }
-            ofile.write_all(&data)?;
         } else {
             // Aggregate output to obs-sized blocks
             obuf.extend_from_slice(&data);
 
             while obuf.len() >= config.obs {
                 let block: Vec<u8> = obuf.drain(..config.obs).collect();
+                ofile
+                    .write_all(&block)
+                    .map_err(|e| write_failed(&stats, e))?;
                 stats.out_full += 1;
-                ofile.write_all(&block)?;
             }
         }
     }
 
     // Write any remaining data in output buffer
     if !obuf.is_empty() {
+        ofile
+            .write_all(&obuf)
+            .map_err(|e| write_failed(&stats, e))?;
         stats.out_partial += 1;
-        ofile.write_all(&obuf)?;
     }
 
-    ofile.flush()?;
+    ofile.flush().map_err(|e| write_failed(&stats, e))?;
 
     // An interrupted copy ends as soon as the statistics are out, as GNU's
     // does; only a finished one is synced.
@@ -789,9 +811,18 @@ fn parse_cmdline(args: &[OsString]) -> Result<Config, Box<dyn std::error::Error>
     Ok(config)
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
     plib::diag::init_locale("dd");
 
+    // Returned from `main`, an error would be printed with `Debug`
+    // (`Error: Os { code: 28, ... }`).
+    if let Err(e) = run() {
+        plib::diag::error(&plib::diag::error_text(e.as_ref()));
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Install SIGINT handler
     unsafe {
         libc::signal(

@@ -701,3 +701,56 @@ fn test_dd_non_utf8_operand_is_an_error() {
         assert_eq!(run.status.code(), Some(1), "{arg:?}: {run:?}");
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn dd_write_error_on_full_device() {
+    // A failed write to standard output is "dd: write error: REASON",
+    // with the system's text for the error and exit status 1.
+    plib::testing::assert_write_error_message_on_full_device("dd", &["status=none"], b"x", 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn dd_bs_write_error_on_full_device() {
+    // A failed write to standard output is "dd: write error: REASON",
+    // with the system's text for the error and exit status 1.
+    plib::testing::assert_write_error_message_on_full_device(
+        "dd",
+        &["bs=1", "status=none"],
+        b"x\n",
+        1,
+    );
+}
+
+// A failed write ends the copy with the statistics so far, as a failed read
+// does, and counts no output record for the block that was not written.
+#[cfg(target_os = "linux")]
+#[test]
+fn dd_write_error_reports_statistics() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let enospc = {
+        let mut probe = full.try_clone().unwrap();
+        plib::diag::io_error_text(&probe.write_all(b"x").unwrap_err())
+    };
+    let mut child = Command::new(plib::testing::get_binary_path("dd"))
+        .env("LC_ALL", "C")
+        .stdin(Stdio::piped())
+        .stdout(full)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"x").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("0+1 records in\n0+0 records out\ndd: write error: {enospc}\n")
+    );
+}

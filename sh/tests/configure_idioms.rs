@@ -145,4 +145,8 @@ fn lineno_in_heredoc_and_command_substitution() {
     sh("echo $LINENO\n\necho $LINENO", "1\n3\n");
     sh(":\ncat <<EOF\n$LINENO\nEOF", "2\n");
     sh(":\n:\necho `echo $LINENO` $(echo $LINENO)", "3 3\n");
+    // A command is numbered by the line it starts on, not the line after
+    // its here-document body or its last continuation line.
+    sh(":\necho $LINENO <<EOF\nx\nEOF\necho $LINENO", "2\n5\n");
+    sh(":\necho a \\\n$LINENO $(echo $LINENO)", "a 2 2\n");
 }

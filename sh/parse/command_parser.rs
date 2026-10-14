@@ -768,7 +768,7 @@ impl<'src> CommandParser<'src> {
                 self.alias_became_reserved_word = false;
                 return self.parse_command(alias_table);
             }
-            Ok(command_type.map(|type_| Command::new(type_, self.lineno())))
+            Ok(command_type.map(|type_| Command::new(type_, start_lineno)))
         }
     }
 

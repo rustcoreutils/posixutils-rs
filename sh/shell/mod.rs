@@ -177,6 +177,8 @@ pub struct Shell {
     pub dot_script_depth: u32,
     pub is_interactive: bool,
     pub last_lineno: u32,
+    /// The line of the command being executed, the value of LINENO.
+    pub command_lineno: u32,
     pub exit_action: TrapAction,
     pub signal_manager: SignalManager,
     pub background_jobs: JobManager,
@@ -946,6 +948,7 @@ impl Shell {
     }
 
     fn interpret_command(&mut self, command: &Command, ignore_errexit: bool) -> i32 {
+        self.command_lineno = command.lineno;
         let lineno_var = self.environment.set_global_forced(
             "LINENO".to_string(),
             ShString::from(command.lineno.to_string()),
@@ -1230,7 +1233,7 @@ impl Shell {
                 self.become_subshell();
                 drop(read_pipe);
                 dup2(write_pipe.as_raw_fd(), libc::STDOUT_FILENO)?;
-                self.execute_program(program)
+                self.execute_nested_program(program)
                     .map_err(CommandExecutionError::ParseError)?;
                 self.exit(self.last_pipeline_exit_status);
             }
@@ -1275,6 +1278,17 @@ impl Shell {
                 Ok(ShString::from(bytes))
             }
         }
+    }
+
+    /// Executes text that is part of the command being executed, the operands
+    /// of `eval` or a command substitution: its lines are numbered from the
+    /// line of that command, so LINENO keeps counting the script's lines.
+    pub fn execute_nested_program(&mut self, program: &[u8]) -> Result<i32, ParserError> {
+        let saved_lineno = self.last_lineno;
+        self.last_lineno = self.command_lineno.saturating_sub(1);
+        let result = self.execute_program(program);
+        self.last_lineno = saved_lineno;
+        result
     }
 
     pub fn execute_program(&mut self, program: &[u8]) -> Result<i32, ParserError> {
@@ -1494,6 +1508,7 @@ impl Default for Shell {
             dot_script_depth: 0,
             is_interactive: false,
             last_lineno: 0,
+            command_lineno: 0,
             exit_action: TrapAction::Default,
             signal_manager: SignalManager::new(false),
             background_jobs: JobManager::default(),

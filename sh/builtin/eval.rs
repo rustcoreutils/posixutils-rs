@@ -33,7 +33,7 @@ impl SpecialBuiltinUtility for Eval {
         }
 
         std::mem::swap(&mut shell.opened_files, opened_files);
-        let execution_result = shell.execute_program(&program);
+        let execution_result = shell.execute_nested_program(&program);
         std::mem::swap(&mut shell.opened_files, opened_files);
 
         execution_result

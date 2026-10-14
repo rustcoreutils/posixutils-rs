@@ -238,7 +238,12 @@ fn write_description_stub(opts: &Options, err: &YaccError) {
     // POSIX requires the -v description to be produced; if even the stub
     // cannot be written, warn rather than failing silently.
     if let Err(e) = fs::write(&path, body) {
-        diag::warning(&format!("{} '{}': {}", gettext("cannot write"), path, e));
+        diag::warning(&format!(
+            "{} '{}': {}",
+            gettext("cannot write"),
+            path,
+            plib::diag::io_error_text(&e)
+        ));
     }
 }
 

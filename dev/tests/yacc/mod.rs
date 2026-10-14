@@ -5280,3 +5280,25 @@ expr : NUM { $$ = $1; }
         );
     }
 }
+
+/// An output file that cannot be created is reported with the system's text
+/// for the error, without Rust's "(os error N)" suffix.
+#[test]
+fn yacc_uncreatable_output_names_the_system_error() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let grammar = dir.path().join("g.y");
+    std::fs::write(&grammar, "%%\ns: 'a';\n").unwrap();
+    let prefix = "/nonexistent/yacc-out";
+    let target = format!("{prefix}.tab.c");
+    let create_error = plib::diag::io_error_text(&std::fs::File::create(&target).unwrap_err());
+    let out = plib::testing::run_test_base(
+        "yacc",
+        &["-b".into(), prefix.into(), grammar.to_str().unwrap().into()],
+        b"",
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("yacc: cannot create '{target}': {create_error}\n")
+    );
+}

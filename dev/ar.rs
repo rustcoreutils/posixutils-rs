@@ -576,6 +576,16 @@ fn move_cmd(args: MoveArgs) -> ArResult<()> {
     Ok(())
 }
 
+/// The diagnostic for a failed write to standard output.
+fn write_error(e: std::io::Error) -> Box<dyn std::error::Error> {
+    format!(
+        "{}: {}",
+        gettext("write error"),
+        plib::diag::io_error_text(&e)
+    )
+    .into()
+}
+
 fn print_cmd(args: PrintArgs) -> ArResult<()> {
     let archive_path = Path::new(&args.archive);
     let archive = Archive::read_from_file(archive_path)?;
@@ -585,7 +595,7 @@ fn print_cmd(args: PrintArgs) -> ArResult<()> {
             if args.verbose {
                 print!("\n<{}>\n\n", member.name.to_string_lossy());
             }
-            stdout().write_all(&member.data)?;
+            stdout().write_all(&member.data).map_err(write_error)?;
         }
         return Ok(());
     } else {
@@ -597,7 +607,7 @@ fn print_cmd(args: PrintArgs) -> ArResult<()> {
                     // given, the prefix is the operand, not the member name.
                     print!("\n<{}>\n\n", file.to_string_lossy());
                 }
-                stdout().write_all(&member.data)?;
+                stdout().write_all(&member.data).map_err(write_error)?;
             } else {
                 diag::error(&format!(
                     "{}: {}",
@@ -1054,8 +1064,13 @@ fn main() {
         Commands::List(args) => list_cmd(args),
         Commands::Extract(args) => extract_cmd(args),
     };
-    if let Err(err) = result {
-        diag::error(&format!("{}", err));
+    match result {
+        Err(err) => diag::error(&format!("{}", err)),
+        // Member contents need not end in a <newline>, and what is left in the
+        // line buffer at exit is flushed with its error discarded.
+        Ok(()) => {
+            diag::flush_stdout();
+        }
     }
     std::process::exit(diag::exit_status());
 }

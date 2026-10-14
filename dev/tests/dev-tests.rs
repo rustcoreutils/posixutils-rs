@@ -2512,3 +2512,18 @@ fn strings_option_argument_may_begin_with_hyphen() {
         plib::testing::assert_hyphen_option_argument("strings", &[opt, "-zq", "--help"]);
     }
 }
+
+// A failed write of member contents to standard output is "ar: write error:
+// REASON", with the system's text for the error.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_ar_print_write_error_on_full_device() {
+    let archive = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/ar/print.a");
+    plib::testing::assert_write_error_message_on_full_device("ar", &["-p", archive], b"", 1);
+    plib::testing::assert_write_error_message_on_full_device(
+        "ar",
+        &["-p", archive, "lib1.o"],
+        b"",
+        1,
+    );
+}

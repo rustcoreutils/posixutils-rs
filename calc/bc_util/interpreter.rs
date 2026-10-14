@@ -31,9 +31,18 @@ struct ErrorCall {
 pub struct ExecutionError {
     message: String,
     call_stack: Vec<ErrorCall>,
+    /// The failed write to standard output this error stands for, if any.
+    /// That is not a runtime error of the program, and the caller reports it
+    /// as a write error instead.
+    write_failure: Option<io::Error>,
 }
 
 impl ExecutionError {
+    /// The failed write this error carries, if it is one.
+    pub fn write_failure(&self) -> Option<&io::Error> {
+        self.write_failure.as_ref()
+    }
+
     fn add_call(mut self, function_name: char, line: usize, file: Rc<str>) -> Self {
         self.call_stack.push(ErrorCall {
             function_name,
@@ -58,6 +67,7 @@ impl From<&'static str> for ExecutionError {
         Self {
             message: message.to_string(),
             call_stack: Vec::new(),
+            write_failure: None,
         }
     }
 }
@@ -67,6 +77,7 @@ impl From<io::Error> for ExecutionError {
         Self {
             message: format!("cannot write output: {}", plib::diag::io_error_text(&e)),
             call_stack: Vec::new(),
+            write_failure: Some(e),
         }
     }
 }

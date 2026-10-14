@@ -729,7 +729,12 @@ fn run_on_full_device(
         .spawn()
         .unwrap_or_else(|e| panic!("spawn {}: {}", cmd, e));
     let mut input = child.stdin.take().expect("stdin");
-    input.write_all(stdin).expect("write stdin");
+    // A utility whose first write fails may exit before reading its input,
+    // and the pipe is then closed under us.
+    match input.write_all(stdin) {
+        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => panic!("write stdin: {e}"),
+        _ => {}
+    }
     drop(input);
     let out = child.wait_with_output().expect("wait");
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();

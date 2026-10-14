@@ -129,6 +129,38 @@ fn readlink_reports_write_error() {
     plib::testing::assert_write_error_on_full_device("readlink", &["-n", link], b"", 1);
 }
 
+// The write error reads "readlink: write error: REASON".
+#[cfg(target_os = "linux")]
+#[test]
+fn readlink_write_error_message_on_full_device() {
+    let dir = tempdir().unwrap();
+    let link = dir.path().join("link");
+    symlink("target", &link).unwrap();
+    let link = link.to_str().unwrap();
+    plib::testing::assert_write_error_message_on_full_device("readlink", &[link], b"", 1);
+}
+
+// A diagnostic that cannot be written to standard error still leaves
+// status 1; readlink panicked with status 101.
+#[cfg(target_os = "linux")]
+#[test]
+fn readlink_diagnostic_to_full_stderr_exits_one() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("file.txt");
+    File::create(&file_path).unwrap();
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_readlink"))
+        .arg(&file_path)
+        .stderr(full)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+}
+
 // Any error the system reports is the system's own message, as other utilities give it, not
 // "Unknown error: ... (os error N)": `link/` naming a link to a file is ENOTDIR.
 #[test]

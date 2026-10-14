@@ -10,8 +10,8 @@
 use clap::Parser;
 use gettextrs::gettext;
 use std::fs;
+use std::io::stdout;
 use std::io::Write;
-use std::io::{stderr, stdout};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::path::{Component, Path};
@@ -161,22 +161,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match write!(stdout_lock, "{output}").and_then(|()| stdout_lock.flush()) {
                 Ok(()) => 0_i32,
                 Err(e) => {
-                    plib::diag::error(&format!(
-                        "{}: {}",
-                        gettext("write error"),
-                        plib::diag::io_error_text(&e)
-                    ));
+                    plib::diag::write_error(&e);
                     1_i32
                 }
             }
         }
         Err(error_description) => {
+            // A diagnostic that cannot be written to standard error is lost,
+            // but the status still says readlink failed.
             if !error_description.is_empty() {
-                let mut stderr_lock = stderr().lock();
-
-                writeln!(&mut stderr_lock, "readlink: {error_description}").unwrap();
-
-                stderr_lock.flush().unwrap();
+                plib::diag::error(&error_description);
             }
 
             1_i32

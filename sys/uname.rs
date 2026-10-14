@@ -131,7 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match get_uname() {
         Ok(info) => print_info(&args, &info),
         Err(e) => {
-            eprintln!("{}", e);
+            eprintln!("{}", plib::diag::io_error_text(&e));
             exit_code = 1;
         }
     }

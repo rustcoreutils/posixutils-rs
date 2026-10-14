@@ -211,10 +211,21 @@ enum Op {
 fn rm_sem_key(semkey: i32) -> bool {
     match sem_key_lookup(semkey) {
         Ok(semid) => sem_rm(semid)
-            .map_err(|e| eprintln!("ipcrm: {}: {}", gettext("semaphore key"), e))
+            .map_err(|e| {
+                eprintln!(
+                    "ipcrm: {}: {}",
+                    gettext("semaphore key"),
+                    plib::diag::io_error_text(&e)
+                )
+            })
             .is_err(),
         Err(e) => {
-            eprintln!("ipcrm: {}: 0x{:x}: {}", gettext("semaphore key"), semkey, e);
+            eprintln!(
+                "ipcrm: {}: 0x{:x}: {}",
+                gettext("semaphore key"),
+                semkey,
+                plib::diag::io_error_text(&e)
+            );
             true
         }
     }
@@ -222,21 +233,34 @@ fn rm_sem_key(semkey: i32) -> bool {
 
 fn rm_sem_id(semid: i32) -> bool {
     sem_rm(semid)
-        .map_err(|e| eprintln!("ipcrm: {}: {}: {}", gettext("semaphore id"), semid, e))
+        .map_err(|e| {
+            eprintln!(
+                "ipcrm: {}: {}: {}",
+                gettext("semaphore id"),
+                semid,
+                plib::diag::io_error_text(&e)
+            )
+        })
         .is_err()
 }
 
 fn rm_shm_key(shmkey: i32) -> bool {
     match shm_key_lookup(shmkey) {
         Ok(shmid) => shm_rm(shmid)
-            .map_err(|e| eprintln!("ipcrm: {}: {}", gettext("shared memory key"), e))
+            .map_err(|e| {
+                eprintln!(
+                    "ipcrm: {}: {}",
+                    gettext("shared memory key"),
+                    plib::diag::io_error_text(&e)
+                )
+            })
             .is_err(),
         Err(e) => {
             eprintln!(
                 "ipcrm: {}: 0x{:x}: {}",
                 gettext("shared memory key"),
                 shmkey,
-                e
+                plib::diag::io_error_text(&e)
             );
             true
         }
@@ -245,7 +269,14 @@ fn rm_shm_key(shmkey: i32) -> bool {
 
 fn rm_shm_id(shmid: i32) -> bool {
     shm_rm(shmid)
-        .map_err(|e| eprintln!("ipcrm: {}: {}: {}", gettext("shared memory id"), shmid, e))
+        .map_err(|e| {
+            eprintln!(
+                "ipcrm: {}: {}: {}",
+                gettext("shared memory id"),
+                shmid,
+                plib::diag::io_error_text(&e)
+            )
+        })
         .is_err()
 }
 
@@ -253,14 +284,20 @@ fn rm_shm_id(shmid: i32) -> bool {
 fn rm_msg_key(msgkey: i32) -> bool {
     match msg_key_lookup(msgkey) {
         Ok(msgid) => msg_rm(msgid)
-            .map_err(|e| eprintln!("ipcrm: {}: {}", gettext("message queue key"), e))
+            .map_err(|e| {
+                eprintln!(
+                    "ipcrm: {}: {}",
+                    gettext("message queue key"),
+                    plib::diag::io_error_text(&e)
+                )
+            })
             .is_err(),
         Err(e) => {
             eprintln!(
                 "ipcrm: {}: 0x{:x}: {}",
                 gettext("message queue key"),
                 msgkey,
-                e
+                plib::diag::io_error_text(&e)
             );
             true
         }
@@ -270,7 +307,14 @@ fn rm_msg_key(msgkey: i32) -> bool {
 #[cfg(not(target_os = "macos"))]
 fn rm_msg_id(msgid: i32) -> bool {
     msg_rm(msgid)
-        .map_err(|e| eprintln!("ipcrm: {}: {}: {}", gettext("message queue id"), msgid, e))
+        .map_err(|e| {
+            eprintln!(
+                "ipcrm: {}: {}: {}",
+                gettext("message queue id"),
+                msgid,
+                plib::diag::io_error_text(&e)
+            )
+        })
         .is_err()
 }
 

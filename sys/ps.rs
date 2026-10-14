@@ -710,7 +710,7 @@ fn main() -> ExitCode {
     let processes = match platform::list_processes() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("ps: {}", e);
+            eprintln!("ps: {}", plib::diag::io_error_text(&e));
             return ExitCode::from(1);
         }
     };

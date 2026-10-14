@@ -79,7 +79,7 @@ fn handle_sysconf(
         } else {
             // Actual error occurred
             let e = std::io::Error::from_raw_os_error(errno_val);
-            eprintln!("getconf: {}: {}", var, e);
+            eprintln!("getconf: {}: {}", var, plib::diag::io_error_text(&e));
             std::process::exit(1);
         }
     } else {
@@ -114,7 +114,7 @@ fn handle_confstr(
             println!("undefined");
         } else {
             let e = std::io::Error::from_raw_os_error(errno_val);
-            eprintln!("getconf: {}: {}", var, e);
+            eprintln!("getconf: {}: {}", var, plib::diag::io_error_text(&e));
             std::process::exit(1);
         }
         return Ok(());
@@ -131,7 +131,7 @@ fn handle_confstr(
     if result == 0 {
         let errno_val = errno::errno().0;
         let e = std::io::Error::from_raw_os_error(errno_val);
-        eprintln!("getconf: {}: {}", var, e);
+        eprintln!("getconf: {}: {}", var, plib::diag::io_error_text(&e));
         std::process::exit(1);
     } else {
         // Strip only the NUL terminator; the value is printed verbatim per the
@@ -206,7 +206,7 @@ fn handle_pathconf(
         } else {
             // Actual error occurred
             let e = std::io::Error::from_raw_os_error(errno_val);
-            eprintln!("getconf: {}: {}", pathname, e);
+            eprintln!("getconf: {}: {}", pathname, plib::diag::io_error_text(&e));
             std::process::exit(1);
         }
     } else {

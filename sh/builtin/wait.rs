@@ -11,34 +11,38 @@ use crate::builtin::{parse_pid, skip_option_terminator, BuiltinResult, BuiltinUt
 use crate::os::errno::Errno;
 use crate::os::Pid;
 use crate::shell::opened_files::OpenedFiles;
-use crate::shell::Shell;
+use crate::shell::{ChildWait, Shell};
 use crate::shstr::ShString;
 
-/// Waits for `pid`, returning its status and whether it actually terminated
-/// (the wait also ends when the child merely stops).
-fn wait_for_pid(pid: Pid, shell: &mut Shell) -> (i32, bool) {
+/// Waits for `pid`, returning its status, or `Err` with the status to return
+/// at once when a trapped signal ended the wait (XCU 2.11).
+fn wait_for_pid(pid: Pid, shell: &mut Shell) -> Result<i32, i32> {
     // A background job may already have been reaped by the periodic sweep, in
     // which case `waitpid` gives ECHILD and the status lives only in the job
     // table -- or, for a repeated `wait`, only in the memory of jobs already
     // collected. dash and bash both keep reporting it.
     if let Some(status) = shell.background_jobs.take_collected_status(pid) {
-        return (status, true);
+        return Ok(status);
     }
-    let result = match shell.wait_child_process_result(pid) {
-        Ok(result) => result,
+    match shell.wait_child_process_interruptibly(pid) {
+        Ok(ChildWait::Terminated(status)) => {
+            // Reaped, so it is no longer a job.
+            shell.background_jobs.collect(pid, status);
+            Ok(status)
+        }
+        // A merely stopped child is still alive and stays in the table.
+        Ok(ChildWait::Stopped(status)) => Ok(status),
+        Ok(ChildWait::Interrupted(status)) => Err(status),
         // No such child: never a child of this shell, or one whose status is
         // long enough past that it is no longer remembered.
-        Err(err) if err.errno == Errno::ECHILD => (127, true),
-        // Any other error (e.g. EINTR from a trapped signal) must not abort the
-        // shell; report a non-zero status rather than panicking.
-        Err(_) => (127, false),
-    };
-    if result.1 {
-        // Reaped, so it is no longer a job; a merely stopped child is still
-        // alive and must stay in the table.
-        shell.background_jobs.collect(pid, result.0);
+        Err(err) if err.errno == Errno::ECHILD => {
+            shell.background_jobs.collect(pid, 127);
+            Ok(127)
+        }
+        // Any other error must not abort the shell; report a non-zero status
+        // rather than panicking.
+        Err(_) => Ok(127),
     }
-    result
 }
 
 pub struct Wait;
@@ -58,13 +62,18 @@ impl BuiltinUtility for Wait {
                 .map(|job| job.pid)
                 .collect::<Vec<_>>();
             for pid in pids {
-                wait_for_pid(pid, shell);
+                if let Err(interrupted) = wait_for_pid(pid, shell) {
+                    return Ok(interrupted);
+                }
             }
         } else {
             for pid in pids {
                 let pid = parse_pid(&pid.display().to_string(), shell)
                     .map_err(|err| format!("wait: {err}"))?;
-                (status, _) = wait_for_pid(pid, shell);
+                status = match wait_for_pid(pid, shell) {
+                    Ok(status) => status,
+                    Err(interrupted) => return Ok(interrupted),
+                };
             }
         }
 

@@ -307,7 +307,16 @@ impl Display for CompoundCommand {
 #[cfg_attr(test, derive(PartialEq))]
 pub struct FunctionDefinition {
     pub name: Name,
-    pub body: Rc<CompoundCommand>,
+    pub body: Rc<FunctionBody>,
+}
+
+/// What a function runs: its compound command, and the redirections that
+/// follow it in the definition (XCU 2.9.5), performed on every call.
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
+pub struct FunctionBody {
+    pub command: CompoundCommand,
+    pub redirections: Vec<Redirection>,
 }
 
 #[derive(Debug, Clone)]
@@ -325,7 +334,11 @@ impl Display for CommandType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             CommandType::FunctionDefinition(func) => {
-                write!(f, "{} () {}", func.name, func.body)
+                write!(f, "{} () {}", func.name, func.body.command)?;
+                for redirection in &func.body.redirections {
+                    write!(f, "{}", redirection.kind)?;
+                }
+                Ok(())
             }
             CommandType::SimpleCommand(cmd) => {
                 write!(f, "{}", cmd)

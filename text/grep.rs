@@ -223,6 +223,9 @@ struct Args {
     #[arg(short = 'o', long, help = gettext("Write only the matched parts of selected lines, each on its own line"))]
     only_matching: bool,
 
+    #[arg(short = 'z', long, help = gettext("Input and output lines end in a NUL byte, not a newline"))]
+    null_data: bool,
+
     #[arg(short = 'A', long, value_name = "NUM", help = gettext("Print NUM lines of context after each selected line"))]
     after_context: Option<usize>,
 
@@ -381,6 +384,7 @@ impl Args {
             output_mode,
             patterns,
             context,
+            eol: if self.null_data { b'\0' } else { b'\n' },
             printed_any: false,
             input_files: self.input_files,
         })
@@ -473,8 +477,8 @@ impl Patterns {
         }
     }
 
-    /// Checks if the line `input` (its bytes, without the <newline>) matches
-    /// the present patterns.
+    /// Checks if the line `input` (its bytes, without the <newline>, or the NUL under
+    /// `-z`) matches the present patterns.
     ///
     /// A line need not be valid UTF-8: in the C locale every byte is a
     /// character, and in a UTF-8 locale a byte that is no character still
@@ -581,6 +585,8 @@ struct GrepModel {
     output_mode: OutputMode,
     patterns: Patterns,
     context: Context,
+    /// The byte that ends an input line and a written one: NUL under `-z`, else newline.
+    eol: u8,
     /// Whether any line has been written, so a later group of context is separated from it.
     printed_any: bool,
     input_files: Vec<String>,
@@ -666,10 +672,10 @@ impl GrepModel {
         loop {
             line.clear();
             line_number += 1;
-            match reader.read_until(b'\n', &mut line) {
+            match reader.read_until(self.eol, &mut line) {
                 Ok(0) => break,
                 Ok(_) => {
-                    let trimmed = line.strip_suffix(b"\n").unwrap_or(&line);
+                    let trimmed = line.strip_suffix(&[self.eol]).unwrap_or(&line);
                     if self.patterns.matches(trimmed) == self.invert_match {
                         if self.output_mode == OutputMode::Default {
                             self.unselected_line(input_name, line_number, trimmed, &mut pending);
@@ -755,7 +761,8 @@ impl GrepModel {
     /// context line. A line that does not follow the last one written starts a new group.
     fn print_line(&mut self, name: &str, number: u64, text: &[u8], sep: u8, pending: &mut Pending) {
         if self.context.separate && self.printed_any && pending.last_printed != Some(number - 1) {
-            write_line(b"", b"--");
+            // The separator ends in a newline even under -z, as in GNU grep.
+            write_line(b"", b"--", b'\n');
         }
         let mut prefix = Vec::new();
         if self.with_filename {
@@ -767,13 +774,13 @@ impl GrepModel {
             prefix.push(sep);
         }
         if !self.only_matching {
-            write_line(&prefix, text);
+            write_line(&prefix, text, self.eol);
         } else if (sep == b':') != self.invert_match {
             // Under -o a line that matches has its matches written: a selected line, or under
             // -v a context line, as in GNU grep.  Other lines write nothing, but still join or
             // separate groups.
             for part in self.patterns.matched_parts(text) {
-                write_line(&prefix, &text[part]);
+                write_line(&prefix, &text[part], self.eol);
             }
         }
         pending.last_printed = Some(number);
@@ -781,15 +788,15 @@ impl GrepModel {
     }
 }
 
-/// Write a selected line, after `prefix`, to standard output as its bytes.
+/// Write a selected line, after `prefix` and ending in `eol`, to standard output as its bytes.
 /// grep cannot go on once its output fails, so a write error ends it with
 /// status 2.
-fn write_line(prefix: &[u8], line: &[u8]) {
+fn write_line(prefix: &[u8], line: &[u8], eol: u8) {
     let mut out = io::stdout().lock();
     let written = out
         .write_all(prefix)
         .and_then(|()| out.write_all(line))
-        .and_then(|()| out.write_all(b"\n"));
+        .and_then(|()| out.write_all(&[eol]));
     if let Err(err) = written {
         plib::diag::error(&format!(
             "{}: {}",

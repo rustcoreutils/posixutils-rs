@@ -565,6 +565,11 @@ table is present.
    bracket terms are an error.  No `-regextype` or `-iregex`.  Forced by
    debhelper (`dh_md5sums`, `dh_fixperms`, and the `-X` exclusions of every
    dh_* tool).
+ * `-quit` — always true, and find stops there: nothing after it in the
+   expression runs, no further file or starting point is visited, and the
+   exit status is what it is so far.  Pending `-exec ... {} +` sets are still
+   run.  Forced by util-linux, whose Debian rules install a bash completion
+   only if `find "debian/tmp/$BCNAME" -quit` succeeds.
 
 ### gettext / ngettext
 
@@ -601,6 +606,15 @@ table is present.
    still separates groups, all as in GNU grep.  `-c`, `-l` and `-q` are
    unchanged.  Forced by util-linux's test suite
    (`tests/ts/libmount/debug`).
+ * `-z` / `--null-data` — input lines end in a NUL byte instead of a
+   newline, and so does each line or `-o` part written; a last line without
+   one gets one.  A newline inside a line is an ordinary character: `.`
+   matches it, `^` and `$` match only at the line's ends, and it is no word
+   character for `-w`.  Patterns are still separated by newlines.  The `--`
+   between context groups, `-c` counts and `-l` names still end in a
+   newline, as in GNU grep.  libxcrypt's debian/rules runs
+   `find * -print0 | egrep --null-data --invert-match ...` to build
+   libxcrypt-source.
 
 ### head
 
@@ -962,6 +976,14 @@ being redirected through a directory operand swapped for a symbolic link.
  * `break` and `continue` outside any loop are non-fatal no-ops, matching dash
    and bash, rather than the shell-aborting special-builtin error POSIX
    requires.
+ * `export -n NAME[=VALUE]...` — takes the export attribute away and keeps
+   the value, as in bash and ksh; with `=VALUE` it assigns first.  A name
+   never set is not an error, and a readonly variable may lose the
+   attribute.  As in bash, with no operand `export -n` lists the exported
+   variables as `-p` does, and `-n` may be combined with `-p`, which is
+   ignored when there are operands.
+   binutils' top-level Makefile runs `export -n ELF_PACKAGE_METADATA` under
+   `/bin/sh`.
 
 ### sleep
 

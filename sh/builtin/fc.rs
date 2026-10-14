@@ -162,12 +162,9 @@ impl<'s> FcArgs<'s> {
 fn execute_history(
     history: &str,
     shell: &mut Shell,
-    opened_files: &mut OpenedFiles,
     keep_in_history: bool,
 ) -> Result<i32, BuiltinError> {
-    std::mem::swap(opened_files, &mut shell.opened_files);
     let result = shell.execute_program(history.as_bytes());
-    std::mem::swap(opened_files, &mut shell.opened_files);
     if !keep_in_history {
         shell.history.remove_last_entry();
     }
@@ -179,7 +176,6 @@ fn open_editor_with_file(
     editor: &str,
     file_path: PathBuf,
     shell: &mut Shell,
-    opened_files: &OpenedFiles,
 ) -> Result<i32, BuiltinError> {
     let command_path = shell
         .find_command(
@@ -192,7 +188,7 @@ fn open_editor_with_file(
         ShString::from(editor),
         ShString::from(file_path.as_os_str()),
     ];
-    Ok(shell.fork_and_exec(command_path, &args, opened_files)?)
+    Ok(shell.fork_and_exec(command_path, &args)?)
 }
 
 fn edit(
@@ -201,7 +197,6 @@ fn edit(
     editor: Option<&str>,
     first: Option<EndPoint>,
     last: Option<EndPoint>,
-    opened_files: &mut OpenedFiles,
 ) -> Result<i32, BuiltinError> {
     let history = match (first, last) {
         (None, None) => shell
@@ -227,7 +222,7 @@ fn edit(
     let editor = editor
         .unwrap_or_else(|| shell.environment.get_str_value("FCEDIT").unwrap_or("ed"))
         .to_string();
-    let result = open_editor_with_file(&editor, path, shell, opened_files)?;
+    let result = open_editor_with_file(&editor, path, shell)?;
     if result != 0 {
         return Ok(result);
     }
@@ -236,12 +231,7 @@ fn edit(
     file.read_to_string(&mut edited_contents)
         .map_err(|err| format!("fc: failed to read edited commands ({err})"))?;
     // if the command wasn't edited, we don't add it to the history again
-    execute_history(
-        &edited_contents,
-        shell,
-        opened_files,
-        edited_contents != history,
-    )
+    execute_history(&edited_contents, shell, edited_contents != history)
 }
 
 fn list(
@@ -294,7 +284,7 @@ impl BuiltinUtility for Fc {
                 editor,
                 first,
                 last,
-            } => edit(shell, reverse, editor, first, last, opened_files)?,
+            } => edit(shell, reverse, editor, first, last)?,
             FcArgs::List {
                 reverse,
                 suppress_command_number,
@@ -321,12 +311,12 @@ impl BuiltinUtility for Fc {
                 shell.history.remove_last_entry();
                 if let Some(replacement) = replace {
                     let history = history.replace(replacement.old, replacement.new);
-                    execute_history(&history, shell, opened_files, true)?
+                    execute_history(&history, shell, true)?
                 } else {
                     // command was not changed and is already in the history, so we don't add it.
                     // The standard doesn't specify this, but its what bash does, and it seems
                     // like a good idea
-                    execute_history(&history, shell, opened_files, false)?
+                    execute_history(&history, shell, false)?
                 }
             }
         };

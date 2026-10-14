@@ -8,11 +8,12 @@
 //
 
 use crate::builtin::trap::TrapAction;
-use crate::os::errno::{get_current_errno_value, Errno};
-use crate::os::{pipe, read, write, OsError, OsResult, Pid};
+use crate::os::errno::Errno;
+use crate::os::{close, dup_private, pipe, read, OsError, OsResult, Pid};
 use std::fmt::{Display, Formatter};
-use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
@@ -228,80 +229,198 @@ pub const SIGNALS: &[Signal] = &[
     Signal::SigSys,
 ];
 
-static mut SIGNAL_WRITE: Option<RawFd> = None;
-static mut SIGNAL_READ: Option<RawFd> = None;
+/// The two ends of the self-pipe that wakes the shell when a trapped signal
+/// arrives, or -1 before it exists. Written once at startup and read from the
+/// signal handler, hence atomics.
+static SIGNAL_WRITE: AtomicI32 = AtomicI32::new(-1);
+static SIGNAL_READ: AtomicI32 = AtomicI32::new(-1);
 
-extern "C" fn write_signal_to_buffer(signal: libc::c_int) {
-    // SIGNAL_WRITE is never modified after the initial
-    // setup, and is a valid file descriptor, so this is safe
-    let fd = unsafe { SIGNAL_WRITE.unwrap() };
-    write(fd, &signal.to_ne_bytes()).expect("failed to write to signal buffer");
+/// One flag per signal number, set by the handler and cleared when the shell
+/// takes the signal. The pipe only wakes the shell up: it has a fixed
+/// capacity, while these flags cannot overflow, so which signals arrived is
+/// never lost however many arrive before the shell looks. Several deliveries
+/// of one signal coalesce into one, as POSIX allows (XCU 2.11).
+static PENDING: [AtomicBool; 128] = [const { AtomicBool::new(false) }; 128];
+
+/// Set by the handler after its flag and wake-up byte, so the shell can
+/// check for signals after every command without a system call. The handler
+/// interrupts the shell's only thread and runs to completion, so whenever
+/// this is clear no flag is set, and a byte in the pipe is not this
+/// process's (see `drain_signal_pipe`).
+static ANY_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// The calling thread's `errno`.
+fn errno_location() -> *mut libc::c_int {
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "emscripten"))]
+    unsafe {
+        libc::__errno_location()
+    }
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    unsafe {
+        libc::__error()
+    }
+    #[cfg(any(target_os = "openbsd", target_os = "netbsd"))]
+    unsafe {
+        libc::__errno()
+    }
+}
+
+/// The handler of every trapped signal. It runs between any two instructions
+/// of the shell, so it does only async-signal-safe things: it never blocks
+/// (the pipe is non-blocking, and a full pipe already holds a wake-up), never
+/// allocates or panics, and it leaves `errno` as it found it, or a signal
+/// arriving between a failed call and the read of its `errno` would change
+/// the error the shell reports.
+extern "C" fn record_signal(signal: libc::c_int) {
+    let errno = errno_location();
+    let saved_errno = unsafe { *errno };
+    if let Some(flag) = usize::try_from(signal).ok().and_then(|n| PENDING.get(n)) {
+        flag.store(true, Ordering::SeqCst);
+    }
+    let fd = SIGNAL_WRITE.load(Ordering::SeqCst);
+    if fd >= 0 {
+        let byte = 0u8;
+        // Nothing to do about a failure: EAGAIN is a full pipe, which wakes
+        // the shell anyway, and the flag above records the signal.
+        unsafe { libc::write(fd, (&byte as *const u8).cast(), 1) };
+    }
+    ANY_PENDING.store(true, Ordering::SeqCst);
+    unsafe { *errno = saved_errno };
+}
+
+/// Prepares one end of the signal pipe. Neither end may block: the handler
+/// must not wait for room in a full pipe, and the shell must not wait for a
+/// byte when none is pending. And the pipe belongs to the shell alone: the
+/// utilities it execs must not inherit either end.
+fn configure_signal_pipe_end(fd: RawFd) -> OsResult<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+        || unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0
+    {
+        return Err(OsError::from_current_errno("fcntl"));
+    }
+    Ok(())
 }
 
 /// # Safety
 /// cannot be called by multiple threads
 pub unsafe fn setup_signal_handling() {
-    let (read_pipe, write_pipe) = pipe().expect("could not create signal buffer pipe");
-    let result = unsafe { libc::fcntl(read_pipe.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
-    if result < 0 {
-        panic!(
-            "failed initialize async buffer for signal handling ({})",
-            get_current_errno_value()
-        );
+    // The ends are moved above 9, out of the way of the descriptors
+    // scripts redirect (see `dup_private`).
+    let created = pipe().and_then(|(read_pipe, write_pipe)| {
+        let read_pipe = unsafe { OwnedFd::from_raw_fd(dup_private(read_pipe.as_raw_fd())?) };
+        let write_pipe = unsafe { OwnedFd::from_raw_fd(dup_private(write_pipe.as_raw_fd())?) };
+        configure_signal_pipe_end(read_pipe.as_raw_fd())?;
+        configure_signal_pipe_end(write_pipe.as_raw_fd())?;
+        Ok((read_pipe, write_pipe))
+    });
+    // Without the pipe (no descriptors to spare, say) the shell still runs,
+    // traps included, as dash and bash do: the handler's flags record the
+    // signals, and a blocking call the shell is in returns EINTR. All that
+    // is lost is the wake-up of a wait for terminal input by a signal that
+    // arrives just before the wait begins.
+    if let Ok((read_pipe, write_pipe)) = created {
+        SIGNAL_WRITE.store(write_pipe.into_raw_fd(), Ordering::SeqCst);
+        SIGNAL_READ.store(read_pipe.into_raw_fd(), Ordering::SeqCst);
     }
-    // This pipe belongs to the shell alone; the utilities it execs must not
-    // inherit either end.
-    for fd in [read_pipe.as_raw_fd(), write_pipe.as_raw_fd()] {
-        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-            panic!(
-                "failed to set close-on-exec on the signal buffer ({})",
-                get_current_errno_value()
-            );
-        }
+}
+
+/// Whether `fd` is one end of the signal pipe.
+pub fn is_signal_pipe_fd(fd: RawFd) -> bool {
+    fd >= 0
+        && (SIGNAL_READ.load(Ordering::SeqCst) == fd || SIGNAL_WRITE.load(Ordering::SeqCst) == fd)
+}
+
+/// Moves the end of the signal pipe numbered `fd` to another descriptor,
+/// so that a redirection can have `fd`. Every signal is blocked meanwhile:
+/// a handler that read the old number could otherwise write its byte into
+/// whatever the redirection puts there.
+pub fn move_signal_pipe_fd(fd: RawFd) -> OsResult<()> {
+    // SAFETY: both sets are initialised (sigfillset, sigprocmask) before
+    // they are read.
+    unsafe {
+        let mut all: libc::sigset_t = std::mem::zeroed();
+        let mut previous: libc::sigset_t = std::mem::zeroed();
+        libc::sigfillset(&mut all);
+        libc::sigprocmask(libc::SIG_SETMASK, &all, &mut previous);
+        let result = dup_private(fd).map(|copy| {
+            for end in [&SIGNAL_READ, &SIGNAL_WRITE] {
+                let _ = end.compare_exchange(fd, copy, Ordering::SeqCst, Ordering::SeqCst);
+            }
+            let _ = close(fd);
+        });
+        libc::sigprocmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+        result
     }
-    SIGNAL_WRITE = Some(write_pipe.into_raw_fd());
-    SIGNAL_READ = Some(read_pipe.into_raw_fd());
 }
 
 /// The read end of the self-pipe the signal handlers write to. Pollable, so a
-/// wait for input can be woken by a signal instead of being timed out.
+/// wait for input can be woken by a signal instead of being timed out. -1,
+/// which `poll` ignores, when there is no pipe.
 pub fn signal_read_fd() -> RawFd {
-    // SIGNAL_READ is never modified after the initial setup, so this is safe
-    unsafe { SIGNAL_READ.unwrap() }
+    SIGNAL_READ.load(Ordering::SeqCst)
 }
 
-fn get_pending_signal() -> Option<Signal> {
-    // SIGNAL_READ is never modified after the initial
-    // setup, so this is safe
-    let fd = unsafe { SIGNAL_READ.unwrap() };
-    let mut buf = [0u8; size_of::<libc::c_int>()];
-    match read(fd, &mut buf) {
-        Err(err) => {
-            if err.errno == Errno::EAGAIN {
-                None
-            } else {
-                panic!("failed to write to signal pipe ({err})");
-            }
-        }
-        Ok(size) => {
-            if size == 0 {
-                None
-            } else {
-                let signal = libc::c_int::from_ne_bytes(buf);
-                Some(Signal::try_from(signal).unwrap())
+/// Empties the signal pipe. The bytes carry no information, so a failure to
+/// read them loses nothing but a wake-up: it is reported and otherwise
+/// ignored. A subshell shares the pipe with its parent, so a byte may also
+/// come from the other process, whose flags are its own; anything that
+/// polls the pipe must empty it once woken, or the stray byte would keep
+/// waking it.
+pub fn drain_signal_pipe() {
+    let fd = signal_read_fd();
+    if fd < 0 {
+        return;
+    }
+    let mut buf = [0u8; 256];
+    loop {
+        match read(fd, &mut buf) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(err) if err.errno == Errno::EINTR => {}
+            Err(err) if err.errno == Errno::EAGAIN => break,
+            Err(err) => {
+                stderr_println!("{err}");
+                break;
             }
         }
     }
+}
+
+fn get_pending_signal() -> Option<Signal> {
+    if !ANY_PENDING.swap(false, Ordering::SeqCst) {
+        return None;
+    }
+    // Empty the pipe before looking at the flags: a signal that arrives in
+    // between leaves its flag, its byte and ANY_PENDING, so the byte is
+    // emptied next time and nothing is missed.
+    drain_signal_pipe();
+    let signal = SIGNALS
+        .iter()
+        .copied()
+        .find(|&signal| PENDING[i32::from(signal) as usize].swap(false, Ordering::SeqCst));
+    if signal.is_some() {
+        // Others may be pending too; the caller asks again until None.
+        ANY_PENDING.store(true, Ordering::SeqCst);
+    }
+    signal
 }
 
 unsafe fn handle_signal(signal: Signal, handler: libc::sighandler_t) {
     // sigaction contains different field on different systems, we can't
     // initialize it directly
     let mut action = std::mem::zeroed::<libc::sigaction>();
+    // A one-argument handler (or SIG_DFL/SIG_IGN), so not SA_SIGINFO, which
+    // would call it with three.
     action.sa_sigaction = handler;
     // never fails
     libc::sigemptyset(&mut action.sa_mask);
-    action.sa_flags = libc::SA_SIGINFO;
+    action.sa_flags = 0;
 
     let result = libc::sigaction(signal.into(), &action, std::ptr::null_mut());
     if result < 0 {
@@ -317,30 +436,104 @@ pub unsafe fn handle_signal_default(signal: Signal) {
     handle_signal(signal, libc::SIG_DFL);
 }
 
+/// Whether `signal` is ignored right now, as when the shell starts.
+fn is_ignored(signal: Signal) -> bool {
+    let mut current = unsafe { std::mem::zeroed::<libc::sigaction>() };
+    let result = unsafe { libc::sigaction(signal.into(), std::ptr::null(), &mut current) };
+    result == 0 && current.sa_sigaction == libc::SIG_IGN
+}
+
+/// The shell waits for its children, which an ignored SIGCHLD would have the
+/// system reap before `waitpid` sees them; so a SIGCHLD ignored on entry is
+/// reset (as in dash), not kept like the other signals.
+pub fn reset_inherited_sigchld() {
+    if is_ignored(Signal::SigChld) {
+        unsafe { handle_signal_default(Signal::SigChld) };
+    }
+}
+
 pub unsafe fn handle_signal_write_to_signal_buffer(signal: Signal) {
     handle_signal(
         signal,
-        write_signal_to_buffer as *const extern "C" fn(libc::c_int) as libc::sighandler_t,
+        record_signal as *const extern "C" fn(libc::c_int) as libc::sighandler_t,
     )
+}
+
+/// What the shell does about a signal that has arrived.
+pub enum PendingSignal {
+    /// Runs its trap action (or nothing, for an ignored or default one).
+    Action(TrapAction),
+    /// Abandons the command being run and returns to the prompt.
+    Interrupt,
 }
 
 #[derive(Clone)]
 pub struct SignalManager {
     actions: [TrapAction; Signal::Count as usize],
+    /// XCU 2.11 and `trap`: a signal ignored when the shell started stays
+    /// ignored in every command the shell runs, and a non-interactive shell
+    /// cannot trap or reset it (silently, as in bash and dash). Its default
+    /// action, for this shell and its children, is to stay ignored.
+    ignored_on_entry: [bool; Signal::Count as usize],
+    /// The shell is interactive and this is not a subshell of it: SIGINT
+    /// is always caught, and untrapped it abandons the command being run.
     is_interactive: bool,
     sigint_count: u32,
+    /// Trap actions are running. Signals that arrive meanwhile wait until
+    /// they finish rather than nest inside them: signals are checked after
+    /// every command, so a stream of them would otherwise nest without
+    /// bound, and the stack would overflow.
+    running_traps: bool,
 }
 
 impl SignalManager {
+    /// Records the dispositions the shell inherited, so it must be created
+    /// before the shell changes any of them.
     pub fn new(is_interactive: bool) -> Self {
+        let mut ignored_on_entry = [false; Signal::Count as usize];
+        let mut actions = [const { TrapAction::Default }; Signal::Count as usize];
+        for &signal in SIGNALS {
+            if signal != Signal::SigKill && signal != Signal::SigStop && is_ignored(signal) {
+                ignored_on_entry[signal as usize] = true;
+                // `trap` lists it as ignored (XCU `trap`).
+                actions[signal as usize] = TrapAction::Ignore;
+            }
+        }
         Self {
-            actions: [const { TrapAction::Default }; Signal::Count as usize],
+            actions,
+            ignored_on_entry,
             is_interactive,
             sigint_count: 0,
+            running_traps: false,
+        }
+    }
+
+    /// Marks trap actions as running; false if they already are, when the
+    /// caller must leave pending signals to the run in progress.
+    pub fn begin_running_traps(&mut self) -> bool {
+        !std::mem::replace(&mut self.running_traps, true)
+    }
+
+    pub fn end_running_traps(&mut self) {
+        self.running_traps = false;
+    }
+
+    /// Installs the default action of `signal`: SIG_DFL, or SIG_IGN for a
+    /// signal ignored on entry.
+    fn install_default(&self, signal: Signal) {
+        if self.ignored_on_entry[signal as usize] {
+            unsafe { handle_signal_ignore(signal) };
+        } else {
+            unsafe { handle_signal_default(signal) };
         }
     }
 
     pub fn reset(&mut self) {
+        // A subshell started from a trap action runs its own traps.
+        self.running_traps = false;
+        // A subshell of an interactive shell is not interactive: an
+        // untrapped SIGINT takes its default action there (as in dash).
+        self.is_interactive = false;
         for signal in SIGNALS {
             let signal = *signal;
             if signal == Signal::SigKill || signal == Signal::SigStop {
@@ -352,10 +545,12 @@ impl SignalManager {
                 // set at startup for an interactive shell, but its not registered
                 // as a trap action
                 TrapAction::Commands(_) | TrapAction::Default => {
-                    unsafe { handle_signal_default(signal) };
                     *action = TrapAction::Default;
+                    self.install_default(signal);
                 }
-                TrapAction::Ignore => {}
+                // An interactive shell catches an ignored SIGINT, and a
+                // caught signal is reset to its default by `exec`.
+                TrapAction::Ignore => unsafe { handle_signal_ignore(signal) },
             }
         }
     }
@@ -363,6 +558,8 @@ impl SignalManager {
     /// Re-installs `saved`'s dispositions, after a `reset()` that turned out
     /// not to be followed by replacing the process (a failed `exec`).
     pub fn restore(&mut self, saved: Self) {
+        self.running_traps = saved.running_traps;
+        self.is_interactive = saved.is_interactive;
         for signal in SIGNALS {
             let signal = *signal;
             if signal == Signal::SigKill || signal == Signal::SigStop {
@@ -375,6 +572,9 @@ impl SignalManager {
     pub fn set_action(&mut self, signal: Signal, action: TrapAction) {
         assert!(signal != Signal::SigKill && signal != Signal::SigStop);
 
+        if self.ignored_on_entry[signal as usize] && !self.is_interactive {
+            return;
+        }
         if self.is_interactive
             && signal == Signal::SigInt
             && (action == TrapAction::Ignore || action == TrapAction::Default)
@@ -386,7 +586,7 @@ impl SignalManager {
         }
         match action {
             TrapAction::Default => {
-                unsafe { handle_signal_default(signal) };
+                self.install_default(signal);
             }
             TrapAction::Ignore => {
                 unsafe { handle_signal_ignore(signal) };
@@ -398,15 +598,53 @@ impl SignalManager {
         self.actions[signal as usize] = action;
     }
 
-    pub fn get_pending_action(&mut self) -> Option<&TrapAction> {
-        if let Some(signal) = get_pending_signal() {
-            if signal == Signal::SigInt {
-                self.sigint_count += 1;
+    /// Whether any signal has a trap action (commands) set. Ignored signals
+    /// do not count: an ignored disposition survives `exec`.
+    pub fn catches_any(&self) -> bool {
+        self.actions
+            .iter()
+            .any(|action| matches!(action, TrapAction::Commands(_)))
+    }
+
+    /// Takes a signal that has arrived, with what the shell is to do about
+    /// it.
+    pub fn take_pending_signal(&mut self) -> Option<PendingSignal> {
+        let signal = get_pending_signal()?;
+        if signal == Signal::SigInt {
+            self.sigint_count += 1;
+            if self.sigint_interrupts() {
+                return Some(PendingSignal::Interrupt);
             }
-            Some(&self.actions[signal as usize])
-        } else {
-            None
         }
+        Some(PendingSignal::Action(self.actions[signal as usize].clone()))
+    }
+
+    /// Whether SIGINT abandons the command being run: in an interactive
+    /// shell (not a subshell of one) that has no trap for it, as in dash.
+    fn sigint_interrupts(&self) -> bool {
+        self.is_interactive && self.actions[Signal::SigInt as usize] == TrapAction::Default
+    }
+
+    /// A signal that has arrived and that ends a wait of the `wait` utility,
+    /// left pending for `take_pending_signal` to take: one with a trap
+    /// action, or a SIGINT that abandons the command being run.
+    pub fn pending_signal_ending_wait(&self) -> Option<Signal> {
+        SIGNALS.iter().copied().find(|&signal| {
+            (matches!(self.actions[signal as usize], TrapAction::Commands(_))
+                || (signal == Signal::SigInt && self.sigint_interrupts()))
+                && PENDING[i32::from(signal) as usize].load(Ordering::SeqCst)
+        })
+    }
+
+    /// Whether a SIGINT that abandons the command being run has arrived.
+    pub fn interrupt_pending(&self) -> bool {
+        self.sigint_interrupts() && PENDING[libc::SIGINT as usize].load(Ordering::SeqCst)
+    }
+
+    /// Whether SIGINT, delivered now, would be the shell's to act on: true
+    /// for the interactive shell, which catches it whatever its trap.
+    pub fn catches_sigint_interactively(&self) -> bool {
+        self.is_interactive
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (Signal, &TrapAction)> {

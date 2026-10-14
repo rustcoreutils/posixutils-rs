@@ -245,8 +245,10 @@ trait Lexer {
             }
             match self.lookahead() {
                 b'\\' => {
+                    // The escaped character is skipped whatever it is, so that
+                    // `\\` cannot make the backquote after it look escaped.
                     self.advance();
-                    if self.lookahead() == b'`' {
+                    if !self.reached_eof() {
                         self.advance();
                     }
                 }

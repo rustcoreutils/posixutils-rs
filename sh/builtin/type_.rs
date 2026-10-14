@@ -55,7 +55,7 @@ impl BuiltinUtility for Type_ {
                     ));
                 } else {
                     // here we do what bash does, we don't stop processing commands, but we return 1
-                    opened_files.write_err(format!("type: '{}' not found\n", command_name));
+                    opened_files.write_err(format!("type: {}: not found\n", command_name));
                     status = 1;
                 };
             }

@@ -246,10 +246,16 @@ pub fn split_fields(
 /// - parameter expansion
 /// - command substitution
 /// - arithmetic expansion
+///
+/// `field_splitting_will_be_performed` says whether the result will be split
+/// into fields: where it will not (an assignment, a `case` word or pattern, a
+/// redirection target, a here-document), `$*` and `$@` join the positional
+/// parameters with the first character of IFS (XCU 2.5.2).
 fn simple_word_expansion_into(
     result: &mut ExpandedWord,
     word: &Word,
     tilde_mode: TildeMode,
+    field_splitting_will_be_performed: bool,
     shell: &mut Shell,
 ) -> ExpansionResult<()> {
     let mut word = word.clone();
@@ -262,7 +268,13 @@ fn simple_word_expansion_into(
                 expansion,
                 inside_double_quotes,
             } => {
-                expand_parameter_into(result, &expansion, inside_double_quotes, true, shell)?;
+                expand_parameter_into(
+                    result,
+                    &expansion,
+                    inside_double_quotes,
+                    field_splitting_will_be_performed,
+                    shell,
+                )?;
             }
             WordPart::ArithmeticExpansion {
                 expr,
@@ -296,7 +308,7 @@ pub fn expand_word_to_string(
         TildeMode::Word
     };
     let mut expanded_word = ExpandedWord::default();
-    simple_word_expansion_into(&mut expanded_word, word, tilde_mode, shell)?;
+    simple_word_expansion_into(&mut expanded_word, word, tilde_mode, false, shell)?;
     Ok(expanded_word.to_sh_string())
 }
 
@@ -309,6 +321,7 @@ pub fn expand_declaration_operand(word: &Word, shell: &mut Shell) -> ExpansionRe
         &mut expanded_word,
         word,
         TildeMode::DeclarationOperand,
+        false,
         shell,
     )?;
     Ok(expanded_word.to_sh_string())
@@ -326,15 +339,14 @@ pub fn expand_word(
         TildeMode::Word
     };
     let mut expanded_word = ExpandedWord::default();
-    simple_word_expansion_into(&mut expanded_word, word, tilde_mode, shell)?;
+    simple_word_expansion_into(&mut expanded_word, word, tilde_mode, true, shell)?;
     let ifs = shell.environment.get_str_value("IFS");
     let mut result = Vec::new();
     for field in split_fields(expanded_word, ifs, usize::MAX) {
         if shell.set_options.noglob {
             result.push(field.to_sh_string())
         } else {
-            let pattern =
-                FilenamePattern::new(&field).map_err(CommandExecutionError::ExpansionError)?;
+            let pattern = FilenamePattern::new(&field).map_err(CommandExecutionError::Expansion)?;
             let files = glob(&pattern, Path::new(&shell.current_directory));
             if files.is_empty() {
                 result.push(pattern.into())
@@ -351,8 +363,8 @@ pub fn expand_word(
 
 pub fn word_to_pattern(word: &Word, shell: &mut Shell) -> ExpansionResult<Pattern> {
     let mut expanded_word = ExpandedWord::default();
-    simple_word_expansion_into(&mut expanded_word, word, TildeMode::Word, shell)?;
-    Pattern::new(&expanded_word).map_err(CommandExecutionError::ExpansionError)
+    simple_word_expansion_into(&mut expanded_word, word, TildeMode::Word, false, shell)?;
+    Pattern::new(&expanded_word).map_err(CommandExecutionError::Expansion)
 }
 
 #[cfg(test)]

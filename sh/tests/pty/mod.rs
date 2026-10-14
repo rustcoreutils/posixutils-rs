@@ -231,3 +231,215 @@ fn vi_mode_edits_the_line_before_running_it() {
     let dir = sh.exit();
     assert_eq!(read_result(&dir.path().join("edited")), "TWO\n");
 }
+
+/// Runs `sh -c script` in `dir` with a fresh pseudo-terminal as its
+/// controlling terminal, and hangs the terminal up once the script has
+/// created the file `started`; the script goes on when the file `go`
+/// appears. Returns whether the shell exited successfully.
+fn run_through_a_hangup(script: &str, dir: &Path) -> bool {
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut cmd = CommandBuilder::new(plib::testing::get_binary_path("sh"));
+    cmd.args(["-c", script]);
+    cmd.env("ENV", "");
+    cmd.cwd(dir);
+    let mut child = pair.slave.spawn_command(cmd).unwrap();
+    drop(pair.slave);
+    read_result(&dir.join("started"));
+    // Closing the only master descriptor hangs the terminal up: the session
+    // loses its controlling terminal, as when expect's pty goes away.
+    drop(pair.master);
+    std::fs::write(dir.join("go"), "").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return status.success();
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("the shell did not finish after the terminal hung up");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The script for `run_through_a_hangup`: a pipeline that is running when
+/// the terminal goes away, then two more commands.
+fn pipeline_across_a_hangup(set_option: &str) -> String {
+    format!(
+        "trap '' HUP; {set_option}
+         {{ : > started; while [ ! -e go ]; do sleep 0.02; done; echo x; }} | cat > /dev/null
+         echo survived $? > out
+         echo a | cat > out2"
+    )
+}
+
+// Without job control the shell never touches the terminal's foreground
+// process group, so a terminal that goes away mid-pipeline changes nothing.
+// The shell used to hand the pipeline the terminal and panicked when taking
+// it back failed (ENOTTY), which failed ~40 of binutils' DejaGnu tests run
+// under expect. dash and bash both carry on.
+#[test]
+fn pipeline_survives_the_terminal_going_away() {
+    let dir = tempdir().unwrap();
+    let ok = run_through_a_hangup(&pipeline_across_a_hangup(""), dir.path());
+    assert_eq!(read_result(&dir.path().join("out")), "survived 0\n");
+    assert_eq!(read_result(&dir.path().join("out2")), "a\n");
+    assert!(ok, "the shell exited unsuccessfully");
+}
+
+// Under job control the pipeline is a job of its own and is handed the
+// terminal; taking it back after the terminal has gone away fails (ENOTTY)
+// and must change nothing, as in bash (dash stops with an error).
+#[test]
+fn job_control_pipeline_survives_the_terminal_going_away() {
+    let dir = tempdir().unwrap();
+    let ok = run_through_a_hangup(&pipeline_across_a_hangup("set -m"), dir.path());
+    assert_eq!(read_result(&dir.path().join("out")), "survived 0\n");
+    assert_eq!(read_result(&dir.path().join("out2")), "a\n");
+    assert!(ok, "the shell exited unsuccessfully");
+}
+
+// Ctrl-C at an interactive prompt stops a running loop of built-ins and
+// returns to the prompt, as in dash (the user's choice, 2026-10-14): the
+// shell's SIGINT handling only recorded the signal, so `while :; do :; done`
+// could never be interrupted.
+#[test]
+fn ctrl_c_interrupts_a_loop_of_builtins() {
+    let mut sh = ShPtySession::new();
+    let out = sh.path("back");
+    sh.line("while :; do :; done");
+    thread::sleep(Duration::from_millis(300));
+    sh.keys("\x03");
+    thread::sleep(Duration::from_millis(300));
+    sh.line(&format!("echo back > '{}'", out.display()));
+    let dir = sh.exit();
+    assert_eq!(read_result(&dir.path().join("back")).trim(), "back");
+}
+
+/// Waits for the shell to create `path`, which a test command does once it
+/// is running; generous, for a slow CI machine.
+fn wait_for_file(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !path.exists() {
+        if Instant::now() >= deadline {
+            panic!("{} was never created", path.display());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Types ^C once the command running at the prompt has created `started`,
+/// then has `$?` written to `status`.
+fn interrupt_once_started(sh: &mut ShPtySession) {
+    wait_for_file(&sh.path("started"));
+    // let a foreground utility, if any, get going
+    thread::sleep(Duration::from_millis(300));
+    sh.keys("\x03");
+    thread::sleep(Duration::from_millis(300));
+    sh.line("echo $? > status");
+}
+
+/// Runs `command` at the prompt and interrupts it once started.
+fn interrupt_at_the_prompt(command: &str) -> TempDir {
+    let mut sh = ShPtySession::new();
+    sh.line(command);
+    interrupt_once_started(&mut sh);
+    sh.exit()
+}
+
+// ^C abandons the whole command line, not just the loop, and leaves `$?`
+// 130, as in dash.
+#[test]
+fn ctrl_c_abandons_the_command_line_with_status_130() {
+    let dir = interrupt_at_the_prompt("while :; do : > started; done; echo no > after");
+    assert_eq!(read_result(&dir.path().join("status")).trim(), "130");
+    assert!(!dir.path().join("after").exists());
+}
+
+// A foreground utility has the terminal and gets the SIGINT itself; the
+// shell then abandons the rest of the line, as dash does.
+#[test]
+fn ctrl_c_stops_a_foreground_utility_and_the_rest_of_the_line() {
+    let dir = interrupt_at_the_prompt(": > started; sleep 30; echo no > after");
+    assert_eq!(read_result(&dir.path().join("status")).trim(), "130");
+    assert!(!dir.path().join("after").exists());
+}
+
+// The same inside a function, an `eval` and a loop's condition.
+#[test]
+fn ctrl_c_leaves_functions_eval_and_conditions() {
+    let dir = interrupt_at_the_prompt(
+        "f() { eval 'while : > started; do :; done'; echo no > f; }; f; echo no > after",
+    );
+    assert_eq!(read_result(&dir.path().join("status")).trim(), "130");
+    assert!(!dir.path().join("f").exists());
+    assert!(!dir.path().join("after").exists());
+}
+
+// `read` from the terminal is interrupted and assigns nothing.
+#[test]
+fn ctrl_c_interrupts_read() {
+    let mut sh = ShPtySession::new();
+    sh.line("x=old; : > started; if read x; then echo no > then; fi; echo no > after");
+    interrupt_once_started(&mut sh);
+    sh.line("echo \"$x\" > x");
+    let dir = sh.exit();
+    assert_eq!(read_result(&dir.path().join("status")).trim(), "130");
+    assert_eq!(read_result(&dir.path().join("x")), "old\n");
+    assert!(!dir.path().join("then").exists());
+    assert!(!dir.path().join("after").exists());
+}
+
+// `wait` for a background job is interrupted; the job runs on.
+#[test]
+fn ctrl_c_interrupts_wait() {
+    let mut sh = ShPtySession::new();
+    sh.line("sleep 30 & : > started; wait; echo no > after");
+    interrupt_once_started(&mut sh);
+    sh.line("jobs > jobs; kill %1");
+    let dir = sh.exit();
+    assert_eq!(read_result(&dir.path().join("status")).trim(), "130");
+    assert!(read_result(&dir.path().join("jobs")).contains("Running"));
+    assert!(!dir.path().join("after").exists());
+}
+
+// ^C while a line is being typed discards it.
+#[test]
+fn ctrl_c_discards_the_line_being_typed() {
+    let mut sh = ShPtySession::new();
+    sh.keys("echo no > typed");
+    sh.keys("\x03");
+    thread::sleep(Duration::from_millis(300));
+    sh.line("echo $? > status");
+    let dir = sh.exit();
+    assert_eq!(read_result(&dir.path().join("status")).trim(), "130");
+    assert!(!dir.path().join("typed").exists());
+}
+
+// A trapped SIGINT runs its trap, and the command goes on.
+#[test]
+fn trapped_ctrl_c_runs_the_trap_and_goes_on() {
+    let dir = interrupt_at_the_prompt(
+        "trap 't=1' INT; t=0; while [ $t = 0 ]; do : > started; done; echo \"after $?\" > after",
+    );
+    assert_eq!(read_result(&dir.path().join("after")), "after 0\n");
+    assert_eq!(read_result(&dir.path().join("status")).trim(), "0");
+}
+
+// An ignored SIGINT is ignored by the commands the shell runs too, though
+// the interactive shell itself catches it, and a caught signal is reset to
+// its default by exec.
+#[test]
+fn ignored_sigint_stays_ignored_for_commands() {
+    let mut sh = ShPtySession::new();
+    sh.line("trap '' INT; sh -c 'kill -INT $$; echo survived' > out");
+    let dir = sh.exit();
+    assert_eq!(read_result(&dir.path().join("out")), "survived\n");
+}

@@ -1,0 +1,6 @@
+after hidden
+after to_stderr
+read: from heredoc
+read: from heredoc
+call 1
+call 2

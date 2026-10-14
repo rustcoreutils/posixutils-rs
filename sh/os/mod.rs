@@ -10,13 +10,12 @@
 use crate::os::errno::{get_current_errno_value, Errno};
 use crate::os::signals::TermSignal;
 use crate::shell::environment::Environment;
-use crate::shell::opened_files::{OpenedFile, OpenedFiles};
 use crate::shstr::ShString;
 use std::convert::Infallible;
 use std::ffi::{CString, OsStr, OsString};
 use std::fmt::{Display, Formatter};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
@@ -147,6 +146,10 @@ pub fn wait_for_input(fd: RawFd) -> OsResult<()> {
                 errno,
             });
         }
+    } else if fds[1].revents != 0 {
+        // The signals themselves are in the handler's flags; the byte that
+        // woke the poll (perhaps a subshell's) must not wake it again.
+        crate::os::signals::drain_signal_pipe();
     }
     Ok(())
 }
@@ -183,6 +186,29 @@ pub fn dup_cloexec(fd: RawFd) -> OsResult<OwnedFd> {
         return Err(OsError::from_current_errno("fcntl"));
     }
     Ok(unsafe { OwnedFd::from_raw_fd(dup_result) })
+}
+
+/// Copies `fd` to a descriptor of the shell's own: close-on-exec, and above
+/// 9, where no redirection names it unless it asks for that number. Under
+/// a descriptor limit that leaves none above 9 (`ulimit -n 10`), the lowest
+/// free one is taken instead.
+pub fn dup_private(fd: RawFd) -> OsResult<RawFd> {
+    let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10) };
+    if copy >= 0 {
+        return Ok(copy);
+    }
+    let errno = get_current_errno_value();
+    if errno != Errno::EINVAL && errno != Errno::EMFILE {
+        return Err(OsError {
+            command: "fcntl",
+            errno,
+        });
+    }
+    let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if copy < 0 {
+        return Err(OsError::from_current_errno("fcntl"));
+    }
+    Ok(copy)
 }
 
 pub fn dup2(old_fd: RawFd, new_fd: RawFd) -> OsResult<RawFd> {
@@ -264,6 +290,11 @@ pub fn close(fd: RawFd) -> OsResult<()> {
 /// body larger than the pipe buffer would block the writer forever. An
 /// immediately-unlinked temporary file has no such limit and, unlike a pipe,
 /// is seekable, which is what a redirection from a here-document behaves like.
+///
+/// The descriptor returned is open only for reading, as a here-document's is
+/// in dash (a pipe) and bash: a command that writes to it (`cat 1<<EOF`, or a
+/// copy made with `n>&m`) gets EBADF instead of silently writing into the
+/// temporary file.
 pub fn here_document_fd(contents: &[u8]) -> OsResult<OwnedFd> {
     let dir = std::env::var_os("TMPDIR").unwrap_or_else(|| OsString::from("/tmp"));
     let mut template = dir.into_vec();
@@ -278,17 +309,54 @@ pub fn here_document_fd(contents: &[u8]) -> OsResult<OwnedFd> {
     if fd < 0 {
         return Err(OsError::from_current_errno("mkstemp"));
     }
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    // Unlink right away: the descriptor keeps the contents alive, and nothing
+    let writer = unsafe { OwnedFd::from_raw_fd(fd) };
+    // The reading descriptor is a second open of the same file, made before
+    // the name goes away; it has its own offset, still at the start. Where
+    // others can rename entries in TMPDIR, the name may no longer be ours
+    // by now: never follow a symbolic link, block on a FIFO or take a
+    // terminal while finding out, and the identity check below refuses
+    // whatever it was.
+    let fd = unsafe {
+        libc::open(
+            template.as_ptr() as *const libc::c_char,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY,
+        )
+    };
+    let reader = if fd < 0 {
+        Err(OsError::from_current_errno("open"))
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    };
+    // Unlink right away: the descriptors keep the contents alive, and nothing
     // is left behind even if the shell dies before the command finishes.
     if unsafe { libc::unlink(template.as_ptr() as *const libc::c_char) } < 0 {
         return Err(OsError::from_current_errno("unlink"));
     }
-    write_all(fd.as_raw_fd(), contents)?;
-    if unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_SET) } < 0 {
-        return Err(OsError::from_current_errno("lseek"));
+    let reader = reader?;
+    // The name was reopened, so make sure it still named the file mkstemp
+    // created.
+    let (writer_stat, reader_stat) = (fstat(writer.as_raw_fd())?, fstat(reader.as_raw_fd())?);
+    if (writer_stat.st_dev, writer_stat.st_ino) != (reader_stat.st_dev, reader_stat.st_ino) {
+        return Err(OsError {
+            command: "open",
+            errno: Errno::EEXIST,
+        });
     }
-    Ok(fd)
+    // It is our regular file: the command gets an ordinary blocking
+    // descriptor.
+    if unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, libc::O_RDONLY) } < 0 {
+        return Err(OsError::from_current_errno("fcntl"));
+    }
+    write_all(writer.as_raw_fd(), contents)?;
+    Ok(reader)
+}
+
+fn fstat(fd: RawFd) -> OsResult<libc::stat> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } < 0 {
+        return Err(OsError::from_current_errno("fstat"));
+    }
+    Ok(unsafe { stat.assume_init() })
 }
 
 pub enum ExecError {
@@ -305,80 +373,14 @@ impl From<OsError> for ExecError {
     }
 }
 
-/// Duplicates `fd` onto a descriptor strictly greater than `floor`, so that it
-/// cannot collide with any redirection destination.
-fn dup_above(fd: RawFd, floor: RawFd) -> OsResult<RawFd> {
-    let new_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, floor + 1) };
-    if new_fd < 0 {
-        return Err(OsError {
-            command: "fcntl",
-            errno: get_current_errno_value(),
-        });
-    }
-    Ok(new_fd)
-}
-
+/// Replaces the process with `command`. The shell has already put the
+/// command's redirections on its own descriptors, and its private ones are
+/// close-on-exec, so the command inherits exactly the redirected set.
 pub fn exec(
     command: OsString,
     args: &[ShString],
-    opened_files: &OpenedFiles,
     env: &Environment,
 ) -> Result<Infallible, ExecError> {
-    // A source descriptor may itself be another redirection's destination
-    // (`3>&1 1>&2 2>&3`), and the map is iterated in an arbitrary order, so
-    // placing them one at a time can clobber a source before it is read. Move
-    // every source out of the way first, above every destination, then put them
-    // where they belong.
-    let highest_dest = opened_files
-        .opened_files
-        .keys()
-        .map(|id| *id as i32)
-        .max()
-        .unwrap_or(libc::STDERR_FILENO);
-    let mut staged: Vec<(RawFd, RawFd)> = Vec::with_capacity(opened_files.opened_files.len());
-    let mut to_close: Vec<RawFd> = Vec::new();
-    // Descriptors this function opened and must not leave behind.
-    let mut temporaries: Vec<RawFd> = Vec::new();
-    for (id, file) in &opened_files.opened_files {
-        let dest = *id as i32;
-        let src = match file {
-            OpenedFile::Stdin => libc::STDIN_FILENO,
-            OpenedFile::Stdout => libc::STDOUT_FILENO,
-            OpenedFile::Stderr => libc::STDERR_FILENO,
-            OpenedFile::ReadFile(file)
-            | OpenedFile::WriteFile(file)
-            | OpenedFile::ReadWriteFile(file) => file.as_raw_fd(),
-            OpenedFile::HereDocument(contents) => {
-                // Owned here: the temporary must be closed once it has been
-                // duplicated into place, or it is inherited by the exec'd
-                // process as a stray descriptor.
-                let fd = here_document_fd(contents.borrow().as_bytes())?.into_raw_fd();
-                temporaries.push(fd);
-                fd
-            }
-            OpenedFile::Closed => {
-                // `2>&-`: the descriptor must actually be closed, not merely
-                // dropped from the table and inherited. Deferred until every
-                // other redirection is in place: closing fd 5 for `5<&-` frees
-                // it, so a later `<file` in the same command may well have been
-                // handed fd 5 by the kernel, and closing it here would take
-                // that descriptor with it.
-                to_close.push(dest);
-                continue;
-            }
-        };
-        staged.push((dup_above(src, highest_dest)?, dest));
-    }
-    for (src, dest) in staged {
-        dup2(src, dest)?;
-        close(src)?;
-    }
-    for fd in temporaries {
-        let _ = close(fd);
-    }
-    for fd in to_close {
-        let _ = close(fd);
-    }
     // An interior NUL cannot be passed through execve. A shell value may
     // contain one, so this is an error to report, not a reason to abort in the
     // child after the fork.
@@ -431,6 +433,25 @@ pub fn tcsetpgrp(fd: RawFd, pgid: Pid) -> OsResult<()> {
     Ok(())
 }
 
+/// `tcsetpgrp` with SIGTTOU blocked. A process outside the terminal's
+/// foreground process group, such as a shell taking the terminal back from a
+/// job, is otherwise stopped by SIGTTOU instead (XSH tcsetpgrp()); blocking
+/// the signal lets the call go ahead without one being sent.
+pub fn give_terminal_to(fd: RawFd, pgid: Pid) -> OsResult<()> {
+    // SAFETY: both sets are initialised (sigemptyset, sigprocmask) before
+    // they are read.
+    unsafe {
+        let mut block: libc::sigset_t = std::mem::zeroed();
+        let mut previous: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut block);
+        libc::sigaddset(&mut block, libc::SIGTTOU);
+        libc::sigprocmask(libc::SIG_BLOCK, &block, &mut previous);
+        let result = tcsetpgrp(fd, pgid);
+        libc::sigprocmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+        result
+    }
+}
+
 pub fn is_process_in_foreground() -> bool {
     if let Ok(pgid) = tcgetpgrp(io::stdin().as_raw_fd()) {
         pgid == getpgrp()
@@ -471,16 +492,12 @@ pub fn setpgid(pid: Pid, pgid: Pid) -> OsResult<()> {
     Ok(())
 }
 
-pub fn getpgid(pid: Pid) -> OsResult<Pid> {
-    let pid = unsafe { libc::getpgid(pid) };
-    if pid < 0 {
-        return Err(OsError::from_current_errno("getpgid"));
-    }
-    Ok(pid)
-}
-
 pub fn chdir(path: &OsStr) -> LibcResult<()> {
-    let path = CString::new(path.as_bytes()).expect("path contains null characters");
+    // A shell value can hold a NUL byte (one `read` from a file, say), which
+    // no pathname can: an invalid argument, as std::fs reports it.
+    let Ok(path) = CString::new(path.as_bytes()) else {
+        return Err(Errno::EINVAL);
+    };
     let result = unsafe { libc::chdir(path.as_ptr()) };
     if result < 0 {
         return Err(get_current_errno_value());

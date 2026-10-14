@@ -14,7 +14,7 @@ use crate::builtin::{
 use crate::option_parser::OptionParser;
 use crate::os::DEFAULT_PATH;
 use crate::shell::opened_files::OpenedFiles;
-use crate::shell::Shell;
+use crate::shell::{report_write_error, Shell};
 use crate::shstr::{ShStr, ShString};
 use gettextrs::gettext;
 
@@ -124,23 +124,26 @@ impl BuiltinUtility for Command {
         };
 
         if args.action == Action::Execute {
-            if let Some(special_builtin_utility) =
-                get_special_builtin_utility(&args.command_name.display().to_string())
-            {
-                return special_builtin_utility.exec(&args.args[1..], shell, opened_files);
-            } else if let Some(builtin_utility) =
-                get_builtin_utility(&args.command_name.display().to_string())
-            {
-                return builtin_utility.exec(&args.args[1..], shell, opened_files);
+            // A write error is reported here, under the utility's own name
+            // rather than as one of `command`'s.
+            let name = args.command_name.display().to_string();
+            if let Some(special_builtin_utility) = get_special_builtin_utility(&name) {
+                return special_builtin_utility
+                    .exec(&args.args[1..], shell, opened_files)
+                    .map(|status| report_write_error(&name, status, opened_files));
+            } else if let Some(builtin_utility) = get_builtin_utility(&name) {
+                return builtin_utility
+                    .exec(&args.args[1..], shell, opened_files)
+                    .map(|status| report_write_error(&name, status, opened_files));
             } else if let Some(command) = shell.find_command(args.command_name, default_path, true)
             {
                 return shell
-                    .fork_and_exec(command, args.args, opened_files)
+                    .fork_and_exec(command, args.args)
                     .map_err(BuiltinError::OsError);
             }
             // POSIX: a command that cannot be found exits with status 127.
             opened_files.write_err(format!(
-                "command: {} not found\n",
+                "command: {}: not found\n",
                 args.command_name.display()
             ));
             return Ok(127);
@@ -184,7 +187,7 @@ impl BuiltinUtility for Command {
                 ))
             }
         } else {
-            return Err(format!("command: {} not found", args.command_name.display()).into());
+            return Err(format!("command: {}: not found", args.command_name.display()).into());
         }
 
         Ok(0)

@@ -211,6 +211,22 @@ impl<'s> SourceString<'s> {
         self.read_state.reached_eof
     }
 
+    /// How many bytes of the original string have been read. Text inserted
+    /// by the lexer (an alias value, the rest of a `<<` line) is not counted.
+    fn original_offset(&self) -> usize {
+        let current = self.read_state.current_part;
+        let before: usize = self.parts[..current]
+            .iter()
+            .filter(|part| part.in_original_string)
+            .map(|part| part.text.len())
+            .sum();
+        if self.parts[current].in_original_string {
+            before + self.read_state.current_part_char_iter.pos
+        } else {
+            before
+        }
+    }
+
     fn line_no(&self) -> u32 {
         self.read_state.line_no
     }
@@ -520,6 +536,14 @@ fn char_to_operator_token(c: u8) -> Option<CommandToken<'static>> {
 pub struct CommandLexer<'src> {
     source: SourceString<'src>,
     prev_read_state: SourceReadState,
+}
+
+impl CommandLexer<'_> {
+    /// How many bytes of the source have been read, up to the end of the
+    /// last token returned.
+    pub fn source_offset(&self) -> usize {
+        self.source.original_offset()
+    }
 }
 
 impl Lexer for CommandLexer<'_> {

@@ -10,12 +10,13 @@
 use crate::builtin::{args_for_option_scan, BuiltinResult, BuiltinUtility};
 use crate::option_parser::OptionParser;
 use crate::os::chdir;
+use crate::os::errno::Errno;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use crate::shstr::{ShStr, ShString};
 use gettextrs::gettext;
+use plib::diag::io_error_text;
 use std::ffi::{OsStr, OsString};
-use std::fmt::Display;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
@@ -72,8 +73,23 @@ impl<'a> CdArgs<'a> {
     }
 }
 
-fn io_err_to_string<Err: Display>(err: Err) -> String {
-    format!("cd: io error ({err})\n")
+/// The diagnostic for a directory `cd` could not change to: the operand as
+/// given and the system's reason.
+fn chdir_failure(directory: &OsStr, err: Errno) -> String {
+    format!(
+        "cd: {} '{}': {}",
+        gettext("cannot change directory to"),
+        directory.to_string_lossy(),
+        io_error_text(&err.into())
+    )
+}
+
+fn getcwd_failure(err: std::io::Error) -> String {
+    format!(
+        "cd: {}: {}",
+        gettext("cannot determine the current directory"),
+        io_error_text(&err)
+    )
 }
 
 /// Resolves `.` and `..` components purely lexically (without touching the
@@ -119,7 +135,7 @@ fn current_logical_dir(shell: &Shell) -> Result<OsString, String> {
         Some(pwd) if pwd.starts_with('/') => Ok(OsString::from(pwd)),
         _ => std::env::current_dir()
             .map(PathBuf::into_os_string)
-            .map_err(io_err_to_string),
+            .map_err(getcwd_failure),
     }
 }
 
@@ -213,7 +229,8 @@ impl BuiltinUtility for Cd {
                     curr_path = OsString::from_vec(lexical_normalize(curr_path.as_bytes()));
                 }
 
-                chdir(AsRef::<OsStr>::as_ref(&curr_path)).map_err(io_err_to_string)?;
+                chdir(AsRef::<OsStr>::as_ref(&curr_path))
+                    .map_err(|err| chdir_failure(dir.as_os_str(), err))?;
                 if handle_dot_dot_physically {
                     // -P: the new working directory is whatever the kernel
                     // resolved, with symbolic links already followed. `PWD`
@@ -262,7 +279,7 @@ impl BuiltinUtility for Cd {
                 {
                     let old_working_dir = current_logical_dir(shell)?;
                     let oldpwd_ostr = OsString::from(oldpwd.clone());
-                    chdir(&oldpwd_ostr).map_err(io_err_to_string)?;
+                    chdir(&oldpwd_ostr).map_err(|err| chdir_failure(&oldpwd_ostr, err))?;
                     shell.current_directory = oldpwd_ostr;
                     shell.assign_global("PWD".to_string(), oldpwd.clone())?;
                     shell.assign_global(

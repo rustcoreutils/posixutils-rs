@@ -10,15 +10,13 @@
 use crate::nonempty::NonEmpty;
 use crate::parse::command::{
     Assignment, CaseItem, Command, CommandType, CompleteCommand, CompoundCommand, Conjunction,
-    FunctionDefinition, IORedirectionKind, If, LogicalOp, Name, Pipeline, Redirection,
-    RedirectionKind, SimpleCommand,
+    FunctionBody, FunctionDefinition, IORedirectionKind, If, LogicalOp, Name, Pipeline,
+    Redirection, RedirectionKind, SimpleCommand,
 };
 use crate::parse::lexer::command_lexer::{CommandLexer, CommandToken};
 use crate::parse::lexer::is_blank;
-use crate::parse::word::{
-    Parameter, ParameterExpansion, SpecialParameter, Word, WordPair, WordPart,
-};
-use crate::parse::word_parser::parse_word_pair;
+use crate::parse::word::WordPair;
+use crate::parse::word_parser::{parse_here_document, parse_word_pair};
 use crate::parse::{AliasTable, ParseResult, ParserError};
 use crate::shstr::ShString;
 use std::borrow::Cow;
@@ -46,7 +44,7 @@ fn try_into_assignment(word: &[u8], line_no: u32) -> ParseResult<Result<Assignme
             let (name, value) = word.split_at(pos);
             // Safe: every byte of `name` passed the ASCII test above.
             let name = Rc::from(std::str::from_utf8(name).expect("a name is ASCII"));
-            parse_word_pair(&value[1..], line_no, false).map(|value| Ok(Assignment { name, value }))
+            parse_word_pair(&value[1..], line_no).map(|value| Ok(Assignment { name, value }))
         } else {
             Ok(Err(word))
         }
@@ -74,6 +72,13 @@ impl<'src> CommandParser<'src> {
 
     pub fn lineno(&self) -> u32 {
         self.lookahead_lineno + self.start_lineno
+    }
+
+    /// How many bytes of the source have been read: after
+    /// [`Self::parse_next_command`], the end of the line that ends the
+    /// command (its terminating newline is the lookahead).
+    pub fn source_offset(&self) -> usize {
+        self.lexer.source_offset()
     }
 
     /// POSIX 2.4: a reserved word is only recognized as such when it is the
@@ -198,7 +203,7 @@ impl<'src> CommandParser<'src> {
         let line_no = self.lookahead_lineno;
         let token = self.advance()?;
         if let Some(word) = token.as_word_bytes() {
-            parse_word_pair(word, line_no, false)
+            parse_word_pair(word, line_no)
         } else {
             Err(ParserError::new(
                 line_no,
@@ -236,7 +241,7 @@ impl<'src> CommandParser<'src> {
                 delimiter,
                 contents,
             } => {
-                let contents = parse_word_pair(contents.as_ref(), self.lookahead_lineno, true)?;
+                let contents = parse_here_document(contents.as_ref(), self.lookahead_lineno)?;
                 let delimiter = ShString::from(delimiter.to_vec());
                 self.advance()?;
                 return Ok(Some(RedirectionKind::HereDocument {
@@ -267,7 +272,7 @@ impl<'src> CommandParser<'src> {
         self.advance()?;
         match self.advance()? {
             CommandToken::Word(word) => {
-                let file = parse_word_pair(&word, line_no, false)?;
+                let file = parse_word_pair(&word, line_no)?;
                 Ok(Some(RedirectionKind::IORedirection { kind, file }))
             }
             other => Err(ParserError::new(
@@ -327,10 +332,10 @@ impl<'src> CommandParser<'src> {
         loop {
             // An alias name is text; a word that is not cannot name one.
             let Some(name) = std::str::from_utf8(next_substitution.as_ref()).ok() else {
-                return parse_word_pair(&next_substitution, self.lookahead_lineno, false).map(Some);
+                return parse_word_pair(&next_substitution, self.lookahead_lineno).map(Some);
             };
             if self.is_currently_processing_substitution(name) {
-                return parse_word_pair(&next_substitution, self.lookahead_lineno, false).map(Some);
+                return parse_word_pair(&next_substitution, self.lookahead_lineno).map(Some);
             }
             if let Some(alias) = alias_table.get(name) {
                 *apply_alias_substitution_to_next_word =
@@ -353,7 +358,7 @@ impl<'src> CommandParser<'src> {
                 if !performed_one_substitution {
                     *apply_alias_substitution_to_next_word = false;
                 }
-                return parse_word_pair(next_substitution.as_ref(), self.lookahead_lineno, false)
+                return parse_word_pair(next_substitution.as_ref(), self.lookahead_lineno)
                     .map(Some);
             }
         }
@@ -392,11 +397,9 @@ impl<'src> CommandParser<'src> {
                                 }
                                 command.words.extend(next_word);
                             } else {
-                                command.words.push(parse_word_pair(
-                                    word,
-                                    self.lookahead_lineno,
-                                    false,
-                                )?);
+                                command
+                                    .words
+                                    .push(parse_word_pair(word, self.lookahead_lineno)?);
                             }
                         }
                     };
@@ -425,7 +428,7 @@ impl<'src> CommandParser<'src> {
                     } else {
                         command
                             .words
-                            .push(parse_word_pair(word, self.lookahead_lineno, false)?);
+                            .push(parse_word_pair(word, self.lookahead_lineno)?);
                     }
                     self.advance()?;
                 }
@@ -505,7 +508,12 @@ impl<'src> CommandParser<'src> {
     }
 
     fn parse_do_group(&mut self, alias_table: &AliasTable) -> ParseResult<CompleteCommand> {
-        self.match_token(CommandToken::Do)?;
+        // `for name do` has no separator before `do`, so the lexer has read
+        // it as a word (POSIX 2.4: `do` is reserved as the third word of a
+        // `for`).
+        if !self.match_reserved_word(CommandToken::Do)? {
+            self.match_token(CommandToken::Do)?;
+        }
         let inner = self.parse_compound_list(alias_table)?;
         self.match_token(CommandToken::Done)?;
         Ok(inner)
@@ -520,16 +528,12 @@ impl<'src> CommandParser<'src> {
         if self.match_reserved_word(CommandToken::In)? {
             while self.lookahead.as_word_bytes().is_some() {
                 let word = self.advance()?.into_word_cow().unwrap();
-                words.push(parse_word_pair(&word, self.lookahead_lineno, false)?);
+                words.push(parse_word_pair(&word, self.lookahead_lineno)?);
             }
         } else {
-            let default_iterable_word = Word {
-                parts: vec![WordPart::ParameterExpansion {
-                    expansion: ParameterExpansion::Simple(Parameter::Special(SpecialParameter::At)),
-                    inside_double_quotes: false,
-                }],
-            };
-            words.push(WordPair::new(default_iterable_word, "$@"))
+            // Without `in`, the loop is `for name in "$@"` (XCU 2.9.4.2):
+            // each positional parameter is one field, not split or globbed.
+            words.push(parse_word_pair(b"\"$@\"", self.lookahead_lineno)?);
         }
         match self.lookahead {
             CommandToken::SemiColon | CommandToken::Newline => {
@@ -704,10 +708,18 @@ impl<'src> CommandParser<'src> {
         self.match_token(CommandToken::RParen)?;
         // POSIX grammar allows a linebreak between `()` and the function body.
         self.skip_linebreak()?;
-        if let Some(body) = self.parse_compound_command(alias_table)? {
+        if let Some(command) = self.parse_compound_command(alias_table)? {
+            // function_body : compound_command redirect_list?
+            let mut redirections = Vec::new();
+            while let Some(redirection) = self.parse_redirection_opt()? {
+                redirections.push(redirection);
+            }
             Ok(FunctionDefinition {
                 name,
-                body: Rc::from(body),
+                body: Rc::new(FunctionBody {
+                    command,
+                    redirections,
+                }),
             })
         } else {
             Err(ParserError::new(
@@ -770,7 +782,7 @@ impl<'src> CommandParser<'src> {
                 self.alias_became_reserved_word = false;
                 return self.parse_command(alias_table);
             }
-            Ok(command_type.map(|type_| Command::new(type_, self.lineno())))
+            Ok(command_type.map(|type_| Command::new(type_, start_lineno)))
         }
     }
 
@@ -905,10 +917,7 @@ impl<'src> CommandParser<'src> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parse::word::test_utils::{
-        quoted_literal, special_parameter, unquoted_literal, unquoted_literal_pair,
-    };
-    use crate::parse::word::SpecialParameter;
+    use crate::parse::word::test_utils::{quoted_literal, unquoted_literal, unquoted_literal_pair};
     use crate::shstr::ShString;
 
     fn parse_complete_command(
@@ -1482,7 +1491,7 @@ mod tests {
             parse_compound_command("for i; do\ncmd\ndone").0,
             CompoundCommand::ForClause {
                 iter_var: Rc::from("i"),
-                words: vec![WordPair::new(special_parameter(SpecialParameter::At), "$@")],
+                words: vec![parse_word_pair(b"\"$@\"", 1).unwrap()],
                 body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false),
             }
         );
@@ -1708,9 +1717,13 @@ mod tests {
             parse_command("function_name() { cmd; }"),
             CommandType::FunctionDefinition(FunctionDefinition {
                 name: Rc::from("function_name"),
-                body: Rc::from(CompoundCommand::BraceGroup(
-                    complete_command_from_word_pair(unquoted_literal_pair("cmd"), false)
-                ))
+                body: Rc::new(FunctionBody {
+                    command: CompoundCommand::BraceGroup(complete_command_from_word_pair(
+                        unquoted_literal_pair("cmd"),
+                        false
+                    )),
+                    redirections: Vec::new(),
+                })
             })
         );
 
@@ -1718,12 +1731,15 @@ mod tests {
             parse_command("function_name() ( cmd1 )"),
             CommandType::FunctionDefinition(FunctionDefinition {
                 name: Rc::from("function_name"),
-                body: Rc::from(CompoundCommand::Subshell(CompleteCommand {
-                    commands: NonEmpty::new(conjunction_from_word_pair(
-                        unquoted_literal_pair("cmd1"),
-                        false
-                    ))
-                }))
+                body: Rc::new(FunctionBody {
+                    command: CompoundCommand::Subshell(CompleteCommand {
+                        commands: NonEmpty::new(conjunction_from_word_pair(
+                            unquoted_literal_pair("cmd1"),
+                            false
+                        ))
+                    }),
+                    redirections: Vec::new(),
+                })
             })
         );
     }

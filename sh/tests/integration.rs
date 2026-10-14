@@ -1085,6 +1085,13 @@ mod commands {
         );
     }
     #[test]
+    fn function_definition_redirections() {
+        test_script(
+            include_str!("sh/commands/function_definition_redirections.sh"),
+            include_str!("sh/commands/function_definition_redirections.out"),
+        );
+    }
+    #[test]
     fn if_construct() {
         test_script(
             include_str!("sh/commands/if_construct.sh"),
@@ -1799,6 +1806,19 @@ mod audit_regressions {
         run_successfully_and("cd \"\" 2>/dev/null; echo rc=$?\n", |out| {
             assert_eq!(out, "rc=1\n");
         });
+    }
+
+    // `cd` to a line holding a NUL byte, which no pathname can, used to
+    // panic the shell; `read` now drops the NUL, as dash and bash do, and
+    // `cd` to the directory that does not exist fails with status 1.
+    #[test]
+    fn cd_to_a_value_holding_a_nul_byte_fails() {
+        run_successfully_and(
+            "printf 'a\\000b\\n' | { read x; cd \"$x\" 2>/dev/null; echo rc=$?; }\n",
+            |out| {
+                assert_eq!(out, "rc=1\n");
+            },
+        );
     }
 
     // POSIX 88722: "The following options shall be supported by the

@@ -11,7 +11,7 @@ use crate::builtin::{args_as_str, BuiltinError, BuiltinResult, BuiltinUtility};
 use crate::option_parser::OptionParser;
 use crate::os::errno::Errno;
 use crate::os::read;
-use crate::shell::opened_files::{OpenedFile, OpenedFiles, STDIN_FILENO};
+use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use crate::shstr::ShString;
 use crate::wordexp::expanded_word::ExpandedWord;
@@ -20,6 +20,17 @@ use gettextrs::gettext;
 use std::io::IsTerminal;
 use std::os::fd::{AsRawFd, RawFd};
 
+/// The diagnostic for input `read` could not read (`read <&1` with standard
+/// output a pipe gives EBADF): the system's reason.
+fn read_error(errno: Errno) -> BuiltinError {
+    format!(
+        "read: {}: {}",
+        gettext("read error"),
+        plib::diag::io_error_text(&std::io::Error::from(errno))
+    )
+    .into()
+}
+
 fn read_byte_non_blocking(fd: RawFd) -> Result<Option<u8>, BuiltinError> {
     let mut buffer = [0u8; 1];
     match read(fd, &mut buffer) {
@@ -27,17 +38,29 @@ fn read_byte_non_blocking(fd: RawFd) -> Result<Option<u8>, BuiltinError> {
         Ok(1) => Ok(Some(buffer[0])),
         Ok(_) => unreachable!(),
         Err(err) if err.errno == Errno::EAGAIN => Ok(None),
-        Err(err) => Err(format!("read: failed to read from stdin ({err})").into()),
+        Err(err) => Err(read_error(err.errno)),
     }
 }
 
-fn read_byte(fd: RawFd) -> Result<Option<u8>, BuiltinError> {
+/// Reads one byte, or None at the end of the input or once an interrupt
+/// (^C in an interactive shell) abandons the command. A signal that
+/// interrupts the read has its trap run, and the read goes on, as when
+/// reading from the terminal.
+fn read_byte(shell: &mut Shell, fd: RawFd) -> Result<Option<u8>, BuiltinError> {
     let mut buffer = [0u8; 1];
-    match read(fd, &mut buffer) {
-        Ok(0) => Ok(None),
-        Ok(1) => Ok(Some(buffer[0])),
-        Ok(_) => unreachable!(),
-        Err(err) => Err(format!("read: failed to read from stdin ({err})").into()),
+    loop {
+        match read(fd, &mut buffer) {
+            Ok(0) => return Ok(None),
+            Ok(1) => return Ok(Some(buffer[0])),
+            Ok(_) => unreachable!(),
+            Err(err) if err.errno == Errno::EINTR => {
+                shell.handle_async_events();
+                if shell.is_interrupted() {
+                    return Ok(None);
+                }
+            }
+            Err(err) => return Err(read_error(err.errno)),
+        }
     }
 }
 
@@ -55,12 +78,18 @@ impl Prompt<'_> {
     }
 }
 
+/// Whether `byte` is dropped from the input: a NUL, unless it is the
+/// delimiter (`-d ''`). As in dash and bash (POSIX leaves input holding a
+/// NUL unspecified): no variable can hold one, and it is dropped before
+/// anything else looks at it, so a backslash before a NUL escapes the
+/// byte after it, as in dash.
+fn is_dropped(byte: u8, delimiter: u8) -> bool {
+    byte == 0 && delimiter != 0
+}
+
 struct ReadResult {
     contents: ExpandedWord,
     reached_eof: bool,
-    /// Bytes taken from a here-document, which has no file offset of its own
-    /// and so must be shortened by the caller. Meaningless for real fds.
-    consumed_bytes: usize,
 }
 
 fn read_until_from_non_blocking_fd(
@@ -75,6 +104,9 @@ fn read_until_from_non_blocking_fd(
     let mut escape_next = false;
     'outer: loop {
         while let Some(next) = read_byte_non_blocking(fd)? {
+            if is_dropped(next, delimiter) {
+                continue;
+            }
             if escape_next {
                 escape_next = false;
                 if next == delimiter {
@@ -102,6 +134,9 @@ fn read_until_from_non_blocking_fd(
         }
         // might receive signals while reading
         shell.handle_async_events();
+        if shell.is_interrupted() {
+            break;
+        }
         // Wait for the next byte instead of sleeping a tick between polls; the
         // signal pipe is watched too, so a trap is still handled promptly.
         crate::os::wait_for_input(fd)?;
@@ -112,11 +147,11 @@ fn read_until_from_non_blocking_fd(
     Ok(ReadResult {
         contents: result,
         reached_eof: false,
-        consumed_bytes: 0,
     })
 }
 
 fn read_until_from_file(
+    shell: &mut Shell,
     fd: RawFd,
     delimiter: u8,
     backslash_escape: bool,
@@ -126,7 +161,10 @@ fn read_until_from_file(
     let mut result = ExpandedWord::default();
     let mut escape_next = false;
     let mut reached_eof = true;
-    while let Some(next) = read_byte(fd)? {
+    while let Some(next) = read_byte(shell, fd)? {
+        if is_dropped(next, delimiter) {
+            continue;
+        }
         if escape_next {
             escape_next = false;
             if next == delimiter {
@@ -161,7 +199,6 @@ fn read_until_from_file(
     Ok(ReadResult {
         contents: result,
         reached_eof,
-        consumed_bytes: 0,
     })
 }
 
@@ -188,6 +225,7 @@ fn read_from_stdin(
         result
     } else {
         read_until_from_file(
+            shell,
             std::io::stdin().as_raw_fd(),
             delimiter,
             backslash_escape,
@@ -196,54 +234,10 @@ fn read_from_stdin(
     }
 }
 
-fn read_from_here_document(content: &[u8], delimiter: u8, backslash_escape: bool) -> ReadResult {
-    // Scanned over bytes: the delimiter and the backslash are ASCII, so nothing
-    // here needs decoding and the contents survive unchanged.
-    let mut buffer = ShString::new();
-    let mut result = ExpandedWord::default();
-    let mut reached_eof = true;
-    let mut escape_next = false;
-    let mut consumed_bytes = content.len();
-    for (offset, c) in content.iter().copied().enumerate() {
-        // An escaped character is taken literally, so the delimiter test must
-        // come after this one: backslash-<delimiter> is a line continuation,
-        // not the end of the line (same rule as `read_until_from_file`).
-        if escape_next {
-            escape_next = false;
-            if c == delimiter {
-                continue;
-            } else if c == b'\\' {
-                buffer.push_bytes(b"\\");
-            } else {
-                result.append(std::mem::take(&mut buffer), false, true);
-                result.append(ShString::from(vec![c]), true, true);
-            }
-            continue;
-        }
-        if c == delimiter {
-            reached_eof = false;
-            consumed_bytes = offset + 1;
-            break;
-        }
-        if backslash_escape && c == b'\\' {
-            escape_next = true;
-            continue;
-        }
-        buffer.push_bytes([c]);
-    }
-    if !buffer.is_empty() {
-        result.append(buffer, false, true);
-    }
-    ReadResult {
-        contents: result,
-        reached_eof,
-        consumed_bytes,
-    }
-}
-
+/// Reads one line (up to `delimiter`) from the shell's standard input,
+/// which the command's redirections, if any, have already replaced.
 fn read_until(
     shell: &mut Shell,
-    file: &OpenedFile,
     delimiter: u8,
     backslash_escape: bool,
     opened_files: &OpenedFiles,
@@ -252,10 +246,7 @@ fn read_until(
     // without -r), but only when the shell is interactive *and* the input is
     // actually the terminal -- prompting for text coming from a file would be
     // noise. It goes through the shell's stderr so redirection is honored.
-    let prompt_ps2 = shell.is_interactive
-        && backslash_escape
-        && matches!(file, OpenedFile::Stdin)
-        && std::io::stdin().is_terminal();
+    let prompt_ps2 = shell.is_interactive && backslash_escape && std::io::stdin().is_terminal();
     let continuation_prompt = if prompt_ps2 {
         Some(shell.get_ps2())
     } else {
@@ -265,35 +256,7 @@ fn read_until(
         prompt,
         opened_files,
     });
-    match file {
-        OpenedFile::Stdin => {
-            read_from_stdin(shell, delimiter, backslash_escape, continuation_prompt)
-        }
-        OpenedFile::ReadFile(file) => read_until_from_file(
-            file.as_raw_fd(),
-            delimiter,
-            backslash_escape,
-            continuation_prompt,
-        ),
-        OpenedFile::ReadWriteFile(file) => read_until_from_file(
-            file.as_raw_fd(),
-            delimiter,
-            backslash_escape,
-            continuation_prompt,
-        ),
-        OpenedFile::HereDocument(contents) => {
-            // A here-document has no file offset, so the text just read is
-            // removed from the shared buffer; the next `read` continues after
-            // it, as it would with a real descriptor.
-            let result =
-                read_from_here_document(contents.borrow().as_bytes(), delimiter, backslash_escape);
-            let mut remaining = contents.borrow_mut();
-            let consumed = result.consumed_bytes.min(remaining.len());
-            *remaining = ShString::from(remaining[consumed..].to_vec());
-            Ok(result)
-        }
-        _ => Err(gettext("read: invalid standard input").into()),
-    }
+    read_from_stdin(shell, delimiter, backslash_escape, continuation_prompt)
 }
 
 pub struct BuiltinRead;
@@ -344,17 +307,16 @@ impl BuiltinUtility for BuiltinRead {
         }
         let vars = &args[first_operand..];
 
-        let stdin = opened_files
-            .get_file(STDIN_FILENO)
-            .cloned()
-            .ok_or(BuiltinError::from("read: standard input is not opened"))?;
         let input = read_until(
             shell,
-            &stdin,
             delim.unwrap_or(b'\n'),
             backslash_escape,
             opened_files,
         )?;
+        // An interrupted `read` assigns nothing (dash).
+        if shell.is_interrupted() {
+            return Ok(128 + libc::SIGINT);
+        }
 
         let fields = split_fields(
             input.contents,

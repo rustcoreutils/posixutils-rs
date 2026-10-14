@@ -11,7 +11,8 @@ use std::fmt::{Debug, Display, Formatter};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct Errno {
-    // value is always a valid libc errno value
+    // an errno value as the system reported it, which need not be one of the
+    // constants below
     value: libc::c_int,
 }
 
@@ -306,7 +307,7 @@ impl Debug for Errno {
             libc::EWOULDBLOCK => write!(f, "EWOULDBLOCK: operation would block"),
             libc::EXDEV => write!(f, "EXDEV: improper hard link"),
             // Not every errno the kernel can return is named here.
-            other => write!(f, "errno {other}"),
+            other => write!(f, "{}", std::io::Error::from_raw_os_error(other)),
         }
     }
 }
@@ -317,97 +318,17 @@ impl Display for Errno {
     }
 }
 
-impl TryFrom<libc::c_int> for Errno {
-    type Error = ();
-    fn try_from(value: libc::c_int) -> Result<Self, Self::Error> {
-        // some variants have the same value, but its not guaranteed by the
-        // standard
-        #[allow(unreachable_patterns, clippy::match_overlapping_arm)]
-        match value {
-            libc::E2BIG => Ok(Self::E2BIG),
-            libc::EACCES => Ok(Self::EACCES),
-            libc::EADDRINUSE => Ok(Self::EADDRINUSE),
-            libc::EADDRNOTAVAIL => Ok(Self::EADDRNOTAVAIL),
-            libc::EAGAIN => Ok(Self::EAGAIN),
-            libc::EALREADY => Ok(Self::EALREADY),
-            libc::EBADF => Ok(Self::EBADF),
-            libc::EBADMSG => Ok(Self::EBADMSG),
-            libc::EBUSY => Ok(Self::EBUSY),
-            libc::ECANCELED => Ok(Self::ECANCELED),
-            libc::ECHILD => Ok(Self::ECHILD),
-            libc::ECONNABORTED => Ok(Self::ECONNABORTED),
-            libc::ECONNREFUSED => Ok(Self::ECONNREFUSED),
-            libc::ECONNRESET => Ok(Self::ECONNRESET),
-            libc::EDEADLK => Ok(Self::EDEADLK),
-            libc::EDESTADDRREQ => Ok(Self::EDESTADDRREQ),
-            libc::EDOM => Ok(Self::EDOM),
-            libc::EDQUOT => Ok(Self::EDQUOT),
-            libc::EEXIST => Ok(Self::EEXIST),
-            libc::EFAULT => Ok(Self::EFAULT),
-            libc::EFBIG => Ok(Self::EFBIG),
-            libc::EHOSTUNREACH => Ok(Self::EHOSTUNREACH),
-            libc::EIDRM => Ok(Self::EIDRM),
-            libc::EILSEQ => Ok(Self::EILSEQ),
-            libc::EINPROGRESS => Ok(Self::EINPROGRESS),
-            libc::EINTR => Ok(Self::EINTR),
-            libc::EINVAL => Ok(Self::EINVAL),
-            libc::EIO => Ok(Self::EIO),
-            libc::EISCONN => Ok(Self::EISCONN),
-            libc::EISDIR => Ok(Self::EISDIR),
-            libc::ELOOP => Ok(Self::ELOOP),
-            libc::EMFILE => Ok(Self::EMFILE),
-            libc::EMLINK => Ok(Self::EMLINK),
-            libc::EMSGSIZE => Ok(Self::EMSGSIZE),
-            libc::EMULTIHOP => Ok(Self::EMULTIHOP),
-            libc::ENAMETOOLONG => Ok(Self::ENAMETOOLONG),
-            libc::ENETDOWN => Ok(Self::ENETDOWN),
-            libc::ENETRESET => Ok(Self::ENETRESET),
-            libc::ENETUNREACH => Ok(Self::ENETUNREACH),
-            libc::ENFILE => Ok(Self::ENFILE),
-            libc::ENOBUFS => Ok(Self::ENOBUFS),
-            libc::ENODEV => Ok(Self::ENODEV),
-            libc::ENOENT => Ok(Self::ENOENT),
-            libc::ENOEXEC => Ok(Self::ENOEXEC),
-            libc::ENOLCK => Ok(Self::ENOLCK),
-            libc::ENOLINK => Ok(Self::ENOLINK),
-            libc::ENOMEM => Ok(Self::ENOMEM),
-            libc::ENOMSG => Ok(Self::ENOMSG),
-            libc::ENOPROTOOPT => Ok(Self::ENOPROTOOPT),
-            libc::ENOSPC => Ok(Self::ENOSPC),
-            libc::ENOSYS => Ok(Self::ENOSYS),
-            libc::ENOTCONN => Ok(Self::ENOTCONN),
-            libc::ENOTDIR => Ok(Self::ENOTDIR),
-            libc::ENOTEMPTY => Ok(Self::ENOTEMPTY),
-            libc::ENOTRECOVERABLE => Ok(Self::ENOTRECOVERABLE),
-            libc::ENOTSOCK => Ok(Self::ENOTSOCK),
-            libc::ENOTSUP => Ok(Self::ENOTSUP),
-            libc::ENOTTY => Ok(Self::ENOTTY),
-            libc::ENXIO => Ok(Self::ENXIO),
-            libc::EOPNOTSUPP => Ok(Self::EOPNOTSUPP),
-            libc::EOVERFLOW => Ok(Self::EOVERFLOW),
-            libc::EOWNERDEAD => Ok(Self::EOWNERDEAD),
-            libc::EPERM => Ok(Self::EPERM),
-            libc::EPIPE => Ok(Self::EPIPE),
-            libc::EPROTO => Ok(Self::EPROTO),
-            libc::EPROTONOSUPPORT => Ok(Self::EPROTONOSUPPORT),
-            libc::EPROTOTYPE => Ok(Self::EPROTOTYPE),
-            libc::ERANGE => Ok(Self::ERANGE),
-            libc::EROFS => Ok(Self::EROFS),
-            libc::ESOCKTNOSUPPORT => Ok(Self::ESOCKTNOSUPPORT),
-            libc::ESPIPE => Ok(Self::ESPIPE),
-            libc::ESRCH => Ok(Self::ESRCH),
-            libc::ESTALE => Ok(Self::ESTALE),
-            libc::ETIMEDOUT => Ok(Self::ETIMEDOUT),
-            libc::ETXTBSY => Ok(Self::ETXTBSY),
-            libc::EWOULDBLOCK => Ok(Self::EWOULDBLOCK),
-            libc::EXDEV => Ok(Self::EXDEV),
-            _ => Err(()),
-        }
+/// The current `errno`, whatever its value: the system may report one this
+/// module has no name for (ELIBBAD from Linux's execve, EBADARCH from
+/// macOS's), and that is an error to report, not a reason to stop.
+pub fn get_current_errno_value() -> Errno {
+    Errno {
+        value: std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
     }
 }
 
-pub fn get_current_errno_value() -> Errno {
-    // guaranteed to be some, unwrap is safe
-    let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
-    errno.try_into().expect("invalid errno value")
+impl From<Errno> for std::io::Error {
+    fn from(value: Errno) -> Self {
+        std::io::Error::from_raw_os_error(value.value)
+    }
 }

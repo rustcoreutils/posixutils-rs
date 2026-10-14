@@ -15,6 +15,20 @@ use crate::parse::{ParseResult, ParserError};
 use crate::shstr::ShString;
 use std::rc::Rc;
 
+/// How the text being parsed is quoted before any quote inside it is seen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuoteContext {
+    /// An ordinary word.
+    Unquoted,
+    /// The word of `${parameter-word}` (and `=`, `?`, `+`) inside double
+    /// quotes or a here-document: it is double-quoted text, in which further
+    /// double quotes nest and single quotes are ordinary characters.
+    DoubleQuoted,
+    /// The body of a here-document with an unquoted delimiter (POSIX XCU
+    /// 2.7.4): double-quoted text in which `"` is an ordinary character too.
+    HereDocument,
+}
+
 struct WordParser<'src> {
     lexer: WordLexer<'src>,
     lookahead: WordToken<'src>,
@@ -104,7 +118,11 @@ impl<'src> WordParser<'src> {
         }
     }
 
-    fn parse_parameter_expansion(&mut self) -> ParseResult<ParameterExpansion> {
+    /// `quoted` tells whether the expansion is inside double quotes or a
+    /// here-document, whose quoting the word of `-`, `=`, `?` and `+`
+    /// inherits. A pattern of `#` or `%` does not: quotes in it are quotes
+    /// even there, as in dash and bash.
+    fn parse_parameter_expansion(&mut self, quoted: bool) -> ParseResult<ParameterExpansion> {
         // skip '$'
         self.advance()?;
 
@@ -143,7 +161,8 @@ impl<'src> WordParser<'src> {
                 WordToken::Char(b'}') => Ok(ParameterExpansion::Simple(parameter)),
                 WordToken::Char(b'%') => {
                     let remove_largest = self.matches_token(WordToken::Char(b'%'))?;
-                    let word = self.parse_word_until(WordToken::Char(b'}'))?;
+                    let word =
+                        self.parse_word_until(WordToken::Char(b'}'), QuoteContext::Unquoted)?;
                     self.match_token(WordToken::Char(b'}'))?;
                     Ok(ParameterExpansion::RemovePattern {
                         parameter,
@@ -154,7 +173,8 @@ impl<'src> WordParser<'src> {
                 }
                 WordToken::Char(b'#') => {
                     let remove_largest = self.matches_token(WordToken::Char(b'#'))?;
-                    let word = self.parse_word_until(WordToken::Char(b'}'))?;
+                    let word =
+                        self.parse_word_until(WordToken::Char(b'}'), QuoteContext::Unquoted)?;
                     self.match_token(WordToken::Char(b'}'))?;
                     Ok(ParameterExpansion::RemovePattern {
                         parameter,
@@ -170,7 +190,12 @@ impl<'src> WordParser<'src> {
                     } else {
                         false
                     };
-                    let word = self.parse_word_until(WordToken::Char(b'}'))?;
+                    let context = if quoted {
+                        QuoteContext::DoubleQuoted
+                    } else {
+                        QuoteContext::Unquoted
+                    };
+                    let word = self.parse_word_until(WordToken::Char(b'}'), context)?;
                     self.match_token(WordToken::Char(b'}'))?;
                     match operation {
                         WordToken::Char(b'-') => Ok(ParameterExpansion::UnsetUseDefault {
@@ -215,7 +240,7 @@ impl<'src> WordParser<'src> {
         }
     }
 
-    fn parse_word_until(&mut self, end: WordToken) -> ParseResult<Word> {
+    fn parse_word_until(&mut self, end: WordToken, context: QuoteContext) -> ParseResult<Word> {
         fn push_literal(literal: &mut ShString, parts: &mut Vec<WordPart>, quoted: bool) {
             let mut temp = ShString::new();
             std::mem::swap(&mut temp, literal);
@@ -239,20 +264,23 @@ impl<'src> WordParser<'src> {
 
         let mut current_literal = ShString::new();
         let mut word_parts = Vec::new();
-        let mut inside_double_quotes = false;
+        let quoted_by_context = context != QuoteContext::Unquoted;
+        // whether a `"` in the text has opened double quotes not yet closed
+        let mut open_double_quotes = false;
 
         loop {
-            if !inside_double_quotes && self.lookahead == end {
+            if !open_double_quotes && self.lookahead == end {
                 break;
             }
+            let inside_double_quotes = quoted_by_context || open_double_quotes;
             match self.lookahead {
+                WordToken::DoubleQuote if context == QuoteContext::HereDocument => {
+                    current_literal.push_bytes(b"\"");
+                    self.advance()?;
+                }
                 WordToken::DoubleQuote => {
-                    if inside_double_quotes {
-                        push_literal(&mut current_literal, &mut word_parts, true);
-                    } else {
-                        push_literal(&mut current_literal, &mut word_parts, false);
-                    }
-                    inside_double_quotes = !inside_double_quotes;
+                    push_literal(&mut current_literal, &mut word_parts, inside_double_quotes);
+                    open_double_quotes = !open_double_quotes;
                     self.advance()?;
                 }
                 WordToken::SingleQuote => {
@@ -287,7 +315,7 @@ impl<'src> WordParser<'src> {
                         &mut current_literal,
                         &mut word_parts,
                         WordPart::ParameterExpansion {
-                            expansion: self.parse_parameter_expansion()?,
+                            expansion: self.parse_parameter_expansion(inside_double_quotes)?,
                             inside_double_quotes,
                         },
                         inside_double_quotes,
@@ -300,10 +328,19 @@ impl<'src> WordParser<'src> {
                         // taken raw rather than re-lexed, so `\\` followed by a
                         // newline stays a literal backslash and a literal
                         // newline instead of becoming a line continuation, and
-                        // `\$(cmd)` stays literal text.
+                        // `\$(cmd)` stays literal text. In a here-document `"`
+                        // is an ordinary character, so `\"` is two of them.
                         match self.lexer.next_char() {
-                            Some(c @ (b'$' | b'`' | b'"' | b'\\')) => {
-                                current_literal.push_bytes([c])
+                            Some(c @ (b'$' | b'`' | b'\\')) => current_literal.push_bytes([c]),
+                            Some(b'"') if context != QuoteContext::HereDocument => {
+                                current_literal.push_bytes(b"\"")
+                            }
+                            // In the word of a `${p-word}` that is itself
+                            // within double quotes or a here-document, `\}`
+                            // is a literal `}` and does not end the
+                            // expansion (XCU 2.6.2).
+                            Some(b'}') if quoted_by_context && end == WordToken::Char(b'}') => {
+                                current_literal.push_bytes(b"}")
                             }
                             // backslash-newline is still a line continuation
                             Some(b'\n') => {}
@@ -363,9 +400,10 @@ impl<'src> WordParser<'src> {
                         &mut current_literal,
                         &mut word_parts,
                         WordPart::CommandSubstitution {
-                            // `\\\`` inside a backquoted substitution is a
-                            // literal backtick.
-                            commands: ShString::from(replace_escaped_backticks(commands)),
+                            commands: ShString::from(unescape_backquoted(
+                                commands,
+                                inside_double_quotes,
+                            )),
                             inside_double_quotes,
                         },
                         inside_double_quotes,
@@ -414,7 +452,7 @@ impl<'src> WordParser<'src> {
             }
         }
 
-        if inside_double_quotes {
+        if open_double_quotes {
             return Err(ParserError::new(
                 self.line_no,
                 "unterminated double quotes",
@@ -422,7 +460,11 @@ impl<'src> WordParser<'src> {
             ));
         }
 
-        push_literal(&mut current_literal, &mut word_parts, false);
+        if quoted_by_context && !current_literal.is_empty() {
+            push_literal(&mut current_literal, &mut word_parts, true);
+        } else {
+            push_literal(&mut current_literal, &mut word_parts, false);
+        }
 
         Ok(Word { parts: word_parts })
     }
@@ -438,13 +480,23 @@ impl<'src> WordParser<'src> {
     }
 }
 
-/// Replaces `\\\`` with a literal backtick, byte-wise.
-fn replace_escaped_backticks(bytes: &[u8]) -> Vec<u8> {
+/// Recovers the commands of a backquoted command substitution. Within the
+/// backquotes, a backslash keeps its literal meaning except before `$`, `` ` ``
+/// and `\`, where it is removed (POSIX XCU 2.6.3). When the substitution is
+/// itself inside double quotes, `\"` also stands for `"`, as in dash and
+/// bash.
+fn unescape_backquoted(bytes: &[u8], inside_double_quotes: bool) -> Vec<u8> {
     let mut result = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'\\' && bytes.get(i + 1) == Some(&b'`') {
-            result.push(b'`');
+        let escapes_next = bytes[i] == b'\\'
+            && match bytes.get(i + 1) {
+                Some(b'$' | b'`' | b'\\') => true,
+                Some(b'"') => inside_double_quotes,
+                _ => false,
+            };
+        if escapes_next {
+            result.push(bytes[i + 1]);
             i += 2;
         } else {
             result.push(bytes[i]);
@@ -471,7 +523,7 @@ fn quote_literals(word: Word) -> Result<Word, ParserError> {
 
 pub fn parse_word(text: &[u8], line_no: u32, contents_are_quoted: bool) -> ParseResult<Word> {
     let mut parser = WordParser::new(text, line_no)?;
-    let word = parser.parse_word_until(WordToken::Eof)?;
+    let word = parser.parse_word_until(WordToken::Eof, QuoteContext::Unquoted)?;
     if contents_are_quoted {
         quote_literals(word)
     } else {
@@ -479,12 +531,17 @@ pub fn parse_word(text: &[u8], line_no: u32, contents_are_quoted: bool) -> Parse
     }
 }
 
-pub fn parse_word_pair(
-    text: &[u8],
-    line_no: u32,
-    contents_are_quoted: bool,
-) -> ParseResult<WordPair> {
-    parse_word(text, line_no, contents_are_quoted).map(|w| WordPair::new(w, text))
+pub fn parse_word_pair(text: &[u8], line_no: u32) -> ParseResult<WordPair> {
+    parse_word(text, line_no, false).map(|w| WordPair::new(w, text))
+}
+
+/// Parses the body of a here-document whose delimiter is unquoted. Quotes in
+/// it are ordinary characters, while expansions are performed as inside
+/// double quotes (POSIX XCU 2.7.4).
+pub fn parse_here_document(text: &[u8], line_no: u32) -> ParseResult<WordPair> {
+    let mut parser = WordParser::new(text, line_no)?;
+    let word = parser.parse_word_until(WordToken::Eof, QuoteContext::HereDocument)?;
+    Ok(WordPair::new(word, text))
 }
 
 #[cfg(test)]

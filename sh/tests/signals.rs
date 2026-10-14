@@ -210,6 +210,29 @@ fn trap_waits_for_the_foreground_command() {
     );
 }
 
+// XCU 2.11: a trapped signal makes `wait` return at once with a status
+// above 128, and its trap runs right after; the job is still there to wait
+// for again. dash and bash print the same. The shell waited for the job to
+// finish and returned its status.
+#[test]
+fn trapped_signal_interrupts_wait() {
+    sh_c(
+        "trap 'echo t' USR1; sleep 1 & p=$!; (sleep 0.2; kill -USR1 $$) & \
+         wait $p; echo wait=$?; wait $p; echo again=$?",
+        "t\nwait=138\nagain=0\n",
+    );
+    sh_c(
+        "trap 'echo t' USR1; sleep 5 & p=$!; (sleep 0.2; kill -USR1 $$) & \
+         wait; echo wait=$?; kill $p",
+        "t\nwait=138\n",
+    );
+    // An ignored signal does not.
+    sh_c(
+        "trap '' USR1; sleep 0.5 & p=$!; (kill -USR1 $$) & wait $p; echo wait=$?",
+        "wait=0\n",
+    );
+}
+
 // A signal that arrives while a trap action runs waits for it to finish
 // instead of running a nested trap: a trap that sends its own signal again
 // tens of thousands of times overflowed the stack once signals were checked

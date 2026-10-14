@@ -568,6 +568,15 @@ impl SignalManager {
         }
     }
 
+    /// A signal that has arrived and has a trap action, left pending for
+    /// `get_pending_action` to take.
+    pub fn pending_trapped_signal(&self) -> Option<Signal> {
+        SIGNALS.iter().copied().find(|&signal| {
+            matches!(self.actions[signal as usize], TrapAction::Commands(_))
+                && PENDING[i32::from(signal) as usize].load(Ordering::SeqCst)
+        })
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (Signal, &TrapAction)> {
         SIGNALS
             .iter()

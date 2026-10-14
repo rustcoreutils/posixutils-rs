@@ -17,7 +17,7 @@ use crate::cli::terminal::Terminal;
 use crate::jobs::{JobManager, JobState};
 use crate::nonempty::NonEmpty;
 use crate::os::errno::Errno;
-use crate::os::signals::{Signal, SignalManager};
+use crate::os::signals::{Signal, SignalManager, TermSignal};
 use crate::os::{
     dup2, exec, find_command, fork, getpgrp, give_terminal_to, is_process_in_foreground, pipe,
     setpgid, waitpid, ExecError, ForkResult, OsError, OsResult, Pid, WaitStatus,
@@ -121,6 +121,15 @@ pub fn report_write_error(name: &str, status: i32, opened_files: &OpenedFiles) -
         }
         None => status,
     }
+}
+
+/// How a wait for a child ended; each carries the status to report.
+pub enum ChildWait {
+    Terminated(i32),
+    /// Stopped, so still alive, and still a job.
+    Stopped(i32),
+    /// A trapped signal arrived first (only for the `wait` utility).
+    Interrupted(i32),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -378,16 +387,33 @@ impl Shell {
         std::process::exit(code);
     }
 
+    /// Waits for a foreground command, `child_pid`, and returns its status.
     pub fn wait_child_process(&mut self, child_pid: Pid) -> OsResult<i32> {
-        self.wait_child_process_result(child_pid)
-            .map(|(status, _)| status)
+        Ok(match self.wait_child(child_pid, false)? {
+            ChildWait::Terminated(status)
+            | ChildWait::Stopped(status)
+            | ChildWait::Interrupted(status) => status,
+        })
     }
 
-    /// Waits for `child_pid`, returning its status and whether it actually
-    /// terminated. A stopped child also ends the wait, but it is still alive
-    /// and must stay in the job table.
-    pub fn wait_child_process_result(&mut self, child_pid: Pid) -> OsResult<(i32, bool)> {
+    /// Waits for `child_pid` as the `wait` utility does: XCU 2.11 has a
+    /// trapped signal end the wait at once, with a status above 128, and its
+    /// trap runs right after.
+    pub fn wait_child_process_interruptibly(&mut self, child_pid: Pid) -> OsResult<ChildWait> {
+        self.wait_child(child_pid, true)
+    }
+
+    fn wait_child(&mut self, child_pid: Pid, trap_interrupts: bool) -> OsResult<ChildWait> {
         loop {
+            // A signal that arrived just before the wait began did not
+            // interrupt it, so it is looked for first.
+            if trap_interrupts {
+                if let Some(signal) = self.signal_manager.pending_trapped_signal() {
+                    return Ok(ChildWait::Interrupted(
+                        TermSignal(signal.into()).exit_status(),
+                    ));
+                }
+            }
             // Block rather than poll with WNOHANG and sleep, which cost a full
             // tick per foreground command. A trapped signal interrupts the
             // wait with EINTR, but its trap is not run here: XCU 2.11 has it
@@ -395,8 +421,12 @@ impl Shell {
             // the end of the pipeline, with `$?` the command's status.
             match waitpid(child_pid, false, true)? {
                 WaitStatus::Interrupted => {}
-                WaitStatus::Exited { exit_status } => return Ok((exit_status, true)),
-                WaitStatus::Signaled { signal, .. } => return Ok((signal.exit_status(), true)),
+                WaitStatus::Exited { exit_status } => {
+                    return Ok(ChildWait::Terminated(exit_status))
+                }
+                WaitStatus::Signaled { signal, .. } => {
+                    return Ok(ChildWait::Terminated(signal.exit_status()))
+                }
                 WaitStatus::Stopped { signal } => {
                     // Only register the job if it is not one already, or the
                     // table would gain a duplicate under a new number.
@@ -407,7 +437,7 @@ impl Shell {
                             JobState::Stopped,
                         );
                     }
-                    return Ok((signal.exit_status(), false));
+                    return Ok(ChildWait::Stopped(signal.exit_status()));
                 }
                 // Only reachable for a status this shell does not ask for
                 // (WIFCONTINUED); the child is still running, so wait again.

@@ -8,7 +8,7 @@
 //
 
 use crate::builtin::trap::TrapAction;
-use crate::os::errno::{get_current_errno_value, Errno};
+use crate::os::errno::Errno;
 use crate::os::{pipe, read, OsError, OsResult, Pid};
 use std::fmt::{Display, Formatter};
 use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
@@ -284,37 +284,43 @@ extern "C" fn record_signal(signal: libc::c_int) {
     unsafe { *errno = saved_errno };
 }
 
+/// Prepares one end of the signal pipe. Neither end may block: the handler
+/// must not wait for room in a full pipe, and the shell must not wait for a
+/// byte when none is pending. And the pipe belongs to the shell alone: the
+/// utilities it execs must not inherit either end.
+fn configure_signal_pipe_end(fd: RawFd) -> OsResult<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+        || unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0
+    {
+        return Err(OsError::from_current_errno("fcntl"));
+    }
+    Ok(())
+}
+
 /// # Safety
 /// cannot be called by multiple threads
 pub unsafe fn setup_signal_handling() {
-    let (read_pipe, write_pipe) = pipe().expect("could not create signal buffer pipe");
-    // Neither end may block: the handler must not wait for room in a full
-    // pipe, and the shell must not wait for a byte when none is pending.
-    for fd in [read_pipe.as_raw_fd(), write_pipe.as_raw_fd()] {
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-            panic!(
-                "failed initialize async buffer for signal handling ({})",
-                get_current_errno_value()
-            );
-        }
+    let created = pipe().and_then(|(read_pipe, write_pipe)| {
+        configure_signal_pipe_end(read_pipe.as_raw_fd())?;
+        configure_signal_pipe_end(write_pipe.as_raw_fd())?;
+        Ok((read_pipe, write_pipe))
+    });
+    // Without the pipe (no descriptors to spare, say) the shell still runs,
+    // traps included, as dash and bash do: the handler's flags record the
+    // signals, and a blocking call the shell is in returns EINTR. All that
+    // is lost is the wake-up of a wait for terminal input by a signal that
+    // arrives just before the wait begins.
+    if let Ok((read_pipe, write_pipe)) = created {
+        SIGNAL_WRITE.store(write_pipe.into_raw_fd(), Ordering::SeqCst);
+        SIGNAL_READ.store(read_pipe.into_raw_fd(), Ordering::SeqCst);
     }
-    // This pipe belongs to the shell alone; the utilities it execs must not
-    // inherit either end.
-    for fd in [read_pipe.as_raw_fd(), write_pipe.as_raw_fd()] {
-        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-            panic!(
-                "failed to set close-on-exec on the signal buffer ({})",
-                get_current_errno_value()
-            );
-        }
-    }
-    SIGNAL_WRITE.store(write_pipe.into_raw_fd(), Ordering::SeqCst);
-    SIGNAL_READ.store(read_pipe.into_raw_fd(), Ordering::SeqCst);
 }
 
 /// The read end of the self-pipe the signal handlers write to. Pollable, so a
-/// wait for input can be woken by a signal instead of being timed out.
+/// wait for input can be woken by a signal instead of being timed out. -1,
+/// which `poll` ignores, when there is no pipe.
 pub fn signal_read_fd() -> RawFd {
     SIGNAL_READ.load(Ordering::SeqCst)
 }

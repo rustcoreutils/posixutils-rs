@@ -181,3 +181,38 @@ fn signal_flood_neither_hangs_nor_loses_a_signal() {
     );
     assert!(output.status.success());
 }
+
+// A shell started with no descriptors to spare cannot create its signal
+// pipe, and must run (traps included) without it rather than panic, as dash
+// and bash run. The limit leaves room for the dynamic loader's one file at a
+// time, which is Linux's loader's need.
+#[cfg(target_os = "linux")]
+#[test]
+fn shell_runs_without_descriptors_for_its_signal_pipe() {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let mut command = Command::new(SH);
+    command
+        .args([
+            "-c",
+            "trap 'echo got' USR1; echo hi; kill -USR1 $$; /bin/sh -c :",
+        ])
+        .stdin(Stdio::null());
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: 4,
+                rlim_max: 4,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command.output().expect("run sh");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "hi\ngot\n");
+    assert!(output.status.success());
+}

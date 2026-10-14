@@ -185,3 +185,41 @@ fn fuser_help_and_version_exit_zero() {
         );
     }
 }
+
+// A failed write of the process IDs to standard output is
+// "fuser: write error: REASON" on a line of its own, not run on after the
+// file name that fuser has already written to standard error.
+#[cfg(target_os = "linux")]
+#[test]
+fn fuser_write_error_message_on_full_device() {
+    use std::io::Write;
+    let dir = plib::tmp::tempdir().unwrap();
+    let path = dir.path().join("held");
+    // Held open by this test process, so fuser has a process ID to write.
+    let _held = std::fs::File::create(&path).unwrap();
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let enospc = {
+        let mut probe = full.try_clone().unwrap();
+        plib::diag::io_error_text(&probe.write_all(b"x").unwrap_err())
+    };
+    let out = std::process::Command::new(plib::testing::get_binary_path("fuser"))
+        .arg(&path)
+        .env("LC_ALL", "C")
+        .stdout(full)
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.starts_with(&format!("{}:", path.display())),
+        "{stderr:?}"
+    );
+    assert!(
+        stderr.ends_with(&format!("\nfuser: write error: {enospc}\n")),
+        "{stderr:?}"
+    );
+}

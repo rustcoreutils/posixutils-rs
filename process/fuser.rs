@@ -1544,8 +1544,13 @@ fn print_matches(name: &mut Names, user: bool) -> Result<(), io::Error> {
 
     for (pid, (access, uid)) in proc_map {
         // POSIX format is " %1d": exactly one leading space before each PID.
-        print!(" {}", pid);
-        io::stdout().flush()?;
+        let mut stdout = io::stdout();
+        if let Err(e) = write!(stdout, " {}", pid).and_then(|()| stdout.flush()) {
+            // End the line the file name began on standard error, so the
+            // diagnostic is a line of its own.
+            eprintln!();
+            return Err(diag::WriteError(e).into());
+        }
 
         eprint!("{}", access);
         if user {

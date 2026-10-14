@@ -220,3 +220,60 @@ fn builtin_not_found_message_form() {
         1,
     );
 }
+
+// An exec that fails with an errno the shell has no name for is reported
+// like any other failure (status 126), not a panic. The kernel gives
+// ELIBBAD for a program whose ELF interpreter is not an ELF file; the shell
+// panicked converting it.
+#[cfg(target_os = "linux")]
+#[test]
+fn exec_failure_with_an_unnamed_errno_is_reported() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let dir = concat!(env!("CARGO_TARGET_TMPDIR"), "/sh_unnamed_errno");
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).unwrap();
+
+    // A copy of a dynamically linked program, with its PT_INTERP pointing at
+    // a text file. Read in the host's byte order, which is the ELF's.
+    let mut elf = std::fs::read("/bin/sh").unwrap();
+    let u16_at = |e: &[u8], o: usize| u16::from_ne_bytes(e[o..o + 2].try_into().unwrap());
+    let u32_at = |e: &[u8], o: usize| u32::from_ne_bytes(e[o..o + 4].try_into().unwrap());
+    let u64_at = |e: &[u8], o: usize| u64::from_ne_bytes(e[o..o + 8].try_into().unwrap());
+    if &elf[..4] != b"\x7fELF" || elf[4] != 2 {
+        return; // not a 64-bit ELF
+    }
+    let phoff = u64_at(&elf, 0x20) as usize;
+    let phentsize = u16_at(&elf, 0x36) as usize;
+    let phnum = u16_at(&elf, 0x38) as usize;
+    let Some(interp) = (0..phnum)
+        .map(|i| phoff + i * phentsize)
+        .find(|&ph| u32_at(&elf, ph) == 3)
+    else {
+        return; // statically linked
+    };
+    let offset = u64_at(&elf, interp + 8) as usize;
+    let size = u64_at(&elf, interp + 32) as usize;
+    let path = b"./i";
+    elf[offset..offset + size].fill(0);
+    elf[offset..offset + path.len()].copy_from_slice(path);
+    for (name, contents) in [("prog", elf), ("i", b"not an ELF file\n".repeat(16))] {
+        let file = format!("{dir}/{name}");
+        std::fs::write(&file, contents).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sh"))
+        .args(["-c", &format!("cd {dir} && ./prog; echo $?")])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "126\n", "{stderr}");
+    assert!(
+        stderr.starts_with("sh: failed to execute ./prog"),
+        "{stderr}"
+    );
+    assert!(output.status.success());
+    std::fs::remove_dir_all(dir).unwrap();
+}

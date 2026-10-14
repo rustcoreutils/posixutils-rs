@@ -192,6 +192,24 @@ fn trap_runs_after_the_command_that_received_the_signal() {
     assert_eq!(output.status.code(), Some(3));
 }
 
+// XCU 2.11: a trapped signal received while the shell waits for a
+// foreground command runs its trap only after the command has completed,
+// with `$?` the command's status, as in dash and bash. The shell ran the
+// trap in the middle of the wait, before the command's output.
+#[test]
+fn trap_waits_for_the_foreground_command() {
+    sh_c(
+        &format!(
+            "trap 'echo t' USR1; {SH} -c 'kill -USR1 $PPID; sleep 0.1; echo child'; echo after"
+        ),
+        "child\nt\nafter\n",
+    );
+    sh_c(
+        &format!("trap 'echo t $?' USR1; {SH} -c 'kill -USR1 $PPID; exit 3'; echo $?"),
+        "t 3\n3\n",
+    );
+}
+
 // A signal that arrives while a trap action runs waits for it to finish
 // instead of running a nested trap: a trap that sends its own signal again
 // tens of thousands of times overflowed the stack once signals were checked

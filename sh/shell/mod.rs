@@ -388,14 +388,13 @@ impl Shell {
     /// and must stay in the job table.
     pub fn wait_child_process_result(&mut self, child_pid: Pid) -> OsResult<(i32, bool)> {
         loop {
-            // Block. Signal handlers are installed without SA_RESTART and write
-            // to a self-pipe, so a signal interrupts the wait with EINTR and the
-            // trap runs below; polling with WNOHANG and sleeping instead cost a
-            // full tick per foreground command.
+            // Block rather than poll with WNOHANG and sleep, which cost a full
+            // tick per foreground command. A trapped signal interrupts the
+            // wait with EINTR, but its trap is not run here: XCU 2.11 has it
+            // wait until the foreground command has completed, and it runs at
+            // the end of the pipeline, with `$?` the command's status.
             match waitpid(child_pid, false, true)? {
-                WaitStatus::Interrupted => {
-                    self.handle_async_events();
-                }
+                WaitStatus::Interrupted => {}
                 WaitStatus::Exited { exit_status } => return Ok((exit_status, true)),
                 WaitStatus::Signaled { signal, .. } => return Ok((signal.exit_status(), true)),
                 WaitStatus::Stopped { signal } => {
@@ -410,17 +409,22 @@ impl Shell {
                     }
                     return Ok((signal.exit_status(), false));
                 }
-                WaitStatus::StillAlive => {
-                    // Only reachable for a status this shell does not ask for
-                    // (WIFCONTINUED); the child is still running, so wait again.
-                    self.handle_async_events();
-                }
+                // Only reachable for a status this shell does not ask for
+                // (WIFCONTINUED); the child is still running, so wait again.
+                WaitStatus::StillAlive => {}
             }
         }
     }
 
     pub fn handle_async_events(&mut self) {
         self.process_signals();
+        self.handle_job_events();
+    }
+
+    /// Reaps finished background jobs and reports them as `set -b` asks,
+    /// without running traps; for the places that must leave traps to the
+    /// end of the pipeline.
+    pub fn handle_job_events(&mut self) {
         // Reap terminated background jobs whether or not job control is on:
         // without this a non-interactive `cmd &` loop leaves one zombie per
         // iteration. Only the *reporting* of state changes is a job-control
@@ -562,8 +566,9 @@ impl Shell {
             ForkResult::Parent { child } => {
                 let status = self.wait_child_process(child);
                 // A background job may have finished while this one ran.
-                // `update_jobs` is a no-op when nothing is tracked.
-                self.handle_async_events();
+                // `update_jobs` is a no-op when nothing is tracked. Traps
+                // wait for the end of the pipeline, when `$?` is set.
+                self.handle_job_events();
                 status
             }
         }
@@ -1503,14 +1508,13 @@ impl Shell {
                 // Blocking, so EINTR must be retried like every other wait
                 // site: handlers are installed without SA_RESTART, and folding
                 // `Interrupted` into 0 would report success for whatever the
-                // child actually did and leave it unreaped.
+                // child actually did and leave it unreaped. The trap of a
+                // signal that interrupts it runs at the end of the pipeline.
                 self.last_command_substitution_status = loop {
                     match waitpid(child, false, false)? {
                         WaitStatus::Exited { exit_status } => break exit_status,
                         WaitStatus::Signaled { signal } => break signal.exit_status(),
-                        WaitStatus::Interrupted | WaitStatus::StillAlive => {
-                            self.handle_async_events()
-                        }
+                        WaitStatus::Interrupted | WaitStatus::StillAlive => {}
                         WaitStatus::Stopped { .. } => break 0,
                     }
                 };

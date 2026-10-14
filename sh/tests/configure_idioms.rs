@@ -156,6 +156,49 @@ fn unquoted_at_in_assignment_joins_like_star() {
     sh("IFS=-; set a b c; v=${@%c}; echo \"[$v]\"", "[a-b-]\n");
 }
 
+// The word of a double-quoted `${p:-word}` (also `=`, `?`, `+`) is within
+// those double quotes (XCU 2.2.3): not field split, not globbed, no tilde
+// expansion, single quotes literal, and `\}` is a `}` (XCU 2.6.2). The
+// pattern of `${p#word}` and its siblings is not. configure is full of
+// `"${CONFIG_SHELL-/bin/sh}"` and `"${var+set}"`.
+#[test]
+fn double_quoted_parameter_word_is_quoted() {
+    sh("x='a  b'; echo \"${u:-$x}\" \"${x+$x}\"", "a  b a  b\n");
+    sh("IFS=-; set a b c; echo \"${u:-$*}\"", "a-b-c\n");
+    sh(
+        "set -- a 'b  c'; for i in \"${u:-$@}\"; do echo \"[$i]\"; done",
+        "[a]\n[b  c]\n",
+    );
+    sh("echo \"${u:-/*}\" \"${u:-~}\"", "/* ~\n");
+    sh("y=Y; echo \"${y:+'$y'}\" \"${u:-a\\}b}\"", "'Y' a}b\n");
+    sh("echo \"${u=a  b}\"; echo \"$u\"", "a  b\na  b\n");
+    // `\"` in a pattern is a literal `"`, so `%\"c\"` removes nothing.
+    sh(
+        "x=abc; echo \"${x#*}\" \"${x#'a'}\" \"${x%\\\"c\\\"}\" \"${x%\"c\"}\"",
+        "abc bc abc ab\n",
+    );
+    // Unquoted, the word is still split and globbed.
+    sh("x='a  b'; echo ${u:-$x} ${u:-/}", "a b /\n");
+}
+
+// `\}` in the word of `${p-word}` is a literal `}` under every operator,
+// within double quotes, nested double quotes and a here-document alike.
+#[test]
+fn backslash_brace_in_quoted_parameter_word() {
+    sh(
+        "u=; printf '%s\\n' \"${u:-a\\}b}\" \"${u-a\\}b}\" \"${u:=a\\}b}\" \"$u\"",
+        "a}b\n\na}b\na}b\n",
+    );
+    sh(
+        "u=; v=x; printf '%s\\n' \"${v:+a\\}b}\" \"${u+a\\}b}\" \"${u:-a\\}}\"",
+        "a}b\na}b\na}\n",
+    );
+    sh("u=; printf '%s\\n' \"${u:-\"a\\}b\"}\"", "a}b\n");
+    sh("u=; printf '%s\\n' \"${u:-a\\\\}b}\"", "a\\b}\n");
+    sh("u=; cat <<EOF\n${u:-a\\}b}\nEOF", "a}b\n");
+    sh("x='a}b'; printf '%s\\n' \"${x%\\}b}\"", "a\n");
+}
+
 // In a here-document with an unquoted delimiter, quotes are ordinary
 // characters and a backslash is special only before $, `, \ and newline
 // (XCU 2.7.4). configure writes config.status this way.

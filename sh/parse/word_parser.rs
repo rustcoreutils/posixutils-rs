@@ -335,6 +335,13 @@ impl<'src> WordParser<'src> {
                             Some(b'"') if context != QuoteContext::HereDocument => {
                                 current_literal.push_bytes(b"\"")
                             }
+                            // In the word of a `${p-word}` that is itself
+                            // within double quotes or a here-document, `\}`
+                            // is a literal `}` and does not end the
+                            // expansion (XCU 2.6.2).
+                            Some(b'}') if quoted_by_context && end == WordToken::Char(b'}') => {
+                                current_literal.push_bytes(b"}")
+                            }
                             // backslash-newline is still a line continuation
                             Some(b'\n') => {}
                             Some(other) => {

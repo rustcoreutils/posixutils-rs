@@ -15,6 +15,7 @@ pub mod cscan;
 pub mod curuser;
 pub mod date_arg;
 pub mod diag;
+pub mod echo;
 #[cfg(unix)]
 pub mod exec;
 #[cfg(unix)]

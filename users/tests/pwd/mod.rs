@@ -137,3 +137,19 @@ fn test_pwd_output_is_absolute() {
         "getcwd output must be absolute: {out}"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pwd_write_error_on_full_device() {
+    // A failed write to standard output is "pwd: write error: REASON",
+    // with the system's text for the error and exit status 1.
+    plib::testing::assert_write_error_message_on_full_device("pwd", &[], b"", 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pwd_physical_write_error_on_full_device() {
+    // A failed write to standard output is "pwd: write error: REASON",
+    // with the system's text for the error and exit status 1.
+    plib::testing::assert_write_error_message_on_full_device("pwd", &["-P"], b"", 1);
+}

@@ -109,11 +109,15 @@ fn main() -> ExitCode {
 
     // Emit the pathname byte-faithfully (paths are not guaranteed UTF-8).
     let mut out = io::stdout().lock();
-    if out
+    if let Err(e) = out
         .write_all(cwd.as_bytes())
         .and_then(|_| out.write_all(b"\n"))
-        .is_err()
     {
+        plib::diag::error(&format!(
+            "{}: {}",
+            gettext("write error"),
+            plib::diag::io_error_text(&e)
+        ));
         return ExitCode::from(1);
     }
 

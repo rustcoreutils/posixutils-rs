@@ -310,6 +310,14 @@ impl Shell {
         frames.frames.pop();
     }
 
+    /// Ends every command whose redirections are in effect, innermost
+    /// first, as when the shell exits from within them.
+    pub fn undo_all_redirections(&mut self) {
+        while !self.redirection_frames.frames.is_empty() {
+            self.pop_redirections();
+        }
+    }
+
     /// In a newly forked child: the commands it was forked from are
     /// completed by the parent, so their saved descriptors are closed here.
     pub fn forget_redirections(&mut self) {
@@ -452,7 +460,7 @@ impl Shell {
     /// exits once the command completes.
     ///
     /// A redirection that fails leaves the earlier ones in place (and
-    /// saved); undoing the frame undoes them too.
+    /// saved), so that the failure is reported where they send it.
     pub fn apply_redirections(
         &mut self,
         redirections: &[Redirection],
@@ -500,9 +508,16 @@ impl Shell {
         run: impl FnOnce(&mut Self) -> Result<T, CommandExecutionError>,
     ) -> Result<T, CommandExecutionError> {
         self.push_redirections();
-        let result = self
-            .apply_redirections(redirections, true)
-            .and_then(|()| run(self));
+        let result = match self.apply_redirections(redirections, true) {
+            Ok(()) => run(self),
+            Err(err @ CommandExecutionError::Redirection(_)) => {
+                // Written before the redirections made so far are undone,
+                // so that it goes where they send it, as in dash and bash.
+                self.eprint(&err.to_string());
+                Err(CommandExecutionError::RedirectionReported)
+            }
+            Err(err) => Err(err),
+        };
         self.pop_redirections();
         result
     }

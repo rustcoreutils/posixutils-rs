@@ -336,3 +336,32 @@ fn background_standard_input_after_exec() {
     sh_c("{ cat & wait; } <<EOF\nbraced\nEOF", "braced\n");
     sh_c("exec 0<<EOF\nexecd\nEOF\ncat & wait", "");
 }
+
+// The EXIT trap runs once the commands `exit` abandoned are undone, so it
+// writes to the shell's own standard output, as in dash and bash.
+#[test]
+fn exit_trap_runs_after_redirections_are_undone() {
+    run_test(TestPlan {
+        cmd: "sh".to_string(),
+        args: vec![
+            "-c".to_string(),
+            "trap 'echo bye' EXIT; { exit 3; } >/dev/null".to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: "bye\n".to_string(),
+        expected_err: String::new(),
+        expected_exit_code: 3,
+    });
+}
+
+// A redirection that fails is reported where the command's earlier
+// redirections send its standard error, as in dash and bash.
+#[test]
+fn failed_redirection_is_reported_on_redirected_stderr() {
+    sh_c(
+        "{ :; } 2>/dev/null >/nonexistent/dir/x; echo rc=$?; \
+         cat 2>/dev/null </nonexistent/x; echo rc=$?; \
+         read x 2>/dev/null </nonexistent/x; echo rc=$?",
+        "rc=1\nrc=1\nrc=1\n",
+    );
+}

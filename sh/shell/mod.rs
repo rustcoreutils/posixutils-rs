@@ -58,6 +58,10 @@ pub mod opened_files;
 #[derive(Clone, Debug)]
 pub enum CommandExecutionError {
     Redirection(String),
+    /// A redirection failure already written to the standard error the
+    /// command's earlier redirections set up, as dash and bash write it
+    /// (`cmd 2>/dev/null </no/such` is silent).
+    RedirectionReported,
     VariableAssignment(CannotModifyReadonly),
     Expansion(String),
     Os(OsError),
@@ -82,6 +86,7 @@ impl Display for CommandExecutionError {
             CommandExecutionError::Redirection(err) => {
                 writeln!(f, "{err}")
             }
+            CommandExecutionError::RedirectionReported => Ok(()),
             CommandExecutionError::VariableAssignment(err) => {
                 writeln!(f, "{err}")
             }
@@ -372,6 +377,10 @@ impl Shell {
         // an `exit` invoked from within the trap action terminates immediately
         // (POSIX) instead of recursing forever.
         let exit_action = std::mem::replace(&mut self.exit_action, TrapAction::Default);
+        // The commands being run are abandoned, so their redirections are
+        // undone first: the trap writes where the shell's own output goes,
+        // as in dash and bash (`trap 'echo bye' EXIT; { exit; } >f`).
+        self.undo_all_redirections();
         self.execute_action(exit_action);
         if self.is_interactive && !self.is_subshell {
             write_history_to_file(&self.history, &self.environment);
@@ -674,12 +683,15 @@ impl Shell {
         // `exec` keeps these redirections (see `keep_redirections`).
         self.push_redirections();
         if let Err(err) = self.apply_redirections(&simple_command.redirections, true) {
-            self.pop_redirections();
             if !self.is_interactive {
                 self.eprint(&err.to_string());
                 self.exit(1)
             }
-            return Err(err);
+            // Reported where the redirections made so far send it, as in
+            // dash and bash (`: 2>/dev/null >/no/such` is silent).
+            self.eprint(&err.to_string());
+            self.pop_redirections();
+            return Ok(1);
         }
         let mut opened_files = OpenedFiles::default();
         let status = match special_builtin_utility.exec(args, self, &mut opened_files) {

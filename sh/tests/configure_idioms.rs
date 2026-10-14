@@ -174,6 +174,21 @@ fn command_not_found_message_obeys_redirection() {
     sh("{ no_such_command_xyz; } 2>/dev/null; echo $?", "127\n");
 }
 
+// A PATH assignment in front of a command is the PATH the command is
+// searched with (XCU 2.9.1), and does not leave a remembered location
+// behind for later commands.
+#[test]
+fn path_prefix_assignment_is_used_for_search() {
+    sh(
+        "env >/dev/null; { PATH=/nonexistent env >/dev/null; } 2>/dev/null; echo $?",
+        "127\n",
+    );
+    sh(
+        "p=$PATH; PATH=/nonexistent; PATH=$p env >/dev/null; a=$?; { env >/dev/null; } 2>/dev/null; b=$?; PATH=$p; echo $a $b",
+        "0 127\n",
+    );
+}
+
 // LINENO is the line of the command being executed (XCU 2.5.3), also when
 // it is expanded in a here-document or a command substitution.
 #[test]

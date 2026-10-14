@@ -668,6 +668,24 @@ impl Shell {
         }
     }
 
+    /// Searches for the non-built-in utility a simple command names, once its
+    /// variable assignments are in effect. They are exported to the utility,
+    /// so a `PATH=dir` among them is the PATH it is searched with (as in dash
+    /// and bash). That search neither uses nor fills the remembered
+    /// locations, which belong to the shell's own PATH.
+    fn search_for_utility(
+        &mut self,
+        command_name: &ShStr,
+        assignments: &[Assignment],
+    ) -> Option<OsString> {
+        if assignments.iter().any(|a| &*a.name == "PATH") {
+            let path = self.environment.get_str_value("PATH").unwrap_or("");
+            find_command(command_name, path)
+        } else {
+            self.find_command(command_name, "", self.set_options.hashall)
+        }
+    }
+
     fn interpret_simple_command(
         &mut self,
         simple_command: &SimpleCommand,
@@ -736,16 +754,15 @@ impl Shell {
         } else if let Some(builtin_utility) = get_builtin_utility(&command_name) {
             self.exec_builtin_utility(simple_command, &expanded_words[1..], builtin_utility)
         } else {
-            let command = self
-                .find_command(&expanded_words[0], "", self.set_options.hashall)
-                .ok_or(CommandExecutionError::CommandNotFound(
-                    expanded_words[0].display().to_string(),
-                ))?;
-
             self.environment.push_scope();
             let result = self
                 .assign_locals(&simple_command.assignments)
                 .and_then(|_| {
+                    let command = self
+                        .search_for_utility(&expanded_words[0], &simple_command.assignments)
+                        .ok_or(CommandExecutionError::CommandNotFound(
+                            expanded_words[0].display().to_string(),
+                        ))?;
                     let mut opened_files = self.opened_files.clone();
                     opened_files.redirect(&simple_command.redirections, self)?;
                     self.fork_and_exec(command, &expanded_words, &opened_files)

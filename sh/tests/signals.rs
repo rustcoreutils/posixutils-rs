@@ -45,6 +45,40 @@ fn background_pid_is_the_command() {
     sh_c("{ sleep 30; } & p=$!; kill $p; wait $p; echo $?", "143\n");
 }
 
+// The shell forks every command of a background pipeline itself, so `$!`
+// is the pipeline's last command, as in dash and bash, and `wait $!` waits
+// for the whole pipeline with its status: the last command's, or under
+// pipefail the rightmost failure's.
+#[test]
+fn background_pipeline_pid_is_its_last_command() {
+    sh_c(
+        &format!(
+            "set -- $(true | {SH} -c 'echo $$' & echo $!; wait); \
+             test $# = 2 && test \"$1\" = \"$2\" && echo same"
+        ),
+        "same\n",
+    );
+    sh_c(
+        "sleep 0.1 | sleep 30 & p=$!; ps -o args= -p $p; kill $p; wait $p; echo $?",
+        "sleep 30\n143\n",
+    );
+    sh_c("(exit 3) | (exit 4) & wait $!; echo $?", "4\n");
+    sh_c("set -o pipefail; (exit 5) | true & wait $!; echo $?", "5\n");
+    // `wait` with no operand waits for every command of it.
+    sh_c(
+        "{ sleep 0.2; echo first; } | { cat; echo last; } & wait; echo done",
+        "first\nlast\ndone\n",
+    );
+    // Without job control every command ignores SIGINT, and only the first
+    // reads /dev/null in place of the shell's standard input.
+    sh_c(
+        "sleep 0.1 | sh -c 'kill -INT $$; echo survived' & wait",
+        "survived\n",
+    );
+    sh_c("echo x | { cat | cat & wait; }; echo end", "end\n");
+    sh_c("echo x | { { cat | cat & wait; } <&0; }", "x\n");
+}
+
 // Running the last command in place must not lose what the shell still has
 // to do afterwards: an EXIT trap, the status inversion of `!`, the commands
 // after it, or the status a command substitution reports.

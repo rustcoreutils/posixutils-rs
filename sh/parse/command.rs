@@ -407,6 +407,18 @@ pub struct Conjunction {
 }
 
 impl Conjunction {
+    /// The pipeline of an asynchronous list that is a single pipeline of two
+    /// or more commands (`a | b &`), which the shell runs as a job of those
+    /// commands rather than in a subshell, as dash does. A negated pipeline
+    /// has to invert its status once it has finished, so it is not one.
+    pub fn background_pipeline(&self) -> Option<&Pipeline> {
+        if !self.is_async || self.elements.len() != 1 {
+            return None;
+        }
+        let (pipeline, _) = self.elements.first();
+        (pipeline.commands.len() > 1 && !pipeline.negate_status).then_some(pipeline)
+    }
+
     fn format_into(&self, f: &mut Formatter<'_>, print_semicolon: bool) -> std::fmt::Result {
         for (pipeline, op) in &self.elements {
             match op {

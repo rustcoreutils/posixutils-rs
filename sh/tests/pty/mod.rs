@@ -631,6 +631,33 @@ fn fg_resumes_a_whole_pipeline() {
     assert_eq!(read_result(&dir.path().join("out")), "a\n");
 }
 
+// A background pipeline is one job whose processes the shell forked itself
+// into the group of the first, as for a foreground pipeline: `jobs -l` shows
+// that process, `$!` is the last one, `kill %1` reaches both and `wait %1`
+// reports the last one's status.
+#[test]
+fn background_pipeline_is_a_job_of_every_command() {
+    let mut sh = ShPtySession::new();
+    sh.line("sh -c 'echo $$ > p1; sleep 30' | sh -c 'echo $$ > p2; cat' &");
+    wait_for_file(&sh.path("p1"));
+    wait_for_file(&sh.path("p2"));
+    sh.line("echo $! > bang; jobs -l > jobs; kill %1; wait %1; echo $? > status");
+    wait_for_file(&sh.path("status"));
+    sh.line("kill -0 $(cat p1) $(cat p2) 2>/dev/null; echo $? > gone");
+    let dir = sh.exit();
+    let p1 = read_result(&dir.path().join("p1")).trim().to_string();
+    let p2 = read_result(&dir.path().join("p2")).trim().to_string();
+    assert_eq!(read_result(&dir.path().join("bang")).trim(), p2);
+    assert_eq!(
+        read_result(&dir.path().join("jobs")),
+        format!(
+            "[1] + {p1} Running sh -c 'echo $$ > p1; sleep 30' | sh -c 'echo $$ > p2; cat' &\n"
+        )
+    );
+    assert_eq!(read_result(&dir.path().join("status")).trim(), "143");
+    assert_ne!(read_result(&dir.path().join("gone")).trim(), "0");
+}
+
 // `bg` resumes a suspended job in the background: `jobs` shows it stopped,
 // then running, and `wait` collects it.
 #[test]

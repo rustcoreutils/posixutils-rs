@@ -368,6 +368,41 @@ pub(crate) fn job_process_started(child: Pid, pgid: Pid, foreground: bool) {
     }
 }
 
+/// How the commands of a pipeline of two or more are run.
+#[derive(Clone, Copy)]
+enum PipelineKind {
+    /// Without job control, waited for, in the shell's process group.
+    Waited,
+    /// A foreground job under job control: a process group of its own,
+    /// which has the terminal.
+    Foreground,
+    /// An asynchronous list: under job control a process group of its own
+    /// without the terminal, else in the shell's group.
+    Background {
+        job_control: bool,
+        /// Standard input is redirected explicitly, so the first command
+        /// does not read /dev/null in its place.
+        stdin_redirected: bool,
+    },
+}
+
+impl PipelineKind {
+    /// Whether the commands go in a process group of their own, and if so
+    /// whether it is a foreground one.
+    fn job_group(self) -> Option<bool> {
+        match self {
+            PipelineKind::Waited
+            | PipelineKind::Background {
+                job_control: false, ..
+            } => None,
+            PipelineKind::Foreground => Some(true),
+            PipelineKind::Background {
+                job_control: true, ..
+            } => Some(false),
+        }
+    }
+}
+
 /// Makes the shell's process group the terminal's foreground group again,
 /// once a foreground job has terminated or stopped (XCU 2.11).
 pub(crate) fn take_terminal_back() {
@@ -1535,7 +1570,7 @@ impl Shell {
     /// them one suspended job and `fg` and `bg` resume all of them.
     fn run_pipeline_as_job(&mut self, pipeline: &Pipeline) -> OsResult<i32> {
         let mut pids = Vec::with_capacity(pipeline.commands.len());
-        let started = self.start_pipeline_commands(pipeline, &mut pids, true);
+        let started = self.start_pipeline_commands(pipeline, &mut pids, PipelineKind::Foreground);
         // Wait for what did start even when a later pipe or fork failed.
         let status = if pids.is_empty() {
             Ok(0)
@@ -1554,7 +1589,7 @@ impl Shell {
     /// exited non-zero (else 0); otherwise it is the last command's.
     fn run_pipeline_commands(&mut self, pipeline: &Pipeline) -> OsResult<i32> {
         let mut pids = Vec::with_capacity(pipeline.commands.len());
-        let started = self.start_pipeline_commands(pipeline, &mut pids, false);
+        let started = self.start_pipeline_commands(pipeline, &mut pids, PipelineKind::Waited);
         // Reap what did start even when a later pipe or fork failed.
         let statuses: Vec<i32> = pids
             .into_iter()
@@ -1574,14 +1609,52 @@ impl Shell {
         }
     }
 
-    /// Forks one child per pipeline command, recording each in `pids`. With
-    /// `as_job` they form a foreground job's process group, led by the
-    /// first.
+    /// Runs a pipeline of two or more commands as an asynchronous list
+    /// (`a | b &`), as dash does: the shell forks every command itself and
+    /// records every process in the job, as for a foreground pipeline, so
+    /// that `wait`, `jobs`, pipefail and job control see each command.
+    /// Under job control they are put in a process group led by the first;
+    /// `$!` is the last command, as in dash and bash.
+    fn start_background_pipeline(&mut self, pipeline: &Pipeline, command: String) -> i32 {
+        let job_control = self.job_control_active();
+        let kind = PipelineKind::Background {
+            job_control,
+            // Asked before the children forget which descriptors enclosing
+            // commands redirected (see `interpret_conjunction`).
+            stdin_redirected: self.is_redirected(libc::STDIN_FILENO),
+        };
+        let mut pids = Vec::with_capacity(pipeline.commands.len());
+        let started = self.start_pipeline_commands(pipeline, &mut pids, kind);
+        // What did start is a job even when a later pipe or fork failed.
+        if let Some(&last) = pids.last() {
+            self.last_background_pid = Some(last);
+            let process_group = job_control.then_some(pids[0]);
+            self.background_jobs.add_job(Job::new(
+                &pids,
+                process_group,
+                command,
+                self.set_options.pipefail,
+            ));
+            self.handle_async_events();
+        }
+        if started.is_ok() {
+            return 0;
+        }
+        self.eprint("sh: failed to create background job\n");
+        if !self.is_interactive {
+            self.exit(1);
+        }
+        1
+    }
+
+    /// Forks one child per pipeline command, recording each in `pids`, the
+    /// first command's process leading the job's process group if `kind`
+    /// makes one.
     fn start_pipeline_commands(
         &mut self,
         pipeline: &Pipeline,
         pids: &mut Vec<Pid>,
-        as_job: bool,
+        kind: PipelineKind,
     ) -> OsResult<()> {
         let count = pipeline.commands.len();
         // The read end of the pipe from the previous command; the first
@@ -1597,10 +1670,17 @@ impl Shell {
             let leader = pids.first().copied().unwrap_or(0);
             match fork()? {
                 ForkResult::Child => {
-                    if as_job {
-                        enter_job_process_group(leader, true);
+                    if let Some(foreground) = kind.job_group() {
+                        enter_job_process_group(leader, foreground);
                     }
                     self.become_subshell();
+                    if let PipelineKind::Background {
+                        job_control: false,
+                        stdin_redirected,
+                    } = kind
+                    {
+                        self.enter_async_list_without_job_control(index == 0 && !stdin_redirected);
+                    }
                     let stdout = next_pipe.map(|(read, write)| {
                         drop(read);
                         write
@@ -1615,9 +1695,9 @@ impl Shell {
                     self.exit(status);
                 }
                 ForkResult::Parent { child } => {
-                    if as_job {
+                    if let Some(foreground) = kind.job_group() {
                         let pgid = if leader == 0 { child } else { leader };
-                        job_process_started(child, pgid, true);
+                        job_process_started(child, pgid, foreground);
                     }
                     pids.push(child);
                     // Replacing the previous read end closes it: only the
@@ -1695,8 +1775,25 @@ impl Shell {
         status
     }
 
+    /// POSIX 2.11: without job control, an asynchronous list ignores SIGINT
+    /// and SIGQUIT, and, with `reads_dev_null`, reads from /dev/null, so it
+    /// neither competes for the terminal nor dies with the foreground job.
+    /// For a pipeline only the first command reads /dev/null, as in dash.
+    fn enter_async_list_without_job_control(&mut self, reads_dev_null: bool) {
+        self.signal_manager
+            .set_action(Signal::SigInt, TrapAction::Ignore);
+        self.signal_manager
+            .set_action(Signal::SigQuit, TrapAction::Ignore);
+        if reads_dev_null {
+            self.redirect_stdin_to_dev_null();
+        }
+    }
+
     fn interpret_conjunction(&mut self, conjunction: &Conjunction, ignore_errexit: bool) -> i32 {
         let exits_after = self.take_exits_after_command();
+        if let Some(pipeline) = conjunction.background_pipeline() {
+            return self.start_background_pipeline(pipeline, conjunction.to_string());
+        }
         if conjunction.is_async {
             match fork() {
                 Ok(ForkResult::Child) => {
@@ -1716,17 +1813,7 @@ impl Shell {
                         // shell's group.
                         let _ = setpgid(0, 0);
                     } else {
-                        // POSIX 2.11: without job control, an asynchronous list
-                        // ignores SIGINT and SIGQUIT and reads from /dev/null,
-                        // so it neither competes for the terminal nor dies with
-                        // the foreground job.
-                        self.signal_manager
-                            .set_action(Signal::SigInt, TrapAction::Ignore);
-                        self.signal_manager
-                            .set_action(Signal::SigQuit, TrapAction::Ignore);
-                        if !stdin_redirected {
-                            self.redirect_stdin_to_dev_null();
-                        }
+                        self.enter_async_list_without_job_control(!stdin_redirected);
                     }
                     self.exits_after_command = true;
                     let status = self.interpret_and_or_list(&conjunction.elements, false);

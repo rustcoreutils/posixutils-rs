@@ -204,13 +204,19 @@ pub fn parse<T: Parser>() -> T {
 
 /// Parse `argv` as `T`, exiting through [`exit`] on an error or a request for
 /// help or the version.
-pub fn parse_from<T, I, A>(argv: I) -> T
-where
-    T: Parser,
-    I: IntoIterator<Item = A>,
-    A: Into<OsString> + Clone,
-{
+pub fn parse_from<T: Parser>(argv: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> T {
     T::try_parse_from(argv).unwrap_or_else(|e| exit(e))
+}
+
+/// [`parse_from`] for a caller that needs clap's matches, such as the order
+/// in which options were given.
+pub fn get_matches_from(
+    command: Command,
+    argv: impl IntoIterator<Item = impl Into<OsString> + Clone>,
+) -> clap::ArgMatches {
+    command
+        .try_get_matches_from(argv)
+        .unwrap_or_else(|e| exit(e))
 }
 
 /// Print clap's message for `e` and exit, as [`clap::Error::exit`] does,

@@ -1068,3 +1068,12 @@ fn xargs_test_exit(input: &str, args: &[&str], out: &str, err: &str, code: i32) 
         expected_exit_code: code,
     });
 }
+
+// A failed write of the help text is a write error, not a silent success.
+#[cfg(target_os = "linux")]
+#[test]
+fn help_write_error_on_full_device() {
+    for cmd in ["fuser", "timeout", "xargs"] {
+        plib::testing::assert_write_error_message_on_full_device(cmd, &["--help"], b"", 1);
+    }
+}

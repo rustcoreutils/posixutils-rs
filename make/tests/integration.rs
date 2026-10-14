@@ -2982,3 +2982,10 @@ fn make_option_argument_may_begin_with_hyphen() {
         plib::testing::assert_hyphen_option_argument("make", &[opt, "-zq", "--help"]);
     }
 }
+
+// A failed write of the help text is a write error, not a silent success.
+#[cfg(target_os = "linux")]
+#[test]
+fn help_write_error_on_full_device() {
+    plib::testing::assert_write_error_message_on_full_device("make", &["--help"], b"", 1);
+}

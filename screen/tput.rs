@@ -211,8 +211,9 @@ fn main() -> ExitCode {
 
     let args = match plib::optarg::try_parse::<Args>() {
         Ok(a) => a,
+        // Help and version are written to standard output with status 0.
+        Err(e) if !e.use_stderr() => plib::optarg::exit(e),
         Err(e) => {
-            // Clap already prints the error message
             let _ = e.print();
             return ExitCode::from(EXIT_USAGE_ERROR);
         }

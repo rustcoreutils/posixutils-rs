@@ -593,3 +593,10 @@ fn m4_partial_line_write_error_on_full_device() {
     // with the system's text for the error and exit status 1.
     plib::testing::assert_write_error_message_on_full_device("m4", &[], b"x", 1);
 }
+
+// A failed write of the help text is a write error, not a silent success.
+#[cfg(target_os = "linux")]
+#[test]
+fn help_write_error_on_full_device() {
+    plib::testing::assert_write_error_message_on_full_device("m4", &["--help"], b"", 1);
+}

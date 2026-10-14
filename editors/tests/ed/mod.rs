@@ -2389,3 +2389,10 @@ fn failed_read_still_remembers_the_pathname() {
     let out = ed_in(dir.path(), &["-s", "e1"], "r nosuch\nf\nq\n");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "?\ne1\n");
 }
+
+// A failed write of the help text is a write error, not a silent success.
+#[cfg(target_os = "linux")]
+#[test]
+fn help_write_error_on_full_device() {
+    plib::testing::assert_write_error_message_on_full_device("ed", &["--help"], b"", 1);
+}

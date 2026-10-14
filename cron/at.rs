@@ -100,6 +100,10 @@ fn main() -> std::process::ExitCode {
 
 fn at_main() -> Result<(), Box<dyn std::error::Error>> {
     let args = plib::optarg::try_parse::<Args>().unwrap_or_else(|err| {
+        // Help and version are written to standard output with status 0.
+        if !err.use_stderr() {
+            plib::optarg::exit(err);
+        }
         eprintln!("{}", err);
         std::process::exit(1);
     });

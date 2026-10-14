@@ -171,7 +171,8 @@ impl Args {
     /// Parse the command line and split the operand list into the utility
     /// and its arguments.
     fn parse_command_line() -> Self {
-        let matches = Args::command().get_matches_from(plib::optarg::args_os::<Args>());
+        let matches =
+            plib::optarg::get_matches_from(Args::command(), plib::optarg::args_os::<Args>());
         let mut args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
         args.keep_last_batching_option(&matches);
         let mut command = std::mem::take(&mut args.command).into_iter();

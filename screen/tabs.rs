@@ -332,8 +332,7 @@ fn main() -> ExitCode {
             if e.kind() == clap::error::ErrorKind::DisplayHelp
                 || e.kind() == clap::error::ErrorKind::DisplayVersion
             {
-                print!("{}", e);
-                return ExitCode::SUCCESS;
+                plib::optarg::exit(e);
             }
             eprintln!("{}", e);
             return ExitCode::from(1);

@@ -648,7 +648,7 @@ fn tail(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("tail");
 
-    let args = Args::parse_from(plib::optarg::keep_leading_equals::<Args>(
+    let args = plib::optarg::parse_from::<Args>(plib::optarg::keep_leading_equals::<Args>(
         expand_historical_count(std::env::args_os()),
     ));
 

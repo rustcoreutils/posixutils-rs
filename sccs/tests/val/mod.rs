@@ -487,3 +487,13 @@ fn val_stdin_read_error_ends_input() {
     assert!(out.stdout.is_empty());
     assert_ne!(out.status.code(), Some(0));
 }
+
+// A failed write of the help or version text is a write error, not a silent
+// success. admin's own --help wants a file operand, so its version is used.
+#[cfg(target_os = "linux")]
+#[test]
+fn help_write_error_on_full_device() {
+    for (cmd, opt) in [("prs", "--help"), ("val", "--help"), ("admin", "--version")] {
+        plib::testing::assert_write_error_message_on_full_device(cmd, &[opt], b"", 1);
+    }
+}

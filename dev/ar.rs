@@ -1052,7 +1052,7 @@ fn canonicalize_args(mut args: Vec<OsString>) -> Vec<OsString> {
 
 fn main() {
     diag::init_locale("ar");
-    let args = Args::parse_from(plib::optarg::keep_leading_equals::<Args>(
+    let args = plib::optarg::parse_from::<Args>(plib::optarg::keep_leading_equals::<Args>(
         canonicalize_args(std::env::args_os().collect()),
     ));
     let result = match args.command {

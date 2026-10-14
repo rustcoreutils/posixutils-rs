@@ -498,8 +498,7 @@ fn main() {
 
     let args = plib::optarg::try_parse::<Args>().unwrap_or_else(|err| match err.kind() {
         clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
-            print!("{err}");
-            std::process::exit(0);
+            plib::optarg::exit(err)
         }
         _ => {
             diag::error(

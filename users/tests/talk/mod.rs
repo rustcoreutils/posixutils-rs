@@ -516,3 +516,10 @@ fn test_talk_multibyte_character_survives() {
     drop(b);
     stop_talkd(daemon, &socket);
 }
+
+// A failed write of the help text is a write error, not a silent success.
+#[cfg(target_os = "linux")]
+#[test]
+fn help_write_error_on_full_device() {
+    plib::testing::assert_write_error_message_on_full_device("talk", &["--help"], b"", 1);
+}

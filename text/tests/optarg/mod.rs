@@ -35,3 +35,12 @@ fn attached_option_argument_may_begin_with_equals() {
         plib::testing::assert_equals_option_argument(cmd, opt, rest, input);
     }
 }
+
+// A failed write of the help text is a write error, not a silent success.
+#[cfg(target_os = "linux")]
+#[test]
+fn help_write_error_on_full_device() {
+    for cmd in ["grep", "head", "pr", "sed", "tail"] {
+        plib::testing::assert_write_error_message_on_full_device(cmd, &["--help"], b"", 1);
+    }
+}

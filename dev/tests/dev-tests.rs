@@ -2527,3 +2527,10 @@ fn test_ar_print_write_error_on_full_device() {
         1,
     );
 }
+
+// A failed write of the help text is a write error, not a silent success.
+#[cfg(target_os = "linux")]
+#[test]
+fn help_write_error_on_full_device() {
+    plib::testing::assert_write_error_message_on_full_device("ar", &["--help"], b"", 1);
+}

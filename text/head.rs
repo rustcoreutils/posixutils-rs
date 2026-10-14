@@ -206,7 +206,7 @@ fn head_file(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("head");
 
-    let mut args = Args::parse_from(plib::optarg::keep_leading_equals::<Args>(
+    let mut args = plib::optarg::parse_from::<Args>(plib::optarg::keep_leading_equals::<Args>(
         expand_historical_count(std::env::args_os()),
     ));
 

@@ -1642,8 +1642,7 @@ fn fuser_main() -> Result<(), Box<dyn std::error::Error>> {
         // `--help` and `--version` are a successful request for information,
         // not an error: clap writes the text itself and the status is 0.
         clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
-            print!("{err}");
-            std::process::exit(0);
+            plib::optarg::exit(err)
         }
         _ => {
             let mut stdout = std::io::stdout();

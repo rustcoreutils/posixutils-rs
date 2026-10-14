@@ -2364,14 +2364,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = plib::optarg::try_parse::<Args>().unwrap_or_else(|err| {
         if err.kind() == ErrorKind::DisplayHelp || err.kind() == ErrorKind::DisplayVersion {
-            // Print help or version message
-            eprintln!("{}", err);
-        } else {
-            // Print custom error message
-            eprintln!("Error parsing arguments: {}", err);
+            // Help and version are written to standard output with status 0.
+            plib::optarg::exit(err);
         }
-
-        // Exit with a non-zero status code
+        eprintln!("Error parsing arguments: {}", err);
         std::process::exit(1);
     });
 

@@ -745,3 +745,10 @@ fn test_at_non_utf8_environment_and_directory() {
     expected.push(b'\n');
     assert_eq!(run.stdout, expected);
 }
+
+// A failed write of the help text is a write error, not a silent success.
+#[cfg(target_os = "linux")]
+#[test]
+fn help_write_error_on_full_device() {
+    plib::testing::assert_write_error_message_on_full_device("at", &["--help"], b"", 1);
+}

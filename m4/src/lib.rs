@@ -116,8 +116,10 @@ impl Args {
 
     pub fn parse() -> Self {
         let argv = std::env::args_os().collect();
-        let matches = Self::command()
-            .get_matches_from(plib::optarg::keep_leading_equals_with(argv, Self::command));
+        let matches = plib::optarg::get_matches_from(
+            Self::command(),
+            plib::optarg::keep_leading_equals_with(argv, Self::command),
+        );
 
         let line_synchronization = matches.get_flag("line_synchronization");
 

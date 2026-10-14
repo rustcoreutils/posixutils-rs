@@ -500,3 +500,91 @@ fn job_control_stop_signals_are_the_shells_own() {
     assert!(inherited.contains("TSTP"), "got {inherited:?}");
     assert!(!inherited.contains("TTIN"), "got {inherited:?}");
 }
+
+/// Types ^Z once the command running at the prompt has created `started`.
+fn suspend_once_started(sh: &mut ShPtySession) {
+    wait_for_file(&sh.path("started"));
+    // let a foreground utility, if any, get going
+    thread::sleep(Duration::from_millis(300));
+    sh.keys("\x1a");
+    thread::sleep(Duration::from_millis(300));
+}
+
+// XCU 2.11: a foreground command and every command of a foreground pipeline
+// run in a process group of their own, which has the terminal while they
+// run.
+#[test]
+fn foreground_jobs_get_a_process_group_and_the_terminal() {
+    let mut sh = ShPtySession::new();
+    sh.line("sh -c 'echo $$ $(ps -o pgid= -p $$) $(ps -o tpgid= -p $$)' > simple");
+    sh.line("sh -c 'echo $(ps -o pgid= -p $$) $(ps -o tpgid= -p $$)' | cat > pipeline");
+    sh.line("echo $$ > shell");
+    let dir = sh.exit();
+    let simple = numbers(&read_result(&dir.path().join("simple")));
+    assert_eq!(simple.len(), 3, "got {simple:?}");
+    assert!(
+        simple[0] == simple[1] && simple[1] == simple[2],
+        "pid, process group and terminal group differ: {simple:?}"
+    );
+    let pipeline = numbers(&read_result(&dir.path().join("pipeline")));
+    let shell = numbers(&read_result(&dir.path().join("shell")));
+    assert_eq!(pipeline.len(), 2, "got {pipeline:?}");
+    assert_eq!(pipeline[0], pipeline[1], "the pipeline lacks the terminal");
+    assert_ne!(
+        pipeline[0], shell[0],
+        "the pipeline is in the shell's group"
+    );
+}
+
+// ^Z stops a foreground utility; it becomes a suspended job, and `$?` is
+// that of a process stopped by SIGTSTP.
+#[test]
+fn ctrl_z_suspends_a_foreground_utility() {
+    let mut sh = ShPtySession::new();
+    sh.line(": > started; sleep 30");
+    suspend_once_started(&mut sh);
+    sh.line("kill -l $? > status; jobs > jobs; kill -KILL %1");
+    let dir = sh.exit();
+    assert_eq!(read_result(&dir.path().join("status")).trim(), "TSTP");
+    assert_eq!(
+        read_result(&dir.path().join("jobs")),
+        "[1] + Stopped sleep 30\n"
+    );
+}
+
+// ^Z stops every command of a foreground pipeline, as one job.
+#[test]
+fn ctrl_z_suspends_a_whole_pipeline() {
+    let mut sh = ShPtySession::new();
+    sh.line("sh -c ': > started; sleep 1; echo a' | cat > out");
+    suspend_once_started(&mut sh);
+    // longer than the pipeline would have taken had it gone on running
+    thread::sleep(Duration::from_millis(1500));
+    sh.line("jobs > jobs; cat out > early");
+    sh.line("bg >/dev/null; wait; cat out > late");
+    let dir = sh.exit();
+    assert_eq!(
+        read_result(&dir.path().join("jobs")),
+        "[1] + Stopped sh -c ': > started; sleep 1; echo a' | cat >out\n"
+    );
+    assert_eq!(read_result(&dir.path().join("early")), "");
+    assert_eq!(read_result(&dir.path().join("late")), "a\n");
+}
+
+// ^C reaches only the foreground job: a background job runs on, and the
+// shell abandons the line and returns to the prompt.
+#[test]
+fn ctrl_c_reaches_only_the_foreground_job() {
+    let mut sh = ShPtySession::new();
+    sh.line("sleep 30 &");
+    sh.line(": > started; sleep 30; echo no > after");
+    interrupt_once_started(&mut sh);
+    sh.line("jobs > jobs; kill %1");
+    let dir = sh.exit();
+    assert_eq!(read_result(&dir.path().join("status")).trim(), "130");
+    assert_eq!(
+        read_result(&dir.path().join("jobs")),
+        "[1] + Running sleep 30 &\n"
+    );
+    assert!(!dir.path().join("after").exists());
+}

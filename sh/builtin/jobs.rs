@@ -76,12 +76,16 @@ impl BuiltinUtility for Jobs {
             for job in shell.background_jobs.iter() {
                 print_job(job, print_option, opened_files)?;
             }
+            // What `jobs` listed is reported; the shell does not report it
+            // again before the next prompt, as in dash.
+            shell.background_jobs.forget_reports();
         } else {
             for operand in &args[options_parser.next_argument()..] {
                 let job_id = parse_job_id(operand)
                     .map_err(|_| format!("jobs: invalid job id '{operand}'"))?;
-                if let Some(job) = shell.background_jobs.get_job(job_id) {
+                if let Some(job) = shell.background_jobs.get_job_mut(job_id) {
                     print_job(job, print_option, opened_files)?;
+                    job.state_should_be_reported = false;
                 } else {
                     return Err(format!("jobs: '{operand}' no such job").into());
                 }

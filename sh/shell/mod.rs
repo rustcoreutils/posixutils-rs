@@ -19,9 +19,9 @@ use crate::nonempty::NonEmpty;
 use crate::os::errno::Errno;
 use crate::os::signals::{kill, PendingSignal, Signal, SignalManager, TermSignal};
 use crate::os::{
-    exec, find_command, fork, getpgrp, give_terminal_to, is_process_in_foreground, job_control_tty,
-    pipe, set_job_control_tty, setpgid, tcgetpgrp, waitpid, ExecError, ForkResult, OsError,
-    OsResult, Pid, WaitOptions, WaitStatus,
+    exec, find_command, fork, getpgrp, give_terminal_to, job_control_tty, pipe,
+    set_job_control_tty, setpgid, tcgetpgrp, waitpid, ExecError, ForkResult, OsError, OsResult,
+    Pid, WaitOptions, WaitStatus,
 };
 use crate::parse::command::{
     Assignment, CaseItem, Command, CommandType, CompleteCommand, CompoundCommand, Conjunction,
@@ -44,7 +44,7 @@ use std::ffi::OsString;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::{IsTerminal, Read};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::rc::Rc;
 use std::{env, io};
@@ -340,6 +340,42 @@ fn is_assignment_shaped(word: &[u8]) -> bool {
     }
 }
 
+/// In a child forked for a process of a job under job control: joins the
+/// job's process group, the one led by `leader` (0: leads it itself), and,
+/// for a foreground job, gives that group the terminal (XCU 2.11).
+///
+/// The parent does the same (`job_process_started`), so it is done before
+/// the command runs whichever goes first. A call that fails changes nothing
+/// for the command and is ignored, as bash ignores it: the terminal may have
+/// gone away (ENOTTY), or the process may have finished already (ESRCH).
+pub(crate) fn enter_job_process_group(leader: Pid, foreground: bool) {
+    let _ = setpgid(0, leader);
+    if foreground {
+        if let Some(terminal) = job_control_tty() {
+            let _ = give_terminal_to(terminal, getpgrp());
+        }
+    }
+}
+
+/// The parent's side of `enter_job_process_group` for its child `child`,
+/// in the process group `pgid`.
+pub(crate) fn job_process_started(child: Pid, pgid: Pid, foreground: bool) {
+    let _ = setpgid(child, pgid);
+    if foreground {
+        if let Some(terminal) = job_control_tty() {
+            let _ = give_terminal_to(terminal, pgid);
+        }
+    }
+}
+
+/// Makes the shell's process group the terminal's foreground group again,
+/// once a foreground job has terminated or stopped (XCU 2.11).
+pub(crate) fn take_terminal_back() {
+    if let Some(terminal) = job_control_tty() {
+        let _ = give_terminal_to(terminal, getpgrp());
+    }
+}
+
 impl Shell {
     /// POSIX 2.12: a subshell starts with every trap the parent *caught* reset
     /// to its default action; ignored traps stay ignored. That covers the EXIT
@@ -534,6 +570,21 @@ impl Shell {
         }
     }
 
+    /// Waits for the foreground job of the processes `pids` (job control),
+    /// whose process group is the first one's, then takes the terminal back
+    /// (XCU 2.11).
+    fn wait_for_foreground_job(&mut self, pids: &[Pid]) -> OsResult<i32> {
+        let job = Job::new(
+            pids,
+            pids.first().copied(),
+            self.last_pipeline_command.clone(),
+            self.set_options.pipefail,
+        );
+        let status = self.wait_for_job(job);
+        take_terminal_back();
+        status
+    }
+
     pub fn handle_async_events(&mut self) {
         self.process_signals();
         self.handle_job_events();
@@ -692,13 +743,22 @@ impl Shell {
     }
 
     pub fn fork_and_exec(&mut self, command: OsString, args: &[ShString]) -> OsResult<i32> {
+        let job_control = self.job_control_active();
         match fork()? {
             ForkResult::Child => {
+                if job_control {
+                    enter_job_process_group(0, true);
+                }
                 self.become_subshell();
                 self.exec(command, args)
             }
             ForkResult::Parent { child } => {
-                let status = self.wait_child_process(child);
+                let status = if job_control {
+                    job_process_started(child, child, true);
+                    self.wait_for_foreground_job(&[child])
+                } else {
+                    self.wait_child_process(child)
+                };
                 // A background job may have finished while this one ran.
                 // `update_jobs` is a no-op when nothing is tracked. Traps
                 // wait for the end of the pipeline, when `$?` is set.
@@ -1224,15 +1284,27 @@ impl Shell {
             let status = self.interpret(commands, false);
             self.exit(status);
         }
+        // Under job control a subshell is a foreground job of its own, as in
+        // dash: ^Z stops it, and everything it runs, as one job.
+        let job_control = self.job_control_active();
         match fork()? {
             ForkResult::Child => {
+                if job_control {
+                    enter_job_process_group(0, true);
+                }
                 self.become_subshell();
                 self.exits_after_command = true;
                 let status = self.interpret(commands, false);
                 self.exit(status);
             }
             ForkResult::Parent { child } => {
-                self.wait_child_process(child).map_err(|err| err.into())
+                let status = if job_control {
+                    job_process_started(child, child, true);
+                    self.wait_for_foreground_job(&[child])
+                } else {
+                    self.wait_child_process(child)
+                };
+                status.map_err(|err| err.into())
             }
         }
     }
@@ -1456,46 +1528,22 @@ impl Shell {
         let _ = set_job_control_tty(None);
     }
 
-    /// Runs a pipeline of two or more commands as one job (`set -m`): a
-    /// wrapper subshell leads a process group of its own holding every
-    /// command, and is given the terminal while it runs if the shell has it.
-    ///
-    /// Both processes put the wrapper in its group and hand it the terminal,
-    /// so it is done before any command runs whichever goes first. A call
-    /// that fails changes nothing for the commands, and is ignored as bash
-    /// ignores it: the terminal may have gone away (ENOTTY), or the wrapper
-    /// may have finished already (ESRCH, EPERM).
+    /// Runs a pipeline of two or more commands as one foreground job
+    /// (`set -m`), as dash does: the shell forks every command straight into
+    /// a process group led by the first, which is given the terminal while
+    /// the job runs, and records every process, so that ^Z makes all of
+    /// them one suspended job and `fg` and `bg` resume all of them.
     fn run_pipeline_as_job(&mut self, pipeline: &Pipeline) -> OsResult<i32> {
-        let foreground = is_process_in_foreground();
-        let terminal = io::stdin().as_raw_fd();
-        match fork()? {
-            ForkResult::Child => {
-                let _ = setpgid(0, 0);
-                if foreground {
-                    let _ = give_terminal_to(terminal, getpgrp());
-                }
-                self.become_subshell();
-                let status = match self.run_pipeline_commands(pipeline) {
-                    Ok(status) => status,
-                    Err(err) => {
-                        self.eprint(&format!("{err}\n"));
-                        1
-                    }
-                };
-                self.exit(status);
-            }
-            ForkResult::Parent { child } => {
-                let _ = setpgid(child, child);
-                if foreground {
-                    let _ = give_terminal_to(terminal, child);
-                }
-                let status = self.wait_child_process(child);
-                if foreground {
-                    let _ = give_terminal_to(terminal, getpgrp());
-                }
-                status
-            }
-        }
+        let mut pids = Vec::with_capacity(pipeline.commands.len());
+        let started = self.start_pipeline_commands(pipeline, &mut pids, true);
+        // Wait for what did start even when a later pipe or fork failed.
+        let status = if pids.is_empty() {
+            Ok(0)
+        } else {
+            self.wait_for_foreground_job(&pids)
+        };
+        started?;
+        status
     }
 
     /// Runs each command of a pipeline of two or more in a child process of
@@ -1506,7 +1554,7 @@ impl Shell {
     /// exited non-zero (else 0); otherwise it is the last command's.
     fn run_pipeline_commands(&mut self, pipeline: &Pipeline) -> OsResult<i32> {
         let mut pids = Vec::with_capacity(pipeline.commands.len());
-        let started = self.start_pipeline_commands(pipeline, &mut pids);
+        let started = self.start_pipeline_commands(pipeline, &mut pids, false);
         // Reap what did start even when a later pipe or fork failed.
         let statuses: Vec<i32> = pids
             .into_iter()
@@ -1526,11 +1574,14 @@ impl Shell {
         }
     }
 
-    /// Forks one child per pipeline command, recording each in `pids`.
+    /// Forks one child per pipeline command, recording each in `pids`. With
+    /// `as_job` they form a foreground job's process group, led by the
+    /// first.
     fn start_pipeline_commands(
         &mut self,
         pipeline: &Pipeline,
         pids: &mut Vec<Pid>,
+        as_job: bool,
     ) -> OsResult<()> {
         let count = pipeline.commands.len();
         // The read end of the pipe from the previous command; the first
@@ -1542,8 +1593,13 @@ impl Shell {
             } else {
                 None
             };
+            // 0 for the first command, which leads the group itself.
+            let leader = pids.first().copied().unwrap_or(0);
             match fork()? {
                 ForkResult::Child => {
+                    if as_job {
+                        enter_job_process_group(leader, true);
+                    }
                     self.become_subshell();
                     let stdout = next_pipe.map(|(read, write)| {
                         drop(read);
@@ -1559,6 +1615,10 @@ impl Shell {
                     self.exit(status);
                 }
                 ForkResult::Parent { child } => {
+                    if as_job {
+                        let pgid = if leader == 0 { child } else { leader };
+                        job_process_started(child, pgid, true);
+                    }
                     pids.push(child);
                     // Replacing the previous read end closes it: only the
                     // commands may hold the pipes, or a reader never sees
@@ -1674,9 +1734,16 @@ impl Shell {
                 }
                 Ok(ForkResult::Parent { child }) => {
                     self.last_background_pid = Some(child);
+                    // XCU 2.11: the job's process is made a process group
+                    // leader, by both processes so that `kill %n` can never
+                    // find the group missing.
+                    let process_group = self.job_control_active().then(|| {
+                        job_process_started(child, child, false);
+                        child
+                    });
                     self.background_jobs.add_job(Job::new(
                         &[child],
-                        None,
+                        process_group,
                         conjunction.to_string(),
                         false,
                     ));

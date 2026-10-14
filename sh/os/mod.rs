@@ -14,7 +14,6 @@ use crate::shstr::ShString;
 use std::convert::Infallible;
 use std::ffi::{CString, OsStr, OsString};
 use std::fmt::{Display, Formatter};
-use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
@@ -529,14 +528,6 @@ pub fn move_job_control_tty_fd(fd: RawFd) -> OsResult<()> {
     let _ = JOB_CONTROL_TTY.compare_exchange(fd, copy, Ordering::SeqCst, Ordering::SeqCst);
     let _ = close(fd);
     Ok(())
-}
-
-pub fn is_process_in_foreground() -> bool {
-    if let Ok(pgid) = tcgetpgrp(io::stdin().as_raw_fd()) {
-        pgid == getpgrp()
-    } else {
-        false
-    }
 }
 
 pub fn find_in_path(command: &std::ffi::OsStr, env_path: &str) -> Option<OsString> {

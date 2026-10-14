@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::os::write;
+use crate::os::{dup_cloexec, write, OsResult};
 use crate::parse::command::{IORedirectionKind, Redirection, RedirectionKind};
 use crate::shell::{CommandExecutionError, Shell};
 use crate::shstr::{ShStr, ShString};
@@ -16,7 +16,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::rc::Rc;
 
@@ -51,6 +51,31 @@ pub enum OpenedFile {
 
 fn io_err_to_redirection_err(err: std::io::Error) -> CommandExecutionError {
     CommandExecutionError::RedirectionError(format!("sh: io error ({})", err))
+}
+
+/// A standard descriptor that a pipeline or command substitution replaces
+/// with a pipe end in its child process.
+#[derive(Clone, Copy)]
+pub enum StandardFd {
+    Stdin,
+    Stdout,
+}
+
+impl StandardFd {
+    fn fileno(self) -> u32 {
+        match self {
+            StandardFd::Stdin => STDIN_FILENO,
+            StandardFd::Stdout => STDOUT_FILENO,
+        }
+    }
+
+    /// Whether `file` names the shell's real descriptor for `self`.
+    fn is(self, file: &OpenedFile) -> bool {
+        matches!(
+            (self, file),
+            (StandardFd::Stdin, OpenedFile::Stdin) | (StandardFd::Stdout, OpenedFile::Stdout)
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -279,6 +304,39 @@ impl OpenedFiles {
             self.opened_files
                 .insert(STDIN_FILENO, OpenedFile::ReadFile(Rc::new(file)));
         }
+    }
+
+    /// Called just before the process puts something new (a pipe end) on the
+    /// real standard descriptor `fd`, as a pipeline or command substitution
+    /// does in its child. From then on the command's descriptor `fd` is that
+    /// new file, whatever an earlier `exec` redirected it to (`exec </dev/null;
+    /// echo a | cat` must still read the pipe). Any other descriptor that was a
+    /// copy of the old one (`exec 7<&0`, `exec 3>&1`) keeps its file: it is
+    /// given a descriptor of its own before the old one is replaced.
+    pub fn take_over_standard_fd(&mut self, fd: StandardFd) -> OsResult<()> {
+        let fileno = fd.fileno();
+        let mut detached: Option<Rc<File>> = None;
+        for (id, file) in self.opened_files.iter_mut() {
+            if *id == fileno || !fd.is(file) {
+                continue;
+            }
+            let copy = match &detached {
+                Some(copy) => copy.clone(),
+                None => detached
+                    .insert(Rc::new(File::from(dup_cloexec(fileno as RawFd)?)))
+                    .clone(),
+            };
+            *file = match fd {
+                StandardFd::Stdin => OpenedFile::ReadFile(copy),
+                StandardFd::Stdout => OpenedFile::WriteFile(copy),
+            };
+        }
+        let standard = match fd {
+            StandardFd::Stdin => OpenedFile::Stdin,
+            StandardFd::Stdout => OpenedFile::Stdout,
+        };
+        self.opened_files.insert(fileno, standard);
+        Ok(())
     }
 
     pub fn get_file(&self, fileno: u32) -> Option<&OpenedFile> {

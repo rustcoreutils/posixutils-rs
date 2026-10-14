@@ -40,6 +40,42 @@ fn pipeline_reads_its_pipe_after_exec_redirects_stdin() {
     );
 }
 
+// Likewise for standard output: a pipe or a command substitution replaces
+// whatever `exec` redirected it to, and a closed descriptor too.
+#[test]
+fn pipe_and_substitution_replace_exec_redirected_stdout() {
+    sh(
+        "exec 3>&1 >/dev/null; x=$(echo a); y=`echo b`; echo \"[$x$y]\" >&3",
+        "[ab]\n",
+    );
+    sh("exec 3>&1 >/dev/null; echo a | cat >&3", "a\n");
+    sh("exec 3>&1 >&-; x=$(echo a); echo \"[$x]\" >&3", "[a]\n");
+    sh("exec <&-; echo a | cat", "a\n");
+}
+
+// A descriptor that `exec` made a copy of standard input or output keeps
+// referring to that file inside a pipeline or command substitution;
+// configure writes its messages to `exec 6>&1` this way.
+#[test]
+fn exec_copy_of_standard_fd_survives_pipe() {
+    sh("exec 3>&1; x=$(echo hi >&3); echo \"[$x]\"", "hi\n[]\n");
+    sh(
+        "exec 3>&1 >/dev/null; x=$(echo a; echo b >&3); echo \"[$x]\" >&3",
+        "b\n[a]\n",
+    );
+    run_test(TestPlan {
+        cmd: "sh".to_string(),
+        args: vec![
+            "-c".to_string(),
+            "exec 7<&0 </dev/null; echo a | cat; cat <&7".to_string(),
+        ],
+        stdin_data: "in\n".to_string(),
+        expected_out: "a\nin\n".to_string(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
 // The redirection made by `exec` stays in effect for commands that are not
 // in a pipeline.
 #[test]

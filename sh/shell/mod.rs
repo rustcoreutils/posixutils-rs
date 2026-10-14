@@ -32,7 +32,7 @@ use crate::parse::word_parser::parse_word;
 use crate::parse::{AliasTable, ParserError};
 use crate::shell::environment::{CannotModifyReadonly, Environment, Value};
 use crate::shell::history::{initialize_history_from_system, write_history_to_file, History};
-use crate::shell::opened_files::OpenedFiles;
+use crate::shell::opened_files::{OpenedFiles, StandardFd};
 use crate::shstr::{ShStr, ShString};
 use crate::wordexp::{
     expand_declaration_operand, expand_word, expand_word_to_string, word_to_pattern,
@@ -1015,6 +1015,13 @@ impl Shell {
                                     .expect("failed to set process group for pipeline subcommand");
                                 drop(read_pipe);
                                 let write_stdout = write_pipe.into_raw_fd();
+                                // The first command reads the shell's own
+                                // standard input; every later one, its pipe.
+                                if current_stdin != libc::STDIN_FILENO {
+                                    self.opened_files.take_over_standard_fd(StandardFd::Stdin)?;
+                                }
+                                self.opened_files
+                                    .take_over_standard_fd(StandardFd::Stdout)?;
                                 dup2(current_stdin, libc::STDIN_FILENO)?;
                                 dup2(write_stdout, libc::STDOUT_FILENO)?;
                                 // fds 0 and 1 now hold both ends; the extra
@@ -1039,6 +1046,7 @@ impl Shell {
                             }
                         }
                     }
+                    self.opened_files.take_over_standard_fd(StandardFd::Stdin)?;
                     dup2(current_stdin, libc::STDIN_FILENO)?;
                     if current_stdin != libc::STDIN_FILENO {
                         close(current_stdin)?;
@@ -1232,6 +1240,8 @@ impl Shell {
             ForkResult::Child => {
                 self.become_subshell();
                 drop(read_pipe);
+                self.opened_files
+                    .take_over_standard_fd(StandardFd::Stdout)?;
                 dup2(write_pipe.as_raw_fd(), libc::STDOUT_FILENO)?;
                 self.execute_nested_program(program)
                     .map_err(CommandExecutionError::ParseError)?;

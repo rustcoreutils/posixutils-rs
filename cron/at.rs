@@ -292,8 +292,14 @@ fn remove_jobs(job_ids: &[u32]) -> Result<(), String> {
             let file_path = path.join(&job_info.file_name);
 
             // Only the job's owner (or root) may remove it (audit #A7).
-            let meta = fs::symlink_metadata(&file_path)
-                .map_err(|e| format!("{} {}: {}", gettext("Could not stat job"), job_id, e))?;
+            let meta = fs::symlink_metadata(&file_path).map_err(|e| {
+                format!(
+                    "{} {}: {}",
+                    gettext("Could not stat job"),
+                    job_id,
+                    plib::diag::io_error_text(&e)
+                )
+            })?;
             if uid != 0 && meta.uid() != uid {
                 return Err(format!("you do not own job {}", job_id));
             }

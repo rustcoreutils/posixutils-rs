@@ -79,7 +79,11 @@ fn install_crontab(target: &str, content: &str) -> ! {
     // file: this is the spool copy, and a crontab is readable only by its
     // owner and the daemon.
     if let Err(e) = plib::io::write_atomic_mode(Path::new(target), content.as_bytes(), 0o600) {
-        diag_error(&format!("{}: {}", gettext("cannot install crontab"), e));
+        diag_error(&format!(
+            "{}: {}",
+            gettext("cannot install crontab"),
+            plib::diag::io_error_text(&e)
+        ));
         exit(1);
     }
 
@@ -103,7 +107,11 @@ fn do_replace(target: &str, file: &Option<String>) -> ! {
     match read_source(file) {
         Ok(content) => install_crontab(target, &content),
         Err(e) => {
-            diag_error(&format!("{}: {}", gettext("cannot read input"), e));
+            diag_error(&format!(
+                "{}: {}",
+                gettext("cannot read input"),
+                plib::diag::io_error_text(&e)
+            ));
             exit(1);
         }
     }
@@ -118,7 +126,11 @@ fn do_list(target: &str) -> ! {
             exit(0);
         }
         Err(e) => {
-            diag_error(&format!("{}: {}", gettext("no crontab to list"), e));
+            diag_error(&format!(
+                "{}: {}",
+                gettext("no crontab to list"),
+                plib::diag::io_error_text(&e)
+            ));
             exit(1);
         }
     }
@@ -128,7 +140,11 @@ fn do_remove(target: &str) -> ! {
     match fs::remove_file(target) {
         Ok(()) => exit(0),
         Err(e) => {
-            diag_error(&format!("{}: {}", gettext("cannot remove crontab"), e));
+            diag_error(&format!(
+                "{}: {}",
+                gettext("cannot remove crontab"),
+                plib::diag::io_error_text(&e)
+            ));
             exit(1);
         }
     }
@@ -145,7 +161,7 @@ fn do_edit(target: &str) -> ! {
         diag_error(&format!(
             "{}: {}",
             gettext("cannot access crontab spool"),
-            e
+            plib::diag::io_error_text(&e)
         ));
         exit(1);
     }
@@ -158,7 +174,7 @@ fn do_edit(target: &str) -> ! {
             diag_error(&format!(
                 "{}: {}",
                 gettext("cannot create temporary file"),
-                e
+                plib::diag::io_error_text(&e)
             ));
             exit(1);
         }
@@ -166,7 +182,11 @@ fn do_edit(target: &str) -> ! {
     if let Err(e) = tmp.write_all(current.as_bytes()).and_then(|()| tmp.flush()) {
         discard_edit(
             tmp,
-            format!("{}: {}", gettext("cannot write temporary file"), e),
+            format!(
+                "{}: {}",
+                gettext("cannot write temporary file"),
+                plib::diag::io_error_text(&e)
+            ),
         );
     }
     let tmp_path = tmp.path().to_path_buf();
@@ -190,7 +210,14 @@ fn do_edit(target: &str) -> ! {
         ),
         // The editor never started, so the buffer is just a copy of the
         // current crontab and there is nothing to preserve.
-        Err(e) => discard_edit(tmp, format!("{}: {}", gettext("cannot launch editor"), e)),
+        Err(e) => discard_edit(
+            tmp,
+            format!(
+                "{}: {}",
+                gettext("cannot launch editor"),
+                plib::diag::io_error_text(&e)
+            ),
+        ),
     }
 
     match fs::read_to_string(&tmp_path) {
@@ -203,7 +230,11 @@ fn do_edit(target: &str) -> ! {
         // The edits exist but could not be read back; keep them.
         Err(e) => keep_edit(
             tmp,
-            format!("{}: {}", gettext("cannot read edited crontab"), e),
+            format!(
+                "{}: {}",
+                gettext("cannot read edited crontab"),
+                plib::diag::io_error_text(&e)
+            ),
         ),
     }
 }

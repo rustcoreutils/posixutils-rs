@@ -143,9 +143,11 @@ pub fn open_trusted(path: &Path, policy: &TrustPolicy) -> Result<(File, Metadata
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
-        .map_err(|e| format!("cannot open: {e}"))?;
+        .map_err(|e| format!("cannot open: {}", plib::diag::io_error_text(&e)))?;
 
-    let meta = file.metadata().map_err(|e| format!("cannot stat: {e}"))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("cannot stat: {}", plib::diag::io_error_text(&e)))?;
 
     check_metadata(&meta, policy).map_err(|r| r.to_string())?;
 

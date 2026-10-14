@@ -17,10 +17,10 @@ use crate::cli::terminal::Terminal;
 use crate::jobs::{JobManager, JobState};
 use crate::nonempty::NonEmpty;
 use crate::os::errno::Errno;
-use crate::os::signals::{kill, Signal, SignalManager};
+use crate::os::signals::{Signal, SignalManager};
 use crate::os::{
-    dup2, exec, find_command, fork, getpgid, getpgrp, is_process_in_foreground, pipe, setpgid,
-    tcsetpgrp, waitpid, ExecError, ForkResult, OsError, OsResult, Pid, WaitStatus,
+    dup2, exec, find_command, fork, getpgrp, give_terminal_to, is_process_in_foreground, pipe,
+    setpgid, waitpid, ExecError, ForkResult, OsError, OsResult, Pid, WaitStatus,
 };
 use crate::parse::command::{
     Assignment, CaseItem, Command, CommandType, CompleteCommand, CompoundCommand, Conjunction,
@@ -1215,17 +1215,22 @@ impl Shell {
     /// Runs a pipeline of two or more commands as one job (`set -m`): a
     /// wrapper subshell leads a process group of its own holding every
     /// command, and is given the terminal while it runs if the shell has it.
+    ///
+    /// Both processes put the wrapper in its group and hand it the terminal,
+    /// so it is done before any command runs whichever goes first. A call
+    /// that fails changes nothing for the commands, and is ignored as bash
+    /// ignores it: the terminal may have gone away (ENOTTY), or the wrapper
+    /// may have finished already (ESRCH, EPERM).
     fn run_pipeline_as_job(&mut self, pipeline: &Pipeline) -> OsResult<i32> {
+        let foreground = is_process_in_foreground();
+        let terminal = io::stdin().as_raw_fd();
         match fork()? {
             ForkResult::Child => {
-                self.become_subshell();
-                // this should never fail as both arguments are valid
-                setpgid(0, 0).expect("failed to create new process group");
-                // wait for the parent process to put the subshell in the foreground
-                if let Err(err) = kill(0, Some(Signal::SigStop)) {
-                    self.eprint(&format!("sh: internal call to kill failed ({err})"));
-                    self.exit(1);
+                let _ = setpgid(0, 0);
+                if foreground {
+                    let _ = give_terminal_to(terminal, getpgrp());
                 }
+                self.become_subshell();
                 let status = match self.run_pipeline_commands(pipeline) {
                     Ok(status) => status,
                     Err(err) => {
@@ -1235,47 +1240,17 @@ impl Shell {
                 };
                 self.exit(status);
             }
-            ForkResult::Parent { child } => loop {
-                // Blocking; a signal interrupts with EINTR and is
-                // handled below rather than being polled for.
-                match waitpid(child, false, true)? {
-                    WaitStatus::Exited { .. } => {
-                        // the only way this happened is if there was an error before going
-                        // the child went to sleep
-                        return Ok(1);
-                    }
-                    WaitStatus::Signaled { .. } => {
-                        self.eprint(
-                            "sh: unsynchronised pipeline was terminated by another process\n",
-                        );
-                        return Ok(1);
-                    }
-                    WaitStatus::Stopped { .. } => {
-                        if is_process_in_foreground() {
-                            // should never fail as child is a valid process id and
-                            // in the same session as the current shell
-                            let child_gpid =
-                                getpgid(child).expect("failed to get process id of child process");
-                            // should never fail as stdin is a valid file descriptor and
-                            // child gpid is valid and in the same session
-                            tcsetpgrp(io::stdin().as_raw_fd(), child_gpid)
-                                .expect("failed to set pipeline in foreground");
-                            kill(child, Some(Signal::SigCont)).expect("failed to start pipeline");
-                            let status = self.wait_child_process(child)?;
-                            // should never fail
-                            tcsetpgrp(io::stdin().as_raw_fd(), getpgrp())
-                                .expect("failed to reset foreground process");
-                            return Ok(status);
-                        } else {
-                            kill(child, Some(Signal::SigCont)).expect("failed start pipeline");
-                            return self.wait_child_process(child);
-                        }
-                    }
-                    WaitStatus::StillAlive | WaitStatus::Interrupted => {
-                        self.handle_async_events();
-                    }
+            ForkResult::Parent { child } => {
+                let _ = setpgid(child, child);
+                if foreground {
+                    let _ = give_terminal_to(terminal, child);
                 }
-            },
+                let status = self.wait_child_process(child);
+                if foreground {
+                    let _ = give_terminal_to(terminal, getpgrp());
+                }
+                status
+            }
         }
     }
 
@@ -1427,8 +1402,10 @@ impl Shell {
                     let job_control = self.job_control_active();
                     self.become_subshell();
                     if job_control {
-                        // should never fail
-                        setpgid(0, 0).expect("failed to create process group for background job");
+                        // Fails only for a session leader, which a forked
+                        // child is not; the job would then run in the
+                        // shell's group.
+                        let _ = setpgid(0, 0);
                     } else {
                         // POSIX 2.11: without job control, an asynchronous list
                         // ignores SIGINT and SIGQUIT and reads from /dev/null,

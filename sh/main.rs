@@ -10,7 +10,7 @@
 use crate::cli::args::{parse_args, ExecutionMode};
 use crate::cli::terminal::is_attached_to_terminal;
 use crate::cli::{clear_line, set_cursor_pos};
-use crate::os::{getpgrp, is_process_in_foreground, tcsetpgrp, wait_for_input};
+use crate::os::wait_for_input;
 use crate::parse::ParserError;
 use crate::shell::Shell;
 use crate::shstr::{ShStr, ShString};
@@ -313,10 +313,6 @@ fn non_terminal_repl(shell: &mut Shell) -> ! {
 }
 
 fn interactive_shell(shell: &mut Shell) {
-    if is_process_in_foreground() {
-        let pgid = getpgrp();
-        tcsetpgrp(io::stdin().as_raw_fd(), pgid).unwrap();
-    }
     shell.terminal.set_nonblocking_no_echo();
     unsafe { handle_signal_ignore(Signal::SigQuit) }
     unsafe { handle_signal_ignore(Signal::SigTerm) }

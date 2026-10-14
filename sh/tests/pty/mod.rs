@@ -293,3 +293,15 @@ fn pipeline_survives_the_terminal_going_away() {
     assert_eq!(read_result(&dir.path().join("out2")), "a\n");
     assert!(ok, "the shell exited unsuccessfully");
 }
+
+// Under job control the pipeline is a job of its own and is handed the
+// terminal; taking it back after the terminal has gone away fails (ENOTTY)
+// and must change nothing, as in bash (dash stops with an error).
+#[test]
+fn job_control_pipeline_survives_the_terminal_going_away() {
+    let dir = tempdir().unwrap();
+    let ok = run_through_a_hangup(&pipeline_across_a_hangup("set -m"), dir.path());
+    assert_eq!(read_result(&dir.path().join("out")), "survived 0\n");
+    assert_eq!(read_result(&dir.path().join("out2")), "a\n");
+    assert!(ok, "the shell exited unsuccessfully");
+}

@@ -496,6 +496,25 @@ pub fn tcsetpgrp(fd: RawFd, pgid: Pid) -> OsResult<()> {
     Ok(())
 }
 
+/// `tcsetpgrp` with SIGTTOU blocked. A process outside the terminal's
+/// foreground process group, such as a shell taking the terminal back from a
+/// job, is otherwise stopped by SIGTTOU instead (XSH tcsetpgrp()); blocking
+/// the signal lets the call go ahead without one being sent.
+pub fn give_terminal_to(fd: RawFd, pgid: Pid) -> OsResult<()> {
+    // SAFETY: both sets are initialised (sigemptyset, sigprocmask) before
+    // they are read.
+    unsafe {
+        let mut block: libc::sigset_t = std::mem::zeroed();
+        let mut previous: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut block);
+        libc::sigaddset(&mut block, libc::SIGTTOU);
+        libc::sigprocmask(libc::SIG_BLOCK, &block, &mut previous);
+        let result = tcsetpgrp(fd, pgid);
+        libc::sigprocmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+        result
+    }
+}
+
 pub fn is_process_in_foreground() -> bool {
     if let Ok(pgid) = tcgetpgrp(io::stdin().as_raw_fd()) {
         pgid == getpgrp()
@@ -534,14 +553,6 @@ pub fn setpgid(pid: Pid, pgid: Pid) -> OsResult<()> {
         return Err(OsError::from_current_errno("setpgid"));
     }
     Ok(())
-}
-
-pub fn getpgid(pid: Pid) -> OsResult<Pid> {
-    let pid = unsafe { libc::getpgid(pid) };
-    if pid < 0 {
-        return Err(OsError::from_current_errno("getpgid"));
-    }
-    Ok(pid)
 }
 
 pub fn chdir(path: &OsStr) -> LibcResult<()> {

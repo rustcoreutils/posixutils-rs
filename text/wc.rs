@@ -178,7 +178,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(count) => rows.push((count, None)),
             Err(e) => {
                 exit_code = 1;
-                eprintln!("wc: stdin: {}", e);
+                eprintln!("wc: stdin: {}", plib::diag::io_error_text(&e));
             }
         }
     } else {

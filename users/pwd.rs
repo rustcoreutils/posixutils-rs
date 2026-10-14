@@ -101,7 +101,7 @@ fn main() -> ExitCode {
             plib::diag::error(&format!(
                 "{}: {}",
                 gettext("cannot determine current directory"),
-                e
+                plib::diag::io_error_text(&e)
             ));
             return ExitCode::from(1);
         }

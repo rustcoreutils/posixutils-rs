@@ -210,7 +210,7 @@ pub enum TalkError {
     NotTty,
     #[error("Failed to resolve addresses: {0}")]
     AddressResolutionFailed(String),
-    #[error("I/O error: {0}")]
+    #[error("I/O error: {}", plib::diag::io_error_text(.0))]
     IoError(#[from] io::Error),
     #[error("An error occurred: {0}")]
     Other(String),
@@ -588,11 +588,14 @@ fn talk_local(args: Args) -> Result<(), TalkError> {
                     let _ = send_delete_local(&socket_path, &mut msg, &mut res);
 
                     if let Err(e) = handle_client(client_stream) {
-                        eprintln!("Failed to handle client: {}", e);
+                        eprintln!("Failed to handle client: {}", plib::diag::io_error_text(&e));
                     }
                     break;
                 }
-                Err(e) => eprintln!("Failed to accept connection: {}", e),
+                Err(e) => eprintln!(
+                    "Failed to accept connection: {}",
+                    plib::diag::io_error_text(&e)
+                ),
             }
         }
     }
@@ -721,7 +724,7 @@ fn spawn_input_thread(
         // Initialize terminal drawing. The stdout lock is taken and released
         // inside; each render below re-acquires it briefly (audit #TK21).
         if let Err(e) = draw_terminal(split_row, width) {
-            eprintln!("Failed to draw terminal: {}", e);
+            eprintln!("Failed to draw terminal: {}", plib::diag::io_error_text(&e));
             return; // Exit thread on failure
         }
 
@@ -776,7 +779,10 @@ fn spawn_input_thread(
                         // The peer's stream is display-only: nothing it sends is
                         // echoed back, so the transmit half of `apply` is dropped.
                         if let Err(e) = apply(c, &keys, &mut win, &mut handle, Origin::Peer) {
-                            eprintln!("Error rendering peer input: {}", e);
+                            eprintln!(
+                                "Error rendering peer input: {}",
+                                plib::diag::io_error_text(&e)
+                            );
                             break;
                         }
                     }
@@ -1396,13 +1402,13 @@ fn handle_new_invitation(
     msg.id_num = local_id;
     let msg_bytes1 = msg
         .to_bytes()
-        .map_err(|e| TalkError::Other(e.to_string()))?;
+        .map_err(|e| TalkError::Other(plib::diag::io_error_text(&e)))?;
 
     msg.r#type = MessageType::Delete as u8;
     msg.id_num = remote_id;
     let msg_bytes2 = msg
         .to_bytes()
-        .map_err(|e| TalkError::Other(e.to_string()))?;
+        .map_err(|e| TalkError::Other(plib::diag::io_error_text(&e)))?;
 
     let clone_socket = Arc::clone(&socket);
 
@@ -1423,10 +1429,13 @@ fn handle_new_invitation(
                 send_delete(daemon_port, his_machine_addr, msg, &socket, res)?;
 
                 if let Err(e) = handle_client(client_stream) {
-                    eprintln!("Failed to handle client: {}", e);
+                    eprintln!("Failed to handle client: {}", plib::diag::io_error_text(&e));
                 }
             }
-            Err(e) => eprintln!("Failed to accept connection: {}", e),
+            Err(e) => eprintln!(
+                "Failed to accept connection: {}",
+                plib::diag::io_error_text(&e)
+            ),
         }
     }
 
@@ -1634,7 +1643,11 @@ fn resolve_address(host: &str) -> Result<Ipv4Addr, io::Error> {
     let addrs = (host, 0u16).to_socket_addrs().map_err(|e| {
         io::Error::new(
             io::ErrorKind::NotFound,
-            format!("Error resolving address for {}: {}", host, e),
+            format!(
+                "Error resolving address for {}: {}",
+                host,
+                plib::diag::io_error_text(&e)
+            ),
         )
     })?;
 
@@ -2044,7 +2057,7 @@ fn request(
     msg.r#type = msg_type as u8;
     let msg_bytes = msg
         .to_bytes()
-        .map_err(|e| TalkError::Other(e.to_string()))?;
+        .map_err(|e| TalkError::Other(plib::diag::io_error_text(&e)))?;
 
     let start_time = Instant::now();
     let timeout = Duration::from_secs(5);
@@ -2074,13 +2087,13 @@ fn request(
                         continue;
                     }
                     Err(e) => {
-                        eprintln!("Error receiving message: {}", e);
+                        eprintln!("Error receiving message: {}", plib::diag::io_error_text(&e));
                         return Err(TalkError::IoError(e));
                     }
                 }
             }
             Err(e) => {
-                eprintln!("Error sending message: {}", e);
+                eprintln!("Error sending message: {}", plib::diag::io_error_text(&e));
                 return Err(TalkError::IoError(e));
             }
         }
@@ -2136,7 +2149,7 @@ fn request_local(
     msg.r#type = msg_type as u8;
     let msg_bytes = msg
         .to_bytes()
-        .map_err(|e| TalkError::Other(e.to_string()))?;
+        .map_err(|e| TalkError::Other(plib::diag::io_error_text(&e)))?;
 
     let start_time = Instant::now();
     let timeout = Duration::from_secs(5);
@@ -2288,7 +2301,7 @@ fn clear_terminal() {
 fn handle_delete_invitations(socket: &UdpSocket, msg_bytes: &[u8], talkd_addr: &SocketAddr) {
     loop {
         if let Err(e) = socket.send_to(msg_bytes, talkd_addr) {
-            eprintln!("Error sending message: {}", e);
+            eprintln!("Error sending message: {}", plib::diag::io_error_text(&e));
             break;
         }
 
@@ -2307,7 +2320,7 @@ fn handle_delete_invitations(socket: &UdpSocket, msg_bytes: &[u8], talkd_addr: &
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(e) => {
-                eprintln!("Error receiving message: {}", e);
+                eprintln!("Error receiving message: {}", plib::diag::io_error_text(&e));
                 break;
             }
         }

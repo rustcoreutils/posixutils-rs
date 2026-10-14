@@ -153,3 +153,27 @@ fn pwd_physical_write_error_on_full_device() {
     // with the system's text for the error and exit status 1.
     plib::testing::assert_write_error_message_on_full_device("pwd", &["-P"], b"", 1);
 }
+
+/// A working directory that has been removed is reported with the system's
+/// text for the error, without Rust's "(os error N)" suffix.
+#[cfg(target_os = "linux")]
+#[test]
+fn pwd_physical_removed_directory_names_the_system_error() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let gone = dir.path().join("gone");
+    std::fs::create_dir(&gone).unwrap();
+    let out = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("cd \"$1\" && rmdir \"$1\" && exec \"$2\" -P")
+        .arg("sh")
+        .arg(&gone)
+        .arg(plib::testing::get_binary_path("pwd"))
+        .output()
+        .unwrap();
+    let enoent = plib::diag::io_error_text(&std::io::Error::from_raw_os_error(libc::ENOENT));
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("pwd: cannot determine current directory: {enoent}\n")
+    );
+}

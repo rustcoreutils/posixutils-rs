@@ -213,7 +213,11 @@ fn main() {
                 deliver(&mut recipient, &rendered);
             }
             Err(e) => {
-                plib::diag::error(&format!("{}: {}", gettext("read error"), e));
+                plib::diag::error(&format!(
+                    "{}: {}",
+                    gettext("read error"),
+                    plib::diag::io_error_text(&e)
+                ));
                 exit(1);
             }
         }

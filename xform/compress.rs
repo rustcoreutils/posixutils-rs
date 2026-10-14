@@ -1131,7 +1131,7 @@ fn main() {
         match get_compress_algorithm(&args) {
             Ok(a) => a,
             Err(e) => {
-                diag::error(&e.to_string());
+                diag::error(&plib::diag::io_error_text(&e));
                 std::process::exit(1);
             }
         }

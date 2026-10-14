@@ -24,6 +24,7 @@ use crate::builtin::getopts::GetOpts;
 use crate::builtin::hash::Hash;
 use crate::builtin::jobs::Jobs;
 use crate::builtin::kill::Kill;
+use crate::builtin::printf::Printf;
 use crate::builtin::pwd::Pwd;
 use crate::builtin::read::BuiltinRead;
 use crate::builtin::readonly::ReadOnly;
@@ -64,6 +65,7 @@ mod getopts;
 mod hash;
 mod jobs;
 mod kill;
+mod printf;
 pub(crate) mod pwd;
 mod read;
 mod readonly;
@@ -201,8 +203,9 @@ pub fn get_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
         "true" => Some(&True),
         "false" => Some(&False),
         // Printing is the commonest thing a script does; dash and bash both
-        // build echo in rather than fork for every line.
+        // build these in rather than fork for every line.
         "echo" => Some(&Echo),
+        "printf" => Some(&Printf),
         // A conditional is the most frequently executed command in a script;
         // forking one per `[ ... ]` makes every loop pay for a process.
         "test" => Some(&Test {

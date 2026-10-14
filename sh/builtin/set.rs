@@ -64,6 +64,7 @@ impl SpecialBuiltinUtility for SetSpecialBuiltin {
                             opened_files.write_out(line);
                         }
                     }
+                    ParsedArgs::OptionsOnly => {}
                     ParsedArgs::ArgsStart(i) => {
                         shell.positional_parameters = args[i..].to_vec();
                     }
@@ -136,6 +137,10 @@ pub enum ParsedArgs {
     PrintSettingsShellReadable,
     ResetPositionalParameters,
     PrintVars,
+    /// Only options were given, so the positional parameters stay as they are.
+    OptionsOnly,
+    /// The positional parameters are replaced by the arguments from this index
+    /// on, which may be none after `--`.
     ArgsStart(usize),
 }
 
@@ -280,11 +285,13 @@ impl SetOptions {
             }
         }
         let mut i = 0;
+        let mut saw_double_dash = false;
         while i < args.len() {
             match args[i] {
                 // POSIX: `--` terminates the options wherever it appears, not
                 // only in first position (`set -f -- "$@"` is the common form).
                 "--" => {
+                    saw_double_dash = true;
                     i += 1;
                     break;
                 }
@@ -303,7 +310,13 @@ impl SetOptions {
             }
             i += 1;
         }
-        Ok(ParsedArgs::ArgsStart(i))
+        // The positional parameters are replaced only when there are
+        // arguments after the options, or `--` says the empty list is meant.
+        if i == args.len() && !saw_double_dash {
+            Ok(ParsedArgs::OptionsOnly)
+        } else {
+            Ok(ParsedArgs::ArgsStart(i))
+        }
     }
 }
 
@@ -350,7 +363,7 @@ mod tests {
     #[test]
     fn parse_positive_short_options_no_args() {
         let (options, parse_result) = parse_args(vec!["-a", "-nmh", "-C"]);
-        assert_eq!(parse_result, ParsedArgs::ArgsStart(3));
+        assert_eq!(parse_result, ParsedArgs::OptionsOnly);
         assert_eq!(
             options,
             SetOptions {
@@ -367,7 +380,7 @@ mod tests {
     #[test]
     fn parse_negative_short_options_no_args() {
         let (options, parse_result) = parse_args(vec!["+xvu", "+e", "+x"]);
-        assert_eq!(parse_result, ParsedArgs::ArgsStart(3));
+        assert_eq!(parse_result, ParsedArgs::OptionsOnly);
         assert_eq!(
             options,
             SetOptions {
@@ -413,7 +426,7 @@ mod tests {
     #[test]
     fn parse_positive_long_options_no_args() {
         let (options, parse_result) = parse_args(vec!["-o", "ignoreeof", "-o", "notify"]);
-        assert_eq!(parse_result, ParsedArgs::ArgsStart(4));
+        assert_eq!(parse_result, ParsedArgs::OptionsOnly);
         assert_eq!(
             options,
             SetOptions {
@@ -427,7 +440,7 @@ mod tests {
     #[test]
     fn parse_negative_long_options_no_args() {
         let (options, parse_result) = parse_args(vec!["+o", "vi", "+o", "nolog"]);
-        assert_eq!(parse_result, ParsedArgs::ArgsStart(4));
+        assert_eq!(parse_result, ParsedArgs::OptionsOnly);
         assert_eq!(
             options,
             SetOptions {

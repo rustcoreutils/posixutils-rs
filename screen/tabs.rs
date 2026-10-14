@@ -13,6 +13,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use gettextrs::gettext;
+use plib::diag::WriteError;
 use terminfo::{capability as cap, Database};
 
 // POSIX: "The maximum number of tab stops allowed is terminal-dependent."
@@ -273,6 +274,15 @@ fn parse_cmd_line_inner(args: &Args, max: u16) -> Result<Vec<u16>, String> {
     Ok(generate_repetitive_tabs(8, max))
 }
 
+/// A capability that could not be sent: a failed write is a write error,
+/// anything else is described with `what` was being done.
+fn cap_failure(what: String, e: terminfo::Error) -> io::Error {
+    match e {
+        terminfo::Error::Io(e) => WriteError(e).into(),
+        e => io::Error::other(format!("{what}: {e}")),
+    }
+}
+
 /// Set hardware tabs using terminfo capabilities.
 fn set_hw_tabs(info: &Database, tabstops: &[u16]) -> io::Result<()> {
     // POSIX: "If standard output is not a terminal, undefined results occur."
@@ -294,27 +304,25 @@ fn set_hw_tabs(info: &Database, tabstops: &[u16]) -> io::Result<()> {
 
     // Clear existing tabs
     if let Err(e) = clear_cap.expand().to(io::stdout()) {
-        let msg = format!("{}: {}", gettext("failed to clear tabs"), e);
-        return Err(io::Error::other(msg));
+        return Err(cap_failure(gettext("failed to clear tabs"), e));
     }
 
     // Set new tabs (if any - might be empty for -0)
     let mut col: u16 = 0;
     for &stop in tabstops {
         while col < stop {
-            io::stdout().write_all(b" ")?;
+            io::stdout().write_all(b" ").map_err(WriteError)?;
             col += 1;
         }
 
         if let Err(e) = set_cap.expand().to(io::stdout()) {
-            let msg = format!("{}: {}", gettext("failed to set tab stop"), e);
-            return Err(io::Error::other(msg));
+            return Err(cap_failure(gettext("failed to set tab stop"), e));
         }
     }
 
     // Carriage return to reset cursor position
-    io::stdout().write_all(b"\r")?;
-    io::stdout().flush()?;
+    io::stdout().write_all(b"\r").map_err(WriteError)?;
+    io::stdout().flush().map_err(WriteError)?;
 
     Ok(())
 }
@@ -385,7 +393,7 @@ fn main() -> ExitCode {
 
     // Set the hardware tabs
     if let Err(e) = set_hw_tabs(&info, &tabstops) {
-        eprintln!("{}: {}", gettext("tabs"), e);
+        plib::diag::error(&plib::diag::error_text(&e));
         return ExitCode::from(1);
     }
 

@@ -4253,3 +4253,18 @@ fn test_lex_error_names_the_file() {
     );
     assert_ne!(out.status.code(), Some(0));
 }
+
+// A failed write to standard output is "lex: write error: REASON".
+#[cfg(target_os = "linux")]
+#[test]
+fn write_error_message_on_full_device() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let spec = dir.path().join("t.l");
+    std::fs::write(&spec, "%%\n[a-z]+ ;\n%%\n").unwrap();
+    plib::testing::assert_write_error_message_on_full_device(
+        "lex",
+        &["-t", spec.to_str().unwrap()],
+        b"",
+        1,
+    );
+}

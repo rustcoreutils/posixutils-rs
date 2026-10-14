@@ -9,10 +9,11 @@
 
 use crate::builtin::trap::TrapAction;
 use crate::os::errno::{get_current_errno_value, Errno};
-use crate::os::{pipe, read, write, OsError, OsResult, Pid};
+use crate::os::{pipe, read, OsError, OsResult, Pid};
 use std::fmt::{Display, Formatter};
 use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
@@ -228,26 +229,75 @@ pub const SIGNALS: &[Signal] = &[
     Signal::SigSys,
 ];
 
-static mut SIGNAL_WRITE: Option<RawFd> = None;
-static mut SIGNAL_READ: Option<RawFd> = None;
+/// The two ends of the self-pipe that wakes the shell when a trapped signal
+/// arrives, or -1 before it exists. Written once at startup and read from the
+/// signal handler, hence atomics.
+static SIGNAL_WRITE: AtomicI32 = AtomicI32::new(-1);
+static SIGNAL_READ: AtomicI32 = AtomicI32::new(-1);
 
-extern "C" fn write_signal_to_buffer(signal: libc::c_int) {
-    // SIGNAL_WRITE is never modified after the initial
-    // setup, and is a valid file descriptor, so this is safe
-    let fd = unsafe { SIGNAL_WRITE.unwrap() };
-    write(fd, &signal.to_ne_bytes()).expect("failed to write to signal buffer");
+/// One flag per signal number, set by the handler and cleared when the shell
+/// takes the signal. The pipe only wakes the shell up: it has a fixed
+/// capacity, while these flags cannot overflow, so which signals arrived is
+/// never lost however many arrive before the shell looks. Several deliveries
+/// of one signal coalesce into one, as POSIX allows (XCU 2.11).
+static PENDING: [AtomicBool; 128] = [const { AtomicBool::new(false) }; 128];
+
+/// The calling thread's `errno`.
+fn errno_location() -> *mut libc::c_int {
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "emscripten"))]
+    unsafe {
+        libc::__errno_location()
+    }
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    unsafe {
+        libc::__error()
+    }
+    #[cfg(any(target_os = "openbsd", target_os = "netbsd"))]
+    unsafe {
+        libc::__errno()
+    }
+}
+
+/// The handler of every trapped signal. It runs between any two instructions
+/// of the shell, so it does only async-signal-safe things: it never blocks
+/// (the pipe is non-blocking, and a full pipe already holds a wake-up), never
+/// allocates or panics, and it leaves `errno` as it found it, or a signal
+/// arriving between a failed call and the read of its `errno` would change
+/// the error the shell reports.
+extern "C" fn record_signal(signal: libc::c_int) {
+    let errno = errno_location();
+    let saved_errno = unsafe { *errno };
+    if let Some(flag) = usize::try_from(signal).ok().and_then(|n| PENDING.get(n)) {
+        flag.store(true, Ordering::SeqCst);
+    }
+    let fd = SIGNAL_WRITE.load(Ordering::SeqCst);
+    if fd >= 0 {
+        let byte = 0u8;
+        // Nothing to do about a failure: EAGAIN is a full pipe, which wakes
+        // the shell anyway, and the flag above records the signal.
+        unsafe { libc::write(fd, (&byte as *const u8).cast(), 1) };
+    }
+    unsafe { *errno = saved_errno };
 }
 
 /// # Safety
 /// cannot be called by multiple threads
 pub unsafe fn setup_signal_handling() {
     let (read_pipe, write_pipe) = pipe().expect("could not create signal buffer pipe");
-    let result = unsafe { libc::fcntl(read_pipe.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
-    if result < 0 {
-        panic!(
-            "failed initialize async buffer for signal handling ({})",
-            get_current_errno_value()
-        );
+    // Neither end may block: the handler must not wait for room in a full
+    // pipe, and the shell must not wait for a byte when none is pending.
+    for fd in [read_pipe.as_raw_fd(), write_pipe.as_raw_fd()] {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            panic!(
+                "failed initialize async buffer for signal handling ({})",
+                get_current_errno_value()
+            );
+        }
     }
     // This pipe belongs to the shell alone; the utilities it execs must not
     // inherit either end.
@@ -259,49 +309,51 @@ pub unsafe fn setup_signal_handling() {
             );
         }
     }
-    SIGNAL_WRITE = Some(write_pipe.into_raw_fd());
-    SIGNAL_READ = Some(read_pipe.into_raw_fd());
+    SIGNAL_WRITE.store(write_pipe.into_raw_fd(), Ordering::SeqCst);
+    SIGNAL_READ.store(read_pipe.into_raw_fd(), Ordering::SeqCst);
 }
 
 /// The read end of the self-pipe the signal handlers write to. Pollable, so a
 /// wait for input can be woken by a signal instead of being timed out.
 pub fn signal_read_fd() -> RawFd {
-    // SIGNAL_READ is never modified after the initial setup, so this is safe
-    unsafe { SIGNAL_READ.unwrap() }
+    SIGNAL_READ.load(Ordering::SeqCst)
 }
 
 fn get_pending_signal() -> Option<Signal> {
-    // SIGNAL_READ is never modified after the initial
-    // setup, so this is safe
-    let fd = unsafe { SIGNAL_READ.unwrap() };
-    let mut buf = [0u8; size_of::<libc::c_int>()];
-    match read(fd, &mut buf) {
-        Err(err) => {
-            if err.errno == Errno::EAGAIN {
-                None
-            } else {
-                panic!("failed to write to signal pipe ({err})");
-            }
-        }
-        Ok(size) => {
-            if size == 0 {
-                None
-            } else {
-                let signal = libc::c_int::from_ne_bytes(buf);
-                Some(Signal::try_from(signal).unwrap())
+    // Empty the pipe before looking at the flags: a signal that arrives in
+    // between leaves both its flag and a byte, and the byte wakes the shell
+    // again later, so nothing is missed.
+    let fd = signal_read_fd();
+    let mut buf = [0u8; 256];
+    loop {
+        match read(fd, &mut buf) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(err) => {
+                if err.errno == Errno::EAGAIN {
+                    break;
+                } else {
+                    panic!("failed to read from signal pipe ({err})");
+                }
             }
         }
     }
+    SIGNALS
+        .iter()
+        .copied()
+        .find(|&signal| PENDING[i32::from(signal) as usize].swap(false, Ordering::SeqCst))
 }
 
 unsafe fn handle_signal(signal: Signal, handler: libc::sighandler_t) {
     // sigaction contains different field on different systems, we can't
     // initialize it directly
     let mut action = std::mem::zeroed::<libc::sigaction>();
+    // A one-argument handler (or SIG_DFL/SIG_IGN), so not SA_SIGINFO, which
+    // would call it with three.
     action.sa_sigaction = handler;
     // never fails
     libc::sigemptyset(&mut action.sa_mask);
-    action.sa_flags = libc::SA_SIGINFO;
+    action.sa_flags = 0;
 
     let result = libc::sigaction(signal.into(), &action, std::ptr::null_mut());
     if result < 0 {
@@ -336,7 +388,7 @@ pub fn reset_inherited_sigchld() {
 pub unsafe fn handle_signal_write_to_signal_buffer(signal: Signal) {
     handle_signal(
         signal,
-        write_signal_to_buffer as *const extern "C" fn(libc::c_int) as libc::sighandler_t,
+        record_signal as *const extern "C" fn(libc::c_int) as libc::sighandler_t,
     )
 }
 

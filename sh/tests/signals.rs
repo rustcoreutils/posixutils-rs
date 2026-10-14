@@ -134,3 +134,50 @@ fn pipeline_without_job_control_stays_in_the_shell_process_group() {
         "same\n",
     );
 }
+
+// A flood of trapped signals while the shell is blocked must neither hang it
+// nor lose a signal. The shell is blocked reading a command substitution,
+// whose reads are retried after each interruption without running traps,
+// while the substitution's command sends it tens of thousands of USR1s and
+// then one USR2. Every delivery used to write a record to a blocking
+// self-pipe, which filled up, and the next signal handler blocked in write()
+// forever. The same signal may be coalesced (XCU 2.11), so USR1 must run at
+// least once and USR2 exactly once, as in dash and bash.
+#[test]
+fn signal_flood_neither_hangs_nor_loses_a_signal() {
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let script = format!(
+        "n=0; trap 'n=$((n+1))' USR1; trap 'm=$((m+1))' USR2; \
+         x=$({SH} -c 'i=0; while [ $i -lt 30000 ]; do kill -USR1 $1; i=$((i+1)); done; \
+         kill -USR2 $1; echo done' flood $$); \
+         echo $x; [ $n -ge 1 ] && echo usr1; echo usr2=$m"
+    );
+    let child = Command::new(SH)
+        .args(["-c", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sh");
+    let pid = child.id() as libc::pid_t;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let output = match rx.recv_timeout(Duration::from_secs(120)) {
+        Ok(output) => output.expect("wait for sh"),
+        Err(_) => {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            panic!("the shell hung under a flood of trapped signals");
+        }
+    };
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "done\nusr1\nusr2=1\n"
+    );
+    assert!(output.status.success());
+}

@@ -329,3 +329,27 @@ fn gencat_write_error_on_full_device() {
         1,
     );
 }
+
+/// A message file that cannot be read, or a catalog that cannot be written,
+/// is reported with the system's text for the error, without Rust's
+/// "(os error N)" suffix or a `Debug` dump.
+#[test]
+fn gencat_io_errors_name_the_system_error() {
+    let missing = "/nonexistent/gencat-input.msg";
+    let open_error = plib::diag::io_error_text(&std::fs::File::open(missing).unwrap_err());
+    let out = plib::testing::run_test_base("gencat", &["-".into(), missing.into()], b"");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(&open_error), "{stderr:?}");
+    assert!(!stderr.contains("(os error"), "{stderr:?}");
+
+    let target = "/nonexistent/gencat-out.cat";
+    let create_error = plib::diag::io_error_text(&std::fs::File::create(target).unwrap_err());
+    let msg = env!("CARGO_MANIFEST_DIR").to_string() + "/tests/gencat/sets_and_messages.msg";
+    let out = plib::testing::run_test_base("gencat", &[target.into(), msg], b"");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("gencat: {target}: {create_error}\n")
+    );
+}

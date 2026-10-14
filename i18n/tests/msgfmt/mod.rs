@@ -743,3 +743,38 @@ fn test_msgfmt_check_plural_forms_as_gnu() {
         }
     }
 }
+
+/// Failures to read an input or create the output are reported with the
+/// system's text for the error, without Rust's "(os error N)" suffix.
+#[test]
+fn msgfmt_io_errors_name_the_system_error() {
+    let target = "/nonexistent/msgfmt-out.mo";
+    let create_error = plib::diag::io_error_text(&std::fs::File::create(target).unwrap_err());
+    let out = plib::testing::run_test_base(
+        "msgfmt",
+        &["-o".into(), target.into(), "/dev/null".into()],
+        b"",
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("msgfmt: {target}: {create_error}\n")
+    );
+
+    #[cfg(target_os = "linux")]
+    {
+        let dir = plib::tmp::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let read_error = plib::diag::io_error_text(&std::fs::read(&path).unwrap_err());
+        let out = plib::testing::run_test_base(
+            "msgfmt",
+            &["-o".into(), "/dev/null".into(), path.clone()],
+            b"",
+        );
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            format!("msgfmt: {path}: I/O error: {read_error}\n")
+        );
+    }
+}

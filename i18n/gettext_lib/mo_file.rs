@@ -104,7 +104,7 @@ impl std::fmt::Display for MoError {
         match self {
             MoError::InvalidMagic(magic) => write!(f, "invalid magic number: 0x{:08x}", magic),
             MoError::InvalidFormat(msg) => write!(f, "invalid format: {}", msg),
-            MoError::Io(e) => write!(f, "I/O error: {}", e),
+            MoError::Io(e) => write!(f, "I/O error: {}", plib::diag::io_error_text(e)),
             MoError::InvalidUtf8(e) => write!(f, "invalid UTF-8: {}", e),
         }
     }

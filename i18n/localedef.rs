@@ -319,7 +319,8 @@ fn main() {
 /// never emitted, because compiling a real locale is the deferred LD-1; when
 /// that lands the data will need to be carried as bytes rather than decoded here.
 fn read_source(path: &Path) -> Result<String, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {}", path.display(), e))?;
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("{}: {}", path.display(), plib::diag::io_error_text(&e)))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -331,7 +332,7 @@ fn read_input(input_path: &Option<PathBuf>) -> Result<String, String> {
             let mut content = Vec::new();
             std::io::stdin()
                 .read_to_end(&mut content)
-                .map_err(|e| format!("stdin: {}", e))?;
+                .map_err(|e| format!("stdin: {}", plib::diag::io_error_text(&e)))?;
             Ok(String::from_utf8_lossy(&content).into_owned())
         }
     }

@@ -15,12 +15,7 @@ use crate::shstr::ShString;
 pub struct Eval;
 
 impl SpecialBuiltinUtility for Eval {
-    fn exec(
-        &self,
-        args: &[ShString],
-        shell: &mut Shell,
-        opened_files: &mut OpenedFiles,
-    ) -> BuiltinResult {
+    fn exec(&self, args: &[ShString], shell: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
         let args = skip_option_terminator(args);
         // `eval` concatenates its operands and reparses them; the lexer works
         // on bytes, so nothing has to be text.
@@ -32,9 +27,7 @@ impl SpecialBuiltinUtility for Eval {
             program.extend_from_slice(arg.as_bytes());
         }
 
-        let saved = shell.opened_files.install(opened_files.clone());
         let execution_result = shell.execute_nested_program(&program);
-        shell.opened_files.restore(saved);
 
         execution_result
             .map_err(|err| format!("eval: parsing error({}): {}", err.lineno, err.message).into())

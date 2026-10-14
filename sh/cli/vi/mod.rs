@@ -521,14 +521,13 @@ impl ViEditor {
                     .ok_or(CommandError)?;
                 let (fd, path) = mkstemp("/tmp/sh-vi.XXXXXX").map_err(|_| CommandError)?;
                 write(fd, &content).map_err(|_| CommandError)?;
-                let opened = shell.opened_files.clone();
                 // restore cooked mode for the editor, then return to raw mode
                 shell.terminal.reset();
                 let args = vec![
                     crate::shstr::ShString::from(editor.clone()),
                     crate::shstr::ShString::from(path.as_os_str()),
                 ];
-                let _ = shell.fork_and_exec(command_path, &args, &opened);
+                let _ = shell.fork_and_exec(command_path, &args);
                 shell.terminal.set_nonblocking_no_echo();
                 // read the edited file back (a fresh handle avoids fd-offset issues)
                 let edited = std::fs::read(&path).map_err(|_| CommandError)?;

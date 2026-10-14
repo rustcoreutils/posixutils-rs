@@ -10,13 +10,12 @@
 use crate::os::errno::{get_current_errno_value, Errno};
 use crate::os::signals::TermSignal;
 use crate::shell::environment::Environment;
-use crate::shell::opened_files::{OpenedFile, OpenedFiles};
 use crate::shstr::ShString;
 use std::convert::Infallible;
 use std::ffi::{CString, OsStr, OsString};
 use std::fmt::{Display, Formatter};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
@@ -189,6 +188,29 @@ pub fn dup_cloexec(fd: RawFd) -> OsResult<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(dup_result) })
 }
 
+/// Copies `fd` to a descriptor of the shell's own: close-on-exec, and above
+/// 9, where no redirection names it unless it asks for that number. Under
+/// a descriptor limit that leaves none above 9 (`ulimit -n 10`), the lowest
+/// free one is taken instead.
+pub fn dup_private(fd: RawFd) -> OsResult<RawFd> {
+    let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10) };
+    if copy >= 0 {
+        return Ok(copy);
+    }
+    let errno = get_current_errno_value();
+    if errno != Errno::EINVAL && errno != Errno::EMFILE {
+        return Err(OsError {
+            command: "fcntl",
+            errno,
+        });
+    }
+    let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if copy < 0 {
+        return Err(OsError::from_current_errno("fcntl"));
+    }
+    Ok(copy)
+}
+
 pub fn dup2(old_fd: RawFd, new_fd: RawFd) -> OsResult<RawFd> {
     let dup_result = unsafe { libc::dup2(old_fd, new_fd) };
     if dup_result < 0 {
@@ -351,103 +373,14 @@ impl From<OsError> for ExecError {
     }
 }
 
-/// Puts each `(src, dest)` pair's source on its destination, inherited
-/// across exec, as if every `dup2` happened at once.
-///
-/// A source may itself be another pair's destination (`3>&1 1>&2 2>&3`),
-/// so a destination is written only once no pending pair still reads it.
-/// When only cycles remain, one source is copied to the lowest free
-/// descriptor to break its cycle. No descriptor above the destinations is
-/// ever asked for: under a low `RLIMIT_NOFILE` there may be none (`ulimit
-/// -n 10` with 3..9 in use), and the lowest free one cannot be a pending
-/// destination, since in a cycle every pending destination is open.
-fn place_descriptors(mut pending: Vec<(RawFd, RawFd)>) -> OsResult<()> {
-    while !pending.is_empty() {
-        let ready = (0..pending.len()).find(|&i| {
-            let dest = pending[i].1;
-            pending
-                .iter()
-                .enumerate()
-                .all(|(j, &(src, _))| j == i || src != dest)
-        });
-        match ready {
-            Some(i) => {
-                let (src, dest) = pending.swap_remove(i);
-                if src == dest {
-                    // dup2 onto itself changes nothing, so a close-on-exec
-                    // source already in place would be closed by the exec.
-                    if unsafe { libc::fcntl(dest, libc::F_SETFD, 0) } < 0 {
-                        return Err(OsError::from_current_errno("fcntl"));
-                    }
-                } else {
-                    dup2(src, dest)?;
-                }
-            }
-            None => {
-                let src = pending[0].0;
-                let copy = dup_cloexec(src)?.into_raw_fd();
-                for pair in pending.iter_mut().filter(|pair| pair.0 == src) {
-                    pair.0 = copy;
-                }
-                // The copy is read by the pairs that took it over and no
-                // longer needed once they are placed; it is close-on-exec,
-                // so the exec drops it.
-            }
-        }
-    }
-    Ok(())
-}
-
+/// Replaces the process with `command`. The shell has already put the
+/// command's redirections on its own descriptors, and its private ones are
+/// close-on-exec, so the command inherits exactly the redirected set.
 pub fn exec(
     command: OsString,
     args: &[ShString],
-    opened_files: &OpenedFiles,
     env: &Environment,
 ) -> Result<Infallible, ExecError> {
-    let mut moves: Vec<(RawFd, RawFd)> = Vec::with_capacity(opened_files.opened_files.len());
-    let mut to_close: Vec<RawFd> = Vec::new();
-    // Descriptors this function opened and must not leave behind.
-    let mut temporaries: Vec<RawFd> = Vec::new();
-    for (id, file) in &opened_files.opened_files {
-        let dest = *id as i32;
-        let src = match file {
-            OpenedFile::Stdin => libc::STDIN_FILENO,
-            OpenedFile::Stdout => libc::STDOUT_FILENO,
-            OpenedFile::Stderr => libc::STDERR_FILENO,
-            OpenedFile::ReadFile(file)
-            | OpenedFile::WriteFile(file)
-            | OpenedFile::ReadWriteFile(file) => file.as_raw_fd(),
-            OpenedFile::HereDocument(contents) => {
-                // Owned here: the temporary must be closed once it has been
-                // duplicated into place, or it is inherited by the exec'd
-                // process as a stray descriptor.
-                let fd = here_document_fd(contents.borrow().as_bytes())?.into_raw_fd();
-                temporaries.push(fd);
-                fd
-            }
-            OpenedFile::Closed => {
-                // `2>&-`: the descriptor must actually be closed, not merely
-                // dropped from the table and inherited. Deferred until every
-                // other redirection is in place: closing fd 5 for `5<&-` frees
-                // it, so a later `<file` in the same command may well have been
-                // handed fd 5 by the kernel, and closing it here would take
-                // that descriptor with it.
-                to_close.push(dest);
-                continue;
-            }
-        };
-        moves.push((src, dest));
-    }
-    let dests: Vec<RawFd> = moves.iter().map(|&(_, dest)| dest).collect();
-    place_descriptors(moves)?;
-    // A here-document that the kernel happened to open on its own
-    // destination is now that descriptor.
-    for fd in temporaries.into_iter().filter(|fd| !dests.contains(fd)) {
-        let _ = close(fd);
-    }
-    for fd in to_close {
-        let _ = close(fd);
-    }
     // An interior NUL cannot be passed through execve. A shell value may
     // contain one, so this is an error to report, not a reason to abort in the
     // child after the fork.

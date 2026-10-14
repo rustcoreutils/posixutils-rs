@@ -9,9 +9,9 @@
 
 use crate::builtin::trap::TrapAction;
 use crate::os::errno::Errno;
-use crate::os::{pipe, read, OsError, OsResult, Pid};
+use crate::os::{close, dup_private, pipe, read, OsError, OsResult, Pid};
 use std::fmt::{Display, Formatter};
-use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
@@ -310,7 +310,11 @@ fn configure_signal_pipe_end(fd: RawFd) -> OsResult<()> {
 /// # Safety
 /// cannot be called by multiple threads
 pub unsafe fn setup_signal_handling() {
+    // The ends are moved above 9, out of the way of the descriptors
+    // scripts redirect (see `dup_private`).
     let created = pipe().and_then(|(read_pipe, write_pipe)| {
+        let read_pipe = unsafe { OwnedFd::from_raw_fd(dup_private(read_pipe.as_raw_fd())?) };
+        let write_pipe = unsafe { OwnedFd::from_raw_fd(dup_private(write_pipe.as_raw_fd())?) };
         configure_signal_pipe_end(read_pipe.as_raw_fd())?;
         configure_signal_pipe_end(write_pipe.as_raw_fd())?;
         Ok((read_pipe, write_pipe))
@@ -323,6 +327,35 @@ pub unsafe fn setup_signal_handling() {
     if let Ok((read_pipe, write_pipe)) = created {
         SIGNAL_WRITE.store(write_pipe.into_raw_fd(), Ordering::SeqCst);
         SIGNAL_READ.store(read_pipe.into_raw_fd(), Ordering::SeqCst);
+    }
+}
+
+/// Whether `fd` is one end of the signal pipe.
+pub fn is_signal_pipe_fd(fd: RawFd) -> bool {
+    fd >= 0
+        && (SIGNAL_READ.load(Ordering::SeqCst) == fd || SIGNAL_WRITE.load(Ordering::SeqCst) == fd)
+}
+
+/// Moves the end of the signal pipe numbered `fd` to another descriptor,
+/// so that a redirection can have `fd`. Every signal is blocked meanwhile:
+/// a handler that read the old number could otherwise write its byte into
+/// whatever the redirection puts there.
+pub fn move_signal_pipe_fd(fd: RawFd) -> OsResult<()> {
+    // SAFETY: both sets are initialised (sigfillset, sigprocmask) before
+    // they are read.
+    unsafe {
+        let mut all: libc::sigset_t = std::mem::zeroed();
+        let mut previous: libc::sigset_t = std::mem::zeroed();
+        libc::sigfillset(&mut all);
+        libc::sigprocmask(libc::SIG_SETMASK, &all, &mut previous);
+        let result = dup_private(fd).map(|copy| {
+            for end in [&SIGNAL_READ, &SIGNAL_WRITE] {
+                let _ = end.compare_exchange(fd, copy, Ordering::SeqCst, Ordering::SeqCst);
+            }
+            let _ = close(fd);
+        });
+        libc::sigprocmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+        result
     }
 }
 

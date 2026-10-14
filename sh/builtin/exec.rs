@@ -23,8 +23,11 @@ impl SpecialBuiltinUtility for Exec {
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
         let args = skip_option_terminator(args);
+        // XCU exec: the redirections affect the current shell execution
+        // environment. They are already on the shell's descriptors; they
+        // are simply not undone when this command completes.
+        shell.keep_redirections();
         if args.is_empty() {
-            shell.opened_files = opened_files.clone();
             return Ok(0);
         }
 
@@ -45,7 +48,7 @@ impl SpecialBuiltinUtility for Exec {
 
         // An interactive shell must survive a failed `exec`; any other shell
         // exits with the failure status.
-        let (message, status) = shell.try_exec(command, args, opened_files);
+        let (message, status) = shell.try_exec(command, args);
         opened_files.write_err(message);
         if shell.is_interactive && !shell.is_subshell {
             return Ok(status);

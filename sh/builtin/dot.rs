@@ -9,14 +9,14 @@
 
 use crate::builtin::{skip_option_terminator, BuiltinResult, SpecialBuiltinUtility};
 use crate::os::{dup_cloexec, find_command};
-use crate::shell::opened_files::{OpenedFile, OpenedFiles};
+use crate::shell::opened_files::OpenedFiles;
 use crate::shell::{execute_script_source, Shell};
 use crate::shstr::{ShStr, ShString};
 use gettextrs::gettext;
 use plib::diag::io_error_text;
 use std::fs::File;
 use std::io::Read;
-use std::os::fd::AsRawFd;
+use std::os::fd::RawFd;
 
 pub struct Dot;
 
@@ -30,39 +30,20 @@ fn descriptor_named_by(path: &ShStr) -> Option<u32> {
     std::str::from_utf8(number).ok()?.parse().ok()
 }
 
-/// Reads the script from one of the shell's descriptors. A builtin's
-/// redirections are held in the shell's descriptor table rather than on the
-/// shell process's own descriptors, and a here-document has no descriptor at
-/// all, so opening `/dev/stdin` would read the wrong file: `. /dev/stdin
-/// <<EOF` has to read the here-document through the table.
-///
-/// Returns `None` when the descriptor is the shell's own standard input,
-/// which the path does name.
-fn read_descriptor(fd: u32, opened_files: &OpenedFiles) -> Option<Result<Vec<u8>, String>> {
-    let cannot_open = || {
-        Err(format!(
-            "dot: /dev/fd/{fd}: {}\n",
-            gettext("cannot open file")
-        ))
-    };
-    let file = match opened_files.get_file(fd) {
-        Some(OpenedFile::Stdin) => return None,
-        Some(OpenedFile::HereDocument(contents)) => {
-            // Reading consumes the here-document, as it would a descriptor.
-            let text = std::mem::take(&mut *contents.borrow_mut());
-            return Some(Ok(text.as_bytes().to_vec()));
-        }
-        Some(OpenedFile::ReadFile(file)) | Some(OpenedFile::ReadWriteFile(file)) => file,
-        _ => return Some(cannot_open()),
-    };
+/// Reads the script from descriptor `fd` of the shell, the one the path
+/// names, through a copy: reading consumes the input, as reading the
+/// descriptor itself would, and works for an unnamed file such as a
+/// here-document's, which reopening the path may not on every system.
+fn read_descriptor(fd: u32) -> Result<Vec<u8>, String> {
+    let copy = RawFd::try_from(fd)
+        .ok()
+        .and_then(|raw| dup_cloexec(raw).ok())
+        .ok_or_else(|| format!("dot: /dev/fd/{fd}: {}\n", gettext("cannot open file")))?;
     let mut source = Vec::new();
-    let read = dup_cloexec(file.as_raw_fd())
-        .map_err(|err| std::io::Error::from(err.errno))
-        .and_then(|fd| File::from(fd).read_to_end(&mut source));
-    Some(match read {
-        Ok(_) => Ok(source),
-        Err(err) => Err(read_failure(&format!("/dev/fd/{fd}"), &err)),
-    })
+    File::from(copy)
+        .read_to_end(&mut source)
+        .map_err(|err| read_failure(&format!("/dev/fd/{fd}"), &err))?;
+    Ok(source)
 }
 
 /// The diagnostic for a script `dot` opened but could not read.
@@ -100,32 +81,21 @@ fn read_script_file(name: &ShStr, shell: &Shell) -> Result<Vec<u8>, String> {
 }
 
 impl SpecialBuiltinUtility for Dot {
-    fn exec(
-        &self,
-        args: &[ShString],
-        shell: &mut Shell,
-        opened_files: &mut OpenedFiles,
-    ) -> BuiltinResult {
+    fn exec(&self, args: &[ShString], shell: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
         let args = skip_option_terminator(args);
 
         if args.len() != 1 {
             return Err(gettext("dot: incorrect number of arguments").into());
         }
 
-        let from_descriptor =
-            descriptor_named_by(&args[0]).and_then(|fd| read_descriptor(fd, opened_files));
-        let source = match from_descriptor {
-            Some(source) => source?,
+        let source = match descriptor_named_by(&args[0]) {
+            Some(fd) => read_descriptor(fd)?,
             None => read_script_file(&args[0], shell)?,
         };
 
-        let saved = shell.opened_files.install(opened_files.clone());
         shell.dot_script_depth += 1;
-
         let result = execute_script_source(shell, &source);
-
         shell.dot_script_depth -= 1;
-        shell.opened_files.restore(saved);
 
         result.map_err(|parser_err| {
             format!(

@@ -19,8 +19,8 @@ use crate::nonempty::NonEmpty;
 use crate::os::errno::Errno;
 use crate::os::signals::{PendingSignal, Signal, SignalManager, TermSignal};
 use crate::os::{
-    dup2, exec, find_command, fork, getpgrp, give_terminal_to, is_process_in_foreground, pipe,
-    setpgid, waitpid, ExecError, ForkResult, OsError, OsResult, Pid, WaitStatus,
+    exec, find_command, fork, getpgrp, give_terminal_to, is_process_in_foreground, pipe, setpgid,
+    waitpid, ExecError, ForkResult, OsError, OsResult, Pid, WaitStatus,
 };
 use crate::parse::command::{
     Assignment, CaseItem, Command, CommandType, CompleteCommand, CompoundCommand, Conjunction,
@@ -32,7 +32,7 @@ use crate::parse::word_parser::parse_word;
 use crate::parse::{AliasTable, ParserError};
 use crate::shell::environment::{CannotModifyReadonly, Environment, Value};
 use crate::shell::history::{initialize_history_from_system, write_history_to_file, History};
-use crate::shell::opened_files::{OpenedFiles, StandardFd};
+use crate::shell::opened_files::{OpenedFiles, RedirectionFrames};
 use crate::shstr::{ShStr, ShString};
 use crate::wordexp::{
     expand_declaration_operand, expand_word, expand_word_to_string, word_to_pattern,
@@ -43,7 +43,7 @@ use std::ffi::OsString;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::Read;
-use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
 use std::rc::Rc;
 use std::{env, io};
@@ -194,7 +194,11 @@ pub struct Shell {
     pub environment: Environment,
     pub program_name: ShString,
     pub positional_parameters: Vec<ShString>,
+    /// Where the shell writes its own diagnostics: its standard error.
     pub opened_files: OpenedFiles,
+    /// The descriptors replaced by the redirections in effect, to be put
+    /// back when their commands complete.
+    pub redirection_frames: RedirectionFrames,
     pub functions: HashMap<Name, Rc<FunctionBody>>,
     pub last_pipeline_exit_status: i32,
     /// Whether `last_pipeline_exit_status`, if nonzero, is the result of a
@@ -326,23 +330,12 @@ fn is_assignment_shaped(word: &[u8]) -> bool {
     }
 }
 
-/// Puts `fd` on descriptor `target` and closes the original. A pipe end can
-/// already be `target` when the shell was started with that descriptor
-/// closed; then it is kept as it is.
-fn move_fd_to(fd: OwnedFd, target: RawFd) -> OsResult<()> {
-    if fd.as_raw_fd() == target {
-        let _ = fd.into_raw_fd();
-        return Ok(());
-    }
-    dup2(fd.as_raw_fd(), target)?;
-    Ok(())
-}
-
 impl Shell {
     /// POSIX 2.12: a subshell starts with every trap the parent *caught* reset
     /// to its default action; ignored traps stay ignored. That covers the EXIT
     /// trap too, which is held separately from the signal traps.
     fn become_subshell(&mut self) {
+        self.forget_redirections();
         self.signal_manager.reset();
         self.exit_action = TrapAction::Default;
         self.is_subshell = true;
@@ -567,70 +560,60 @@ impl Shell {
     /// Replaces the shell process with `command`. Returns only when the exec
     /// failed, giving the diagnostic and the status POSIX prescribes for it;
     /// the caller decides whether to exit (see `exec_and_exit`).
-    pub fn try_exec(
-        &mut self,
-        command: OsString,
-        args: &[ShString],
-        opened_files: &OpenedFiles,
-    ) -> (String, i32) {
+    pub fn try_exec(&mut self, command: OsString, args: &[ShString]) -> (String, i32) {
         let saved_signals = self.signal_manager.clone();
         self.signal_manager.reset();
-        let failure =
-            match exec(command.clone(), args, opened_files, &self.environment).unwrap_err() {
-                ExecError::OsError(err) => (format!("{err}\n"), 126),
-                ExecError::InteriorNul => (
-                    "sh: command, argument or environment entry contains a NUL\n".to_string(),
-                    126,
-                ),
-                ExecError::CannotExecute(errno) => {
-                    if errno == Errno::ENOEXEC {
-                        match execute_file_as_script(self, Path::new(&command)) {
-                            Ok(status) => self.exit(status),
-                            Err(ScriptExecutionError::ParsingError(err)) => {
-                                self.eprint(&format!(
-                                    "sh: parsing error ({}): {}\n",
-                                    err.lineno, err.message
-                                ));
-                                self.exit(2)
-                            }
-                            Err(ScriptExecutionError::Unreadable) => {
-                                // fallthrough to the default error
-                            }
+        let failure = match exec(command.clone(), args, &self.environment).unwrap_err() {
+            ExecError::OsError(err) => (format!("{err}\n"), 126),
+            ExecError::InteriorNul => (
+                "sh: command, argument or environment entry contains a NUL\n".to_string(),
+                126,
+            ),
+            ExecError::CannotExecute(errno) => {
+                if errno == Errno::ENOEXEC {
+                    match execute_file_as_script(self, Path::new(&command)) {
+                        Ok(status) => self.exit(status),
+                        Err(ScriptExecutionError::ParsingError(err)) => {
+                            self.eprint(&format!(
+                                "sh: parsing error ({}): {}\n",
+                                err.lineno, err.message
+                            ));
+                            self.exit(2)
+                        }
+                        Err(ScriptExecutionError::Unreadable) => {
+                            // fallthrough to the default error
                         }
                     }
-                    (
-                        format!(
-                            "sh: failed to execute {} ({})\n",
-                            command.to_string_lossy(),
-                            errno
-                        ),
-                        126,
-                    )
                 }
-            };
+                (
+                    format!(
+                        "sh: failed to execute {} ({})\n",
+                        command.to_string_lossy(),
+                        errno
+                    ),
+                    126,
+                )
+            }
+        };
         // the process was not replaced after all, so the shell keeps its traps
         self.signal_manager.restore(saved_signals);
         failure
     }
 
-    pub fn exec(&mut self, command: OsString, args: &[ShString], opened_files: &OpenedFiles) -> ! {
-        let (message, status) = self.try_exec(command, args, opened_files);
+    pub fn exec(&mut self, command: OsString, args: &[ShString]) -> ! {
+        let (message, status) = self.try_exec(command, args);
         // The failure belongs to the command, so it goes to the command's
-        // standard error (`./not-executable 2>/dev/null` is silent).
-        opened_files.write_err(message);
+        // standard error (`./not-executable 2>/dev/null` is silent), which
+        // its redirections have already replaced.
+        self.eprint(&message);
         self.exit(status)
     }
 
-    pub fn fork_and_exec(
-        &mut self,
-        command: OsString,
-        args: &[ShString],
-        opened_files: &OpenedFiles,
-    ) -> OsResult<i32> {
+    pub fn fork_and_exec(&mut self, command: OsString, args: &[ShString]) -> OsResult<i32> {
         match fork()? {
             ForkResult::Child => {
                 self.become_subshell();
-                self.exec(command, args, opened_files)
+                self.exec(command, args)
             }
             ForkResult::Parent { child } => {
                 let status = self.wait_child_process(child);
@@ -688,25 +671,29 @@ impl Shell {
         // the standard does not specify if the variables should have the export attribute.
         // Bash exports them, we do the same here (neither sh, nor zsh do it though)
         self.assign_globals(&simple_command.assignments, true)?;
-        let mut opened_files = self.opened_files.clone();
-        if let Err(err) = opened_files.redirect(&simple_command.redirections, self) {
+        // `exec` keeps these redirections (see `keep_redirections`).
+        self.push_redirections();
+        if let Err(err) = self.apply_redirections(&simple_command.redirections, true) {
+            self.pop_redirections();
             if !self.is_interactive {
                 self.eprint(&err.to_string());
                 self.exit(1)
             }
             return Err(err);
         }
-        opened_files.take_write_error();
-        match special_builtin_utility.exec(args, self, &mut opened_files) {
-            Ok(status) => Ok(report_write_error(name, status, &opened_files)),
+        let mut opened_files = OpenedFiles::default();
+        let status = match special_builtin_utility.exec(args, self, &mut opened_files) {
+            Ok(status) => report_write_error(name, status, &opened_files),
             Err(err) => {
                 opened_files.write_err(format!("{err}\n"));
                 if !self.is_interactive {
                     self.exit(1)
                 }
-                Ok(1)
+                1
             }
-        }
+        };
+        self.pop_redirections();
+        Ok(status)
     }
 
     fn exec_function(
@@ -765,18 +752,16 @@ impl Shell {
         args: &[ShString],
         builtin_utility: &dyn BuiltinUtility,
     ) -> CommandExecutionResult<i32> {
-        let mut opened_files = self.opened_files.clone();
-        opened_files.redirect(&simple_command.redirections, self)?;
-
-        // The prefix assignments live in a scope of their own, which must be
-        // popped even when the assignment fails: `Environment::exported`
-        // exports every local scope, so a leaked one would put the variable in
-        // the environment of every later child.
-        self.environment.push_scope();
-        opened_files.take_write_error();
-        let result =
-            self.assign_locals(&simple_command.assignments).map(|_| {
-                match builtin_utility.exec(args, self, &mut opened_files) {
+        self.with_redirections(&simple_command.redirections, |shell| {
+            // The prefix assignments live in a scope of their own, which must
+            // be popped even when the assignment fails:
+            // `Environment::exported` exports every local scope, so a leaked
+            // one would put the variable in the environment of every later
+            // child.
+            shell.environment.push_scope();
+            let mut opened_files = OpenedFiles::default();
+            let result = shell.assign_locals(&simple_command.assignments).map(|_| {
+                match builtin_utility.exec(args, shell, &mut opened_files) {
                     Ok(status) => report_write_error(name, status, &opened_files),
                     Err(err) => {
                         opened_files.write_err(format!("{err}\n"));
@@ -784,8 +769,9 @@ impl Shell {
                     }
                 }
             });
-        self.environment.pop_scope();
-        result
+            shell.environment.pop_scope();
+            result
+        })
     }
 
     /// `set -x`: report the command about to be executed, preceded by PS4.
@@ -893,8 +879,7 @@ impl Shell {
                 self.trace(&assigned, &expanded_words);
             }
             if !simple_command.redirections.is_empty() {
-                let mut opened_files = self.opened_files.clone();
-                opened_files.redirect(&simple_command.redirections, self)?;
+                self.with_redirections(&simple_command.redirections, |_| Ok(()))?;
             }
             return Ok(self.last_command_substitution_status);
         }
@@ -935,27 +920,38 @@ impl Shell {
                     // XCU 2.9.1.1: the redirections are performed before
                     // the command is searched for, so a failed search is
                     // reported on the command's own standard error
-                    // (`cmd 2>/dev/null` is silent).
-                    let mut opened_files = self.opened_files.clone();
-                    opened_files.redirect(&simple_command.redirections, self)?;
-                    let Some(command) =
-                        self.search_for_utility(&expanded_words[0], &simple_command.assignments)
-                    else {
-                        // `sh: NAME: not found`, unquoted, as in dash and
-                        // bash: GNU make's tests quote the captured message.
-                        opened_files.write_err(format!(
-                            "sh: {}: {}\n",
-                            expanded_words[0].display(),
-                            gettext("not found")
-                        ));
-                        return Ok(127);
-                    };
+                    // (`cmd 2>/dev/null` is silent). When the command is the
+                    // last thing this process does, nothing needs to be put
+                    // back afterwards.
                     if exits_after && self.can_replace_process() {
                         self.become_subshell();
-                        self.exec(command, &expanded_words, &opened_files)
+                        if let Err(err) =
+                            self.apply_redirections(&simple_command.redirections, false)
+                        {
+                            self.eprint(&err.to_string());
+                            return Ok(1);
+                        }
+                        match self
+                            .search_for_utility(&expanded_words[0], &simple_command.assignments)
+                        {
+                            Some(command) => self.exec(command, &expanded_words),
+                            None => {
+                                self.report_not_found(&expanded_words[0]);
+                                return Ok(127);
+                            }
+                        }
                     }
-                    self.fork_and_exec(command, &expanded_words, &opened_files)
-                        .map_err(|err| err.into())
+                    self.with_redirections(&simple_command.redirections, |shell| {
+                        let Some(command) = shell
+                            .search_for_utility(&expanded_words[0], &simple_command.assignments)
+                        else {
+                            shell.report_not_found(&expanded_words[0]);
+                            return Ok(127);
+                        };
+                        shell
+                            .fork_and_exec(command, &expanded_words)
+                            .map_err(|err| err.into())
+                    })
                 });
             self.environment.pop_scope();
             result
@@ -1192,20 +1188,14 @@ impl Shell {
         })
     }
 
-    /// Runs `run` with `redirections` applied to the shell's descriptor
-    /// table, and undoes them afterwards, keeping whatever an `exec` run
-    /// meanwhile did to other descriptors (see `OpenedFiles::install`).
-    fn with_redirections<T>(
-        &mut self,
-        redirections: &[Redirection],
-        run: impl FnOnce(&mut Self) -> CommandExecutionResult<T>,
-    ) -> CommandExecutionResult<T> {
-        let mut redirected = self.opened_files.clone();
-        redirected.redirect(redirections, self)?;
-        let saved = self.opened_files.install(redirected);
-        let result = run(self);
-        self.opened_files.restore(saved);
-        result
+    /// `sh: NAME: not found`, unquoted, as in dash and bash: GNU make's
+    /// tests quote the captured message.
+    fn report_not_found(&self, name: &ShStr) {
+        self.eprint(&format!(
+            "sh: {}: {}\n",
+            name.display(),
+            gettext("not found")
+        ));
     }
 
     fn define_function(&mut self, definition: &FunctionDefinition) {
@@ -1436,13 +1426,10 @@ impl Shell {
         stdout: Option<OwnedFd>,
     ) -> OsResult<i32> {
         if let Some(stdin) = stdin {
-            self.opened_files.take_over_standard_fd(StandardFd::Stdin)?;
-            move_fd_to(stdin, libc::STDIN_FILENO)?;
+            self.place_descriptor(stdin, libc::STDIN_FILENO)?;
         }
         if let Some(stdout) = stdout {
-            self.opened_files
-                .take_over_standard_fd(StandardFd::Stdout)?;
-            move_fd_to(stdout, libc::STDOUT_FILENO)?;
+            self.place_descriptor(stdout, libc::STDOUT_FILENO)?;
         }
         self.exits_after_command = true;
         Ok(self.interpret_command(command, false))
@@ -1497,6 +1484,14 @@ impl Shell {
             match fork() {
                 Ok(ForkResult::Child) => {
                     let job_control = self.job_control_active();
+                    // POSIX 2.11: without job control, the list reads from
+                    // /dev/null unless its standard input is redirected
+                    // explicitly. An enclosing command's redirection counts
+                    // (`{ cat & } <file` reads the file, as in bash); an
+                    // earlier `exec <file` does not (as in dash and bash).
+                    // Asked before `become_subshell` forgets which
+                    // descriptors enclosing commands redirected.
+                    let stdin_redirected = self.is_redirected(libc::STDIN_FILENO);
                     self.become_subshell();
                     if job_control {
                         // Fails only for a session leader, which a forked
@@ -1512,7 +1507,9 @@ impl Shell {
                             .set_action(Signal::SigInt, TrapAction::Ignore);
                         self.signal_manager
                             .set_action(Signal::SigQuit, TrapAction::Ignore);
-                        self.opened_files.redirect_stdin_to_dev_null();
+                        if !stdin_redirected {
+                            self.redirect_stdin_to_dev_null();
+                        }
                     }
                     self.exits_after_command = true;
                     let status = self.interpret_and_or_list(&conjunction.elements, false);
@@ -1563,13 +1560,10 @@ impl Shell {
             ForkResult::Child => {
                 self.become_subshell();
                 drop(read_pipe);
-                self.opened_files
-                    .take_over_standard_fd(StandardFd::Stdout)?;
-                dup2(write_pipe.as_raw_fd(), libc::STDOUT_FILENO)?;
                 // The write end must not stay open in this process once fd 1
                 // holds it: the last command may replace the process, and the
                 // reader would then wait for a descriptor nobody closes.
-                drop(write_pipe);
+                self.place_descriptor(write_pipe, libc::STDOUT_FILENO)?;
                 self.run_nested_program(program, true)
                     .map_err(CommandExecutionError::Parse)?;
                 self.exit(self.last_pipeline_exit_status);
@@ -1899,6 +1893,7 @@ impl Default for Shell {
             program_name: ShString::from("sh"),
             positional_parameters: Vec::default(),
             opened_files: OpenedFiles::default(),
+            redirection_frames: RedirectionFrames::default(),
             functions: HashMap::default(),
             last_pipeline_exit_status: 0,
             last_status_from_ignored_failure: false,

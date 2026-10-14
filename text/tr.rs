@@ -357,7 +357,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     if let Err(error) = tr(&args) {
-        eprintln!("tr: {error}");
+        eprintln!("tr: {}", plib::diag::error_text(error.as_ref()));
 
         process::exit(1_i32);
     }

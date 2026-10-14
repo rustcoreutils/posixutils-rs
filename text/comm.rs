@@ -183,7 +183,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if let Err(e) = comm_file(mask, lead_dup, &args.file1, &args.file2) {
-        plib::diag::error(&format!("{}", e));
+        plib::diag::error(&plib::diag::io_error_text(&e));
     }
 
     plib::diag::flush_stdout();

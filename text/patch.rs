@@ -247,7 +247,7 @@ fn open_section(
                 .map(|(i, hunk)| (i + 1, hunk.clone(), String::new()))
                 .collect();
             if let Err(e) = write_rejects(&rejects, &name, config, written_rejects) {
-                eprintln!("patch: {}: {}", shown, e);
+                eprintln!("patch: {}: {}", shown, plib::diag::io_error_text(&e));
             }
             Ok(None)
         }
@@ -336,7 +336,11 @@ fn run(args: Args) -> Result<bool, PatchError> {
             || (config.remove_empty && result.content.is_empty() && result.applied_any);
         if removes && config.output_file.is_none() && result.rejected_hunks.is_empty() {
             if let Err(e) = delete_target(&target, &config, &mut backed_up) {
-                eprintln!("patch: {}: {}", shown.display(), e);
+                eprintln!(
+                    "patch: {}: {}",
+                    shown.display(),
+                    plib::diag::io_error_text(&e)
+                );
                 exit_code = 2;
             }
             continue;
@@ -353,7 +357,11 @@ fn run(args: Args) -> Result<bool, PatchError> {
                 &config,
                 &mut written_rejects,
             ) {
-                eprintln!("patch: {}: {}", shown.display(), e);
+                eprintln!(
+                    "patch: {}: {}",
+                    shown.display(),
+                    plib::diag::io_error_text(&e)
+                );
                 exit_code = 2;
             }
             for (num, _, reason) in &result.rejected_hunks {
@@ -372,7 +380,11 @@ fn run(args: Args) -> Result<bool, PatchError> {
             &mut backed_up,
             &mut written_outputs,
         ) {
-            eprintln!("patch: {}: {}", shown.display(), e);
+            eprintln!(
+                "patch: {}: {}",
+                shown.display(),
+                plib::diag::io_error_text(&e)
+            );
             exit_code = 2;
             continue;
         }
@@ -386,7 +398,11 @@ fn run(args: Args) -> Result<bool, PatchError> {
                 &config,
                 &mut written_rejects,
             ) {
-                eprintln!("patch: {}: {}", shown.display(), e);
+                eprintln!(
+                    "patch: {}: {}",
+                    shown.display(),
+                    plib::diag::io_error_text(&e)
+                );
                 exit_code = 2;
             }
             for (num, _, reason) in &result.rejected_hunks {

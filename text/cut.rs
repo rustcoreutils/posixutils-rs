@@ -323,7 +323,11 @@ fn cut_files(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         let mut reader = match input_stream_dashed(source) {
             Ok(r) => io::BufReader::new(r),
             Err(e) => {
-                plib::diag::error(&format!("{}: {}", source.display(), e));
+                plib::diag::error(&format!(
+                    "{}: {}",
+                    source.display(),
+                    plib::diag::io_error_text(&e)
+                ));
                 continue;
             }
         };
@@ -337,7 +341,11 @@ fn cut_files(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 Ok(0) => break,
                 Ok(_) => {}
                 Err(e) => {
-                    plib::diag::error(&format!("{}: {}", source.display(), e));
+                    plib::diag::error(&format!(
+                        "{}: {}",
+                        source.display(),
+                        plib::diag::io_error_text(&e)
+                    ));
                     break;
                 }
             }
@@ -468,7 +476,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = plib::optarg::parse::<Args>();
 
     if let Err(err) = cut_files(args) {
-        plib::diag::error(&format!("{}", err));
+        plib::diag::error(&plib::diag::error_text(err.as_ref()));
     }
 
     std::process::exit(plib::diag::exit_status())

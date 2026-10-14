@@ -762,7 +762,7 @@ fn read_inputs(args: &Args) -> Result<Vec<(String, Vec<String>)>, String> {
         let reader = input_stream_dashed(&f)
             .map_err(|e| format!("cannot read: {name}: {}", plib::diag::io_error_text(&e)))?;
         let lines = read_lines(io::BufReader::new(reader), args.eol())
-            .map_err(|e| format!("read error: {name}: {e}"))?;
+            .map_err(|e| format!("read error: {name}: {}", plib::diag::io_error_text(&e)))?;
         out.push((name, lines));
     }
     Ok(out)
@@ -790,8 +790,13 @@ fn read_lines(mut reader: impl BufRead, eol: u8) -> io::Result<Vec<String>> {
 
 fn write_output(records: &[Record], args: &Args) -> Result<(), String> {
     if let Some(path) = &args.output_file {
-        let file =
-            File::create(path).map_err(|e| format!("open failed: {}: {e}", path.display()))?;
+        let file = File::create(path).map_err(|e| {
+            format!(
+                "open failed: {}: {}",
+                path.display(),
+                plib::diag::io_error_text(&e)
+            )
+        })?;
         write_lines(BufWriter::new(file), records, args.eol())
     } else {
         write_lines(BufWriter::new(io::stdout().lock()), records, args.eol())

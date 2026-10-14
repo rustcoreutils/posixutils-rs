@@ -350,3 +350,17 @@ fn comm_write_error_on_full_device() {
         1,
     );
 }
+
+/// An input that cannot be opened is reported with the system's text for
+/// the error, without Rust's "(os error N)" suffix.
+#[test]
+fn test_comm_open_error_names_the_system_error() {
+    let missing = "/nonexistent/comm-input";
+    let open_error = plib::diag::io_error_text(&std::fs::File::open(missing).unwrap_err());
+    let out = plib::testing::run_test_base("comm", &[missing.into(), "/dev/null".into()], b"");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("comm: {open_error}\n")
+    );
+}

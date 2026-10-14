@@ -448,7 +448,7 @@ pub struct PatchConfig {
 /// Errors that can occur during patch operations.
 #[derive(Error, Debug)]
 pub enum PatchError {
-    #[error("I/O error: {0}")]
+    #[error("I/O error: {}", plib::diag::io_error_text(.0))]
     Io(#[from] std::io::Error),
 
     #[error("parse error at line {line}: {message}")]

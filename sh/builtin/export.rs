@@ -23,10 +23,31 @@ impl SpecialBuiltinUtility for Export {
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
-        if args.first().is_some_and(|arg| *arg == "-p") {
-            if args.len() > 1 && !(args.len() == 2 && args[1] == "--") {
-                return Err(gettext("export: too many arguments").into());
+        // `-p` is POSIX. `-n` (take the export attribute away) is a
+        // bash/ksh extension, forced by binutils, whose top-level Makefile
+        // runs `export -n ELF_PACKAGE_METADATA` under /bin/sh. As in bash,
+        // the two may be combined (`-pn`) and, with no operand, either one
+        // lists the exported variables.
+        let mut print = false;
+        let mut unexport = false;
+        let mut option_count = 0;
+        for arg in args {
+            let Some(letters) = arg.strip_prefix(b"-") else {
+                break;
+            };
+            if letters.is_empty() || !letters.iter().all(|&b| b == b'n' || b == b'p') {
+                break;
             }
+            print |= letters.contains(&b'p');
+            unexport |= letters.contains(&b'n');
+            option_count += 1;
+        }
+        let args = skip_option_terminator(&args[option_count..]);
+
+        if print && !unexport && !args.is_empty() {
+            return Err(gettext("export: too many arguments").into());
+        }
+        if (print || unexport) && args.is_empty() {
             let mut pairs = shell
                 .environment
                 .global_scope()
@@ -49,7 +70,6 @@ impl SpecialBuiltinUtility for Export {
             return Ok(0);
         }
 
-        let args = skip_option_terminator(args);
         if args.is_empty() {
             return Err(gettext("export: too few arguments").into());
         }
@@ -78,9 +98,16 @@ impl SpecialBuiltinUtility for Export {
                 (name.to_string(), None)
             };
             if let Some(value) = value {
-                shell.assign_global(name, value)?.export = true;
-            } else {
+                shell.assign_global(name, value)?.export = !unexport;
+            } else if !unexport {
                 shell.environment.promote_local_or_get_global(name).export = true;
+            } else if shell.environment.get_value(&name).is_some()
+                || shell.environment.global_scope().contains_key(&name)
+            {
+                // A name never mentioned is left alone. A readonly variable
+                // may lose the attribute: that changes only what children
+                // see, not the value, as in bash.
+                shell.environment.promote_local_or_get_global(name).export = false;
             }
         }
         Ok(0)

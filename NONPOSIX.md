@@ -962,6 +962,14 @@ being redirected through a directory operand swapped for a symbolic link.
  * `break` and `continue` outside any loop are non-fatal no-ops, matching dash
    and bash, rather than the shell-aborting special-builtin error POSIX
    requires.
+ * `export -n NAME[=VALUE]...` — takes the export attribute away and keeps
+   the value, as in bash and ksh; with `=VALUE` it assigns first.  A name
+   never set is not an error, and a readonly variable may lose the
+   attribute.  As in bash, with no operand `export -n` lists the exported
+   variables as `-p` does, and `-n` may be combined with `-p`, which is
+   ignored when there are operands.
+   binutils' top-level Makefile runs `export -n ELF_PACKAGE_METADATA` under
+   `/bin/sh`.
 
 ### sleep
 

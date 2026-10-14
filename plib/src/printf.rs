@@ -107,6 +107,9 @@ enum ParseState {
 enum ParsedBackslashSequence {
     IgnoreRestOfFormat,
     Byte(u8),
+    /// A sequence printf does not define, written as is: the <backslash>
+    /// and this byte (as dash and bash do).
+    Undefined(u8),
 }
 
 /// Parse the `\ddd` escape of POSIX 111944-111946: one, two, or three octal
@@ -200,13 +203,16 @@ fn escaped_char(
         b'r' => b'\r',
         b't' => b'\t',
         b'v' => b'\x0B',
+        // The C escapes for characters that need no escaping.  (dash
+        // writes these with their <backslash>, bash and GNU without.)
+        b'\\' | b'"' | b'\'' | b'?' => *byte_after_backslash,
         b'x' => {
             // Some implementations fail if the character after "\x" is not a valid hexadecimal digit
             let byte = parse_hexadecimal_sequence(peekable)?;
 
             return Ok(ParsedBackslashSequence::Byte(byte));
         }
-        &ue => ue,
+        &undefined => return Ok(ParsedBackslashSequence::Undefined(undefined)),
     };
 
     Ok(ParsedBackslashSequence::Byte(parsed_byte))
@@ -290,6 +296,10 @@ fn tokenize_format_str(format: &[u8]) -> Result<Vec<Token>, Box<dyn Error>> {
                     } else if current_byte == b'\\' {
                         match escaped_char(&mut peekable)? {
                             ParsedBackslashSequence::Byte(byte) => {
+                                literal.push(byte);
+                            }
+                            ParsedBackslashSequence::Undefined(byte) => {
+                                literal.push(b'\\');
                                 literal.push(byte);
                             }
                             ParsedBackslashSequence::IgnoreRestOfFormat => {
@@ -1255,6 +1265,24 @@ fn process_b_escapes(arg: &[u8]) -> ProcessBResult {
                 b'r' => output.push(b'\r'),
                 b't' => output.push(b'\t'),
                 b'v' => output.push(b'\x0b'),
+                b'e' => output.push(b'\x1b'),
+                // \ddd, without the leading zero POSIX gives \0ddd, as dash
+                // and bash also accept: one to three octal digits, keeping
+                // the low 8 bits.
+                b'1'..=b'7' => {
+                    let mut octal_value = next_byte - b'0';
+                    for _ in 0..2 {
+                        match peekable.peek() {
+                            Some(&&digit @ b'0'..=b'7') => {
+                                octal_value =
+                                    octal_value.wrapping_mul(8).wrapping_add(digit - b'0');
+                                peekable.next();
+                            }
+                            _ => break,
+                        }
+                    }
+                    output.push(octal_value);
+                }
                 b'0' => {
                     // Octal escape: \0ddd where ddd is 0-3 octal digits
                     let mut octal_value: u8 = 0;
@@ -1277,7 +1305,8 @@ fn process_b_escapes(arg: &[u8]) -> ProcessBResult {
                     output.push(octal_value);
                 }
                 _ => {
-                    // Unknown escape - output the character after backslash
+                    // Undefined: written as is, as dash and bash do.
+                    output.push(b'\\');
                     output.push(next_byte);
                 }
             }
@@ -1374,6 +1403,15 @@ fn format_arg(
         had_error,
     })
 }
+
+/// The diagnostic for a missing format, and its exit status: a usage error,
+/// status 2, as in dash and bash.
+pub fn usage() -> String {
+    gettext("usage: printf format [argument...]")
+}
+
+/// The exit status of a usage error.
+pub const USAGE_STATUS: u8 = 2;
 
 /// Split the utility's arguments into the format and the operands after it,
 /// or `None` if there is no format.

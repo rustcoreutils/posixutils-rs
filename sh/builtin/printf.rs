@@ -11,7 +11,6 @@ use crate::builtin::{BuiltinResult, BuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use crate::shstr::ShString;
-use gettextrs::gettext;
 use std::io::{self, LineWriter, Write};
 
 /// `printf`.
@@ -50,8 +49,8 @@ impl BuiltinUtility for Printf {
         let report = |msg: &str| opened_files.write_err(format!("printf: {msg}\n"));
 
         let Some((format, operands)) = plib::printf::split_operands(args) else {
-            report(&gettext("not enough arguments"));
-            return Ok(1);
+            report(&plib::printf::usage());
+            return Ok(plib::printf::USAGE_STATUS.into());
         };
         let operands: Vec<&[u8]> = operands.iter().map(|a| a.as_bytes()).collect();
 

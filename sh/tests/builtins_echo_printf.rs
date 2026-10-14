@@ -112,7 +112,12 @@ fn printf_works_without_path() {
 #[test]
 fn printf_discards_a_leading_double_dash() {
     sh_c("printf -- '-%s\\n' x; printf -- --; echo", "-x\n--\n");
-    sh_c_full("printf --", "", "printf: not enough arguments\n", 1);
+    sh_c_full(
+        "printf --",
+        "",
+        "printf: usage: printf format [argument...]\n",
+        2,
+    );
 }
 
 #[test]
@@ -151,10 +156,21 @@ fn printf_invalid_number() {
     );
 }
 
-// The standalone utility's text and status (dash and bash exit 2).
+// A usage error, exit status 2, as in dash and bash.
 #[test]
 fn printf_without_a_format_is_an_error() {
-    sh_c_full("printf", "", "printf: not enough arguments\n", 1);
+    sh_c_full(
+        "printf",
+        "",
+        "printf: usage: printf format [argument...]\n",
+        2,
+    );
+}
+
+// dash and bash agree on undefined escapes: written as is.
+#[test]
+fn printf_unknown_escapes_are_literal() {
+    sh_c("printf '\\q|%b|%b\\n' '\\q' '\\e\\101'", "\\q|\\q|\x1bA\n");
 }
 
 #[test]

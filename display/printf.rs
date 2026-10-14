@@ -7,9 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-use gettextrs::gettext;
 use plib::diag;
-use plib::printf::{printf, split_operands};
+use plib::printf::{printf, split_operands, usage, USAGE_STATUS};
 use std::{io, process::ExitCode};
 
 fn main() -> ExitCode {
@@ -37,8 +36,8 @@ fn main() -> ExitCode {
             }
         }
         None => {
-            diag::error(&gettext("not enough arguments"));
-            ExitCode::FAILURE
+            diag::error(&usage());
+            ExitCode::from(USAGE_STATUS)
         }
     }
 }

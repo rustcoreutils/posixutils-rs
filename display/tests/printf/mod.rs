@@ -45,16 +45,34 @@ fn test_leading_double_dash_is_discarded() {
     printf_test(&["x%s\n", "--"], "x--\n");
 }
 
+// No format is a usage error, exit status 2, as in dash and bash.
 #[test]
-fn test_double_dash_alone_is_not_enough_arguments() {
-    run_test(TestPlan {
-        cmd: String::from("printf"),
-        args: vec![String::from("--")],
-        expected_out: String::new(),
-        expected_err: String::from("printf: not enough arguments\n"),
-        stdin_data: String::new(),
-        expected_exit_code: 1,
-    });
+fn test_missing_format_is_a_usage_error() {
+    for args in [vec![], vec![String::from("--")]] {
+        run_test(TestPlan {
+            cmd: String::from("printf"),
+            args,
+            expected_out: String::new(),
+            expected_err: String::from("printf: usage: printf format [argument...]\n"),
+            stdin_data: String::new(),
+            expected_exit_code: 2,
+        });
+    }
+}
+
+// dash and bash agree: in the format, an escape sequence printf does not
+// define is written as is, <backslash> included.
+#[test]
+fn test_format_unknown_escape_is_literal() {
+    printf_test(&["\\q|\\8|\\\\"], "\\q|\\8|\\");
+}
+
+// dash and bash agree on %b: an undefined escape is written as is, \e is
+// <ESC>, and \ddd is octal without the leading zero too.
+#[test]
+fn test_b_specifier_unknown_escape_is_literal() {
+    printf_test(&["%b", "\\q|\\\"|\\'|\\8"], "\\q|\\\"|\\'|\\8");
+    printf_test(&["%b", "\\e|\\101|\\18|\\0101"], "\x1b|A|\x018|A");
 }
 
 #[test]

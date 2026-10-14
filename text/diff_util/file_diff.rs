@@ -14,7 +14,7 @@ use super::{
     file_data::{FileData, LineReader},
     functions::{
         check_existance, io_error_at, is_binary, system_time_to_context_format,
-        system_time_to_unified_format, write_line,
+        system_time_to_unified_format, write_error, write_line,
     },
     hunks::{Hunk, Hunks},
 };
@@ -315,11 +315,11 @@ impl<'a> FileDiff<'a> {
         if let OutputFormat::Context(context) = self.format_options.output_format {
             // Identical files produce no output (not even the file headers).
             if self.are_different {
-                self.print_context(&mut out, context)?;
+                self.print_context(&mut out, context).map_err(write_error)?;
             }
         } else if let OutputFormat::Unified(unified) = self.format_options.output_format {
             if self.are_different {
-                self.print_unified(&mut out, unified)?;
+                self.print_unified(&mut out, unified).map_err(write_error)?;
             }
         } else {
             let hunks_count = self.hunks.hunks().len();
@@ -329,15 +329,15 @@ impl<'a> FileDiff<'a> {
                 let format = &self.format_options.output_format;
                 let hunk = &mut self.hunks.hunks_mut()[hunk_index];
                 match format {
-                    OutputFormat::Default => {
-                        hunk.print_default(&mut out, self.file1, self.file2)?
-                    }
-                    OutputFormat::EditScript => {
-                        hunk.print_edit_script(&mut out, self.file1, self.file2, is_last)?
-                    }
-                    OutputFormat::ForwardEditScript => {
-                        hunk.print_forward_edit_script(&mut out, self.file1, self.file2, is_last)?
-                    }
+                    OutputFormat::Default => hunk
+                        .print_default(&mut out, self.file1, self.file2)
+                        .map_err(write_error)?,
+                    OutputFormat::EditScript => hunk
+                        .print_edit_script(&mut out, self.file1, self.file2, is_last)
+                        .map_err(write_error)?,
+                    OutputFormat::ForwardEditScript => hunk
+                        .print_forward_edit_script(&mut out, self.file1, self.file2, is_last)
+                        .map_err(write_error)?,
                     OutputFormat::Context(_) | OutputFormat::Unified(_) => {
                         eprintln!("context and unified output are handled above");
                         return Ok(DiffExitStatus::Trouble);
@@ -346,7 +346,7 @@ impl<'a> FileDiff<'a> {
             }
         }
 
-        out.flush()?;
+        out.flush().map_err(write_error)?;
 
         if self.are_different {
             // An edit script cannot faithfully represent a file whose final

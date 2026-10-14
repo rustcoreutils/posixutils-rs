@@ -44,31 +44,39 @@ fn line_out(lead_dup: &'static str, outmask: u32, curtype: u32, s: &str) -> io::
         return Ok(());
     }
 
-    match curtype {
-        NO1 => {
-            io::stdout().write_all(s.as_bytes())?;
-        }
+    let lead = match curtype {
+        NO1 => "",
         NO2 => {
-            let lead_f2 = {
-                if (outmask & NO1) != 0 {
-                    ""
-                } else {
-                    "\t"
-                }
-            };
-            let newstr = format!("{}{}", lead_f2, s);
-            io::stdout().write_all(newstr.as_bytes())?;
+            if (outmask & NO1) != 0 {
+                ""
+            } else {
+                "\t"
+            }
         }
-        NODUP => {
-            let newstr = format!("{}{}", lead_dup, s);
-            io::stdout().write_all(newstr.as_bytes())?;
-        }
+        NODUP => lead_dup,
         _ => {
             panic!("should never occur");
         }
-    }
+    };
 
-    Ok(())
+    let newstr = format!("{}{}", lead, s);
+    io::stdout()
+        .write_all(newstr.as_bytes())
+        .map_err(write_error)
+}
+
+/// Turn a failed write to standard output into an error whose text is the
+/// diagnostic, `write error: REASON`, so it reads differently from an error
+/// reading an input file.
+fn write_error(e: io::Error) -> io::Error {
+    io::Error::new(
+        e.kind(),
+        format!(
+            "{}: {}",
+            gettext("write error"),
+            plib::diag::io_error_text(&e)
+        ),
+    )
 }
 
 fn open_file(pathname: &Path) -> io::Result<BufReader<Box<dyn Read>>> {

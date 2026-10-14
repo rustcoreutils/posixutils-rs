@@ -337,3 +337,16 @@ fn mo_catalog(entries: &[(&str, &str)]) -> Vec<u8> {
 fn test_comm_reports_write_error_on_final_partial_line() {
     plib::testing::assert_write_error_on_full_device("comm", &["-", "/dev/null"], b"x", 1);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn comm_write_error_on_full_device() {
+    // A failed write to standard output is "comm: write error: REASON",
+    // with the system's text for the error and exit status 1.
+    plib::testing::assert_write_error_message_on_full_device(
+        "comm",
+        &["-", "/dev/null"],
+        b"x\n",
+        1,
+    );
+}

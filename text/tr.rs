@@ -2460,6 +2460,16 @@ mod transformation {
         }
     }
 
+    /// The diagnostic for a failed write to standard output:
+    /// `write error: REASON`, with the system's text for the error.
+    fn write_error(e: io::Error) -> Box<dyn Error> {
+        Box::from(format!(
+            "{}: {}",
+            gettextrs::gettext("write error"),
+            plib::diag::io_error_text(&e)
+        ))
+    }
+
     pub fn streaming_transform<T: Operation>(t: &mut T) -> Result<(), Box<dyn Error>> {
         const SIZE: usize = 8_usize * 1_024_usize;
 
@@ -2480,14 +2490,18 @@ mod transformation {
                 Ok(0_usize) => {
                     let result =
                         transform_buffer(t, &mut input[..leftover_bytes], &mut output, true);
-                    stdout_lock.write_all(&output[..(result.bytes_written)])?;
+                    stdout_lock
+                        .write_all(&output[..(result.bytes_written)])
+                        .map_err(write_error)?;
                     break;
                 }
                 Ok(us) => {
                     let read_slice = &mut input[..(leftover_bytes + us)];
                     let result = transform_buffer(t, read_slice, &mut output, false);
                     leftover_bytes = result.leftover_bytes;
-                    stdout_lock.write_all(&output[..(result.bytes_written)])?;
+                    stdout_lock
+                        .write_all(&output[..(result.bytes_written)])
+                        .map_err(write_error)?;
                 }
                 Err(er) => {
                     if er.kind() == ErrorKind::Interrupted {

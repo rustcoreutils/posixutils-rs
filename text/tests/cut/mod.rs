@@ -487,3 +487,19 @@ fn attached_option_argument_may_begin_with_equals() {
     cut_test(&["-nd=", "-f2"], "a=b\n", "b\n");
     plib::testing::assert_equals_option_argument("cut", "-d", &["-f2"], b"a=b\n");
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cut_write_error_on_full_device() {
+    // A failed write to standard output is "cut: write error: REASON",
+    // with the system's text for the error and exit status 1.
+    plib::testing::assert_write_error_message_on_full_device("cut", &["-c1"], b"abc\n", 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cut_fields_write_error_on_full_device() {
+    // A failed write to standard output is "cut: write error: REASON",
+    // with the system's text for the error and exit status 1.
+    plib::testing::assert_write_error_message_on_full_device("cut", &["-f1"], b"abc\n", 1);
+}

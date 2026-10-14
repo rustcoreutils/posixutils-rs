@@ -843,3 +843,11 @@ fn test_version_flag_is_long_only() {
     assert_eq!(out.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&out.stdout).starts_with("posixutils-text "));
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sort_write_error_on_full_device() {
+    // A failed write to standard output is "sort: write error: REASON",
+    // with the system's text for the error and exit status 2.
+    plib::testing::assert_write_error_message_on_full_device("sort", &[], b"b\na\n", 2);
+}

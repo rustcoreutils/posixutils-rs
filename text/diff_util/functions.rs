@@ -71,6 +71,19 @@ pub fn io_error_at(path: &Path, error: io::Error) -> io::Error {
     )
 }
 
+/// Turn a failed write to standard output into an error whose text is the
+/// diagnostic, `write error: REASON`, with the system's text for the error.
+pub fn write_error(error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!(
+            "{}: {}",
+            gettextrs::gettext("write error"),
+            plib::diag::io_error_text(&error)
+        ),
+    )
+}
+
 pub fn check_existance(path_buf: &Path) -> io::Result<bool> {
     if !path_buf.exists() {
         eprintln!(

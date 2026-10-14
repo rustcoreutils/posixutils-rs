@@ -798,14 +798,24 @@ fn write_output(records: &[Record], args: &Args) -> Result<(), String> {
     }
 }
 
+/// The diagnostic for a failed write: `write error: REASON`, with the
+/// system's text for the error.
+fn write_error(e: std::io::Error) -> String {
+    format!(
+        "{}: {}",
+        gettext("write error"),
+        plib::diag::io_error_text(&e)
+    )
+}
+
 /// Write each record's line, ended by `eol`.
 fn write_lines(mut w: impl Write, records: &[Record], eol: u8) -> Result<(), String> {
     for r in records {
         w.write_all(r.line.as_bytes())
             .and_then(|()| w.write_all(&[eol]))
-            .map_err(|e| format!("write error: {e}"))?;
+            .map_err(write_error)?;
     }
-    w.flush().map_err(|e| format!("write error: {e}"))
+    w.flush().map_err(write_error)
 }
 
 /// Sequentially scan the inputs for the first out-of-order pair (`-c`/`-C`).

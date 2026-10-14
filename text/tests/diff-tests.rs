@@ -2374,3 +2374,29 @@ fn test_diff_report_identical_files_in_directories() {
         EXIT_STATUS_DIFFERENCE,
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn diff_write_error_on_full_device() {
+    // A failed write to standard output is "diff: write error: REASON",
+    // with the system's text for the error and exit status 2.
+    plib::testing::assert_write_error_message_on_full_device(
+        "diff",
+        &["-", "/dev/null"],
+        b"x\n",
+        2,
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn diff_unified_write_error_on_full_device() {
+    // A failed write to standard output is "diff: write error: REASON",
+    // with the system's text for the error and exit status 2.
+    plib::testing::assert_write_error_message_on_full_device(
+        "diff",
+        &["-u", "-", "/dev/null"],
+        b"x\n",
+        2,
+    );
+}

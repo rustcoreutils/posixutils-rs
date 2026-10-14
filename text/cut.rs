@@ -345,26 +345,35 @@ fn cut_files(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 buf.pop();
             }
 
-            match &parse_option {
+            let written = match &parse_option {
                 ParseVariat::Bytes(ranges) => {
                     // Write the selected bytes verbatim: they need not be valid
                     // characters, so do not route through a UTF-8 string.
                     let mut bytes = cut_bytes(&buf, args.delimiter, ranges, args.no_split);
                     bytes.push(b'\n');
-                    stdout.write_all(&bytes)?;
+                    stdout.write_all(&bytes)
                 }
                 ParseVariat::Characters(ranges) => {
                     let line = String::from_utf8_lossy(&buf);
-                    writeln!(stdout, "{}", cut_characters(&line, args.delimiter, ranges))?;
+                    writeln!(stdout, "{}", cut_characters(&line, args.delimiter, ranges))
                 }
                 ParseVariat::Fields(ranges) => {
                     let line = String::from_utf8_lossy(&buf);
                     let (result, skip) = cut_fields(&line, field_delim, ranges, args.suppress);
-                    if !skip {
-                        writeln!(stdout, "{}", result)?;
+                    if skip {
+                        Ok(())
+                    } else {
+                        writeln!(stdout, "{}", result)
                     }
                 }
-            }
+            };
+            written.map_err(|e| {
+                format!(
+                    "{}: {}",
+                    gettext("write error"),
+                    plib::diag::io_error_text(&e)
+                )
+            })?;
         }
     }
     Ok(())

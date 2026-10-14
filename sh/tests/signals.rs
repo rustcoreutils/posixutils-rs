@@ -135,28 +135,15 @@ fn pipeline_without_job_control_stays_in_the_shell_process_group() {
     );
 }
 
-// A flood of trapped signals while the shell is blocked must neither hang it
-// nor lose a signal. The shell is blocked reading a command substitution,
-// whose reads are retried after each interruption without running traps,
-// while the substitution's command sends it tens of thousands of USR1s and
-// then one USR2. Every delivery used to write a record to a blocking
-// self-pipe, which filled up, and the next signal handler blocked in write()
-// forever. The same signal may be coalesced (XCU 2.11), so USR1 must run at
-// least once and USR2 exactly once, as in dash and bash.
-#[test]
-fn signal_flood_neither_hangs_nor_loses_a_signal() {
+/// Runs `sh -c script`, failing the test instead of hanging it when the
+/// shell does not finish within two minutes.
+fn sh_c_bounded(script: &str) -> std::process::Output {
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
     use std::time::Duration;
 
-    let script = format!(
-        "n=0; trap 'n=$((n+1))' USR1; trap 'm=$((m+1))' USR2; \
-         x=$({SH} -c 'i=0; while [ $i -lt 30000 ]; do kill -USR1 $1; i=$((i+1)); done; \
-         kill -USR2 $1; echo done' flood $$); \
-         echo $x; [ $n -ge 1 ] && echo usr1; echo usr2=$m"
-    );
     let child = Command::new(SH)
-        .args(["-c", &script])
+        .args(["-c", script])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -167,13 +154,75 @@ fn signal_flood_neither_hangs_nor_loses_a_signal() {
     std::thread::spawn(move || {
         let _ = tx.send(child.wait_with_output());
     });
-    let output = match rx.recv_timeout(Duration::from_secs(120)) {
+    match rx.recv_timeout(Duration::from_secs(120)) {
         Ok(output) => output.expect("wait for sh"),
         Err(_) => {
             unsafe { libc::kill(pid, libc::SIGKILL) };
-            panic!("the shell hung under a flood of trapped signals");
+            panic!("the shell hung running {script:?}");
         }
-    };
+    }
+}
+
+// A trap runs as soon as the command during which its signal arrived has
+// finished, with `$?` that command's status, as in dash and bash; not at
+// the next external command, or never if none follows. A trapped TERM sent
+// to a loop of built-ins could not stop it at all.
+#[test]
+fn trap_runs_after_the_command_that_received_the_signal() {
+    sh_c(
+        "trap 'echo got' USR1; kill -USR1 $$; echo after",
+        "got\nafter\n",
+    );
+    sh_c("trap 'echo got' USR1; echo hi; kill -USR1 $$", "hi\ngot\n");
+    sh_c(
+        "trap 'echo trap $?; false' USR1; kill -USR1 $$; echo $?",
+        "trap 0\n0\n",
+    );
+    sh_c(
+        "f() { kill -USR1 $$; echo inf; }; trap 'echo got' USR1; f; echo after",
+        "got\ninf\nafter\n",
+    );
+    sh_c(
+        "trap 'echo got' USR1; x=$(kill -USR1 $$); echo after",
+        "got\nafter\n",
+    );
+    let output =
+        sh_c_bounded("trap 'echo got; exit 3' TERM; (kill -TERM $$) & while :; do :; done");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "got\n");
+    assert_eq!(output.status.code(), Some(3));
+}
+
+// A signal that arrives while a trap action runs waits for it to finish
+// instead of running a nested trap: a trap that sends its own signal again
+// tens of thousands of times overflowed the stack once signals were checked
+// after every command. dash and bash count to the end.
+#[test]
+fn trap_actions_do_not_nest() {
+    let output = sh_c_bounded(
+        "n=0; trap 'n=$((n+1)); [ $n -lt 50000 ] && kill -USR1 $$' USR1; kill -USR1 $$; echo $n",
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "50000\n");
+    assert!(output.status.success());
+}
+
+// A flood of trapped signals while the shell is blocked must neither hang it
+// nor lose a signal. The shell is blocked reading a command substitution,
+// whose reads are retried after each interruption without running traps,
+// while the substitution's command sends it tens of thousands of USR1s and
+// then one USR2. Every delivery used to write a record to a blocking
+// self-pipe, which filled up, and the next signal handler blocked in write()
+// forever. The same signal may be coalesced (XCU 2.11), so USR1 must run at
+// least once and USR2 exactly once, as in dash and bash.
+#[test]
+fn signal_flood_neither_hangs_nor_loses_a_signal() {
+    let script = format!(
+        "n=0; trap 'n=$((n+1))' USR1; trap 'm=$((m+1))' USR2; \
+         x=$({SH} -c 'i=0; while [ $i -lt 30000 ]; do kill -USR1 $1; i=$((i+1)); done; \
+         kill -USR2 $1; echo done' flood $$); \
+         echo $x; [ $n -ge 1 ] && echo usr1; echo usr2=$m"
+    );
+    let output = sh_c_bounded(&script);
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),

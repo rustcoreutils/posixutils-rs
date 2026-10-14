@@ -147,6 +147,10 @@ pub fn wait_for_input(fd: RawFd) -> OsResult<()> {
                 errno,
             });
         }
+    } else if fds[1].revents != 0 {
+        // The signals themselves are in the handler's flags; the byte that
+        // woke the poll (perhaps a subshell's) must not wake it again.
+        crate::os::signals::drain_signal_pipe();
     }
     Ok(())
 }

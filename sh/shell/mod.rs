@@ -467,9 +467,13 @@ impl Shell {
     }
 
     pub fn process_signals(&mut self) {
+        if !self.signal_manager.begin_running_traps() {
+            return;
+        }
         while let Some(action) = self.signal_manager.get_pending_action().cloned() {
             self.execute_action(action)
         }
+        self.signal_manager.end_running_traps();
     }
 
     fn handle_error(&mut self, err: CommandExecutionError) -> i32 {
@@ -1202,6 +1206,11 @@ impl Shell {
         }
         self.last_pipeline_exit_status = status;
         self.last_status_from_ignored_failure = status != 0 && ignored;
+        // A trap runs once the command during which its signal arrived has
+        // finished, with `$?` its status (as in dash and bash); waiting for
+        // the next external command delayed it arbitrarily, and a loop of
+        // built-ins could never be stopped by a trapped signal.
+        self.process_signals();
         Ok(status)
     }
 

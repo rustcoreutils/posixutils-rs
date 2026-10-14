@@ -242,6 +242,13 @@ static SIGNAL_READ: AtomicI32 = AtomicI32::new(-1);
 /// of one signal coalesce into one, as POSIX allows (XCU 2.11).
 static PENDING: [AtomicBool; 128] = [const { AtomicBool::new(false) }; 128];
 
+/// Set by the handler after its flag and wake-up byte, so the shell can
+/// check for signals after every command without a system call. The handler
+/// interrupts the shell's only thread and runs to completion, so whenever
+/// this is clear no flag is set, and a byte in the pipe is not this
+/// process's (see `drain_signal_pipe`).
+static ANY_PENDING: AtomicBool = AtomicBool::new(false);
+
 /// The calling thread's `errno`.
 fn errno_location() -> *mut libc::c_int {
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "emscripten"))]
@@ -281,6 +288,7 @@ extern "C" fn record_signal(signal: libc::c_int) {
         // the shell anyway, and the flag above records the signal.
         unsafe { libc::write(fd, (&byte as *const u8).cast(), 1) };
     }
+    ANY_PENDING.store(true, Ordering::SeqCst);
     unsafe { *errno = saved_errno };
 }
 
@@ -325,32 +333,49 @@ pub fn signal_read_fd() -> RawFd {
     SIGNAL_READ.load(Ordering::SeqCst)
 }
 
-fn get_pending_signal() -> Option<Signal> {
-    // Empty the pipe before looking at the flags: a signal that arrives in
-    // between leaves both its flag and a byte, and the byte wakes the shell
-    // again later, so nothing is missed. The bytes carry no information, so
-    // a failure to read them loses nothing but a wake-up: report it and go on
-    // to the flags.
+/// Empties the signal pipe. The bytes carry no information, so a failure to
+/// read them loses nothing but a wake-up: it is reported and otherwise
+/// ignored. A subshell shares the pipe with its parent, so a byte may also
+/// come from the other process, whose flags are its own; anything that
+/// polls the pipe must empty it once woken, or the stray byte would keep
+/// waking it.
+pub fn drain_signal_pipe() {
     let fd = signal_read_fd();
+    if fd < 0 {
+        return;
+    }
     let mut buf = [0u8; 256];
-    if fd >= 0 {
-        loop {
-            match read(fd, &mut buf) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(err) if err.errno == Errno::EINTR => {}
-                Err(err) if err.errno == Errno::EAGAIN => break,
-                Err(err) => {
-                    stderr_println!("{err}");
-                    break;
-                }
+    loop {
+        match read(fd, &mut buf) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(err) if err.errno == Errno::EINTR => {}
+            Err(err) if err.errno == Errno::EAGAIN => break,
+            Err(err) => {
+                stderr_println!("{err}");
+                break;
             }
         }
     }
-    SIGNALS
+}
+
+fn get_pending_signal() -> Option<Signal> {
+    if !ANY_PENDING.swap(false, Ordering::SeqCst) {
+        return None;
+    }
+    // Empty the pipe before looking at the flags: a signal that arrives in
+    // between leaves its flag, its byte and ANY_PENDING, so the byte is
+    // emptied next time and nothing is missed.
+    drain_signal_pipe();
+    let signal = SIGNALS
         .iter()
         .copied()
-        .find(|&signal| PENDING[i32::from(signal) as usize].swap(false, Ordering::SeqCst))
+        .find(|&signal| PENDING[i32::from(signal) as usize].swap(false, Ordering::SeqCst));
+    if signal.is_some() {
+        // Others may be pending too; the caller asks again until None.
+        ANY_PENDING.store(true, Ordering::SeqCst);
+    }
+    signal
 }
 
 unsafe fn handle_signal(signal: Signal, handler: libc::sighandler_t) {
@@ -411,6 +436,11 @@ pub struct SignalManager {
     ignored_on_entry: [bool; Signal::Count as usize],
     is_interactive: bool,
     sigint_count: u32,
+    /// Trap actions are running. Signals that arrive meanwhile wait until
+    /// they finish rather than nest inside them: signals are checked after
+    /// every command, so a stream of them would otherwise nest without
+    /// bound, and the stack would overflow.
+    running_traps: bool,
 }
 
 impl SignalManager {
@@ -431,7 +461,18 @@ impl SignalManager {
             ignored_on_entry,
             is_interactive,
             sigint_count: 0,
+            running_traps: false,
         }
+    }
+
+    /// Marks trap actions as running; false if they already are, when the
+    /// caller must leave pending signals to the run in progress.
+    pub fn begin_running_traps(&mut self) -> bool {
+        !std::mem::replace(&mut self.running_traps, true)
+    }
+
+    pub fn end_running_traps(&mut self) {
+        self.running_traps = false;
     }
 
     /// Installs the default action of `signal`: SIG_DFL, or SIG_IGN for a
@@ -445,6 +486,8 @@ impl SignalManager {
     }
 
     pub fn reset(&mut self) {
+        // A subshell started from a trap action runs its own traps.
+        self.running_traps = false;
         for signal in SIGNALS {
             let signal = *signal;
             if signal == Signal::SigKill || signal == Signal::SigStop {
@@ -467,6 +510,7 @@ impl SignalManager {
     /// Re-installs `saved`'s dispositions, after a `reset()` that turned out
     /// not to be followed by replacing the process (a failed `exec`).
     pub fn restore(&mut self, saved: Self) {
+        self.running_traps = saved.running_traps;
         for signal in SIGNALS {
             let signal = *signal;
             if signal == Signal::SigKill || signal == Signal::SigStop {

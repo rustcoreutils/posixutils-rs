@@ -794,31 +794,35 @@ impl Shell {
         body: &CompleteCommand,
         ignore_errexit: bool,
     ) -> CommandExecutionResult<i32> {
+        // The list is expanded once, into one list of fields, before the
+        // first iteration (XCU 2.9.4.2): the body cannot change words still
+        // to come, and `continue` moves on to the next field even when it
+        // came from the same word.
+        let mut fields = Vec::new();
+        for word_pair in iter_words {
+            fields.extend(expand_word(&word_pair.word, false, self)?);
+        }
         let mut result = 0;
         self.loop_depth += 1;
-        'outer: for word_pair in iter_words {
-            let items = expand_word(&word_pair.word, false, self)?;
-            for item in items {
-                self.assign_global(iter_var.to_string(), item)?;
-                result = self.interpret(body, ignore_errexit);
-                match self.control_flow_state {
-                    ControlFlowState::Break(_) => {
-                        self.control_flow_state.go_to_outer_loop();
-                        break 'outer;
-                    }
-                    ControlFlowState::Continue(n) => {
-                        self.control_flow_state.go_to_outer_loop();
-                        if n > 1 {
-                            break 'outer;
-                        } else {
-                            continue 'outer;
-                        }
-                    }
-                    ControlFlowState::Return => {
-                        break 'outer;
-                    }
-                    _ => {}
+        for field in fields {
+            if let Err(err) = self.assign_global(iter_var.to_string(), field) {
+                self.loop_depth -= 1;
+                return Err(err.into());
+            }
+            result = self.interpret(body, ignore_errexit);
+            match self.control_flow_state {
+                ControlFlowState::Break(_) => {
+                    self.control_flow_state.go_to_outer_loop();
+                    break;
                 }
+                ControlFlowState::Continue(n) => {
+                    self.control_flow_state.go_to_outer_loop();
+                    if n > 1 {
+                        break;
+                    }
+                }
+                ControlFlowState::Return => break,
+                _ => {}
             }
         }
         self.loop_depth -= 1;

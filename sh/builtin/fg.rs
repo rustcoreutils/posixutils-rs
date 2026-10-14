@@ -10,8 +10,9 @@
 use crate::builtin::{args_as_str, skip_option_terminator, BuiltinResult, BuiltinUtility};
 use crate::jobs::{parse_job_id, Job, JobId, JobState};
 use crate::os::signals::{kill, Signal};
+use crate::os::{give_terminal_to, job_control_tty};
 use crate::shell::opened_files::OpenedFiles;
-use crate::shell::Shell;
+use crate::shell::{take_terminal_back, Shell};
 use crate::shstr::ShString;
 use gettextrs::gettext;
 
@@ -27,16 +28,31 @@ fn run_foreground_job(
         return Err(format!("fg: job {arg} already terminated\n"));
     }
     opened_files.write_out(format!("{}\n", job.command));
-    if let JobState::Stopped(_) = job.state() {
-        if let Err(err) = kill(job.signal_target(), Some(Signal::SigCont)) {
-            let message = format!("fg: failed to resume {arg} ({err})\n");
-            shell.background_jobs.reinsert_job(job);
-            return Err(message);
-        }
-        job.mark_continued();
+    // XCU 2.11: the job's process group becomes the terminal's foreground
+    // group, before it is resumed, so that it can read the terminal at once.
+    let terminal = job.process_group.zip(job_control_tty());
+    if let Some((pgid, terminal)) = terminal {
+        let _ = give_terminal_to(terminal, pgid);
     }
+    // As in dash, the whole group is continued whatever state it was last
+    // seen in: a process may have stopped since. A running job may also
+    // have finished since, which is no failure: the wait collects it.
+    let resumed = kill(job.signal_target(), Some(Signal::SigCont));
+    if let (Err(err), JobState::Stopped(_)) = (resumed, job.state()) {
+        if terminal.is_some() {
+            take_terminal_back();
+        }
+        let message = format!("fg: failed to resume {arg} ({err})\n");
+        shell.background_jobs.reinsert_job(job);
+        return Err(message);
+    }
+    job.mark_continued();
     // The exit status of fg is the exit status of the job it waited for.
-    shell.wait_for_job(job).map_err(|err| format!("{err}\n"))
+    let status = shell.wait_for_job(job).map_err(|err| format!("{err}\n"));
+    if terminal.is_some() {
+        take_terminal_back();
+    }
+    status
 }
 pub struct Fg;
 

@@ -326,10 +326,9 @@ pub fn parse_job_id(text: &str) -> Result<JobId<'_>, ()> {
 /// rare, so the memory is a ring rather than a table that grows forever.
 const COLLECTED_MEMORY: usize = 32;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct JobManager {
     jobs: Vec<Job>,
-    last_job_number: u64,
     /// Statuses of jobs `wait` has already collected, by process id. A
     /// collected job leaves the table -- `jobs` must not list it -- but
     /// `wait` on one of its processes keeps reporting its status, which is
@@ -464,10 +463,13 @@ impl JobManager {
         self.collected.push_back((pid, status));
     }
 
-    /// Adds `job` to the table under a new job number, as the current job.
+    /// Adds `job` to the table as the current job, under the lowest job
+    /// number not in use, as in dash (bash also starts again from 1 once
+    /// the table is empty).
     pub fn add_job(&mut self, mut job: Job) {
-        job.number = self.last_job_number;
-        self.last_job_number += 1;
+        job.number = (1..)
+            .find(|number| self.jobs.iter().all(|job| job.number != *number))
+            .unwrap_or(1);
         self.reinsert_job(job);
     }
 
@@ -534,16 +536,6 @@ impl JobManager {
                 writer(job)
             }
             job.state_should_be_reported = false;
-        }
-    }
-}
-
-impl Default for JobManager {
-    fn default() -> Self {
-        Self {
-            jobs: Vec::new(),
-            last_job_number: 1,
-            collected: VecDeque::new(),
         }
     }
 }

@@ -181,19 +181,19 @@ fn fg_returns_the_jobs_exit_status() {
 
 #[test]
 fn bg_resumes_a_stopped_job() {
+    // `$$` in a subshell is the interactive shell's pid, so the job stops
+    // a shell of its own; `wait` returns once it has stopped.
     let mut sh = ShPtySession::new();
-    let out = sh.path("state");
-    let marker = sh.path("resumed");
-    sh.line(&format!(
-        "{{ kill -STOP $$; echo resumed > '{}'; }} &",
-        marker.display()
-    ));
-    thread::sleep(Duration::from_millis(200));
-    sh.line("bg %1");
-    thread::sleep(Duration::from_millis(300));
-    sh.line(&format!("echo done > '{}'", out.display()));
+    sh.line("sh -c 'kill -STOP $$; echo resumed > resumed' &");
+    sh.line("wait %1; jobs > stopped; bg %1 > bg");
+    wait_for_file(&sh.path("resumed"));
     let dir = sh.exit();
     assert_eq!(read_result(&dir.path().join("resumed")).trim(), "resumed");
+    assert!(read_result(&dir.path().join("stopped")).contains("Stopped (SIGSTOP)"));
+    assert_eq!(
+        read_result(&dir.path().join("bg")),
+        "[1] sh -c 'kill -STOP $$; echo resumed > resumed' &\n"
+    );
 }
 
 #[test]
@@ -587,4 +587,73 @@ fn ctrl_c_reaches_only_the_foreground_job() {
         "[1] + Running sleep 30 &\n"
     );
     assert!(!dir.path().join("after").exists());
+}
+
+// `fg` gives a suspended job the terminal again and resumes it; its status
+// is the job's. A job that stops again under `fg` keeps its number.
+#[test]
+fn fg_resumes_a_suspended_job_in_the_foreground() {
+    let mut sh = ShPtySession::new();
+    sh.line("sh -c ': > started; sleep 1; exit 7'");
+    suspend_once_started(&mut sh);
+    sh.line("fg > fg; echo $? > status");
+    wait_for_file(&sh.path("status"));
+    // again, and stopped once more while in the foreground
+    sh.line("rm started; : > started; sleep 30");
+    suspend_once_started(&mut sh);
+    sh.line("rm started; fg");
+    thread::sleep(Duration::from_millis(300));
+    sh.keys("\x1a");
+    thread::sleep(Duration::from_millis(300));
+    sh.line("jobs > jobs; kill -KILL %1");
+    let dir = sh.exit();
+    assert_eq!(read_result(&dir.path().join("status")).trim(), "7");
+    assert_eq!(
+        read_result(&dir.path().join("fg")),
+        "sh -c ': > started; sleep 1; exit 7'\n"
+    );
+    assert_eq!(
+        read_result(&dir.path().join("jobs")),
+        "[1] + Stopped sleep 30\n"
+    );
+}
+
+// `fg` resumes every process of a suspended pipeline: its output arrives.
+#[test]
+fn fg_resumes_a_whole_pipeline() {
+    let mut sh = ShPtySession::new();
+    sh.line("sh -c ': > started; sleep 1; echo a' | cat > out");
+    suspend_once_started(&mut sh);
+    sh.line("fg > /dev/null; echo $? > status");
+    wait_for_file(&sh.path("status"));
+    let dir = sh.exit();
+    assert_eq!(read_result(&dir.path().join("status")).trim(), "0");
+    assert_eq!(read_result(&dir.path().join("out")), "a\n");
+}
+
+// `bg` resumes a suspended job in the background: `jobs` shows it stopped,
+// then running, and `wait` collects it.
+#[test]
+fn bg_resumes_a_suspended_job_in_the_background() {
+    let mut sh = ShPtySession::new();
+    sh.line("sh -c ': > started; sleep 1; echo done > out'");
+    suspend_once_started(&mut sh);
+    sh.line("jobs > before; bg > bg; jobs > after; wait; echo $? > status");
+    wait_for_file(&sh.path("status"));
+    let dir = sh.exit();
+    let command = "sh -c ': > started; sleep 1; echo done > out'";
+    assert_eq!(
+        read_result(&dir.path().join("before")),
+        format!("[1] + Stopped {command}\n")
+    );
+    assert_eq!(
+        read_result(&dir.path().join("bg")),
+        format!("[1] {command}\n")
+    );
+    assert_eq!(
+        read_result(&dir.path().join("after")),
+        format!("[1] + Running {command}\n")
+    );
+    assert_eq!(read_result(&dir.path().join("status")).trim(), "0");
+    assert_eq!(read_result(&dir.path().join("out")), "done\n");
 }

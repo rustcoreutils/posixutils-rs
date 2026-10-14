@@ -51,7 +51,7 @@ impl fmt::Display for EdError {
             EdError::NoPreviousPattern => write!(f, "{}", gettext("No previous pattern")),
             EdError::NoMatch => write!(f, "{}", gettext("No match")),
             EdError::BufferModified => write!(f, "{}", gettext("Warning: buffer modified")),
-            EdError::Io(e) => write!(f, "{}", e),
+            EdError::Io(e) => f.write_str(&plib::diag::io_error_text(e)),
             EdError::Syntax(msg) => write!(f, "{}", msg),
         }
     }

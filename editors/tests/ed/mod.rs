@@ -2403,3 +2403,19 @@ fn help_write_error_on_full_device() {
 fn write_error_message_on_full_device() {
     plib::testing::assert_write_error_message_on_full_device("ed", &[], b"a\nhello\n.\np\nQ\n", 1);
 }
+
+// With help mode on, a failed file operation is explained in the system's
+// words, without Rust's "(os error N)" suffix.
+#[test]
+fn help_message_for_io_error_has_no_os_error_suffix() {
+    let missing = "/nonexistent-dir/x";
+    let reason = plib::diag::io_error_text(&fs::File::open(missing).unwrap_err());
+    run_test(TestPlan {
+        cmd: String::from("ed"),
+        args: vec![],
+        stdin_data: format!("H\ne {missing}\nq\n"),
+        expected_out: format!("?\n{reason}\n"),
+        expected_err: String::new(),
+        expected_exit_code: 1,
+    });
+}

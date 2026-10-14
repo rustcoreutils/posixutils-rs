@@ -74,7 +74,11 @@ fn apply_increment(increment: i32) {
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
             // Non-fatal: warn and continue to exec the utility anyway.
-            diag::warning(&format!("{}: {}", gettext("cannot set nice value"), e));
+            diag::warning(&format!(
+                "{}: {}",
+                gettext("cannot set nice value"),
+                plib::diag::io_error_text(&e)
+            ));
         }
     }
 }

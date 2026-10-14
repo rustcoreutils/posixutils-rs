@@ -174,7 +174,7 @@ fn main() -> ExitCode {
             // --help / --version are not errors; let clap print and exit 0.
             use clap::error::ErrorKind;
             if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
-                e.exit();
+                plib::optarg::exit(e);
             }
             return ExitCode::from(ERR_UNKNOWN_OPTION);
         }

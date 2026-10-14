@@ -279,10 +279,70 @@ pub fn flush_stdout() -> bool {
     match io::stdout().flush() {
         Ok(()) => true,
         Err(e) => {
-            error(&format!("write error: {}", io_error_text(&e)));
+            write_error(&e);
             false
         }
     }
+}
+
+/// Report a failed write to standard output as `UTILITY: write error: REASON`,
+/// counted like any [`error`].
+pub fn write_error(e: &io::Error) {
+    error(&write_error_text(e));
+}
+
+/// `write error: REASON`, the text of every write-error diagnostic.
+fn write_error_text(e: &io::Error) -> String {
+    format!(
+        "{}: {}",
+        gettextrs::gettext("write error"),
+        io_error_text(e)
+    )
+}
+
+/// A failed write to standard output, displayed as `write error: REASON`.
+///
+/// For a utility that carries read and write failures alike in one
+/// `Box<dyn Error>`: wrap each write's error with it (`.map_err(WriteError)?`),
+/// and [`error_text`] renders it as the common write-error diagnostic, while
+/// a failed read still names its file.
+#[derive(Debug)]
+pub struct WriteError(pub io::Error);
+
+impl fmt::Display for WriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&write_error_text(&self.0))
+    }
+}
+
+impl std::error::Error for WriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+impl From<WriteError> for io::Error {
+    /// Keep the write error recognizable through code that returns
+    /// `io::Result`: [`error_text`] finds it inside.
+    fn from(e: WriteError) -> Self {
+        io::Error::new(e.0.kind(), e)
+    }
+}
+
+/// Whether `e` is a [`WriteError`], boxed or carried inside an `io::Error`.
+///
+/// Standard output has failed then, and output it still buffers would only
+/// fail, and be reported, again at a final flush.
+pub fn is_write_error(e: &(dyn std::error::Error + 'static)) -> bool {
+    e.is::<WriteError>()
+        || e.downcast_ref::<io::Error>()
+            .and_then(|io_err| io_err.get_ref())
+            .is_some_and(|inner| inner.is::<WriteError>())
+}
+
+/// Whether [`init`] (or [`init_locale`]) has named the utility on this thread.
+pub(crate) fn is_initialized() -> bool {
+    UTIL_NAME.with(|s| !s.borrow().is_empty())
 }
 
 /// Render an `io::Error` the way a system utility reports one.
@@ -333,6 +393,13 @@ pub fn io_error_text(e: &io::Error) -> String {
 /// with the parenthetical stripped.
 pub fn error_text(e: &(dyn std::error::Error + 'static)) -> String {
     if let Some(io_err) = e.downcast_ref::<io::Error>() {
+        // A WriteError carried inside an io::Error (see its From impl).
+        if let Some(write) = io_err
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<WriteError>())
+        {
+            return write.to_string();
+        }
         return io_error_text(io_err);
     }
     let s = e.to_string();
@@ -403,6 +470,19 @@ fn write_at(pos: Position, level: &str, msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_error_reads_as_a_write_error_boxed_or_inside_io_error() {
+        let boxed: Box<dyn std::error::Error> = Box::new(WriteError(io::Error::other("full")));
+        assert_eq!(error_text(boxed.as_ref()), "write error: full");
+        let wrapped: Box<dyn std::error::Error> =
+            Box::new(io::Error::from(WriteError(io::Error::other("full"))));
+        assert_eq!(error_text(wrapped.as_ref()), "write error: full");
+        assert!(is_write_error(boxed.as_ref()));
+        assert!(is_write_error(wrapped.as_ref()));
+        let read: Box<dyn std::error::Error> = Box::new(io::Error::other("bad"));
+        assert!(!is_write_error(read.as_ref()));
+    }
 
     /// An environment holding exactly `vars`.
     #[cfg(windows)]

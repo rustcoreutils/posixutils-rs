@@ -169,7 +169,8 @@ impl Args {
             out.extend(words.into_iter().map(OsString::from));
         }
 
-        let mut args = Args::parse_from(plib::optarg::keep_leading_equals::<Args>(out));
+        let mut args =
+            plib::optarg::parse_from::<Args>(plib::optarg::keep_leading_equals::<Args>(out));
         args.add_stdin_if_no_files();
 
         args

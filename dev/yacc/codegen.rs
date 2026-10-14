@@ -86,8 +86,14 @@ fn generate_code_file(
     grammar: &Grammar,
     lalr: &LALRAutomaton,
 ) -> Result<(), YaccError> {
-    let file = File::create(path)
-        .map_err(|e| YaccError::Io(format!("{} '{}': {}", gettext("cannot create"), path, e)))?;
+    let file = File::create(path).map_err(|e| {
+        YaccError::Io(format!(
+            "{} '{}': {}",
+            gettext("cannot create"),
+            path,
+            plib::diag::io_error_text(&e)
+        ))
+    })?;
     let mut w = BufWriter::new(file);
 
     // Header comments
@@ -215,8 +221,14 @@ typedef int YYSTYPE;
         writeln!(w, "{}", epilogue.code)?;
     }
 
-    w.flush()
-        .map_err(|e| YaccError::Io(format!("{} '{}': {}", gettext("error writing"), path, e)))?;
+    w.flush().map_err(|e| {
+        YaccError::Io(format!(
+            "{} '{}': {}",
+            gettext("error writing"),
+            path,
+            plib::diag::io_error_text(&e)
+        ))
+    })?;
 
     Ok(())
 }
@@ -1786,8 +1798,14 @@ fn generate_stack_reference(n: i32, rhs_len: usize, tag: Option<&str>, prefix: &
 
 /// Generate header file (y.tab.h)
 fn generate_header_file(path: &str, opts: &Options, grammar: &Grammar) -> Result<(), YaccError> {
-    let file = File::create(path)
-        .map_err(|e| YaccError::Io(format!("{} '{}': {}", gettext("cannot create"), path, e)))?;
+    let file = File::create(path).map_err(|e| {
+        YaccError::Io(format!(
+            "{} '{}': {}",
+            gettext("cannot create"),
+            path,
+            plib::diag::io_error_text(&e)
+        ))
+    })?;
     let mut w = BufWriter::new(file);
 
     writeln!(
@@ -1826,8 +1844,14 @@ typedef int YYSTYPE;
     // External yylval
     writeln!(w, "extern YYSTYPE {}lval;", opts.sym_prefix)?;
 
-    w.flush()
-        .map_err(|e| YaccError::Io(format!("{} '{}': {}", gettext("error writing"), path, e)))?;
+    w.flush().map_err(|e| {
+        YaccError::Io(format!(
+            "{} '{}': {}",
+            gettext("error writing"),
+            path,
+            plib::diag::io_error_text(&e)
+        ))
+    })?;
 
     Ok(())
 }
@@ -1838,8 +1862,14 @@ fn generate_description_file(
     grammar: &Grammar,
     lalr: &LALRAutomaton,
 ) -> Result<(), YaccError> {
-    let file = File::create(path)
-        .map_err(|e| YaccError::Io(format!("{} '{}': {}", gettext("cannot create"), path, e)))?;
+    let file = File::create(path).map_err(|e| {
+        YaccError::Io(format!(
+            "{} '{}': {}",
+            gettext("cannot create"),
+            path,
+            plib::diag::io_error_text(&e)
+        ))
+    })?;
     let mut w = BufWriter::new(file);
 
     writeln!(w, "Grammar")?;
@@ -2063,8 +2093,14 @@ fn generate_description_file(
         }
     }
 
-    w.flush()
-        .map_err(|e| YaccError::Io(format!("{} '{}': {}", gettext("error writing"), path, e)))?;
+    w.flush().map_err(|e| {
+        YaccError::Io(format!(
+            "{} '{}': {}",
+            gettext("error writing"),
+            path,
+            plib::diag::io_error_text(&e)
+        ))
+    })?;
 
     Ok(())
 }

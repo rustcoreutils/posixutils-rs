@@ -1285,3 +1285,10 @@ fn test_ls_recursive_trailing_slash_symlink() {
         0,
     );
 }
+
+// A failed write of the help text is a write error, not a silent success.
+#[cfg(target_os = "linux")]
+#[test]
+fn help_write_error_on_full_device() {
+    plib::testing::assert_write_error_message_on_full_device("ls", &["--help"], b"", 1);
+}

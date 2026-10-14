@@ -114,3 +114,24 @@ fn option_argument_may_begin_with_hyphen() {
         plib::testing::assert_hyphen_option_argument("ipcrm", &[opt, "-zq", "--help"]);
     }
 }
+
+// A failed write of the help text is a write error, not a silent success.
+#[cfg(target_os = "linux")]
+#[test]
+fn help_write_error_on_full_device() {
+    plib::testing::assert_write_error_message_on_full_device("ipcrm", &["--help"], b"", 1);
+}
+
+/// A failed removal is reported with the system's text for the error,
+/// without Rust's "(os error N)" suffix. No shared memory segment has this
+/// identifier.
+#[test]
+fn ipcrm_failure_names_the_system_error() {
+    let einval = plib::diag::io_error_text(&std::io::Error::from_raw_os_error(libc::EINVAL));
+    let out = plib::testing::run_test_base("ipcrm", &["-m".into(), "2147483646".into()], b"");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("ipcrm: shared memory id: 2147483646: {einval}\n")
+    );
+}

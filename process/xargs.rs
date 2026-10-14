@@ -171,7 +171,8 @@ impl Args {
     /// Parse the command line and split the operand list into the utility
     /// and its arguments.
     fn parse_command_line() -> Self {
-        let matches = Args::command().get_matches_from(plib::optarg::args_os::<Args>());
+        let matches =
+            plib::optarg::get_matches_from(Args::command(), plib::optarg::args_os::<Args>());
         let mut args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
         args.keep_last_batching_option(&matches);
         let mut command = std::mem::take(&mut args.command).into_iter();
@@ -342,7 +343,11 @@ impl<'a> Runner<'a> {
                     ));
                     ExecResult::NotFound
                 } else {
-                    diag::error(&format!("{}: {}", util.to_string_lossy(), e));
+                    diag::error(&format!(
+                        "{}: {}",
+                        util.to_string_lossy(),
+                        plib::diag::io_error_text(&e)
+                    ));
                     ExecResult::CannotInvoke
                 };
                 self.record(result);
@@ -393,7 +398,7 @@ impl<'a> Runner<'a> {
     fn finish(&mut self, status: i32) -> i32 {
         while !self.running.is_empty() {
             if let Err(e) = self.reap_one() {
-                diag::error(&e.to_string());
+                diag::error(&plib::diag::io_error_text(&e));
                 self.running.clear();
                 self.stop.get_or_insert(1);
             }
@@ -1031,7 +1036,7 @@ fn main() {
     let status = match read_and_spawn(&args, &mut runner) {
         Ok(code) => code,
         Err(e) => {
-            diag::error(&e.to_string());
+            diag::error(&plib::diag::io_error_text(&e));
             1
         }
     };

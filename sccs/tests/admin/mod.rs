@@ -696,3 +696,21 @@ fn admin_r_keeps_an_explicit_level() {
 fn admin_non_utf8_argument_is_reported() {
     plib::testing::assert_non_utf8_argument_rejected("admin", &[]);
 }
+
+/// An -i file that cannot be read is reported with the system's text for the
+/// error, without Rust's "(os error N)" suffix.
+#[test]
+fn admin_unreadable_input_names_the_system_error() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = tmp.path().join("s.noinput");
+    let missing = "/nonexistent/admin-input";
+    let open_error = plib::diag::io_error_text(&fs::File::open(missing).unwrap_err());
+    run_test(TestPlan {
+        cmd: String::from("admin"),
+        args: vec![sfile.to_string_lossy().into(), format!("-i{missing}")],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: format!("admin: {open_error}\n"),
+        expected_exit_code: 1,
+    });
+}

@@ -175,16 +175,31 @@ impl TopoSort {
     }
 }
 
-fn tsort_file(pathname: &Option<PathBuf>) -> io::Result<usize> {
+/// Why the sort failed: reading the input, which is reported against the
+/// file, or writing standard output, which is a write error.
+enum Failure {
+    Input(io::Error),
+    Output(io::Error),
+}
+
+/// Every write is to standard output; reads are mapped to `Input` by hand.
+impl From<io::Error> for Failure {
+    fn from(e: io::Error) -> Self {
+        Failure::Output(e)
+    }
+}
+
+fn tsort_file(pathname: &Option<PathBuf>) -> Result<usize, Failure> {
     // No operand or "-" reads stdin; any other path is opened as a file.
-    let file = input_stream_dashed(pathname.as_deref().unwrap_or(Path::new("")))?;
+    let file = input_stream_dashed(pathname.as_deref().unwrap_or(Path::new("")))
+        .map_err(Failure::Input)?;
     let reader = io::BufReader::new(file);
 
     let mut ts = TopoSort::new();
     let mut sv: Vec<String> = Vec::with_capacity(2);
 
     for line in reader.lines() {
-        for token in line?.split_whitespace() {
+        for token in line.map_err(Failure::Input)?.split_whitespace() {
             sv.push(String::from(token));
 
             if sv.len() == 2 {
@@ -250,10 +265,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Otherwise, a reported cycle makes the status non-zero.
             std::process::exit(plib::diag::exit_status());
         }
-        Err(e) => {
+        Err(Failure::Input(e)) => {
             plib::diag::error(&format!(
                 "{}: {}",
                 pathname_display(&args.file),
+                plib::diag::io_error_text(&e)
+            ));
+            std::process::exit(1);
+        }
+        Err(Failure::Output(e)) => {
+            plib::diag::error(&format!(
+                "{}: {}",
+                gettext("write error"),
                 plib::diag::io_error_text(&e)
             ));
             std::process::exit(1);

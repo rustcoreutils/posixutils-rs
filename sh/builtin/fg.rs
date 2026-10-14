@@ -10,33 +10,58 @@
 use crate::builtin::{args_as_str, skip_option_terminator, BuiltinResult, BuiltinUtility};
 use crate::jobs::{parse_job_id, Job, JobId, JobState};
 use crate::os::signals::{kill, Signal};
+use crate::os::{give_terminal_to, job_control_tty, set_tty_modes};
 use crate::shell::opened_files::OpenedFiles;
-use crate::shell::Shell;
+use crate::shell::{modes_to_restore, take_terminal_back, Shell};
 use crate::shstr::ShString;
 use gettextrs::gettext;
 
+/// Resumes `job` in the foreground and waits for it. A job that stops again
+/// goes back into the job table under the same job number, as in dash.
 fn run_foreground_job(
     shell: &mut Shell,
     opened_files: &mut OpenedFiles,
     arg: &str,
-    job: &Job,
+    mut job: Job,
 ) -> Result<i32, String> {
-    if matches!(job.state, JobState::Done(_) | JobState::Signaled(_)) {
-        return Err(format!("fg: job {arg} already terminated"));
-    }
-    if job.state == JobState::Stopped {
-        kill(job.pid, Some(Signal::SigCont))
-            .map_err(|err| format!("fg: failed to resume {arg} ({err})"))?;
+    if job.state().is_terminated() {
+        return Err(format!("fg: job {arg} already terminated\n"));
     }
     opened_files.write_out(format!("{}\n", job.command));
-    let mut temp = job.command.clone();
-    std::mem::swap(&mut shell.last_pipeline_command, &mut temp);
+    // XCU 2.11: the job's process group becomes the terminal's foreground
+    // group, before it is resumed, so that it can read the terminal at once.
+    // An interactive shell saves its own modes first and gives the job back
+    // the ones it stopped with (an editor's raw mode, say).
+    let terminal = job.process_group.zip(job_control_tty());
+    let mut shell_modes = None;
+    if let Some((pgid, terminal)) = terminal {
+        shell_modes = shell.save_tty_modes();
+        if let Some(modes) = job.tty_modes {
+            set_tty_modes(terminal, &modes);
+        }
+        let _ = give_terminal_to(terminal, pgid);
+    }
+    // As in dash, the whole group is continued whatever state it was last
+    // seen in: a process may have stopped since. A running job may also
+    // have finished since, which is no failure: the wait collects it.
+    let resumed = kill(job.signal_target(), Some(Signal::SigCont));
+    if let (Err(err), JobState::Stopped(_)) = (resumed, job.state()) {
+        if terminal.is_some() {
+            take_terminal_back(shell_modes);
+        }
+        let message = format!("fg: failed to resume {arg} ({err})\n");
+        shell.background_jobs.reinsert_job(job);
+        return Err(message);
+    }
+    job.mark_continued();
     // The exit status of fg is the exit status of the job it waited for.
-    let exit_status = shell
-        .wait_child_process(job.pid)
-        .map_err(|err| err.to_string())?;
-    std::mem::swap(&mut shell.last_pipeline_command, &mut temp);
-    Ok(exit_status)
+    let ended = shell.wait_for_job(job);
+    if terminal.is_some() {
+        take_terminal_back(modes_to_restore(&ended, shell_modes));
+    }
+    ended
+        .map(JobState::exit_status)
+        .map_err(|err| format!("{err}\n"))
 }
 pub struct Fg;
 
@@ -64,7 +89,7 @@ impl BuiltinUtility for Fg {
         let args = skip_option_terminator(args);
         if args.is_empty() {
             if let Some(job) = shell.background_jobs.remove_job(JobId::CurrentJob) {
-                match run_foreground_job(shell, opened_files, "current", &job) {
+                match run_foreground_job(shell, opened_files, "current", job) {
                     Ok(s) => status = s,
                     Err(err) => {
                         opened_files.write_err(err);
@@ -80,7 +105,7 @@ impl BuiltinUtility for Fg {
                 match parse_job_id(arg) {
                     Ok(job_id) => {
                         if let Some(job) = shell.background_jobs.remove_job(job_id) {
-                            match run_foreground_job(shell, opened_files, arg, &job) {
+                            match run_foreground_job(shell, opened_files, arg, job) {
                                 Ok(s) => status = s,
                                 Err(err) => {
                                     opened_files.write_err(err);

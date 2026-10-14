@@ -53,7 +53,11 @@ impl fmt::Display for CronError {
         match self {
             Self::Fork => write!(f, "Could not create child process"),
             Self::AlreadyRunning => write!(f, "Another crond instance is already running"),
-            Self::PidFile(e) => write!(f, "Could not create PID file: {}", e),
+            Self::PidFile(e) => write!(
+                f,
+                "Could not create PID file: {}",
+                plib::diag::io_error_text(e)
+            ),
         }
     }
 }
@@ -351,8 +355,9 @@ fn run_at_job(content: &str, owner: &UserInfo) -> bool {
     // SAFETY: called in the forked child before exec.
     if let Err(e) = unsafe { cron::job::drop_privileges(owner.uid, owner.gid, &owner.name) } {
         eprintln!(
-            "crond: {}: {e}",
-            gettext("cannot drop privileges for at job")
+            "crond: {}: {}",
+            gettext("cannot drop privileges for at job"),
+            plib::diag::io_error_text(&e)
         );
         std::process::exit(1);
     }

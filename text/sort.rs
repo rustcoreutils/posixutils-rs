@@ -762,7 +762,7 @@ fn read_inputs(args: &Args) -> Result<Vec<(String, Vec<String>)>, String> {
         let reader = input_stream_dashed(&f)
             .map_err(|e| format!("cannot read: {name}: {}", plib::diag::io_error_text(&e)))?;
         let lines = read_lines(io::BufReader::new(reader), args.eol())
-            .map_err(|e| format!("read error: {name}: {e}"))?;
+            .map_err(|e| format!("read error: {name}: {}", plib::diag::io_error_text(&e)))?;
         out.push((name, lines));
     }
     Ok(out)
@@ -790,12 +790,27 @@ fn read_lines(mut reader: impl BufRead, eol: u8) -> io::Result<Vec<String>> {
 
 fn write_output(records: &[Record], args: &Args) -> Result<(), String> {
     if let Some(path) = &args.output_file {
-        let file =
-            File::create(path).map_err(|e| format!("open failed: {}: {e}", path.display()))?;
+        let file = File::create(path).map_err(|e| {
+            format!(
+                "open failed: {}: {}",
+                path.display(),
+                plib::diag::io_error_text(&e)
+            )
+        })?;
         write_lines(BufWriter::new(file), records, args.eol())
     } else {
         write_lines(BufWriter::new(io::stdout().lock()), records, args.eol())
     }
+}
+
+/// The diagnostic for a failed write: `write error: REASON`, with the
+/// system's text for the error.
+fn write_error(e: std::io::Error) -> String {
+    format!(
+        "{}: {}",
+        gettext("write error"),
+        plib::diag::io_error_text(&e)
+    )
 }
 
 /// Write each record's line, ended by `eol`.
@@ -803,9 +818,9 @@ fn write_lines(mut w: impl Write, records: &[Record], eol: u8) -> Result<(), Str
     for r in records {
         w.write_all(r.line.as_bytes())
             .and_then(|()| w.write_all(&[eol]))
-            .map_err(|e| format!("write error: {e}"))?;
+            .map_err(write_error)?;
     }
-    w.flush().map_err(|e| format!("write error: {e}"))
+    w.flush().map_err(write_error)
 }
 
 /// Sequentially scan the inputs for the first out-of-order pair (`-c`/`-C`).

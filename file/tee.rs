@@ -79,12 +79,15 @@ fn open_outputs(args: &Args, info: &mut TeeInfo) -> bool {
 fn tee_stdin(info: &mut TeeInfo) -> bool {
     let mut buffer = [0; BUFSZ];
     let mut had_error = false;
+    // Once standard output has failed it is reported and left alone, as a
+    // failed file is; the files go on getting the copy.
+    let mut stdout_ok = true;
 
     loop {
         let n_read = match io::stdin().read(&mut buffer[..]) {
             Ok(n) => n,
             Err(e) => {
-                eprintln!("tee: stdin: {}", e);
+                eprintln!("tee: stdin: {}", plib::diag::io_error_text(&e));
                 return true;
             }
         };
@@ -100,10 +103,13 @@ fn tee_stdin(info: &mut TeeInfo) -> bool {
         // Flushed at once: tee does not buffer, and a chunk with no <newline>
         // left in stdout's line buffer would reach it only at exit, where a
         // write error is lost.
-        let mut stdout = io::stdout().lock();
-        if let Err(e) = stdout.write_all(bufslice).and_then(|()| stdout.flush()) {
-            eprintln!("tee: stdout: {}", plib::diag::io_error_text(&e));
-            had_error = true;
+        if stdout_ok {
+            let mut stdout = io::stdout().lock();
+            if let Err(e) = stdout.write_all(bufslice).and_then(|()| stdout.flush()) {
+                plib::diag::write_error(&e);
+                stdout_ok = false;
+                had_error = true;
+            }
         }
 
         for output in &mut info.outputs {

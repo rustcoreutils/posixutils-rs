@@ -487,3 +487,46 @@ fn attached_option_argument_may_begin_with_equals() {
     cut_test(&["-nd=", "-f2"], "a=b\n", "b\n");
     plib::testing::assert_equals_option_argument("cut", "-d", &["-f2"], b"a=b\n");
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cut_write_error_on_full_device() {
+    // A failed write to standard output is "cut: write error: REASON",
+    // with the system's text for the error and exit status 1.
+    plib::testing::assert_write_error_message_on_full_device("cut", &["-c1"], b"abc\n", 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cut_fields_write_error_on_full_device() {
+    // A failed write to standard output is "cut: write error: REASON",
+    // with the system's text for the error and exit status 1.
+    plib::testing::assert_write_error_message_on_full_device("cut", &["-f1"], b"abc\n", 1);
+}
+
+/// An input that cannot be opened or read is named with the system's text
+/// for the error, without Rust's "(os error N)" suffix.
+#[test]
+fn test_cut_input_errors_name_the_system_error() {
+    let missing = "/nonexistent/cut-input";
+    let open_error = plib::diag::io_error_text(&std::fs::File::open(missing).unwrap_err());
+    let out = plib::testing::run_test_base("cut", &["-c1".into(), missing.into()], b"");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("cut: {missing}: {open_error}\n")
+    );
+
+    #[cfg(target_os = "linux")]
+    {
+        let dir = plib::tmp::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let read_error = plib::diag::io_error_text(&std::fs::read(&path).unwrap_err());
+        let out = plib::testing::run_test_base("cut", &["-c1".into(), path.clone()], b"");
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            format!("cut: {path}: {read_error}\n")
+        );
+    }
+}

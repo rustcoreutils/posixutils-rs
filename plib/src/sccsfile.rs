@@ -95,7 +95,7 @@ pub enum SccsError {
 impl fmt::Display for SccsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SccsError::Io(e) => write!(f, "I/O error: {}", e),
+            SccsError::Io(e) => write!(f, "I/O error: {}", crate::diag::io_error_text(e)),
             SccsError::InvalidFormat(s) => write!(f, "Invalid SCCS format: {}", s),
             SccsError::ChecksumMismatch { expected, computed } => {
                 write!(

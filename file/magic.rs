@@ -38,7 +38,7 @@ where
         let mut tf_reader = match make_reader() {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("file: {}", e);
+                eprintln!("file: {}", plib::diag::io_error_text(&e));
                 return None;
             }
         };
@@ -46,7 +46,11 @@ where
             Ok(Some(result)) => return Some(result),
             Ok(None) => continue,
             Err(e) => {
-                eprintln!("file: {}: {}", magic_file.display(), e);
+                eprintln!(
+                    "file: {}: {}",
+                    magic_file.display(),
+                    plib::diag::io_error_text(&e)
+                );
                 continue;
             }
         }

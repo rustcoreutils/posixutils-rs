@@ -55,12 +55,60 @@ fn run_cap_prog(path_bytes: &[u8]) {
     let _ = std::process::Command::new(path).status();
 }
 
+/// The length of the terminfo padding specification at the start of `s`,
+/// if there is one: `$<`, a delay in milliseconds that begins with a digit
+/// or `.` (digits, then optionally `.` and more digits), any number of `*`
+/// (proportional to the lines affected) and `/` (mandatory) flags, and `>`.
+fn padding_len(s: &[u8]) -> Option<usize> {
+    let rest = s.strip_prefix(b"$<")?;
+    if !matches!(rest.first(), Some(b'0'..=b'9' | b'.')) {
+        return None;
+    }
+    let mut i = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    if rest.get(i) == Some(&b'.') {
+        i += 1;
+        i += rest[i..].iter().take_while(|b| b.is_ascii_digit()).count();
+    }
+    i += rest[i..]
+        .iter()
+        .take_while(|&&b| b == b'*' || b == b'/')
+        .count();
+    (rest.get(i) == Some(&b'>')).then_some(2 + i + 1)
+}
+
+/// Remove the padding specifications from an expanded capability.
+///
+/// Padding is a delay the terminal needs, which tputs(3) provides by sending
+/// pad characters at the line's speed, or by waiting, never as the text of
+/// the specification. tput's output is commonly captured or redirected, where
+/// there is no line speed to pad for, so like ncurses' tput it writes none.
+/// Text that only looks like the start of one is ordinary output.
+fn strip_padding(expanded: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(expanded.len());
+    let mut i = 0;
+    while i < expanded.len() {
+        match padding_len(&expanded[i..]) {
+            Some(len) => i += len,
+            None => {
+                out.push(expanded[i]);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Write an expanded capability to standard output, without its padding.
+fn put(expanded: Vec<u8>) -> io::Result<()> {
+    io::stdout().write_all(&strip_padding(&expanded))
+}
+
 fn tput_init(info: &Database) -> terminfo::Result<()> {
     if let Some(cap) = info.get::<cap::Init1String>() {
-        cap.expand().to(io::stdout())?;
+        put(cap.expand().to_vec()?)?;
     }
     if let Some(cap) = info.get::<cap::Init2String>() {
-        cap.expand().to(io::stdout())?;
+        put(cap.expand().to_vec()?)?;
     }
     if let Some(cap) = info.get::<cap::InitFile>() {
         emit_cap_file(cap.as_ref());
@@ -70,7 +118,7 @@ fn tput_init(info: &Database) -> terminfo::Result<()> {
         run_cap_prog(cap.as_ref());
     }
     if let Some(cap) = info.get::<cap::Init3String>() {
-        cap.expand().to(io::stdout())?;
+        put(cap.expand().to_vec()?)?;
     }
 
     Ok(())
@@ -79,11 +127,11 @@ fn tput_init(info: &Database) -> terminfo::Result<()> {
 fn tput_reset(info: &Database) -> terminfo::Result<()> {
     let mut emitted = false;
     if let Some(cap) = info.get::<cap::Reset1String>() {
-        cap.expand().to(io::stdout())?;
+        put(cap.expand().to_vec()?)?;
         emitted = true;
     }
     if let Some(cap) = info.get::<cap::Reset2String>() {
-        cap.expand().to(io::stdout())?;
+        put(cap.expand().to_vec()?)?;
         emitted = true;
     }
     if let Some(cap) = info.get::<cap::ResetFile>() {
@@ -92,7 +140,7 @@ fn tput_reset(info: &Database) -> terminfo::Result<()> {
         emitted |= emit_cap_file(cap.as_ref());
     }
     if let Some(cap) = info.get::<cap::Reset3String>() {
-        cap.expand().to(io::stdout())?;
+        put(cap.expand().to_vec()?)?;
         emitted = true;
     }
 
@@ -105,9 +153,16 @@ fn tput_reset(info: &Database) -> terminfo::Result<()> {
     Ok(())
 }
 
+/// Write the clear-screen sequence, then, as ncurses' tput and clear do, the
+/// user-defined `E3` capability if the terminal has one: it clears the
+/// scrollback, which `clear` alone leaves behind on terminals such as xterm
+/// and the Linux console. `E3` takes no parameters and is written as stored.
 fn tput_clear(info: &Database) -> terminfo::Result<()> {
     if let Some(clear) = info.get::<cap::ClearScreen>() {
-        clear.expand().to(io::stdout())?;
+        put(clear.expand().to_vec()?)?;
+    }
+    if let Some(terminfo::Value::String(e3)) = info.raw("E3") {
+        put(e3.clone())?;
     }
 
     Ok(())
@@ -118,31 +173,44 @@ fn is_valid_operand(operand: &str) -> bool {
     matches!(operand, "clear" | "init" | "reset")
 }
 
+/// How processing an operand failed.
+enum Failure {
+    /// Exit with this status; any diagnostic has been written.
+    Status(u8),
+    /// Writing standard output failed, which every later operand would too.
+    Write(io::Error),
+}
+
+/// Map a capability's result to the operand's: a failed write is a write
+/// error, any other failure is silent with the "other error" status.
+fn cap_result(result: terminfo::Result<()>) -> Result<(), Failure> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(terminfo::Error::Io(e)) => Err(Failure::Write(e)),
+        Err(_) => Err(Failure::Status(EXIT_OTHER_ERROR)),
+    }
+}
+
 /// Process a single operand
-/// Returns true on success, false on failure
-fn process_operand(info: &Database, operand: &str) -> Result<(), u8> {
+fn process_operand(info: &Database, operand: &str) -> Result<(), Failure> {
     match operand {
-        "clear" => {
-            if let Err(_e) = tput_clear(info) {
-                return Err(EXIT_OTHER_ERROR);
-            }
-        }
-        "init" => {
-            if let Err(_e) = tput_init(info) {
-                return Err(EXIT_OTHER_ERROR);
-            }
-        }
-        "reset" => {
-            if let Err(_e) = tput_reset(info) {
-                return Err(EXIT_OTHER_ERROR);
-            }
-        }
+        "clear" => cap_result(tput_clear(info)),
+        "init" => cap_result(tput_init(info)),
+        "reset" => cap_result(tput_reset(info)),
         _ => {
             eprintln!("{}: {}", gettext("Invalid operand"), operand);
-            return Err(EXIT_INVALID_OPERAND);
+            Err(Failure::Status(EXIT_INVALID_OPERAND))
         }
     }
-    Ok(())
+}
+
+/// Report a failed write to standard output.
+fn report_write_error(e: &io::Error) {
+    plib::diag::error(&format!(
+        "{}: {}",
+        gettext("write error"),
+        plib::diag::io_error_text(e)
+    ));
 }
 
 fn main() -> ExitCode {
@@ -150,8 +218,9 @@ fn main() -> ExitCode {
 
     let args = match plib::optarg::try_parse::<Args>() {
         Ok(a) => a,
+        // Help and version are written to standard output with status 0.
+        Err(e) if !e.use_stderr() => plib::optarg::exit(e),
         Err(e) => {
-            // Clap already prints the error message
             let _ = e.print();
             return ExitCode::from(EXIT_USAGE_ERROR);
         }
@@ -193,10 +262,22 @@ fn main() -> ExitCode {
     let mut exit_code = EXIT_SUCCESS;
 
     for operand in &args.operands {
-        if let Err(code) = process_operand(&info, operand) {
-            exit_code = code;
+        match process_operand(&info, operand) {
+            Ok(()) => {}
             // Continue processing remaining operands per POSIX
+            Err(Failure::Status(code)) => exit_code = code,
+            Err(Failure::Write(e)) => {
+                report_write_error(&e);
+                return ExitCode::from(EXIT_OTHER_ERROR);
+            }
         }
+    }
+
+    // The sequences end without a <newline>, so they are still in standard
+    // output's line buffer, where the flush at exit would lose a write error.
+    if let Err(e) = io::stdout().flush() {
+        report_write_error(&e);
+        exit_code = exit_code.max(EXIT_OTHER_ERROR);
     }
 
     ExitCode::from(exit_code)

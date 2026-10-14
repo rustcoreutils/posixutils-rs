@@ -99,10 +99,7 @@ pub fn list_archive<R: ArchiveReader, W: Write>(
 
 /// A failure to write the listing, which ends the run.
 pub(crate) fn listing_error(e: std::io::Error) -> PaxError {
-    PaxError::Io(std::io::Error::new(
-        e.kind(),
-        format!("writing the listing: {e}"),
-    ))
+    PaxError::StdoutWrite(e)
 }
 
 /// The name a later name of a cpio link set is linked to on extraction: the

@@ -11,7 +11,7 @@ use std::ffi::OsString;
 use std::io::{BufWriter, IsTerminal};
 
 use bc_util::{
-    interpreter::Interpreter,
+    interpreter::{ExecutionError, Interpreter},
     output::OutputWriter,
     parser::{parse_program, ParseError},
 };
@@ -85,16 +85,32 @@ fn main() {
     }
 }
 
-/// Report a runtime or write failure. Returns true so callers can record that
-/// something went wrong.
+/// Report a failure. Returns true so callers can record that something went
+/// wrong.
 fn report(e: impl std::fmt::Display) -> bool {
     diag::error(&format!("{}", e));
     true
 }
 
-/// Report a failed write as the system names it. Returns true, as [`report`].
-fn report_io(e: std::io::Error) -> bool {
-    report(diag::io_error_text(&e))
+/// Report a runtime error, or end bc if it stands for a failed write.
+fn report_exec(e: ExecutionError) -> bool {
+    match e.write_failure() {
+        Some(failure) => write_failed(failure),
+        None => report(e),
+    }
+}
+
+/// Report a failed write to standard output and exit.
+///
+/// Nothing more can be shown, and the unwritten output is still buffered: going
+/// on would only fail, and report, again at the next flush.
+fn write_failed(e: &std::io::Error) -> ! {
+    diag::error(&format!(
+        "{}: {}",
+        gettext("write error"),
+        diag::io_error_text(e)
+    ));
+    std::process::exit(1);
 }
 
 /// Report each diagnostic of a parse failure at its own position.
@@ -166,17 +182,17 @@ fn run() {
         match parse_program(&text, file.to_str()) {
             Ok(program) => {
                 if let Err(e) = interpreter.exec(program, &mut out) {
-                    had_error |= report(e);
+                    had_error |= report_exec(e);
                 }
                 if let Err(e) = out.flush() {
-                    had_error |= report_io(e);
+                    write_failed(&e);
                 }
             }
             Err(e) => had_error |= report_parse_error(&e),
         }
         if interpreter.has_quit() {
             if let Err(e) = out.flush() {
-                had_error |= report_io(e);
+                write_failed(&e);
             }
             std::process::exit(if had_error { 1 } else { 0 });
         }
@@ -203,10 +219,10 @@ fn run() {
                         // and its exit status is unaffected; a script does not.
                         let mut failed = false;
                         if let Err(e) = interpreter.exec(program, &mut out) {
-                            failed = report(e);
+                            failed = report_exec(e);
                         }
                         if let Err(e) = out.flush() {
-                            failed = report_io(e);
+                            write_failed(&e);
                         }
                         had_error |= failed && !interactive;
                         line_buffer.clear();
@@ -239,7 +255,7 @@ fn run() {
     }
 
     if let Err(e) = out.flush() {
-        had_error |= report_io(e);
+        write_failed(&e);
     }
     std::process::exit(if had_error { 1 } else { 0 });
 }

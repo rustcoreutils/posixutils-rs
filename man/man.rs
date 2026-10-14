@@ -217,7 +217,8 @@ impl std::fmt::Display for ManError {
             ManError::Io(err) => write!(
                 f,
                 "{}",
-                gettext("failed to execute command: {}").replace("{}", &err.to_string())
+                gettext("failed to execute command: {}")
+                    .replace("{}", &plib::diag::io_error_text(err))
             ),
             ManError::ParseError(err) => write!(
                 f,
@@ -1479,5 +1480,11 @@ mod tests {
         // The two wrapping variants keep their source's text.
         let io = ManError::Io(std::io::Error::other("boom"));
         assert_eq!(io.to_string(), "failed to execute command: boom");
+
+        // A system error is the system's text, without Rust's "(os error N)".
+        let os = std::io::Error::from_raw_os_error(libc::ENOENT);
+        let text = plib::diag::io_error_text(&os);
+        let io = ManError::Io(os);
+        assert_eq!(io.to_string(), format!("failed to execute command: {text}"));
     }
 }

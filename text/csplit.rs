@@ -799,10 +799,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = plib::optarg::parse::<Args>();
 
-    // Validate prefix won't exceed NAME_MAX
-    validate_prefix(&args.prefix, args.num)?;
-
-    let ctx = parse_operands(&args)?;
+    // Check that the prefix won't exceed NAME_MAX, and parse the operands.
+    // Returned from `main`, their errors would be printed with `Debug`
+    // (`Error: Custom { kind: Other, .. }`) and no utility name.
+    let ctx = match validate_prefix(&args.prefix, args.num).and_then(|()| parse_operands(&args)) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            plib::diag::error(&plib::diag::io_error_text(&e));
+            std::process::exit(1);
+        }
+    };
 
     // Arm signal cleanup before the first output file can exist. Skipped
     // entirely under -k, which requires created files to be retained.

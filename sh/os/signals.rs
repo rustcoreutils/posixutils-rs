@@ -484,7 +484,15 @@ pub struct SignalManager {
     /// every command, so a stream of them would otherwise nest without
     /// bound, and the stack would overflow.
     running_traps: bool,
+    /// Job control is on in this shell (not a subshell of it), which then
+    /// ignores the terminal's stop signals, SIGTSTP, SIGTTIN and SIGTTOU,
+    /// unless they are trapped (XCU 2.11, as in dash). The commands it runs
+    /// get their default action back.
+    job_control: bool,
 }
+
+/// The stop signals a job-control shell ignores for itself.
+const JOB_CONTROL_STOP_SIGNALS: [Signal; 3] = [Signal::SigTstp, Signal::SigTtin, Signal::SigTtou];
 
 impl SignalManager {
     /// Records the dispositions the shell inherited, so it must be created
@@ -505,6 +513,7 @@ impl SignalManager {
             is_interactive,
             sigint_count: 0,
             running_traps: false,
+            job_control: false,
         }
     }
 
@@ -521,7 +530,9 @@ impl SignalManager {
     /// Installs the default action of `signal`: SIG_DFL, or SIG_IGN for a
     /// signal ignored on entry.
     fn install_default(&self, signal: Signal) {
-        if self.ignored_on_entry[signal as usize] {
+        if self.ignored_on_entry[signal as usize]
+            || (self.job_control && JOB_CONTROL_STOP_SIGNALS.contains(&signal))
+        {
             unsafe { handle_signal_ignore(signal) };
         } else {
             unsafe { handle_signal_default(signal) };
@@ -534,6 +545,9 @@ impl SignalManager {
         // A subshell of an interactive shell is not interactive: an
         // untrapped SIGINT takes its default action there (as in dash).
         self.is_interactive = false;
+        // Nor does it run job control: the terminal's stop signals stop it
+        // and its commands like any other process.
+        self.job_control = false;
         for signal in SIGNALS {
             let signal = *signal;
             if signal == Signal::SigKill || signal == Signal::SigStop {
@@ -560,12 +574,30 @@ impl SignalManager {
     pub fn restore(&mut self, saved: Self) {
         self.running_traps = saved.running_traps;
         self.is_interactive = saved.is_interactive;
+        self.job_control = saved.job_control;
         for signal in SIGNALS {
             let signal = *signal;
             if signal == Signal::SigKill || signal == Signal::SigStop {
                 continue;
             }
             self.set_action(signal, saved.actions[signal as usize].clone());
+        }
+    }
+
+    pub fn is_ignored_on_entry(&self, signal: Signal) -> bool {
+        self.ignored_on_entry[signal as usize]
+    }
+
+    /// Turns job control on or off for the dispositions of the terminal's
+    /// stop signals: ignored while it is on, unless trapped.
+    pub fn set_job_control(&mut self, on: bool) {
+        self.job_control = on;
+        for signal in JOB_CONTROL_STOP_SIGNALS {
+            match self.actions[signal as usize] {
+                TrapAction::Default => self.install_default(signal),
+                TrapAction::Ignore => unsafe { handle_signal_ignore(signal) },
+                TrapAction::Commands(_) => {}
+            }
         }
     }
 

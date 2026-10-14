@@ -1068,3 +1068,29 @@ fn xargs_test_exit(input: &str, args: &[&str], out: &str, err: &str, code: i32) 
         expected_exit_code: code,
     });
 }
+
+// A failed write of the help text is a write error, not a silent success.
+#[cfg(target_os = "linux")]
+#[test]
+fn help_write_error_on_full_device() {
+    for cmd in ["fuser", "timeout", "xargs"] {
+        plib::testing::assert_write_error_message_on_full_device(cmd, &["--help"], b"", 1);
+    }
+}
+
+/// A utility that cannot be invoked is reported with the system's text for
+/// the error, without Rust's "(os error N)" suffix.
+#[cfg(target_os = "linux")]
+#[test]
+fn utility_that_cannot_be_invoked_names_the_system_error() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let util = dir.path().to_str().unwrap().to_string();
+    let spawn_error =
+        plib::diag::io_error_text(&std::process::Command::new(&util).spawn().unwrap_err());
+    let out = plib::testing::run_test_base("xargs", std::slice::from_ref(&util), b"x\n");
+    assert_eq!(out.status.code(), Some(126));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("xargs: {util}: {spawn_error}\n")
+    );
+}

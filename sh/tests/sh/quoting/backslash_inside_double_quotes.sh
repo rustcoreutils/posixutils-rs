@@ -3,4 +3,4 @@ echo "\`"
 echo "\""
 echo "\
 "
-echo "\n"
+printf "%s\n" "\n"

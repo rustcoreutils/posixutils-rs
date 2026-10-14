@@ -371,7 +371,11 @@ fn main() -> ExitCode {
     get_group_info(&mut userinfo, args.user.is_some());
 
     if let Err(e) = display_user_info(&args, &userinfo) {
-        plib::diag::error(&format!("{}: {}", gettext("write error"), e));
+        plib::diag::error(&format!(
+            "{}: {}",
+            gettext("write error"),
+            plib::diag::io_error_text(&e)
+        ));
         return ExitCode::from(1);
     }
 

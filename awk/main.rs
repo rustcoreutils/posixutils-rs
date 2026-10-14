@@ -51,7 +51,12 @@ fn exit_if_error<T, U: Display>(r: Result<T, U>) -> T {
     match r {
         Ok(v) => v,
         Err(err) => {
-            eprintln!("{err}");
+            // A failed write to standard output ends the run like a runtime
+            // error, but it is the output that failed, not the program.
+            match interpreter::stdout_write_error() {
+                Some(reason) => eprintln!("awk: {}: {reason}", gettext("write error")),
+                None => eprintln!("{err}"),
+            }
             std::process::exit(1);
         }
     }

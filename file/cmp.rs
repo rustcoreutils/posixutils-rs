@@ -92,8 +92,10 @@ fn cmp_main(args: &Args) -> io::Result<u8> {
     }
 
     let open = |p: &PathBuf| {
-        input_reader(p, true)
-            .map_err(|e| io::Error::new(e.kind(), format!("{}: {}", p.display(), e)))
+        input_reader(p, true).map_err(|e| {
+            let text = format!("{}: {}", p.display(), plib::diag::io_error_text(&e));
+            io::Error::new(e.kind(), text)
+        })
     };
     let mut reader1 = open(&args.file1)?;
     let mut reader2 = open(&args.file2)?;
@@ -180,7 +182,7 @@ fn main() -> ExitCode {
             // With -s it is unspecified whether a diagnostic is written; we keep
             // quiet. Otherwise report the error on stderr.
             if !args.silent {
-                eprintln!("cmp: {}", e);
+                eprintln!("cmp: {}", plib::diag::io_error_text(&e));
             }
             ExitCode::from(2)
         }

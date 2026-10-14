@@ -4076,7 +4076,9 @@ fn parse_args_with_more_env() -> Args {
             combined_args.extend(more_args);
             combined_args.extend(cmd_args);
 
-            return Args::parse_from(plib::optarg::keep_leading_equals::<Args>(combined_args));
+            return plib::optarg::parse_from::<Args>(plib::optarg::keep_leading_equals::<Args>(
+                combined_args,
+            ));
         }
     }
 

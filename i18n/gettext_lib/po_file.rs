@@ -108,7 +108,7 @@ pub enum PoError {
 impl std::fmt::Display for PoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PoError::Io(e) => write!(f, "I/O error: {}", e),
+            PoError::Io(e) => write!(f, "I/O error: {}", plib::diag::io_error_text(e)),
             PoError::Parse(line, msg) => write!(f, "line {}: {}", line, msg),
             PoError::InvalidEscape(line, c) => write!(f, "line {}: invalid escape \\{}", line, c),
             PoError::UnterminatedString(line) => write!(f, "line {}: unterminated string", line),

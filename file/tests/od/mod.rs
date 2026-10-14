@@ -1414,3 +1414,19 @@ fn option_argument_may_begin_with_hyphen() {
         plib::testing::assert_hyphen_option_argument("od", &[opt, "-zq", "--help"]);
     }
 }
+
+/// A failed read is reported with the system's text for the error, without
+/// Rust's "(os error N)" suffix.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_od_read_error_names_the_system_error() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap().to_string();
+    let read_error = plib::diag::io_error_text(&std::fs::read(&path).unwrap_err());
+    let out = plib::testing::run_test_base("od", std::slice::from_ref(&path), b"");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.starts_with("od: "), "{stderr:?}");
+    assert!(stderr.ends_with(&format!("{read_error}\n")), "{stderr:?}");
+    assert!(!stderr.contains("(os error"), "{stderr:?}");
+}

@@ -1466,3 +1466,30 @@ fn tr_large_repeat_count_in_string1_terminates() {
 fn test_tr_reports_write_error_on_final_partial_line() {
     plib::testing::assert_write_error_on_full_device("tr", &["a", "b"], b"x", 1);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn tr_write_error_on_full_device() {
+    // A failed write to standard output is "tr: write error: REASON",
+    // with the system's text for the error and exit status 1.
+    plib::testing::assert_write_error_message_on_full_device("tr", &["a", "b"], b"x\n", 1);
+}
+
+/// A failed read of standard input is reported with the system's text for
+/// the error, without Rust's "(os error N)" suffix.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_tr_read_error_names_the_system_error() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let read_error = plib::diag::io_error_text(&std::fs::read(dir.path()).unwrap_err());
+    let out = std::process::Command::new(plib::testing::get_binary_path("tr"))
+        .args(["a", "b"])
+        .stdin(std::fs::File::open(dir.path()).unwrap())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("tr: {read_error}\n")
+    );
+}

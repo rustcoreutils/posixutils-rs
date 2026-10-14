@@ -680,3 +680,18 @@ fn test_bc_sin_to_scale_18() {
 fn test_bc_cos_to_scale_18() {
     test_bc_l!(cos_to_scale_18)
 }
+
+/// A failed write is reported once, in the common form, whether it surfaces
+/// at the flush after an input item or in the middle of executing one.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_bc_write_error_message() {
+    use plib::testing::assert_write_error_message_on_full_device;
+    // Output small enough to sit in the buffer until the flush.
+    assert_write_error_message_on_full_device("bc", &[], b"1+1\n", 1);
+    // Enough output to fill the buffer while the loop runs.
+    let dir = plib::tmp::tempdir().unwrap();
+    let path = dir.path().join("program.bc");
+    std::fs::write(&path, "for(i=0;i<5000;++i) i\n").unwrap();
+    assert_write_error_message_on_full_device("bc", &[path.to_str().unwrap()], b"", 1);
+}

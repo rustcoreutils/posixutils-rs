@@ -1440,3 +1440,35 @@ fn option_argument_may_begin_with_hyphen() {
         plib::testing::assert_hyphen_option_argument("get", &[opt, "-zq", "--help"]);
     }
 }
+
+// A failed write of the retrieved text to standard output is "get: write
+// error: REASON", not an error against the s-file.
+#[cfg(target_os = "linux")]
+#[test]
+fn get_write_error_on_full_device() {
+    let sfile = fixture_path("s.simple");
+    let sfile = sfile.to_str().unwrap();
+    plib::testing::assert_write_error_message_on_full_device("get", &["-p", "-s", sfile], b"", 1);
+    plib::testing::assert_write_error_message_on_full_device(
+        "get",
+        &["-p", "-s", sfile, sfile],
+        b"",
+        1,
+    );
+}
+
+// An SCCS file that cannot be read is reported with the system's text,
+// without Rust's "(os error N)" suffix.
+#[test]
+fn missing_sccs_file_names_the_system_error() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let sfile = dir.path().join("s.missing");
+    let sfile = sfile.to_str().unwrap();
+    let reason = plib::diag::io_error_text(&std::fs::File::open(sfile).unwrap_err());
+    let out = plib::testing::run_test_base("get", &[sfile.to_string()], b"");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("get: {sfile}: I/O error: {reason}\n")
+    );
+}

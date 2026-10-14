@@ -7,7 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::error::Error;
 use std::ffi::OsString;
 use std::io::{self, Read, StdoutLock, Write};
 use std::path::{Path, PathBuf};
@@ -86,13 +85,27 @@ enum CountType {
     Lines(usize),
 }
 
+/// Why copying one file failed: reading the input, which is reported against
+/// the file, or writing standard output, which is a write error.
+enum Failure {
+    Input(io::Error),
+    Output(io::Error),
+}
+
+/// Every write is to standard output; reads are mapped to `Input` by hand.
+impl From<io::Error> for Failure {
+    fn from(e: io::Error) -> Self {
+        Failure::Output(e)
+    }
+}
+
 fn head_file(
     count_type: &CountType,
     pathname: &Path,
     first: bool,
     want_header: bool,
     stdout_lock: &mut StdoutLock,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), Failure> {
     const BUFFER_SIZE: usize = BUFSZ;
 
     // print file header
@@ -105,7 +118,7 @@ fn head_file(
     }
 
     // open file, or stdin ("-" or no operand)
-    let mut file = input_stream_dashed(pathname)?;
+    let mut file = input_stream_dashed(pathname).map_err(Failure::Input)?;
 
     let mut raw_buffer = [0_u8; BUFFER_SIZE];
 
@@ -118,7 +131,8 @@ fn head_file(
                     // Do not read more bytes than necessary
                     let read_up_to_n_bytes = BUFFER_SIZE.min(bytes_remaining);
 
-                    file.read(&mut raw_buffer[..read_up_to_n_bytes])?
+                    file.read(&mut raw_buffer[..read_up_to_n_bytes])
+                        .map_err(Failure::Input)?
                 };
 
                 if number_of_bytes_read == 0_usize {
@@ -146,7 +160,7 @@ fn head_file(
 
             loop {
                 // read a chunk of file data
-                let n_read = file.read(&mut raw_buffer)?;
+                let n_read = file.read(&mut raw_buffer).map_err(Failure::Input)?;
 
                 if n_read == 0_usize {
                     // Reached EOF
@@ -192,7 +206,7 @@ fn head_file(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("head");
 
-    let mut args = Args::parse_from(plib::optarg::keep_leading_equals::<Args>(
+    let mut args = plib::optarg::parse_from::<Args>(plib::optarg::keep_leading_equals::<Args>(
         expand_historical_count(std::env::args_os()),
     ));
 
@@ -227,12 +241,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut stdout_lock = io::stdout().lock();
 
     for filename in files {
-        if let Err(e) = head_file(&count_type, filename, first, want_header, &mut stdout_lock) {
-            plib::diag::error(&format!(
-                "{}: {}",
-                filename.display(),
-                plib::diag::error_text(e.as_ref())
-            ));
+        match head_file(&count_type, filename, first, want_header, &mut stdout_lock) {
+            Ok(()) => {}
+            Err(Failure::Input(e)) => {
+                plib::diag::error(&format!(
+                    "{}: {}",
+                    filename.display(),
+                    plib::diag::io_error_text(&e)
+                ));
+            }
+            Err(Failure::Output(e)) => {
+                // Every later file would fail the same way.
+                plib::diag::error(&format!(
+                    "{}: {}",
+                    gettext("write error"),
+                    plib::diag::io_error_text(&e)
+                ));
+                std::process::exit(1);
+            }
         }
 
         first = false;

@@ -491,3 +491,11 @@ fn test_id_groups_real_includes_real_gid() {
         "id -G -r output {stdout:?} must contain the real gid {real_gid}"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn id_write_error_on_full_device() {
+    // A failed write to standard output is "id: write error: REASON",
+    // with the system's text for the error and exit status 1.
+    plib::testing::assert_write_error_message_on_full_device("id", &[], b"", 1);
+}

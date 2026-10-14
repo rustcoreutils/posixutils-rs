@@ -311,7 +311,7 @@ struct Config {
 
 impl Config {
     fn new() -> (Self, Vec<PathBuf>) {
-        let m = Args::command().get_matches_from(plib::optarg::args_os::<Args>());
+        let m = plib::optarg::get_matches_from(Args::command(), plib::optarg::args_os::<Args>());
 
         // Enables long format (-g, -n, -l, -o)
         const LONG_FORMAT_WITHOUT_OWNER: &str = "long_format_without_owner";
@@ -1168,7 +1168,10 @@ fn process_single_dir(
                     config,
                     path.as_inner(),
                 )
-                .map_err(|e| io::Error::other(format!("'{path_str}': {e}")))?;
+                .map_err(|e| {
+                    let text = plib::diag::io_error_text(&e);
+                    io::Error::other(format!("'{path_str}': {text}"))
+                })?;
 
                 let mut include_entry = false;
 

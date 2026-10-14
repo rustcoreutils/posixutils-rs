@@ -363,12 +363,6 @@ fn interactive_shell(shell: &mut Shell) {
     unsafe { handle_signal_ignore(Signal::SigQuit) }
     unsafe { handle_signal_ignore(Signal::SigTerm) }
     unsafe { handle_signal_write_to_signal_buffer(Signal::SigInt) }
-    if shell.set_options.monitor {
-        // job control signals
-        unsafe { handle_signal_ignore(Signal::SigTtin) }
-        unsafe { handle_signal_ignore(Signal::SigTtou) }
-        unsafe { handle_signal_ignore(Signal::SigTstp) }
-    }
     // POSIX: an interactive shell expands $ENV and, if the result is an absolute
     // pathname, executes that file in the current environment. ENV is ignored if
     // the real and effective user/group IDs differ.
@@ -419,6 +413,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         args.execution_mode == ExecutionMode::Interactive,
     );
     unsafe { setup_signal_handling() };
+    // `-m`, on by default in an interactive shell (XCU 2.11).
+    if shell.set_options.monitor {
+        shell.set_job_control(true);
+    }
     match args.execution_mode {
         ExecutionMode::Interactive => interactive_shell(&mut shell),
         ExecutionMode::ReadCommandsFromStdin => {

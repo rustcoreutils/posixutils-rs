@@ -601,7 +601,7 @@ fn main() -> ExitCode {
     let argv = plib::optarg::keep_leading_equals::<Args>(std::env::args_os())
         .into_iter()
         .map(|a| if a == "-r" { "-r=".into() } else { a });
-    let args = Args::parse_from(argv);
+    let args = plib::optarg::parse_from::<Args>(argv);
 
     let mut success = true;
     for path in operands::expand(&args.files) {

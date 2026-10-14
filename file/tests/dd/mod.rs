@@ -570,6 +570,63 @@ fn test_w_multiplier_rejected() {
     );
 }
 
+// A rejected operand is reported once, as one "dd: ..." line, and dd exits 1
+// without copying anything.
+#[test]
+fn test_operand_errors_are_reported_once() {
+    for args in [
+        &["bs=x"][..],
+        &["bs=2w"],
+        &["bs=0"],
+        &["bs=abc"],
+        &["skip=abc"],
+        &["count=-1"],
+        &["conv=bogus"],
+        &["iflags=bogus"],
+        &["status=bogus"],
+        &["bogus=1"],
+        &["noequals"],
+        &["conv=block"],
+    ] {
+        let (stdout, stderr, code) = run_dd(args, b"abcd");
+        assert_eq!(code, Some(1), "{args:?}: {stderr:?}");
+        assert!(stdout.is_empty(), "{args:?}: {stdout:?}");
+        assert_eq!(stderr.lines().count(), 1, "{args:?}: {stderr:?}");
+        assert!(stderr.starts_with("dd: "), "{args:?}: {stderr:?}");
+    }
+    let (_, stderr, _) = run_dd(&["bs=x"], b"");
+    assert_eq!(stderr, "dd: invalid number: 'x'\n");
+    let (_, stderr, _) = run_dd(&["skip=abc"], b"");
+    assert_eq!(stderr, "dd: invalid number: 'abc'\n");
+}
+
+// A failed read is "dd: read error: REASON", with the system's text and no
+// Rust "(os error N)" suffix, whether conv=noerror goes on or dd stops.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_read_error_message() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let eisdir = plib::diag::io_error_text(&std::io::Error::from_raw_os_error(libc::EISDIR));
+    let ifile = format!("if={}", dir.path().display());
+
+    let (_, stderr, code) = run_dd(&[&ifile, "conv=noerror", "count=1"], b"");
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        stderr,
+        format!(
+            "dd: read error: {eisdir}\n0+0 records in\n0+0 records out\n\
+             0+1 records in\n0+0 records out\n"
+        )
+    );
+
+    let (_, stderr, code) = run_dd(&[&ifile], b"");
+    assert_eq!(code, Some(1), "{stderr}");
+    assert_eq!(
+        stderr,
+        format!("0+0 records in\n0+0 records out\ndd: read error: {eisdir}\n")
+    );
+}
+
 // DD-2: on SIGINT dd writes its statistics and then terminates *as if by the
 // default action*, so the parent observes a signal death (WIFSIGNALED), not a
 // plain non-zero exit.
@@ -700,4 +757,57 @@ fn test_dd_non_utf8_operand_is_an_error() {
             .unwrap();
         assert_eq!(run.status.code(), Some(1), "{arg:?}: {run:?}");
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn dd_write_error_on_full_device() {
+    // A failed write to standard output is "dd: write error: REASON",
+    // with the system's text for the error and exit status 1.
+    plib::testing::assert_write_error_message_on_full_device("dd", &["status=none"], b"x", 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn dd_bs_write_error_on_full_device() {
+    // A failed write to standard output is "dd: write error: REASON",
+    // with the system's text for the error and exit status 1.
+    plib::testing::assert_write_error_message_on_full_device(
+        "dd",
+        &["bs=1", "status=none"],
+        b"x\n",
+        1,
+    );
+}
+
+// A failed write ends the copy with the statistics so far, as a failed read
+// does, and counts no output record for the block that was not written.
+#[cfg(target_os = "linux")]
+#[test]
+fn dd_write_error_reports_statistics() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let enospc = {
+        let mut probe = full.try_clone().unwrap();
+        plib::diag::io_error_text(&probe.write_all(b"x").unwrap_err())
+    };
+    let mut child = Command::new(plib::testing::get_binary_path("dd"))
+        .env("LC_ALL", "C")
+        .stdin(Stdio::piped())
+        .stdout(full)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"x").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("0+1 records in\n0+0 records out\ndd: write error: {enospc}\n")
+    );
 }

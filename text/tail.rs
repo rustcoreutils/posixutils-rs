@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use gettextrs::gettext;
+use plib::diag::WriteError;
 use plib::BUFSZ;
 
 /// Interval between read attempts in the `-f` (follow) poll loop.
@@ -199,8 +200,12 @@ impl FileOrStdin {
     }
 }
 
+/// Write to standard output; a failure is a [`WriteError`], which main reports
+/// as `tail: write error: REASON` rather than as a failure of the input.
 fn print_bytes(stdout_lock: &mut StdoutLock, bytes: &[u8]) -> io::Result<()> {
-    stdout_lock.write_all(bytes)
+    stdout_lock
+        .write_all(bytes)
+        .map_err(|e| WriteError(e).into())
 }
 
 /// Read every line from `read`, stripping a single trailing `\n` from each.
@@ -256,8 +261,8 @@ fn print_reverse_lines<R: Read + BufRead>(
     };
 
     for line in selected.iter().rev() {
-        stdout_lock.write_all(line.as_slice())?;
-        stdout_lock.write_all(b"\n")?;
+        print_bytes(stdout_lock, line.as_slice())?;
+        print_bytes(stdout_lock, b"\n")?;
     }
 
     Ok(())
@@ -360,7 +365,7 @@ fn print_n_lines<R: Read + BufRead>(
 
             // Print the collected lines
             for line in lines {
-                stdout_lock.write_all(line.as_slice())?;
+                print_bytes(stdout_lock, line.as_slice())?;
             }
         }
         RelativeFrom::StartOfFile(us) => {
@@ -401,7 +406,7 @@ fn print_n_lines<R: Read + BufRead>(
             loop {
                 let bytes_read = read
                     .read(&mut buffer)
-                    .map_err(|er| format!("Failed to read: {er}"))?;
+                    .map_err(|er| format!("Failed to read: {}", plib::diag::io_error_text(&er)))?;
 
                 // If no more bytes are read, exit the loop.
                 if bytes_read == 0 {
@@ -440,7 +445,7 @@ fn print_n_bytes<R: Read>(
             loop {
                 let bytes_read = read
                     .read(&mut chunk)
-                    .map_err(|er| format!("Failed to read: {er}"))?;
+                    .map_err(|er| format!("Failed to read: {}", plib::diag::io_error_text(&er)))?;
 
                 // Only a zero-byte read signals true EOF; a short read on a slow
                 // pipe must not terminate accumulation early.
@@ -484,7 +489,7 @@ fn print_n_bytes<R: Read>(
             loop {
                 let bytes_read = read
                     .read(&mut buffer)
-                    .map_err(|er| format!("Failed to read: {er}"))?;
+                    .map_err(|er| format!("Failed to read: {}", plib::diag::io_error_text(&er)))?;
 
                 // If no more bytes are read, exit the loop.
                 if bytes_read == 0_usize {
@@ -544,7 +549,7 @@ fn follow_file(
             }
             Ok(bytes_read) => {
                 print_bytes(stdout_lock, &buffer[..bytes_read])?;
-                stdout_lock.flush()?;
+                stdout_lock.flush().map_err(WriteError)?;
             }
             Err(er) => {
                 if er.kind() == ErrorKind::Interrupted {
@@ -612,7 +617,7 @@ fn tail(
             FileOrStdin::File(path, _) => path.display().to_string(),
             FileOrStdin::Stdin(_) => gettext("standard input"),
         };
-        writeln!(stdout_lock, "==> {name} <==")?;
+        print_bytes(&mut stdout_lock, format!("==> {name} <==\n").as_bytes())?;
     }
 
     {
@@ -648,7 +653,7 @@ fn tail(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("tail");
 
-    let args = Args::parse_from(plib::optarg::keep_leading_equals::<Args>(
+    let args = plib::optarg::parse_from::<Args>(plib::optarg::keep_leading_equals::<Args>(
         expand_historical_count(std::env::args_os()),
     ));
 
@@ -669,6 +674,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         bytes_or_lines,
     ) {
         plib::diag::error(&plib::diag::error_text(er.as_ref()));
+        // The output still buffered would fail, and be reported, again.
+        if plib::diag::is_write_error(er.as_ref()) {
+            std::process::exit(1);
+        }
     }
 
     plib::diag::flush_stdout();

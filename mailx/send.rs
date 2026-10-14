@@ -248,20 +248,23 @@ pub fn send_message(
 
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("Failed to run sendmail: {}", e))?;
+        .map_err(|e| format!("Failed to run sendmail: {}", plib::diag::io_error_text(&e)))?;
 
     {
         let stdin = child.stdin.as_mut().ok_or("Failed to open stdin")?;
         stdin
             .write_all(msg.format().as_bytes())
-            .map_err(|e| format!("Failed to write message: {}", e))?;
+            .map_err(|e| format!("Failed to write message: {}", plib::diag::io_error_text(&e)))?;
     }
 
     // Wait for sendmail if sendwait is set
     if vars.get_bool("sendwait") {
-        let output = child
-            .wait_with_output()
-            .map_err(|e| format!("Failed to wait for sendmail: {}", e))?;
+        let output = child.wait_with_output().map_err(|e| {
+            format!(
+                "Failed to wait for sendmail: {}",
+                plib::diag::io_error_text(&e)
+            )
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -316,7 +319,7 @@ pub(crate) fn record_message(
         .create(true)
         .append(true)
         .open(&path)
-        .map_err(|e| format!("Cannot open {}: {}", path, e))?;
+        .map_err(|e| format!("Cannot open {}: {}", path, plib::diag::io_error_text(&e)))?;
 
     let write = || -> io::Result<()> {
         let mut file = &file;
@@ -337,8 +340,9 @@ pub(crate) fn record_message(
         writeln!(file)?;
         Ok(())
     };
-    write().map_err(|e| format!("{}: {}", path, e))?;
-    file.flush().map_err(|e| format!("{}: {}", path, e))?;
+    write().map_err(|e| format!("{}: {}", path, plib::diag::io_error_text(&e)))?;
+    file.flush()
+        .map_err(|e| format!("{}: {}", path, plib::diag::io_error_text(&e)))?;
 
     Ok(())
 }

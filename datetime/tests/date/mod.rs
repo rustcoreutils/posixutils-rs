@@ -481,3 +481,10 @@ fn test_date_reports_write_error() {
     plib::testing::assert_write_error_on_full_device("date", &["+"], b"", 1);
     plib::testing::assert_write_error_on_full_device("date", &["-Iseconds"], b"", 1);
 }
+
+// A failed write of the help text is a write error, not a silent success.
+#[cfg(target_os = "linux")]
+#[test]
+fn help_write_error_on_full_device() {
+    plib::testing::assert_write_error_message_on_full_device("date", &["--help"], b"", 1);
+}

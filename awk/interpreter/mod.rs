@@ -8,6 +8,7 @@
 //
 
 use array::Array;
+pub use builtins::stdout_write_error;
 use builtins::{builtin_match, builtin_sprintf, call_simple_builtin, print_to_string, sprintf};
 use io::{ReadFiles, ReadPipes, RecordSeparator, WriteFiles, WritePipes};
 use main_input::MainInput;

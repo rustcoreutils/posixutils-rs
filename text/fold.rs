@@ -70,9 +70,23 @@ fn find_last_blank(v: &[u8]) -> Option<usize> {
     v.iter().rposition(|&b| b == b' ' || b == b'\t')
 }
 
-fn fold_file(args: &Args, pathname: &Path) -> io::Result<()> {
+/// Why folding one file failed: reading the input, which is reported against
+/// the file, or writing standard output, which is a write error.
+enum Failure {
+    Input(io::Error),
+    Output(io::Error),
+}
+
+/// Every write is to standard output; reads are mapped to `Input` by hand.
+impl From<io::Error> for Failure {
+    fn from(e: io::Error) -> Self {
+        Failure::Output(e)
+    }
+}
+
+fn fold_file(args: &Args, pathname: &Path) -> Result<(), Failure> {
     // open file, or stdin ("-" or no operand)
-    let mut reader = BufReader::new(input_stream_dashed(pathname)?);
+    let mut reader = BufReader::new(input_stream_dashed(pathname).map_err(Failure::Input)?);
 
     let width = args.width as usize;
     let mut out = BufWriter::new(io::stdout());
@@ -85,7 +99,11 @@ fn fold_file(args: &Args, pathname: &Path) -> io::Result<()> {
     let mut data: Vec<u8> = Vec::new();
     loop {
         data.clear();
-        if reader.read_until(b'\n', &mut data)? == 0 {
+        if reader
+            .read_until(b'\n', &mut data)
+            .map_err(Failure::Input)?
+            == 0
+        {
             break;
         }
         for ch in mb_char_slices(&data) {
@@ -157,16 +175,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut exit_code = 0;
 
     for filename in &args.files {
-        if let Err(e) = fold_file(&args, filename) {
-            exit_code = 1;
-            // Prefixed with the utility name like every other diagnostic in the
-            // tree; this printed only "<file>: <error>", so a fold failure in a
-            // pipeline was not attributable to fold.
-            plib::diag::error(&format!(
-                "{}: {}",
-                filename.display(),
-                plib::diag::io_error_text(&e)
-            ));
+        match fold_file(&args, filename) {
+            Ok(()) => {}
+            Err(Failure::Input(e)) => {
+                exit_code = 1;
+                // Prefixed with the utility name like every other diagnostic in
+                // the tree; this printed only "<file>: <error>", so a fold
+                // failure in a pipeline was not attributable to fold.
+                plib::diag::error(&format!(
+                    "{}: {}",
+                    filename.display(),
+                    plib::diag::io_error_text(&e)
+                ));
+            }
+            Err(Failure::Output(e)) => {
+                // Every later file would fail the same way.
+                plib::diag::error(&format!(
+                    "{}: {}",
+                    gettext("write error"),
+                    plib::diag::io_error_text(&e)
+                ));
+                std::process::exit(1);
+            }
         }
     }
 

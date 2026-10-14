@@ -843,3 +843,38 @@ fn test_version_flag_is_long_only() {
     assert_eq!(out.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&out.stdout).starts_with("posixutils-text "));
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sort_write_error_on_full_device() {
+    // A failed write to standard output is "sort: write error: REASON",
+    // with the system's text for the error and exit status 2.
+    plib::testing::assert_write_error_message_on_full_device("sort", &[], b"b\na\n", 2);
+}
+
+/// A failure to read an input or to create the output file is named with the
+/// system's text for the error, without Rust's "(os error N)" suffix.
+#[test]
+fn test_sort_io_errors_name_the_system_error() {
+    let target = "/nonexistent/sort-output";
+    let create_error = plib::diag::io_error_text(&std::fs::File::create(target).unwrap_err());
+    let out = plib::testing::run_test_base("sort", &["-o".into(), target.into()], b"b\na\n");
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("sort: open failed: {target}: {create_error}\n")
+    );
+
+    #[cfg(target_os = "linux")]
+    {
+        let dir = plib::tmp::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let read_error = plib::diag::io_error_text(&std::fs::read(&path).unwrap_err());
+        let out = plib::testing::run_test_base("sort", std::slice::from_ref(&path), b"");
+        assert_eq!(out.status.code(), Some(2));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            format!("sort: read error: {path}: {read_error}\n")
+        );
+    }
+}

@@ -456,6 +456,8 @@ fn main() -> ExitCode {
     let (attached, rest) = extract_attached_opts(plib::optarg::args_utf8("admin"));
     let args = match Args::try_parse_from(plib::optarg::keep_leading_equals::<Args>(rest)) {
         Ok(a) => a,
+        // The version is written to standard output with status 0.
+        Err(e) if !e.use_stderr() => plib::optarg::exit(e),
         Err(e) => {
             e.print().ok();
             return ExitCode::FAILURE;
@@ -465,8 +467,16 @@ fn main() -> ExitCode {
     // Handle --help manually since we disabled automatic help
     if args.help {
         use clap::CommandFactory;
-        Args::command().print_help().ok();
-        println!();
+        use std::io::Write;
+        let written = Args::command().print_help().and_then(|()| {
+            let mut stdout = std::io::stdout();
+            writeln!(stdout)?;
+            stdout.flush()
+        });
+        if let Err(e) = written {
+            plib::diag::write_error(&e);
+            return ExitCode::FAILURE;
+        }
         return ExitCode::SUCCESS;
     }
 
@@ -536,14 +546,22 @@ fn main() -> ExitCode {
                 Ok(true) => {}
                 Ok(false) => exit_code = ExitCode::FAILURE,
                 Err(e) => {
-                    eprintln!("admin: {}: {}", file_path.display(), e);
+                    eprintln!(
+                        "admin: {}: {}",
+                        file_path.display(),
+                        plib::diag::io_error_text(&e)
+                    );
                     exit_code = ExitCode::FAILURE;
                 }
             }
         } else if args.recompute_checksum {
             // -z: recompute checksum
             if let Err(e) = recompute_checksum(file_path) {
-                eprintln!("admin: {}: {}", file_path.display(), e);
+                eprintln!(
+                    "admin: {}: {}",
+                    file_path.display(),
+                    plib::diag::io_error_text(&e)
+                );
                 exit_code = ExitCode::FAILURE;
             }
         } else if creating_new {
@@ -570,7 +588,7 @@ fn main() -> ExitCode {
             let content = match content {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("admin: {}", e);
+                    eprintln!("admin: {}", plib::diag::io_error_text(&e));
                     exit_code = ExitCode::FAILURE;
                     continue;
                 }
@@ -585,7 +603,7 @@ fn main() -> ExitCode {
             let desc_text = match desc_text {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("admin: {}", e);
+                    eprintln!("admin: {}", plib::diag::io_error_text(&e));
                     exit_code = ExitCode::FAILURE;
                     continue;
                 }
@@ -622,7 +640,11 @@ fn main() -> ExitCode {
                     mr_numbers: mr_numbers.clone(),
                 },
             ) {
-                eprintln!("admin: {}: {}", file_path.display(), e);
+                eprintln!(
+                    "admin: {}: {}",
+                    file_path.display(),
+                    plib::diag::io_error_text(&e)
+                );
                 exit_code = ExitCode::FAILURE;
             }
         } else {
@@ -648,7 +670,7 @@ fn main() -> ExitCode {
             let desc_text = match desc_text {
                 Some(Ok(t)) => Some(t),
                 Some(Err(e)) => {
-                    eprintln!("admin: {}", e);
+                    eprintln!("admin: {}", plib::diag::io_error_text(&e));
                     exit_code = ExitCode::FAILURE;
                     continue;
                 }
@@ -663,7 +685,11 @@ fn main() -> ExitCode {
                 args.add_users.clone(),
                 args.erase_users.clone(),
             ) {
-                eprintln!("admin: {}: {}", file_path.display(), e);
+                eprintln!(
+                    "admin: {}: {}",
+                    file_path.display(),
+                    plib::diag::io_error_text(&e)
+                );
                 exit_code = ExitCode::FAILURE;
             }
         }

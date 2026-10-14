@@ -160,3 +160,12 @@ fn tabs_non_utf8_operand_is_refused() {
         "{output:?}"
     );
 }
+
+// A failed write of the help text is a write error, not a silent success.
+#[cfg(target_os = "linux")]
+#[test]
+fn help_write_error_on_full_device() {
+    for cmd in ["tabs", "tput"] {
+        plib::testing::assert_write_error_message_on_full_device(cmd, &["--help"], b"", 1);
+    }
+}

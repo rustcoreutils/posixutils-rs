@@ -14,10 +14,10 @@ use crate::shstr::ShString;
 use std::convert::Infallible;
 use std::ffi::{CString, OsStr, OsString};
 use std::fmt::{Display, Formatter};
-use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 pub mod errno;
 pub mod signals;
@@ -231,19 +231,56 @@ pub enum WaitStatus {
     Stopped {
         signal: TermSignal,
     },
+    /// A stopped child was resumed by SIGCONT (only with `continued`).
+    Continued,
     StillAlive,
 }
 
-pub fn waitpid(pid: Pid, no_hang: bool, untraced: bool) -> OsResult<WaitStatus> {
+/// Which changes of a child's state `waitpid` reports besides termination.
+#[derive(Clone, Copy)]
+pub struct WaitOptions {
+    /// Return at once (`StillAlive`) when the child has not changed state.
+    pub no_hang: bool,
+    /// Report a child that has stopped (WUNTRACED).
+    pub untraced: bool,
+    /// Report a stopped child that SIGCONT has resumed (WCONTINUED).
+    pub continued: bool,
+}
+
+impl WaitOptions {
+    /// Blocks until the child terminates, or also until it stops when
+    /// `untraced`.
+    pub fn blocking(untraced: bool) -> Self {
+        Self {
+            no_hang: false,
+            untraced,
+            continued: false,
+        }
+    }
+
+    /// Polls for every change of state a job's process can go through.
+    pub fn poll_all() -> Self {
+        Self {
+            no_hang: true,
+            untraced: true,
+            continued: true,
+        }
+    }
+}
+
+pub fn waitpid(pid: Pid, options: WaitOptions) -> OsResult<WaitStatus> {
     let mut status = 0;
-    let mut options = 0;
-    if no_hang {
-        options |= libc::WNOHANG;
+    let mut flags = 0;
+    if options.no_hang {
+        flags |= libc::WNOHANG;
     }
-    if untraced {
-        options |= libc::WUNTRACED;
+    if options.untraced {
+        flags |= libc::WUNTRACED;
     }
-    let wait_result = unsafe { libc::waitpid(pid, &mut status, options) };
+    if options.continued {
+        flags |= libc::WCONTINUED;
+    }
+    let wait_result = unsafe { libc::waitpid(pid, &mut status, flags) };
     if wait_result < 0 {
         let errno = get_current_errno_value();
         if errno == Errno::EINTR {
@@ -256,7 +293,7 @@ pub fn waitpid(pid: Pid, no_hang: bool, untraced: bool) -> OsResult<WaitStatus> 
             command: "waitpid",
             errno,
         })
-    } else if wait_result == 0 && no_hang {
+    } else if wait_result == 0 && options.no_hang {
         Ok(WaitStatus::StillAlive)
     } else if libc::WIFEXITED(status) {
         let exit_status = libc::WEXITSTATUS(status);
@@ -269,9 +306,11 @@ pub fn waitpid(pid: Pid, no_hang: bool, untraced: bool) -> OsResult<WaitStatus> 
         Ok(WaitStatus::Stopped {
             signal: TermSignal(libc::WSTOPSIG(status)),
         })
+    } else if libc::WIFCONTINUED(status) {
+        Ok(WaitStatus::Continued)
     } else {
-        // WIFCONTINUED, or a status this shell does not ask for; the child is
-        // still around, so report it as such rather than aborting.
+        // A status this shell does not know; the child is still around, so
+        // report it as such rather than aborting.
         Ok(WaitStatus::StillAlive)
     }
 }
@@ -438,6 +477,11 @@ pub fn tcsetpgrp(fd: RawFd, pgid: Pid) -> OsResult<()> {
 /// job, is otherwise stopped by SIGTTOU instead (XSH tcsetpgrp()); blocking
 /// the signal lets the call go ahead without one being sent.
 pub fn give_terminal_to(fd: RawFd, pgid: Pid) -> OsResult<()> {
+    with_sigttou_blocked(|| tcsetpgrp(fd, pgid))
+}
+
+/// Runs `f` with SIGTTOU blocked, for a call that changes the terminal.
+fn with_sigttou_blocked<T>(f: impl FnOnce() -> T) -> T {
     // SAFETY: both sets are initialised (sigemptyset, sigprocmask) before
     // they are read.
     unsafe {
@@ -446,18 +490,75 @@ pub fn give_terminal_to(fd: RawFd, pgid: Pid) -> OsResult<()> {
         libc::sigemptyset(&mut block);
         libc::sigaddset(&mut block, libc::SIGTTOU);
         libc::sigprocmask(libc::SIG_BLOCK, &block, &mut previous);
-        let result = tcsetpgrp(fd, pgid);
+        let result = f();
         libc::sigprocmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
         result
     }
 }
 
-pub fn is_process_in_foreground() -> bool {
-    if let Ok(pgid) = tcgetpgrp(io::stdin().as_raw_fd()) {
-        pgid == getpgrp()
-    } else {
-        false
+/// A terminal's modes, as `tcgetattr` reports them.
+#[derive(Clone, Copy)]
+pub struct TtyModes(libc::termios);
+
+/// The modes of the terminal open on `fd`, or `None` when they cannot be
+/// read (not a terminal, or EIO once it has hung up).
+pub fn tty_modes(fd: RawFd) -> Option<TtyModes> {
+    // SAFETY: zeroed is a valid termios (some systems have members beyond
+    // the POSIX ones), and tcgetattr fills it in or fails.
+    let mut modes = unsafe { std::mem::zeroed::<libc::termios>() };
+    if unsafe { libc::tcgetattr(fd, &mut modes) } < 0 {
+        return None;
     }
+    Some(TtyModes(modes))
+}
+
+/// Gives the terminal open on `fd` the modes `modes`, once the output
+/// already written has gone out, as bash does. A failure (the terminal
+/// may have hung up) changes nothing and is ignored. SIGTTOU is blocked,
+/// as for `give_terminal_to`, in case the shell is not the foreground
+/// process group after all.
+pub fn set_tty_modes(fd: RawFd, modes: &TtyModes) {
+    // SAFETY: `modes` came from tcgetattr.
+    with_sigttou_blocked(|| unsafe { libc::tcsetattr(fd, libc::TCSADRAIN, &modes.0) });
+}
+
+/// The shell's own descriptor for the terminal job control hands to jobs,
+/// -1 when it has none. A private copy, so that redirections of the
+/// standard descriptors do not change which terminal that is.
+static JOB_CONTROL_TTY: AtomicI32 = AtomicI32::new(-1);
+
+/// The terminal job control hands to foreground jobs, if any.
+pub fn job_control_tty() -> Option<RawFd> {
+    let fd = JOB_CONTROL_TTY.load(Ordering::SeqCst);
+    (fd >= 0).then_some(fd)
+}
+
+/// Makes a private copy of `fd`, a terminal, the one job control uses, or
+/// with `None` closes the copy.
+pub fn set_job_control_tty(fd: Option<RawFd>) -> OsResult<()> {
+    let copy = match fd {
+        Some(fd) => dup_private(fd)?,
+        None => -1,
+    };
+    let previous = JOB_CONTROL_TTY.swap(copy, Ordering::SeqCst);
+    if previous >= 0 {
+        let _ = close(previous);
+    }
+    Ok(())
+}
+
+/// Whether `fd` is the job-control terminal's private descriptor.
+pub fn is_job_control_tty_fd(fd: RawFd) -> bool {
+    fd >= 0 && JOB_CONTROL_TTY.load(Ordering::SeqCst) == fd
+}
+
+/// Moves the job-control terminal's descriptor off `fd`, so that a
+/// redirection can have that number.
+pub fn move_job_control_tty_fd(fd: RawFd) -> OsResult<()> {
+    let copy = dup_private(fd)?;
+    let _ = JOB_CONTROL_TTY.compare_exchange(fd, copy, Ordering::SeqCst, Ordering::SeqCst);
+    let _ = close(fd);
+    Ok(())
 }
 
 pub fn find_in_path(command: &std::ffi::OsStr, env_path: &str) -> Option<OsString> {

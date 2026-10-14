@@ -256,3 +256,11 @@ fn fold_carriage_return_resets_the_column() {
 fn option_argument_may_begin_with_hyphen() {
     plib::testing::assert_hyphen_option_argument("fold", &["-w", "-zq", "--help"]);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fold_write_error_on_full_device() {
+    // A failed write to standard output is "fold: write error: REASON",
+    // with the system's text for the error and exit status 1.
+    plib::testing::assert_write_error_message_on_full_device("fold", &["-w1"], b"abc\n", 1);
+}

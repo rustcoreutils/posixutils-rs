@@ -757,7 +757,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 7. Remove source file hierarchy
             Ok(Moved::Copied(copied)) => copied.remove(&mut dummy, cfg.verbose),
             Err(e) => {
-                eprintln!("mv: {}", e);
+                eprintln!("mv: {}", plib::diag::io_error_text(&e));
                 false
             }
         }

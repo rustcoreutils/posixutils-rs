@@ -105,8 +105,9 @@ fn encode_historical_line(line: &[u8]) -> Vec<u8> {
     out
 }
 
-/// encodes the file (it can be standard input too) and outputs on standard output
-fn encode_file(base64: bool, file: Option<&Path>, decode_path: &str) -> io::Result<()> {
+/// Encode the file (it can be standard input too), returning the text to
+/// write to standard output.
+fn encode_file(base64: bool, file: Option<&Path>, decode_path: &str) -> io::Result<Vec<u8>> {
     let encoding_type = if base64 {
         EncodingType::Base64
     } else {
@@ -149,10 +150,9 @@ fn encode_file(base64: bool, file: Option<&Path>, decode_path: &str) -> io::Resu
         }
     }
 
-    io::stdout().write_all(out.as_slice())?;
-    io::stdout().write_all(b"\n")?;
+    out.push(b'\n');
 
-    Ok(())
+    Ok(out)
 }
 
 fn main() {
@@ -168,12 +168,24 @@ fn main() {
         }
     };
 
-    if let Err(e) = encode_file(args.base64, file.as_deref(), &decode_path) {
-        let name = file
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| gettext("standard input"));
-        diag::error(&format!("{name}: {e}"));
+    match encode_file(args.base64, file.as_deref(), &decode_path) {
+        Ok(out) => {
+            let mut stdout = io::stdout();
+            if let Err(e) = stdout.write_all(&out).and_then(|()| stdout.flush()) {
+                diag::error(&format!(
+                    "{}: {}",
+                    gettext("write error"),
+                    diag::io_error_text(&e)
+                ));
+            }
+        }
+        Err(e) => {
+            let name = file
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| gettext("standard input"));
+            diag::error(&format!("{name}: {}", diag::io_error_text(&e)));
+        }
     }
 
     std::process::exit(diag::exit_status())

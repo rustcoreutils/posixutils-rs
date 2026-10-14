@@ -29,7 +29,13 @@ impl SpecialBuiltinUtility for SetSpecialBuiltin {
         // break `set -- "$@"`, the single most common idiom in the shell.
         let options = args_for_option_scan(args);
         let options: Vec<&str> = options.iter().map(String::as_str).collect();
-        match shell.set_options.parse_args_and_update(&options) {
+        let monitor_before = shell.set_options.monitor;
+        let parsed = shell.set_options.parse_args_and_update(&options);
+        // `set -m` / `set +m` turn job control on and off (XCU 2.11).
+        if shell.set_options.monitor != monitor_before {
+            shell.set_job_control(shell.set_options.monitor);
+        }
+        match parsed {
             Err(err) => Err(format!("set: {}\n", err).into()),
             Ok(parsed_args) => {
                 match parsed_args {

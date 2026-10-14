@@ -772,7 +772,11 @@ fn daemon_loop(socket_path: &Path, invite_timeout: Duration, tick: Duration) -> 
             // SA_RESTART.
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => {
-                log_err(&format!("{}: {}", gettext("recv error"), e));
+                log_err(&format!(
+                    "{}: {}",
+                    gettext("recv error"),
+                    plib::diag::io_error_text(&e)
+                ));
                 continue;
             }
         };
@@ -785,7 +789,11 @@ fn daemon_loop(socket_path: &Path, invite_timeout: Duration, tick: Duration) -> 
             Ok(m) => m,
             Err(e) => {
                 if limiter.allow() {
-                    log_err(&format!("{}: {}", gettext("failed to parse message"), e));
+                    log_err(&format!(
+                        "{}: {}",
+                        gettext("failed to parse message"),
+                        plib::diag::io_error_text(&e)
+                    ));
                 }
                 continue;
             }
@@ -836,7 +844,11 @@ fn daemon_loop(socket_path: &Path, invite_timeout: Duration, tick: Duration) -> 
         // Send response
         if let Ok(bytes) = response.to_bytes() {
             if let Err(e) = socket.send_to_addr(&bytes, &client_addr) {
-                log_err(&format!("{}: {}", gettext("failed to send response"), e));
+                log_err(&format!(
+                    "{}: {}",
+                    gettext("failed to send response"),
+                    plib::diag::io_error_text(&e)
+                ));
             }
         }
     }
@@ -979,7 +991,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Detach unless asked to stay in the foreground (#TD9).
     if !args.foreground {
         if let Err(e) = daemonize() {
-            plib::diag::error(&format!("{}: {}", gettext("failed to daemonize"), e));
+            plib::diag::error(&format!(
+                "{}: {}",
+                gettext("failed to daemonize"),
+                plib::diag::io_error_text(&e)
+            ));
             std::process::exit(1);
         }
         let _ = DAEMONIZED.set(true);
@@ -993,7 +1009,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tick = Duration::from_secs(args.expiry_tick.max(1));
 
     if let Err(e) = daemon_loop(&args.socket, invite_timeout, tick) {
-        log_err(&e.to_string());
+        log_err(&plib::diag::io_error_text(&e));
         // Clean up socket on error
         let _ = fs::remove_file(&args.socket);
         std::process::exit(1);

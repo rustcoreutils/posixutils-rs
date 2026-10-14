@@ -78,8 +78,10 @@ impl Args {
             "in-place",
             &OptionArguments::of(Args::command()),
         );
-        let matches =
-            Args::command().get_matches_from(plib::optarg::keep_leading_equals::<Args>(argv));
+        let matches = plib::optarg::get_matches_from(
+            Args::command(),
+            plib::optarg::keep_leading_equals::<Args>(argv),
+        );
         let mut args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
         let mut sources: Vec<(usize, ScriptSource)> = Vec::new();
@@ -1190,17 +1192,27 @@ fn emit(bytes: &[u8]) {
         b""
     };
     let mut in_place = IN_PLACE_OUTPUT.lock().unwrap();
-    let result = match in_place.as_mut() {
-        Some(file) => file.write_all(owed).and_then(|()| file.write_all(bytes)),
+    match in_place.as_mut() {
+        Some(file) => {
+            if let Err(err) = file.write_all(owed).and_then(|()| file.write_all(bytes)) {
+                eprintln!("sed: couldn't write: {}", plib::diag::io_error_text(&err));
+                std::process::exit(4);
+            }
+        }
         None => {
             let mut out = std::io::stdout();
-            out.write_all(owed).and_then(|()| out.write_all(bytes))
+            if let Err(err) = out.write_all(owed).and_then(|()| out.write_all(bytes)) {
+                stdout_write_failed(&err);
+            }
         }
-    };
-    if let Err(err) = result {
-        eprintln!("sed: couldn't write: {}", plib::diag::io_error_text(&err));
-        std::process::exit(4);
     }
+}
+
+/// Report a failed write to standard output and end sed with GNU's I/O
+/// status, 4.
+fn stdout_write_failed(err: &std::io::Error) -> ! {
+    plib::diag::write_error(err);
+    std::process::exit(4);
 }
 
 /// Flush standard output before exit. Output that does not end in a
@@ -1208,8 +1220,7 @@ fn emit(bytes: &[u8]) {
 /// at exit discards its error; a write error ends sed as in [`emit`].
 fn flush_output() {
     if let Err(err) = std::io::stdout().flush() {
-        eprintln!("sed: couldn't write: {}", plib::diag::io_error_text(&err));
-        std::process::exit(4);
+        stdout_write_failed(&err);
     }
 }
 

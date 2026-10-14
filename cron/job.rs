@@ -722,8 +722,9 @@ impl CronJob {
             // SAFETY: called in the forked child before exec.
             if let Err(e) = unsafe { drop_privileges(uid, gid, name) } {
                 eprintln!(
-                    "crond: {} {name}: {e}",
-                    gettext("cannot drop privileges for")
+                    "crond: {} {name}: {}",
+                    gettext("cannot drop privileges for"),
+                    plib::diag::io_error_text(&e)
                 );
                 std::process::exit(1);
             }
@@ -761,7 +762,11 @@ impl CronJob {
         let mut child = match command.spawn() {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("crond: {}: {e}", gettext("cannot run job"));
+                eprintln!(
+                    "crond: {}: {}",
+                    gettext("cannot run job"),
+                    plib::diag::io_error_text(&e)
+                );
                 std::process::exit(1);
             }
         };

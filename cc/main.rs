@@ -2979,7 +2979,7 @@ fn parse_args(argv: Vec<String>) -> Args {
         Err(e) => match e.kind() {
             ErrorKind::DisplayHelp
             | ErrorKind::DisplayVersion
-            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => e.exit(),
+            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => plib::optarg::exit(e),
             _ => {
                 eprintln!("c17: {}", parse_error_text(&e, &argv));
                 std::process::exit(1);

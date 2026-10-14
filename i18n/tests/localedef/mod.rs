@@ -562,3 +562,23 @@ fn option_argument_may_begin_with_hyphen() {
         plib::testing::assert_hyphen_option_argument("localedef", &[opt, "-zq", "--help"]);
     }
 }
+
+/// A charmap that cannot be read is reported with the system's text for the
+/// error, without Rust's "(os error N)" suffix.
+#[test]
+fn localedef_unreadable_charmap_names_the_system_error() {
+    let missing = "/nonexistent/localedef-charmap";
+    let open_error = plib::diag::io_error_text(&std::fs::File::open(missing).unwrap_err());
+    let dir = plib::tmp::tempdir().unwrap();
+    let locale = dir.path().join("loc");
+    let out = plib::testing::run_test_base(
+        "localedef",
+        &["-f".into(), missing.into(), locale.to_str().unwrap().into()],
+        b"",
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("localedef: {missing}: {open_error}\n")
+    );
+}

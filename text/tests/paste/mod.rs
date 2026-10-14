@@ -484,3 +484,11 @@ fn attached_option_argument_may_begin_with_equals() {
     }
     plib::testing::assert_equals_option_argument("paste", "-d", &["-", "-"], b"a\nb\n");
 }
+
+// A failed write to standard output is "paste: write error: REASON".
+#[cfg(target_os = "linux")]
+#[test]
+fn write_error_message_on_full_device() {
+    plib::testing::assert_write_error_message_on_full_device("paste", &["-"], b"x\n", 1);
+    plib::testing::assert_write_error_message_on_full_device("paste", &["-s", "-"], b"x\n", 1);
+}

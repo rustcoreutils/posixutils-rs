@@ -361,7 +361,9 @@ enum OutputFile {
 impl Write for OutputFile {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
-            OutputFile::Stdout(s) => s.write(buf),
+            // Standard output is line-buffered; a block is written out whole,
+            // so that a failure belongs to the block that met it.
+            OutputFile::Stdout(s) => s.write(buf).and_then(|n| s.flush().map(|()| n)),
             OutputFile::File(f) => f.write(buf),
         }
     }
@@ -443,6 +445,18 @@ fn output_name(config: &Config) -> String {
     format!("'{}'", name)
 }
 
+/// A failed write to the output ends the copy: write the statistics gathered
+/// so far, as a read error does, and return the diagnostic.
+fn write_failed(stats: &Stats, e: io::Error) -> Box<dyn std::error::Error> {
+    stats.print();
+    format!(
+        "{}: {}",
+        gettext("write error"),
+        plib::diag::io_error_text(&e)
+    )
+    .into()
+}
+
 /// Copy input to output.  Returns the statistics and whether the copy
 /// succeeded; a failure already reported here (a failed conv=fsync) still
 /// leaves the statistics to be written.
@@ -513,7 +527,9 @@ fn copy_convert_file(config: &Config) -> Result<(Stats, bool), Box<dyn std::erro
             // Non-seekable: write null bytes
             let zeros = vec![0u8; config.obs];
             for _ in 0..config.seek {
-                ofile.write_all(&zeros)?;
+                ofile
+                    .write_all(&zeros)
+                    .map_err(|e| write_failed(&stats, e))?;
             }
         }
     }
@@ -542,7 +558,7 @@ fn copy_convert_file(config: &Config) -> Result<(Stats, bool), Box<dyn std::erro
             Ok(n) => n,
             Err(e) => {
                 if config.noerror {
-                    eprintln!("{}: {}", gettext("read error"), e);
+                    plib::diag::error(&read_error(&e));
                     stats.print();
                     // If sync is specified, replace with nulls
                     let has_sync = config
@@ -562,7 +578,7 @@ fn copy_convert_file(config: &Config) -> Result<(Stats, bool), Box<dyn std::erro
                 } else {
                     // Report the statistics gathered so far before aborting.
                     stats.print();
-                    return Err(e.into());
+                    return Err(read_error(&e).into());
                 }
             }
         };
@@ -583,31 +599,37 @@ fn copy_convert_file(config: &Config) -> Result<(Stats, bool), Box<dyn std::erro
 
         if use_passthrough {
             // bs= mode: write each input block as separate output block
+            ofile
+                .write_all(&data)
+                .map_err(|e| write_failed(&stats, e))?;
             if data.len() == config.obs {
                 stats.out_full += 1;
             } else {
                 stats.out_partial += 1;
             }
-            ofile.write_all(&data)?;
         } else {
             // Aggregate output to obs-sized blocks
             obuf.extend_from_slice(&data);
 
             while obuf.len() >= config.obs {
                 let block: Vec<u8> = obuf.drain(..config.obs).collect();
+                ofile
+                    .write_all(&block)
+                    .map_err(|e| write_failed(&stats, e))?;
                 stats.out_full += 1;
-                ofile.write_all(&block)?;
             }
         }
     }
 
     // Write any remaining data in output buffer
     if !obuf.is_empty() {
+        ofile
+            .write_all(&obuf)
+            .map_err(|e| write_failed(&stats, e))?;
         stats.out_partial += 1;
-        ofile.write_all(&obuf)?;
     }
 
-    ofile.flush()?;
+    ofile.flush().map_err(|e| write_failed(&stats, e))?;
 
     // An interrupted copy ends as soon as the statistics are out, as GNU's
     // does; only a finished one is synced.
@@ -624,6 +646,15 @@ fn copy_convert_file(config: &Config) -> Result<(Stats, bool), Box<dyn std::erro
     }
 
     Ok((stats, true))
+}
+
+/// `read error: REASON`, the diagnostic for a failed read of the input.
+fn read_error(e: &io::Error) -> String {
+    format!(
+        "{}: {}",
+        gettext("read error"),
+        plib::diag::io_error_text(e)
+    )
 }
 
 fn parse_conv_list(config: &mut Config, s: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -651,8 +682,7 @@ fn parse_conv_list(config: &mut Config, s: &str) -> Result<(), Box<dyn std::erro
                 continue;
             }
             _ => {
-                eprintln!("{}: {}", gettext("invalid conv option"), convstr);
-                return Err("invalid conv option".into());
+                return Err(format!("{}: {}", gettext("invalid conv option"), convstr).into());
             }
         };
         config.conversions.push(conversion);
@@ -660,10 +690,22 @@ fn parse_conv_list(config: &mut Config, s: &str) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-/// Parse a single component of a block size expression (number with optional suffix)
-fn parse_block_size_component(s: &str) -> Result<usize, Box<dyn std::error::Error>> {
+/// The diagnostic for an operand that is not a number.
+fn invalid_number(s: &str) -> Box<dyn std::error::Error> {
+    format!("{}: '{}'", gettext("invalid number"), s).into()
+}
+
+/// Parse a non-negative decimal operand such as `skip=` or `count=`.
+fn parse_number(s: &str) -> Result<usize, Box<dyn std::error::Error>> {
+    s.parse::<usize>().map_err(|_| invalid_number(s))
+}
+
+/// Parse a single component of a block size expression (number with optional
+/// suffix). A component that is empty or not a number makes the whole
+/// `operand` an invalid number, as GNU dd reports it.
+fn parse_block_size_component(s: &str, operand: &str) -> Result<usize, Box<dyn std::error::Error>> {
     if s.is_empty() {
-        return Err("empty block size".into());
+        return Err(invalid_number(operand));
     }
 
     let mut chars: Vec<char> = s.chars().collect();
@@ -682,16 +724,20 @@ fn parse_block_size_component(s: &str) -> Result<usize, Box<dyn std::error::Erro
                 'm' | 'M' => scale = 1024 * 1024,
                 'g' | 'G' => scale = 1024 * 1024 * 1024,
                 _ => {
-                    eprintln!("{}: {}", gettext("invalid block size suffix"), last);
-                    return Err("invalid block size suffix".into());
+                    return Err(
+                        format!("{}: {}", gettext("invalid block size suffix"), last).into(),
+                    );
                 }
             }
         }
     }
 
     let num_str: String = chars.into_iter().collect();
-    let size = num_str.parse::<usize>()?;
-    Ok(size * scale)
+    let size = num_str
+        .parse::<usize>()
+        .map_err(|_| invalid_number(operand))?;
+    size.checked_mul(scale)
+        .ok_or_else(|| gettext("block size overflow").into())
 }
 
 /// Parse block size expression with 'x' multiplier support
@@ -701,12 +747,14 @@ fn parse_block_size(s: &str) -> Result<usize, Box<dyn std::error::Error>> {
 
     let mut result: usize = 1;
     for part in parts {
-        let component = parse_block_size_component(part)?;
-        result = result.checked_mul(component).ok_or("block size overflow")?;
+        let component = parse_block_size_component(part, s)?;
+        result = result
+            .checked_mul(component)
+            .ok_or_else(|| gettext("block size overflow"))?;
     }
 
     if result == 0 {
-        return Err("block size cannot be zero".into());
+        return Err(gettext("block size cannot be zero").into());
     }
 
     Ok(result)
@@ -722,7 +770,6 @@ fn parse_cmdline(args: &[OsString]) -> Result<Config, Box<dyn std::error::Error>
         let bytes = arg.as_bytes();
         let Some(eq) = bytes.iter().position(|&b| b == b'=') else {
             let msg = format!("{}: {}", gettext("invalid option"), arg.to_string_lossy());
-            eprintln!("{}", msg);
             return Err(msg.into());
         };
         let op = String::from_utf8_lossy(&bytes[..eq]);
@@ -743,9 +790,9 @@ fn parse_cmdline(args: &[OsString]) -> Result<Config, Box<dyn std::error::Error>
                 config.bs_mode = true;
             }
             "cbs" => config.cbs = parse_block_size(&oparg)?,
-            "skip" => config.skip = oparg.parse::<usize>()?,
-            "seek" => config.seek = oparg.parse::<usize>()?,
-            "count" => config.count = Some(oparg.parse::<usize>()?),
+            "skip" => config.skip = parse_number(&oparg)?,
+            "seek" => config.seek = parse_number(&oparg)?,
+            "count" => config.count = Some(parse_number(&oparg)?),
 
             "conv" => parse_conv_list(&mut config, &oparg)?,
 
@@ -754,7 +801,6 @@ fn parse_cmdline(args: &[OsString]) -> Result<Config, Box<dyn std::error::Error>
                 "none" => config.quiet = true,
                 _ => {
                     let msg = format!("{}: '{}'", gettext("invalid status level"), oparg);
-                    eprintln!("dd: {}", msg);
                     return Err(msg.into());
                 }
             },
@@ -765,16 +811,15 @@ fn parse_cmdline(args: &[OsString]) -> Result<Config, Box<dyn std::error::Error>
                         "fullblock" => config.iflags_fullblock = true,
                         "" => {}
                         _ => {
-                            eprintln!("{}: {}", gettext("invalid iflags option"), flag);
-                            return Err(format!("invalid iflags option: {}", flag).into());
+                            let msg = format!("{}: {}", gettext("invalid iflags option"), flag);
+                            return Err(msg.into());
                         }
                     }
                 }
             }
 
             _ => {
-                eprintln!("{}: {}", gettext("invalid option"), op);
-                return Err(format!("invalid option: {}", op).into());
+                return Err(format!("{}: {}", gettext("invalid option"), op).into());
             }
         }
     }
@@ -782,16 +827,24 @@ fn parse_cmdline(args: &[OsString]) -> Result<Config, Box<dyn std::error::Error>
     // block/unblock are unspecified without a non-zero cbs; treat as an error.
     if config.cbs == 0 && config.has_block_unblock() {
         let msg = gettext("conv=block/unblock requires a non-zero cbs=");
-        eprintln!("dd: {}", msg);
         return Err(msg.into());
     }
 
     Ok(config)
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
     plib::diag::init_locale("dd");
 
+    // Returned from `main`, an error would be printed with `Debug`
+    // (`Error: Os { code: 28, ... }`).
+    if let Err(e) = run() {
+        plib::diag::error(&plib::diag::error_text(e.as_ref()));
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Install SIGINT handler
     unsafe {
         libc::signal(

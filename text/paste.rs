@@ -9,6 +9,7 @@
 
 use clap::Parser;
 use gettextrs::gettext;
+use plib::diag::WriteError;
 use std::cell::{OnceCell, RefCell};
 use std::error::Error;
 use std::fs::File;
@@ -60,7 +61,10 @@ impl Source {
 
         match result {
             Ok(us) => Ok(us),
-            Err(er) => Err(Box::from(format!("{source_description}: {er}"))),
+            Err(er) => Err(Box::from(format!(
+                "{source_description}: {}",
+                plib::diag::io_error_text(&er)
+            ))),
         }
     }
 }
@@ -242,8 +246,9 @@ fn open_source(
         ))),
         "" => Ok(None),
         st => {
-            let fi = File::open(st)
-                .map_err(|er| -> Box<dyn Error> { Box::from(format!("{st}: {er}")) })?;
+            let fi = File::open(st).map_err(|er| -> Box<dyn Error> {
+                Box::from(format!("{st}: {}", plib::diag::io_error_text(&er)))
+            })?;
             Ok(Some(Source::File {
                 buf_reader: BufReader::new(fi),
                 file_description: format!("File: {st}"),
@@ -297,12 +302,12 @@ fn write_serial(
 
         if source.read_until_new_line(buffer)? == 0 {
             // EOF: terminate the output line.
-            stdout_lock.write_all(b"\n")?;
+            stdout_lock.write_all(b"\n").map_err(WriteError)?;
             break;
         }
 
         if !first_line {
-            delimiter_state.write(stdout_lock)?;
+            delimiter_state.write(stdout_lock).map_err(WriteError)?;
         }
 
         // Drop the trailing newline if present; keep the line otherwise.
@@ -311,7 +316,7 @@ fn write_serial(
             Some(b'\n') => iter.as_slice(),
             _ => buffer.as_slice(),
         };
-        stdout_lock.write_all(slice)?;
+        stdout_lock.write_all(slice).map_err(WriteError)?;
 
         first_line = false;
     }
@@ -414,7 +419,9 @@ fn paste_files(
         }
 
         // output all segments to stdout at once (one write per line)
-        io::stdout().write_all(output.as_slice())?;
+        io::stdout()
+            .write_all(output.as_slice())
+            .map_err(WriteError)?;
 
         delimiter_state.reset();
     }

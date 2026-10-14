@@ -364,7 +364,7 @@ fn apply_chdir(args: &mut Args) -> PaxResult<()> {
     std::env::set_current_dir(&dir).map_err(|e| {
         PaxError::Io(io::Error::new(
             e.kind(),
-            format!("{}: {}", dir.display(), e),
+            format!("{}: {}", dir.display(), plib::diag::io_error_text(&e)),
         ))
     })
 }
@@ -1019,7 +1019,11 @@ fn list_error(e: PaxError) -> PaxError {
     match e {
         PaxError::Io(e) => PaxError::Io(io::Error::new(
             e.kind(),
-            format!("{}: {}", gettext("pathname list"), e),
+            format!(
+                "{}: {}",
+                gettext("pathname list"),
+                plib::diag::io_error_text(&e)
+            ),
         )),
         e => e,
     }

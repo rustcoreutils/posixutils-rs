@@ -404,10 +404,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let dfa = dfa.minimize();
 
     // Determine output destination
+    // A failure of the output names the file, or for standard output (-t)
+    // is a write error.
+    let output_failure = |e: io::Error| -> Box<dyn std::error::Error> {
+        if args.stdout {
+            Box::new(diag::WriteError(e))
+        } else {
+            format!("{}: {}", args.outfile, diag::io_error_text(&e)).into()
+        }
+    };
     let mut output: Box<dyn Write> = if args.stdout {
         Box::new(io::stdout())
     } else {
-        Box::new(fs::File::create(&args.outfile)?)
+        Box::new(fs::File::create(&args.outfile).map_err(output_failure)?)
     };
 
     // Build a standalone DFA for each variable-length trailing context.
@@ -462,7 +471,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         tc_dfas,
         ..Default::default()
     };
-    codegen::generate(&mut output, &dfa, &lexinfo, &config)?;
+    codegen::generate(&mut output, &dfa, &lexinfo, &config)
+        .and_then(|()| output.flush())
+        .map_err(output_failure)?;
 
     // Write statistics if requested. POSIX: statistics "may also be generated
     // if table sizes are specified with a '%' operator ... as long as the -n
@@ -473,7 +484,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             &mut io::stdout()
         };
-        write_stats(stats_output, &dfa, &nfa, &lexinfo)?;
+        let written = write_stats(stats_output, &dfa, &nfa, &lexinfo);
+        // On standard output, a failure is a write error; on standard error
+        // there is nowhere to report it.
+        if !args.stdout {
+            written.map_err(diag::WriteError)?;
+        }
     }
 
     Ok(())

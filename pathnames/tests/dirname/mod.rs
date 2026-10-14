@@ -144,3 +144,11 @@ fn dirname_non_utf8_bare_name() {
         expected_exit_code: 0,
     });
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn dirname_write_error_on_full_device() {
+    // A failed write to standard output is "dirname: write error: REASON",
+    // with the system's text for the error and exit status 1.
+    plib::testing::assert_write_error_message_on_full_device("dirname", &["/a/b"], b"", 1);
+}

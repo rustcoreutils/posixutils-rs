@@ -94,7 +94,7 @@ fn main() -> ExitCode {
     let messages = match collect_messages(&args) {
         Ok(m) => m,
         Err(e) => {
-            plib::diag::error(&format!("{}", e));
+            plib::diag::error(&plib::diag::io_error_text(&e));
             return ExitCode::from(1);
         }
     };

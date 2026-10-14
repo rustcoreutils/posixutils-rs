@@ -92,7 +92,7 @@ pub enum ViError {
 impl fmt::Display for ViError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ViError::Io(e) => write!(f, "{}", e),
+            ViError::Io(e) => f.write_str(&plib::diag::io_error_text(e)),
             ViError::InvalidCommand(s) => write!(f, "Invalid command: {}", s),
             ViError::MotionFailed(s) => write!(f, "{}", s),
             ViError::NoPreviousSearch => write!(f, "No previous search pattern"),
@@ -165,5 +165,12 @@ mod tests {
         let io_err = io::Error::new(io::ErrorKind::NotFound, "file not found");
         let vi_err: ViError = io_err.into();
         assert!(matches!(vi_err, ViError::Io(_)));
+    }
+
+    #[test]
+    fn io_error_display_has_no_os_error_suffix() {
+        let io_err = std::fs::File::open("/nonexistent-dir/x").unwrap_err();
+        let expected = plib::diag::io_error_text(&io_err);
+        assert_eq!(ViError::Io(io_err).to_string(), expected);
     }
 }

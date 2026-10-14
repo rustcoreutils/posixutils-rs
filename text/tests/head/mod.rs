@@ -474,3 +474,24 @@ fn test_head_reports_write_error_on_final_partial_line() {
     plib::testing::assert_write_error_on_full_device("head", &[], b"x", 1);
     plib::testing::assert_write_error_on_full_device("head", &["-c", "1"], b"xy\n", 1);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn head_write_error_on_full_device() {
+    // A failed write to standard output is "head: write error: REASON",
+    // with the system's text for the error and exit status 1.
+    plib::testing::assert_write_error_message_on_full_device("head", &[], b"x\n", 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn head_two_files_write_error_on_full_device() {
+    // A failed write to standard output is "head: write error: REASON",
+    // with the system's text for the error and exit status 1.
+    plib::testing::assert_write_error_message_on_full_device(
+        "head",
+        &["-", "/dev/null"],
+        b"x\n",
+        1,
+    );
+}

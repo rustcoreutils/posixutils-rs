@@ -145,8 +145,13 @@ fn switch_to_group(identifier: &str, pwd: &User) -> Result<(), String> {
 /// adjusted so the previous identity is preserved where the spec requires.
 fn apply_group_change(new_gid: gid_t) -> Result<(), String> {
     let current_gid = unsafe { getgid() };
-    let mut supp = get_supplementary_gids()
-        .map_err(|e| format!("{}: {}", gettext("cannot read supplementary groups"), e))?;
+    let mut supp = get_supplementary_gids().map_err(|e| {
+        format!(
+            "{}: {}",
+            gettext("cannot read supplementary groups"),
+            plib::diag::io_error_text(&e)
+        )
+    })?;
 
     let old_in_supp = supp.contains(&current_gid);
     let new_in_supp = supp.contains(&new_gid);
@@ -167,8 +172,13 @@ fn apply_group_change(new_gid: gid_t) -> Result<(), String> {
 
     // Apply the supplementary list first (while still privileged), checking the
     // result (the old code discarded setgroups failures).
-    set_supplementary_gids(&supp)
-        .map_err(|e| format!("{}: {}", gettext("cannot set supplementary groups"), e))?;
+    set_supplementary_gids(&supp).map_err(|e| {
+        format!(
+            "{}: {}",
+            gettext("cannot set supplementary groups"),
+            plib::diag::io_error_text(&e)
+        )
+    })?;
 
     // Set real+effective (and, when privileged, saved) group ID.
     if unsafe { libc::setgid(new_gid) } != 0 {

@@ -2818,3 +2818,12 @@ fn test_sed_reports_write_error_on_final_partial_line() {
     // GNU sed's status for an I/O error, as sed uses for every write error.
     plib::testing::assert_write_error_on_full_device("sed", &["-n", "p"], b"x", 4);
 }
+
+// A failed write to standard output is "sed: write error: REASON", with
+// GNU's I/O status 4.
+#[cfg(target_os = "linux")]
+#[test]
+fn write_error_message_on_full_device() {
+    plib::testing::assert_write_error_message_on_full_device("sed", &["p"], b"x\n", 4);
+    plib::testing::assert_write_error_message_on_full_device("sed", &["-n", "p"], b"x", 4);
+}

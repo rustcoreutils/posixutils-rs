@@ -795,8 +795,9 @@ fn add_attrs<W: ArchiveWriter>(
         }
         Err(e) => {
             report(format!(
-                "{}: {e}",
-                gettextrs::gettext("cannot read ACL or extended attributes")
+                "{}: {}",
+                gettextrs::gettext("cannot read ACL or extended attributes"),
+                plib::diag::io_error_text(&e)
             ));
             return;
         }
@@ -814,7 +815,11 @@ fn add_attrs<W: ArchiveWriter>(
 fn add_acls(member: &mut ArchiveEntry, acl: plib::acl::Acl, report: &dyn Fn(String)) {
     match acl.nfs4_text(member.mode) {
         Ok(ace) => member.acl_ace = ace,
-        Err(e) => report(format!("{}: {e}", gettextrs::gettext("cannot read ACL"))),
+        Err(e) => report(format!(
+            "{}: {}",
+            gettextrs::gettext("cannot read ACL"),
+            plib::diag::io_error_text(&e)
+        )),
     }
     member.acl_access = acl
         .access
@@ -840,9 +845,10 @@ fn add_xattrs(member: &mut ArchiveEntry, xattrs: plib::xattr::Values, report: &d
     let lossy = |name: &std::ffi::CStr| String::from_utf8_lossy(name.to_bytes()).into_owned();
     for (name, e) in xattrs.unread {
         report(format!(
-            "{} {}: {e}",
+            "{} {}: {}",
             gettextrs::gettext("cannot read extended attribute"),
-            lossy(&name)
+            lossy(&name),
+            plib::diag::io_error_text(&e)
         ));
     }
     let mut bytes = 0u64;
@@ -920,7 +926,10 @@ fn copy_file_data<R: Read, W: ArchiveWriter>(
             Err(e) => {
                 crate::error::report_error(
                     path,
-                    format!("{e}; padding {remaining} bytes with zeros"),
+                    format!(
+                        "{}; padding {remaining} bytes with zeros",
+                        plib::diag::io_error_text(&e)
+                    ),
                 );
                 return pad_with_zeros(archive, remaining);
             }

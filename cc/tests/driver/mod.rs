@@ -2313,3 +2313,10 @@ fn driver_repeated_flag_last_one_wins() {
 fn c17_non_utf8_argument_is_reported() {
     plib::testing::assert_non_utf8_argument_rejected("c17", &[]);
 }
+
+// A failed write of the help text is a write error, not a silent success.
+#[cfg(target_os = "linux")]
+#[test]
+fn help_write_error_on_full_device() {
+    plib::testing::assert_write_error_message_on_full_device("c17", &["--help"], b"", 1);
+}

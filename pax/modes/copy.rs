@@ -1085,7 +1085,7 @@ fn with_source_attrs(
     let read = match read(options.preserve_xattrs) {
         Ok(Some(read)) => Ok(read),
         Ok(None) => Err(gettextrs::gettext("source file changed as it was read")),
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(plib::diag::io_error_text(&e)),
     };
     match read {
         Ok(read) => {

@@ -13,6 +13,7 @@ use crate::builtin::cd::Cd;
 use crate::builtin::command::Command;
 use crate::builtin::control_flow::{Break, Continue, Return};
 use crate::builtin::dot::Dot;
+use crate::builtin::echo::Echo;
 use crate::builtin::eval::Eval;
 use crate::builtin::exec::Exec;
 use crate::builtin::exit::Exit;
@@ -23,6 +24,7 @@ use crate::builtin::getopts::GetOpts;
 use crate::builtin::hash::Hash;
 use crate::builtin::jobs::Jobs;
 use crate::builtin::kill::Kill;
+use crate::builtin::printf::Printf;
 use crate::builtin::pwd::Pwd;
 use crate::builtin::read::BuiltinRead;
 use crate::builtin::readonly::ReadOnly;
@@ -52,6 +54,7 @@ mod cd;
 mod command;
 mod control_flow;
 mod dot;
+mod echo;
 mod eval;
 mod exec;
 mod exit;
@@ -62,6 +65,7 @@ mod getopts;
 mod hash;
 mod jobs;
 mod kill;
+mod printf;
 pub(crate) mod pwd;
 mod read;
 mod readonly;
@@ -198,6 +202,10 @@ pub fn get_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
         "pwd" => Some(&Pwd),
         "true" => Some(&True),
         "false" => Some(&False),
+        // Printing is the commonest thing a script does; dash and bash both
+        // build these in rather than fork for every line.
+        "echo" => Some(&Echo),
+        "printf" => Some(&Printf),
         // A conditional is the most frequently executed command in a script;
         // forking one per `[ ... ]` makes every loop pay for a process.
         "test" => Some(&Test {
@@ -251,7 +259,7 @@ fn parse_pid(pid: &str, shell: &Shell) -> Result<Pid, String> {
             .background_jobs
             .get_job(job_id)
             .ok_or(format!("'{pid}' no such job"))?;
-        Ok(job.pid)
+        Ok(job.pid())
     } else {
         let pid = pid
             .parse::<libc::pid_t>()

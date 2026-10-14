@@ -522,7 +522,7 @@ fn main() -> ExitCode {
                         return ExitCode::from(s.code().unwrap_or(1) as u8);
                     }
                     Err(e) => {
-                        eprintln!("sccs: admin: {}", e);
+                        eprintln!("sccs: admin: {}", plib::diag::io_error_text(&e));
                         return ExitCode::FAILURE;
                     }
                 }
@@ -715,7 +715,7 @@ fn main() -> ExitCode {
                 let mut tmp = match plib::tmp::Builder::new().prefix("sccs_diff.").tempfile() {
                     Ok(t) => t,
                     Err(e) => {
-                        eprintln!("sccs: {}", e);
+                        eprintln!("sccs: {}", plib::diag::io_error_text(&e));
                         return ExitCode::FAILURE;
                     }
                 };
@@ -809,7 +809,7 @@ fn run_sccs_command(
             }
         }
         Err(e) => {
-            eprintln!("sccs: {}: {}", cmd, e);
+            eprintln!("sccs: {}: {}", cmd, plib::diag::io_error_text(&e));
             ExitCode::FAILURE
         }
     }

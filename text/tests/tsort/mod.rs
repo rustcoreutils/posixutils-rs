@@ -422,3 +422,11 @@ fn tsort_reports_each_independent_cycle() {
         "both cycles must be reported, got {cycles} in {stderr:?}"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn tsort_write_error_on_full_device() {
+    // A failed write to standard output is "tsort: write error: REASON",
+    // with the system's text for the error and exit status 1.
+    plib::testing::assert_write_error_message_on_full_device("tsort", &[], b"a b\n", 1);
+}

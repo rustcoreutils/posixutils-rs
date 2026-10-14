@@ -257,7 +257,11 @@ fn main() {
             }
             let output_path = apply_suffix(output.clone(), args.add_suffix);
             if let Err(e) = write_mo_file(&output_path, &merged) {
-                eprintln!("msgfmt: {}: {}", output_path.display(), e);
+                eprintln!(
+                    "msgfmt: {}: {}",
+                    output_path.display(),
+                    plib::diag::error_text(e.as_ref())
+                );
                 exit_code = 1;
             }
         } else {
@@ -266,7 +270,11 @@ fn main() {
                 let messages = &domains[domain];
                 let output_path = domain_output_path(domain, args.add_suffix);
                 if let Err(e) = write_mo_file(&output_path, messages) {
-                    eprintln!("msgfmt: {}: {}", output_path.display(), e);
+                    eprintln!(
+                        "msgfmt: {}: {}",
+                        output_path.display(),
+                        plib::diag::error_text(e.as_ref())
+                    );
                     exit_code = 1;
                 }
             }

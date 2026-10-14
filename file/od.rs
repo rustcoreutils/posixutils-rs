@@ -1416,7 +1416,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `eprintln!`, and prefixed: this was `eprint!("{}", err)`, so the
         // diagnostic carried no utility name and no newline, and ran into
         // whatever printed next.
-        eprintln!("od: {}", err);
+        eprintln!("od: {}", plib::diag::error_text(err.as_ref()));
     }
 
     std::process::exit(exit_code)

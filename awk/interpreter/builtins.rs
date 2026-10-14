@@ -464,10 +464,22 @@ pub(crate) fn call_simple_builtin(
     Ok(FieldsState::Ok)
 }
 
+/// The system's text for the first failed write to standard output, if one
+/// failed. It ends the run like any runtime error, but is reported as the
+/// write error it is (see [`stdout_write_error`]).
+static STDOUT_WRITE_ERROR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Why writing standard output failed, if it did.
+pub fn stdout_write_error() -> Option<&'static str> {
+    STDOUT_WRITE_ERROR.get().map(String::as_str)
+}
+
 /// Write `s` to standard output as the bytes awk writes for it.
 fn write_stdout(s: &str) -> Result<(), String> {
-    std::io::Write::write_all(&mut std::io::stdout(), &crate::charset::encode(s))
-        .map_err(|e| e.to_string())
+    std::io::Write::write_all(&mut std::io::stdout(), &crate::charset::encode(s)).map_err(|e| {
+        let reason = STDOUT_WRITE_ERROR.get_or_init(|| plib::diag::io_error_text(&e));
+        format!("{}: {reason}", gettextrs::gettext("write error"))
+    })
 }
 
 /// Run `command` via `libc::system` and translate its wait-status into the value

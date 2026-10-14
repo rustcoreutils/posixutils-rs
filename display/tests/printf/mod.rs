@@ -8,8 +8,6 @@
 //
 
 use plib::testing::{get_binary_path, run_test, TestPlan};
-use std::fs::File;
-use std::path::Path;
 use std::process::Command;
 
 fn printf_test(args: &[&str], expected_out: &str) {
@@ -34,6 +32,45 @@ fn test_basic_string_output() {
 #[test]
 fn test_string_no_args() {
     printf_test(&["Hello World"], "Hello World");
+}
+
+// XCU 1.4: a utility with no options that takes operands discards "--" as
+// its first argument.  Only the first one, and only an exact "--".
+#[test]
+fn test_leading_double_dash_is_discarded() {
+    printf_test(&["--", "x%s\n", "a"], "xa\n");
+    printf_test(&["--", "--"], "--");
+    printf_test(&["x%s\n", "--"], "x--\n");
+}
+
+// No format is a usage error, exit status 2, as in dash and bash.
+#[test]
+fn test_missing_format_is_a_usage_error() {
+    for args in [vec![], vec![String::from("--")]] {
+        run_test(TestPlan {
+            cmd: String::from("printf"),
+            args,
+            expected_out: String::new(),
+            expected_err: String::from("printf: usage: printf format [argument...]\n"),
+            stdin_data: String::new(),
+            expected_exit_code: 2,
+        });
+    }
+}
+
+// dash and bash agree: in the format, an escape sequence printf does not
+// define is written as is, <backslash> included.
+#[test]
+fn test_format_unknown_escape_is_literal() {
+    printf_test(&["\\q|\\8|\\\\"], "\\q|\\8|\\");
+}
+
+// dash and bash agree on %b: an undefined escape is written as is, \e is
+// <ESC>, and \ddd is octal without the leading zero too.
+#[test]
+fn test_b_specifier_unknown_escape_is_literal() {
+    printf_test(&["%b", "\\q|\\\"|\\'|\\8"], "\\q|\\\"|\\'|\\8");
+    printf_test(&["%b", "\\e|\\101|\\18|\\0101"], "\x1b|A|\x018|A");
 }
 
 #[test]
@@ -898,36 +935,14 @@ fn test_audit_p16_diagnostics_are_prefixed() {
     assert!(output.stderr.ends_with(b"\n"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn test_audit_p5_write_error_exit_status() {
     // #P5: a failed write must be diagnosed and must not exit 0, even when
-    // the output does not end in a <newline> (the buffered case).
-    if !Path::new("/dev/full").exists() {
-        return;
-    }
-
+    // the output does not end in a <newline> (the buffered case). The
+    // message is the shell built-in's, with the system's text for the error.
     for args in [&["hello\\n"][..], &["hello"][..], &["%s", "hello"][..]] {
-        let devfull = File::options()
-            .write(true)
-            .open("/dev/full")
-            .expect("failed to open /dev/full");
-
-        let output = Command::new(get_binary_path("printf"))
-            .args(args)
-            .stdout(devfull)
-            .output()
-            .expect("failed to run printf");
-
-        assert_eq!(
-            output.status.code(),
-            Some(1),
-            "printf {args:?} > /dev/full should exit 1"
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.starts_with("printf: "),
-            "diagnostic should be prefixed with the utility name, got {stderr:?}"
-        );
+        plib::testing::assert_write_error_message_on_full_device("printf", args, b"", 1);
     }
 }
 

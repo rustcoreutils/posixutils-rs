@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use error::{Error, ErrorKind, Result};
+use error::{Error, ErrorKind, Result, WriteFailed};
 use gettextrs::gettext;
 use input::{Input, InputRead};
 use lexer::MacroName;
@@ -116,8 +116,10 @@ impl Args {
 
     pub fn parse() -> Self {
         let argv = std::env::args_os().collect();
-        let matches = Self::command()
-            .get_matches_from(plib::optarg::keep_leading_equals_with(argv, Self::command));
+        let matches = plib::optarg::get_matches_from(
+            Self::command(),
+            plib::optarg::keep_leading_equals_with(argv, Self::command),
+        );
 
         let line_synchronization = matches.get_flag("line_synchronization");
 
@@ -158,10 +160,17 @@ pub fn run<STDOUT: Write + 'static, STDERR: Write>(
     mut stderr: STDERR,
     args: Args,
 ) -> crate::error::Result<()> {
-    match run_impl(stdout, &mut stderr, args) {
+    match run_impl(MarkWriteErrors(stdout), &mut stderr, args) {
         Ok(_) => Ok(()),
         Err(error) => match error.kind {
             ErrorKind::Exit(_) => Err(error),
+            ErrorKind::Write => {
+                let reason = std::error::Error::source(&error)
+                    .map(plib::diag::error_text)
+                    .unwrap_or_default();
+                writeln!(stderr, "m4: {}: {reason}", gettext("write error"))?;
+                Err(error)
+            }
             _ => {
                 if let Err(error) = stderr.write_all(format!("{error:#}").as_bytes()) {
                     return Err(error.into());
@@ -169,6 +178,20 @@ pub fn run<STDOUT: Write + 'static, STDERR: Write>(
                 Err(error)
             }
         },
+    }
+}
+
+/// The output stream, with every failure marked as a [`WriteFailed`] so it is
+/// reported as a write error.
+struct MarkWriteErrors<W>(W);
+
+impl<W: Write> Write for MarkWriteErrors<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf).map_err(WriteFailed::mark)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush().map_err(WriteFailed::mark)
     }
 }
 

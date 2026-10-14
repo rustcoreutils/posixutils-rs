@@ -337,3 +337,30 @@ fn mo_catalog(entries: &[(&str, &str)]) -> Vec<u8> {
 fn test_comm_reports_write_error_on_final_partial_line() {
     plib::testing::assert_write_error_on_full_device("comm", &["-", "/dev/null"], b"x", 1);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn comm_write_error_on_full_device() {
+    // A failed write to standard output is "comm: write error: REASON",
+    // with the system's text for the error and exit status 1.
+    plib::testing::assert_write_error_message_on_full_device(
+        "comm",
+        &["-", "/dev/null"],
+        b"x\n",
+        1,
+    );
+}
+
+/// An input that cannot be opened is reported with the system's text for
+/// the error, without Rust's "(os error N)" suffix.
+#[test]
+fn test_comm_open_error_names_the_system_error() {
+    let missing = "/nonexistent/comm-input";
+    let open_error = plib::diag::io_error_text(&std::fs::File::open(missing).unwrap_err());
+    let out = plib::testing::run_test_base("comm", &[missing.into(), "/dev/null".into()], b"");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("comm: {open_error}\n")
+    );
+}

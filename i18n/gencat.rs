@@ -1069,7 +1069,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match MessageCatalog::read_catfile(catfile_catalog_file) {
             Ok(catalog) => catfile_catalog = Some(catalog),
             Err(err) => {
-                eprintln!("Error: {err}");
+                eprintln!("Error: {}", plib::diag::error_text(err.as_ref()));
                 std::process::exit(1);
             }
         }
@@ -1084,7 +1084,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(err) => {
                 exit_code = 1;
                 parse_failed = true;
-                eprintln!("Error: {err}");
+                eprintln!("Error: {}", plib::diag::error_text(err.as_ref()));
                 break;
             }
         }
@@ -1096,10 +1096,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             catalog.write_catfile(&mut buffer)?;
 
             if catfile_path_str == "-" {
-                io::stdout().write_all(buffer.get_ref())?;
+                // Flushed here: a catalog does not end in a <newline>, so it is
+                // still in the line buffer at exit, where an error is lost.
+                let mut stdout = io::stdout();
+                if let Err(e) = stdout
+                    .write_all(buffer.get_ref())
+                    .and_then(|()| stdout.flush())
+                {
+                    plib::diag::error(&format!(
+                        "{}: {}",
+                        gettext("write error"),
+                        plib::diag::io_error_text(&e)
+                    ));
+                    exit_code = 1;
+                }
             } else {
-                let mut file = File::create(&args.catfile)?;
-                file.write_all(buffer.get_ref())?;
+                // Returned from `main`, the error would be printed with
+                // `Debug` (`Error: Os { code: 13, .. }`) and no file name.
+                let written = File::create(&args.catfile)
+                    .and_then(|mut file| file.write_all(buffer.get_ref()));
+                if let Err(e) = written {
+                    plib::diag::error(&format!(
+                        "{}: {}",
+                        args.catfile.display(),
+                        plib::diag::io_error_text(&e)
+                    ));
+                    exit_code = 1;
+                }
             }
         }
     }

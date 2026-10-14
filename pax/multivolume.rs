@@ -116,7 +116,11 @@ fn run_volume_script(script: &str, no_stdin: bool, volume: u32, path: &Path) -> 
 
 /// An I/O error about volume `volume`, saying which volume it is.
 fn volume_error(volume: u32, path: &Path, e: io::Error) -> PaxError {
-    let what = format!("volume {volume} ({}): {e}", path.display());
+    let what = format!(
+        "volume {volume} ({}): {}",
+        path.display(),
+        plib::diag::io_error_text(&e)
+    );
     PaxError::Io(io::Error::new(e.kind(), what))
 }
 
@@ -125,7 +129,10 @@ fn volume_error(volume: u32, path: &Path, e: io::Error) -> PaxError {
 fn prompt_volume_change(volume: u32, path: &Path) -> PaxResult<()> {
     use std::io::BufRead;
 
-    let tty_error = |e: io::Error| io::Error::new(e.kind(), format!("/dev/tty: {e}"));
+    let tty_error = |e: io::Error| {
+        let text = format!("/dev/tty: {}", plib::diag::io_error_text(&e));
+        io::Error::new(e.kind(), text)
+    };
     let tty_read = File::open("/dev/tty").map_err(tty_error)?;
     let mut tty_write = std::fs::OpenOptions::new()
         .write(true)

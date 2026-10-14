@@ -10,11 +10,28 @@
 use crate::builtin::{
     args_as_str, parse_pid, skip_option_terminator, BuiltinResult, BuiltinUtility,
 };
+use crate::jobs::parse_job_id;
 use crate::os::signals::{kill, Signal, SIGNALS};
+use crate::os::Pid;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use crate::shstr::ShString;
 use std::str::FromStr;
+
+/// What `kill` sends the signal to for an operand: a job id names the job's
+/// whole process group when it has one of its own, as in dash.
+fn signal_target(operand: &str, shell: &Shell) -> Result<Pid, String> {
+    if operand.starts_with('%') {
+        let job_id =
+            parse_job_id(operand).map_err(|_| format!("'{operand}' is not a valid job id"))?;
+        let job = shell
+            .background_jobs
+            .get_job(job_id)
+            .ok_or(format!("'{operand}' no such job"))?;
+        return Ok(job.signal_target());
+    }
+    parse_pid(operand, shell)
+}
 
 enum KillArgs<'a> {
     SendSignal {
@@ -96,7 +113,7 @@ impl BuiltinUtility for Kill {
         match args {
             KillArgs::SendSignal { signal, pids } => {
                 for pid in pids {
-                    let pid = parse_pid(pid, shell).map_err(|err| format!("kill: {err}"))?;
+                    let pid = signal_target(pid, shell).map_err(|err| format!("kill: {err}"))?;
                     kill(pid, signal)
                         .map_err(|err| format!("kill: failed to send signal ({})", err))?;
                 }

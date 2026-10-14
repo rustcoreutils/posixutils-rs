@@ -128,6 +128,23 @@ fn write_terminfo(
     name: &str,
     strings: &[(usize, &str)],
 ) -> std::path::PathBuf {
+    write_terminfo_extended(dir, name, strings, &[])
+}
+
+/// [`write_terminfo`] with user-defined (extended) string capabilities, such
+/// as `E3`, given by name and value.
+///
+/// The extended section follows the string table, on an even boundary: the
+/// counts of extended booleans, numbers and strings, the count of offsets
+/// (one per string value and one per name) and the size of its table, each a
+/// little-endian i16; then the string offsets into its table, the name
+/// offsets from the first name, and the table: values, then names.
+fn write_terminfo_extended(
+    dir: &std::path::Path,
+    name: &str,
+    strings: &[(usize, &str)],
+    extended: &[(&str, &str)],
+) -> std::path::PathBuf {
     let names = format!("{name}|synthetic test terminal\0");
     let bools: Vec<u8> = Vec::new();
     let numbers: Vec<i16> = Vec::new();
@@ -160,6 +177,35 @@ fn write_terminfo(
         push(*o, &mut out);
     }
     out.extend_from_slice(&table);
+
+    if !extended.is_empty() {
+        if !table.len().is_multiple_of(2) {
+            out.push(0);
+        }
+        let mut ext_table: Vec<u8> = Vec::new();
+        let mut value_offsets = Vec::new();
+        for (_, value) in extended {
+            value_offsets.push(ext_table.len() as i16);
+            ext_table.extend_from_slice(value.as_bytes());
+            ext_table.push(0);
+        }
+        let names_start = ext_table.len();
+        let mut name_offsets = Vec::new();
+        for (cap_name, _) in extended {
+            name_offsets.push((ext_table.len() - names_start) as i16);
+            ext_table.extend_from_slice(cap_name.as_bytes());
+            ext_table.push(0);
+        }
+        push(0, &mut out);
+        push(0, &mut out);
+        push(extended.len() as i16, &mut out);
+        push((2 * extended.len()) as i16, &mut out);
+        push(ext_table.len() as i16, &mut out);
+        for o in value_offsets.iter().chain(&name_offsets) {
+            push(*o, &mut out);
+        }
+        out.extend_from_slice(&ext_table);
+    }
 
     // Entries live at <dir>/<first letter of name>/<name>.
     let sub = dir.join(&name[..1]);
@@ -326,9 +372,131 @@ fn test_tput_unreadable_reset_file_still_falls_back() {
     );
 }
 
+// A padding specification `$<N>` is a delay for tputs(3) to provide, not
+// text: like ncurses' tput, write none of it. Text that only resembles one
+// is ordinary output.
+#[test]
+fn test_tput_padding_is_not_output() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let ti = dir.path().join("terminfo");
+    write_terminfo(
+        &ti,
+        "synthpad",
+        &[(cap::CLEAR_SCREEN, "A$<50>B$<5*>C$<5/>D$<2.5*/>E$<x>F$G$<>H")],
+    );
+    let (code, stdout, stderr) = run_tput_with_terminfo(&ti, &["-T", "synthpad", "clear"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&stdout), "ABCDE$<x>F$G$<>H");
+}
+
+// vt100's clear is `\E[H\E[J$<50>`; ncurses' `tput -T vt100 clear` writes
+// the six bytes of the two escape sequences.
+#[test]
+fn test_tput_clear_vt100_has_no_padding_text() {
+    let (exit_code, stdout, stderr) = run_tput(&["-T", "vt100", "clear"]);
+    assert_eq!(exit_code, 0, "{stderr}");
+    assert_eq!(stdout, "\x1b[H\x1b[J");
+}
+
+// Like ncurses' tput, `clear` writes the clear-screen sequence and then, if
+// the terminal has the extended `E3` capability, the sequence that clears
+// the scrollback; padding is stripped from both.
+#[test]
+fn test_tput_clear_then_e3() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let ti = dir.path().join("terminfo");
+    write_terminfo_extended(
+        &ti,
+        "synthe3",
+        &[(cap::CLEAR_SCREEN, "CLR$<5>")],
+        &[("E3", "SCROLLBACK$<2>")],
+    );
+    let (code, stdout, stderr) = run_tput_with_terminfo(&ti, &["-T", "synthe3", "clear"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&stdout), "CLRSCROLLBACK");
+}
+
+// `tput clear` is byte-identical to ncurses 6's for common terminals: the
+// expected bytes are its output, given as the `clear` and `E3` values they
+// come from. A host whose terminfo database lacks an entry, or holds a
+// different one (macOS ships an older ncurses database), skips that entry.
+#[test]
+fn test_tput_clear_matches_ncurses() {
+    use terminfo::{capability as tcap, Database};
+    // (terminal, clear without its padding, E3)
+    let table: &[(&str, &str, Option<&str>)] = &[
+        ("xterm", "\x1b[H\x1b[2J", Some("\x1b[3J")),
+        ("xterm-256color", "\x1b[H\x1b[2J", Some("\x1b[3J")),
+        ("linux", "\x1b[H\x1b[J", Some("\x1b[3J")),
+        ("vt100", "\x1b[H\x1b[J", None),
+        ("vt220", "\x1b[H\x1b[J", None),
+        ("ansi", "\x1b[H\x1b[J", None),
+        ("screen", "\x1b[H\x1b[J", None),
+    ];
+    for &(term, clear, e3) in table {
+        let Ok(db) = Database::from_name(term) else {
+            eprintln!("skipping {term}: no terminfo entry");
+            continue;
+        };
+        // The entry's clear must be `clear`, optionally followed by padding.
+        let db_clear = db
+            .get::<tcap::ClearScreen>()
+            .map(|c| AsRef::<[u8]>::as_ref(&c).to_vec())
+            .unwrap_or_default();
+        let clear_matches = db_clear
+            .strip_prefix(clear.as_bytes())
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(b"$<"));
+        let db_e3 = match db.raw("E3") {
+            Some(terminfo::Value::String(s)) => Some(s.clone()),
+            _ => None,
+        };
+        if !clear_matches || db_e3.as_deref() != e3.map(str::as_bytes) {
+            eprintln!("skipping {term}: terminfo entry differs from ncurses 6's");
+            continue;
+        }
+        let output = Command::new(env!("CARGO_BIN_EXE_tput"))
+            .args(["-T", term, "clear"])
+            .output()
+            .expect("Failed to execute tput");
+        assert_eq!(output.status.code(), Some(0), "{term}");
+        let expected = format!("{clear}{}", e3.unwrap_or(""));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            expected,
+            "tput -T {term} clear"
+        );
+    }
+}
+
 // XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
 // below used to have the word after it refused as an unknown option.
 #[test]
 fn option_argument_may_begin_with_hyphen() {
     plib::testing::assert_hyphen_option_argument("tput", &["-T", "-zq", "--help"]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn tput_write_error_on_full_device() {
+    // A failed write to standard output is "tput: write error: REASON",
+    // with the system's text for the error and exit status 5.
+    plib::testing::assert_write_error_message_on_full_device(
+        "tput",
+        &["-T", "xterm", "clear"],
+        b"",
+        5,
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn tput_two_operands_write_error_on_full_device() {
+    // A failed write to standard output is "tput: write error: REASON",
+    // with the system's text for the error and exit status 5.
+    plib::testing::assert_write_error_message_on_full_device(
+        "tput",
+        &["-T", "xterm", "clear", "clear"],
+        b"",
+        5,
+    );
 }

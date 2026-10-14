@@ -246,9 +246,7 @@ fn test_csplit_error_line_zero() {
         args: str_args,
         stdin_data: String::from("line1\nline2\n"),
         expected_out: String::from(""),
-        expected_err: String::from(
-            "Error: Custom { kind: Other, error: \"line number must be greater than zero\" }\n",
-        ),
+        expected_err: String::from("csplit: line number must be greater than zero\n"),
         expected_exit_code: 1,
     });
 }

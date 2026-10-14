@@ -332,3 +332,10 @@ fn option_argument_may_begin_with_hyphen() {
         plib::testing::assert_hyphen_option_argument("uniq", &[opt, "-zq", "--help"]);
     }
 }
+
+// A failed write to standard output is "uniq: write error: REASON".
+#[cfg(target_os = "linux")]
+#[test]
+fn write_error_message_on_full_device() {
+    plib::testing::assert_write_error_message_on_full_device("uniq", &[], b"x\n", 1);
+}

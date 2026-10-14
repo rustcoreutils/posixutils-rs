@@ -9,7 +9,7 @@
 
 use std::process::ExitCode;
 
-use posixutils_m4::error::GetExitCode;
+use posixutils_m4::error::{ErrorKind, GetExitCode};
 
 fn main() -> ExitCode {
     env_logger::init();
@@ -21,6 +21,8 @@ fn main() -> ExitCode {
     let stdout = std::io::stdout();
     let mut stderr = std::io::stderr();
     let status = match posixutils_m4::run(stdout, &mut stderr, args) {
+        // Already reported; what is left in the buffer would only fail again.
+        Err(error) if matches!(error.kind, ErrorKind::Write) => return ExitCode::FAILURE,
         Err(error) => u8::try_from(error.get_exit_code()).unwrap_or_else(|e| {
             eprintln!("Error casting exit code {e} into platform agnostic u8");
             1

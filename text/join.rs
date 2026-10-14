@@ -620,10 +620,10 @@ fn run(args: Args) -> Result<bool, JoinError> {
 
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
+    // The input is all in memory by now, so every failure here is a write.
     merge_join(&mut r1, &mut r2, &mut st, &mut out)
-        .map_err(|e| JoinError(plib::diag::io_error_text(&e)))?;
-    out.flush()
-        .map_err(|e| JoinError(plib::diag::io_error_text(&e)))?;
+        .and_then(|()| out.flush())
+        .map_err(|e| JoinError(plib::diag::WriteError(e).to_string()))?;
 
     Ok(st.any_disorder)
 }

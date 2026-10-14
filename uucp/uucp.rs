@@ -205,7 +205,7 @@ fn main() -> ExitCode {
             };
 
             if let Err(e) = result {
-                eprintln!("uucp: {}", e);
+                eprintln!("uucp: {}", plib::diag::io_error_text(&e));
                 success = false;
                 break;
             }
@@ -224,7 +224,11 @@ fn main() -> ExitCode {
     // Handle queued job
     if let Some(j) = job {
         if let Err(e) = j.save() {
-            eprintln!("uucp: {}: {}", gettext("failed to queue job"), e);
+            eprintln!(
+                "uucp: {}: {}",
+                gettext("failed to queue job"),
+                plib::diag::io_error_text(&e)
+            );
             return ExitCode::from(1);
         }
         if args.print_job_id {

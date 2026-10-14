@@ -264,6 +264,11 @@ pub fn close(fd: RawFd) -> OsResult<()> {
 /// body larger than the pipe buffer would block the writer forever. An
 /// immediately-unlinked temporary file has no such limit and, unlike a pipe,
 /// is seekable, which is what a redirection from a here-document behaves like.
+///
+/// The descriptor returned is open only for reading, as a here-document's is
+/// in dash (a pipe) and bash: a command that writes to it (`cat 1<<EOF`, or a
+/// copy made with `n>&m`) gets EBADF instead of silently writing into the
+/// temporary file.
 pub fn here_document_fd(contents: &[u8]) -> OsResult<OwnedFd> {
     let dir = std::env::var_os("TMPDIR").unwrap_or_else(|| OsString::from("/tmp"));
     let mut template = dir.into_vec();
@@ -278,17 +283,45 @@ pub fn here_document_fd(contents: &[u8]) -> OsResult<OwnedFd> {
     if fd < 0 {
         return Err(OsError::from_current_errno("mkstemp"));
     }
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    // Unlink right away: the descriptor keeps the contents alive, and nothing
+    let writer = unsafe { OwnedFd::from_raw_fd(fd) };
+    // The reading descriptor is a second open of the same file, made before
+    // the name goes away; it has its own offset, still at the start.
+    let fd = unsafe {
+        libc::open(
+            template.as_ptr() as *const libc::c_char,
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    let reader = if fd < 0 {
+        Err(OsError::from_current_errno("open"))
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    };
+    // Unlink right away: the descriptors keep the contents alive, and nothing
     // is left behind even if the shell dies before the command finishes.
     if unsafe { libc::unlink(template.as_ptr() as *const libc::c_char) } < 0 {
         return Err(OsError::from_current_errno("unlink"));
     }
-    write_all(fd.as_raw_fd(), contents)?;
-    if unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_SET) } < 0 {
-        return Err(OsError::from_current_errno("lseek"));
+    let reader = reader?;
+    // The name was reopened, so make sure it still named the file mkstemp
+    // created.
+    let (writer_stat, reader_stat) = (fstat(writer.as_raw_fd())?, fstat(reader.as_raw_fd())?);
+    if (writer_stat.st_dev, writer_stat.st_ino) != (reader_stat.st_dev, reader_stat.st_ino) {
+        return Err(OsError {
+            command: "open",
+            errno: Errno::EEXIST,
+        });
     }
-    Ok(fd)
+    write_all(writer.as_raw_fd(), contents)?;
+    Ok(reader)
+}
+
+fn fstat(fd: RawFd) -> OsResult<libc::stat> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } < 0 {
+        return Err(OsError::from_current_errno("fstat"));
+    }
+    Ok(unsafe { stat.assume_init() })
 }
 
 pub enum ExecError {

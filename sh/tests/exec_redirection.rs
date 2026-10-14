@@ -78,6 +78,19 @@ fn heredoc_is_readable_as_dev_stdin() {
     sh_c("printf 'echo ok\\n#\\377\\n' | . /dev/stdin", "ok\n");
 }
 
+// A here-document is input: the descriptor a command is given for one is
+// open only for reading, so writing to it fails with EBADF, as in dash
+// (a pipe) and bash (a temporary file opened read-only).
+#[test]
+fn heredoc_descriptor_is_read_only() {
+    sh_c("echo x 1<<EOF 2>/dev/null\ndoc\nEOF\necho st=$?", "st=1\n");
+    sh_c(
+        "exec 3<<EOF\ndoc\nEOF\nexec 4>&3; echo x 1>&4 2>/dev/null; echo st=$?; cat <&3",
+        "st=1\ndoc\n",
+    );
+    sh_c("cat <<EOF\nbody\nEOF", "body\n");
+}
+
 // `n>&m` and `n<&m` duplicate descriptor m whatever it was opened for
 // (XCU 2.7.5, 2.7.6); the direction only says which way the shell expects
 // it to be used. sed's testsuite/bsd.sh saves and restores its standard

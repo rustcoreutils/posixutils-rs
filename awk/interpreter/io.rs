@@ -219,7 +219,7 @@ pub struct FileStream {
 
 impl FileStream {
     pub fn open(path: &str) -> Result<Self, String> {
-        let file = File::open(path_of(path)).map_err(|e| e.to_string())?;
+        let file = File::open(path_of(path)).map_err(|e| plib::diag::io_error_text(&e))?;
         let reader = BufReader::new(file);
         Ok(Self {
             bytes: reader.bytes(),
@@ -235,7 +235,7 @@ impl Iterator for FileStream {
     fn next(&mut self) -> Option<Self::Item> {
         match self.bytes.next() {
             Some(Ok(byte)) => Some(Ok(byte)),
-            Some(Err(e)) => Some(Err(e.to_string())),
+            Some(Err(e)) => Some(Err(plib::diag::io_error_text(&e))),
             None => {
                 self.is_done = true;
                 None
@@ -309,7 +309,7 @@ impl WriteFiles {
             Entry::Occupied(mut e) => {
                 e.get_mut()
                     .write_all(&charset::encode(contents))
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| plib::diag::io_error_text(&e))?;
             }
             Entry::Vacant(e) => {
                 let mut file = File::options()
@@ -318,9 +318,9 @@ impl WriteFiles {
                     .truncate(!append)
                     .append(append)
                     .open(path_of(filename))
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| plib::diag::io_error_text(&e))?;
                 file.write_all(&charset::encode(contents))
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| plib::diag::io_error_text(&e))?;
                 e.insert(file);
             }
         }
@@ -582,7 +582,7 @@ impl Iterator for StdinRecordReader {
         let next = std::io::stdin().lock().bytes().next();
         match next {
             Some(Ok(byte)) => Some(Ok(byte)),
-            Some(Err(e)) => Some(Err(e.to_string())),
+            Some(Err(e)) => Some(Err(plib::diag::io_error_text(&e))),
             None => {
                 self.is_done = true;
                 None

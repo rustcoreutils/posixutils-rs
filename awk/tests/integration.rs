@@ -2175,3 +2175,21 @@ fn awk_begin_print_write_error_on_full_device() {
         1,
     );
 }
+
+/// A file operand or output file that cannot be opened is reported with the
+/// system's text for the error, without Rust's "(os error N)" suffix.
+#[test]
+fn test_awk_open_errors_name_the_system_error() {
+    let missing = "/nonexistent/awk-file";
+    let open_error = plib::diag::io_error_text(&std::fs::File::open(missing).unwrap_err());
+    for args in [
+        vec!["1".to_string(), missing.to_string()],
+        vec![format!("BEGIN {{ print \"x\" > \"{missing}\" }}")],
+    ] {
+        let out = plib::testing::run_test_base("awk", &args, b"");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_ne!(out.status.code(), Some(0), "{args:?}");
+        assert!(stderr.contains(&open_error), "{args:?}: {stderr:?}");
+        assert!(!stderr.contains("(os error"), "{args:?}: {stderr:?}");
+    }
+}

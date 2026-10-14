@@ -49,6 +49,29 @@ pub enum OpenedFile {
     HereDocument(Rc<RefCell<ShString>>),
 }
 
+impl OpenedFile {
+    /// Whether both entries are the same open file: the one an unchanged
+    /// descriptor keeps when its table is cloned.
+    fn is_same_as(&self, other: &OpenedFile) -> bool {
+        match (self, other) {
+            (OpenedFile::Stdin, OpenedFile::Stdin)
+            | (OpenedFile::Stdout, OpenedFile::Stdout)
+            | (OpenedFile::Stderr, OpenedFile::Stderr)
+            | (OpenedFile::Closed, OpenedFile::Closed) => true,
+            (OpenedFile::ReadFile(a), OpenedFile::ReadFile(b))
+            | (OpenedFile::WriteFile(a), OpenedFile::WriteFile(b))
+            | (OpenedFile::ReadWriteFile(a), OpenedFile::ReadWriteFile(b)) => Rc::ptr_eq(a, b),
+            (OpenedFile::HereDocument(a), OpenedFile::HereDocument(b)) => Rc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+/// What a command's redirections replaced in the shell's descriptor table,
+/// so that they can be undone when the command completes.
+#[must_use = "the redirections must be undone with OpenedFiles::restore"]
+pub struct SavedDescriptors(Vec<(u32, Option<OpenedFile>)>);
+
 fn io_err_to_redirection_err(err: std::io::Error) -> CommandExecutionError {
     CommandExecutionError::Redirection(format!("sh: io error ({})", err))
 }
@@ -337,6 +360,45 @@ impl OpenedFiles {
         };
         self.opened_files.insert(fileno, standard);
         Ok(())
+    }
+
+    /// Makes `table` (this table with a command's redirections applied) the
+    /// shell's descriptor table while the command runs in the current shell
+    /// environment: a compound command, a function, `eval` or `.`. Returns
+    /// the entries it replaced, for `restore`.
+    ///
+    /// Only the descriptors that differ are saved, so that whatever an `exec`
+    /// run by the command does to any other descriptor stays in effect once
+    /// the command completes (`{ exec 4>&1; } >/dev/null` leaves fd 4 open
+    /// on /dev/null, as in dash and bash).
+    pub fn install(&mut self, table: OpenedFiles) -> SavedDescriptors {
+        let mut saved = Vec::new();
+        for (fd, file) in &self.opened_files {
+            let unchanged = table
+                .opened_files
+                .get(fd)
+                .is_some_and(|new| new.is_same_as(file));
+            if !unchanged {
+                saved.push((*fd, Some(file.clone())));
+            }
+        }
+        for fd in table.opened_files.keys() {
+            if !self.opened_files.contains_key(fd) {
+                saved.push((*fd, None));
+            }
+        }
+        *self = table;
+        SavedDescriptors(saved)
+    }
+
+    /// Undoes `install`: each saved descriptor gets back the entry it had.
+    pub fn restore(&mut self, saved: SavedDescriptors) {
+        for (fd, file) in saved.0 {
+            match file {
+                Some(file) => self.opened_files.insert(fd, file),
+                None => self.opened_files.remove(&fd),
+            };
+        }
     }
 
     pub fn get_file(&self, fileno: u32) -> Option<&OpenedFile> {

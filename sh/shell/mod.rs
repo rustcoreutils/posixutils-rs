@@ -963,17 +963,18 @@ impl Shell {
     }
 
     /// Runs `run` with `redirections` applied to the shell's descriptor
-    /// table, and puts the previous table back afterwards.
+    /// table, and undoes them afterwards, keeping whatever an `exec` run
+    /// meanwhile did to other descriptors (see `OpenedFiles::install`).
     fn with_redirections<T>(
         &mut self,
         redirections: &[Redirection],
         run: impl FnOnce(&mut Self) -> CommandExecutionResult<T>,
     ) -> CommandExecutionResult<T> {
-        let mut previous = self.opened_files.clone();
-        previous.redirect(redirections, self)?;
-        std::mem::swap(&mut self.opened_files, &mut previous);
+        let mut redirected = self.opened_files.clone();
+        redirected.redirect(redirections, self)?;
+        let saved = self.opened_files.install(redirected);
         let result = run(self);
-        std::mem::swap(&mut self.opened_files, &mut previous);
+        self.opened_files.restore(saved);
         result
     }
 

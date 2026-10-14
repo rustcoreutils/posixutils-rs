@@ -32,9 +32,9 @@ impl SpecialBuiltinUtility for Eval {
             program.extend_from_slice(arg.as_bytes());
         }
 
-        std::mem::swap(&mut shell.opened_files, opened_files);
+        let saved = shell.opened_files.install(opened_files.clone());
         let execution_result = shell.execute_nested_program(&program);
-        std::mem::swap(&mut shell.opened_files, opened_files);
+        shell.opened_files.restore(saved);
 
         execution_result
             .map_err(|err| format!("eval: parsing error({}): {}", err.lineno, err.message).into())

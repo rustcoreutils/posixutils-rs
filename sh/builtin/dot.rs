@@ -52,13 +52,13 @@ impl SpecialBuiltinUtility for Dot {
             }
         };
 
-        std::mem::swap(&mut shell.opened_files, opened_files);
+        let saved = shell.opened_files.install(opened_files.clone());
         shell.dot_script_depth += 1;
 
         let result = execute_file_as_script(shell, Path::new(&file_path));
 
         shell.dot_script_depth -= 1;
-        std::mem::swap(&mut shell.opened_files, opened_files);
+        shell.opened_files.restore(saved);
 
         match result {
             Ok(status) => Ok(status),

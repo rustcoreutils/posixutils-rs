@@ -165,9 +165,9 @@ fn execute_history(
     opened_files: &mut OpenedFiles,
     keep_in_history: bool,
 ) -> Result<i32, BuiltinError> {
-    std::mem::swap(opened_files, &mut shell.opened_files);
+    let saved = shell.opened_files.install(opened_files.clone());
     let result = shell.execute_program(history.as_bytes());
-    std::mem::swap(opened_files, &mut shell.opened_files);
+    shell.opened_files.restore(saved);
     if !keep_in_history {
         shell.history.remove_last_entry();
     }

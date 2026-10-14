@@ -101,3 +101,13 @@ fn signals_ignored_on_entry_cannot_be_trapped_or_reset() {
         "survived\ntrap -- '' HUP\n",
     );
 }
+
+// The shell must be able to wait for its children even when SIGCHLD was
+// ignored when it started, which would have the system reap them first.
+#[test]
+fn sigchld_ignored_on_entry_does_not_break_wait() {
+    sh_c(
+        &format!("trap '' CHLD; {SH} -c '/bin/false; echo $?; sleep 0 & wait $!; echo $?'"),
+        "1\n0\n",
+    );
+}

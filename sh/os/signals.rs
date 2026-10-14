@@ -324,6 +324,15 @@ fn is_ignored(signal: Signal) -> bool {
     result == 0 && current.sa_sigaction == libc::SIG_IGN
 }
 
+/// The shell waits for its children, which an ignored SIGCHLD would have the
+/// system reap before `waitpid` sees them; so a SIGCHLD ignored on entry is
+/// reset (as in dash), not kept like the other signals.
+pub fn reset_inherited_sigchld() {
+    if is_ignored(Signal::SigChld) {
+        unsafe { handle_signal_default(Signal::SigChld) };
+    }
+}
+
 pub unsafe fn handle_signal_write_to_signal_buffer(signal: Signal) {
     handle_signal(
         signal,

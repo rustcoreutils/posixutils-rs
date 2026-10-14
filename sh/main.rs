@@ -18,7 +18,8 @@ use cli::terminal::read_nonblocking_char;
 use cli::vi::{Action, ViEditor};
 use gettextrs::gettext;
 use os::signals::{
-    handle_signal_ignore, handle_signal_write_to_signal_buffer, setup_signal_handling, Signal,
+    handle_signal_ignore, handle_signal_write_to_signal_buffer, reset_inherited_sigchld,
+    setup_signal_handling, Signal,
 };
 use std::error::Error;
 use std::fs::File;
@@ -368,6 +369,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             std::process::exit(1);
         }
     };
+    reset_inherited_sigchld();
     let mut shell = Shell::initialize_from_system(
         args.program_name,
         args.arguments.into_iter().collect(),

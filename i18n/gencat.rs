@@ -1096,7 +1096,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             catalog.write_catfile(&mut buffer)?;
 
             if catfile_path_str == "-" {
-                io::stdout().write_all(buffer.get_ref())?;
+                // Flushed here: a catalog does not end in a <newline>, so it is
+                // still in the line buffer at exit, where an error is lost.
+                let mut stdout = io::stdout();
+                if let Err(e) = stdout
+                    .write_all(buffer.get_ref())
+                    .and_then(|()| stdout.flush())
+                {
+                    plib::diag::error(&format!(
+                        "{}: {}",
+                        gettext("write error"),
+                        plib::diag::io_error_text(&e)
+                    ));
+                    exit_code = 1;
+                }
             } else {
                 let mut file = File::create(&args.catfile)?;
                 file.write_all(buffer.get_ref())?;

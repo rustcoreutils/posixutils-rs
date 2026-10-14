@@ -316,3 +316,16 @@ fn gencat_keeps_blanks_after_the_first_separator() {
         "a single separating blank must still be consumed"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn gencat_write_error_on_full_device() {
+    // A failed write to standard output is "gencat: write error: REASON",
+    // with the system's text for the error and exit status 1.
+    plib::testing::assert_write_error_message_on_full_device(
+        "gencat",
+        &["-", "-"],
+        b"$set 1\n1 hello\n",
+        1,
+    );
+}

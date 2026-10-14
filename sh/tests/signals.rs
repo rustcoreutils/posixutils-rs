@@ -30,11 +30,17 @@ fn sh_c(script: &str, expected_out: &str) {
 // sends it SIGINT through `$!`.
 #[test]
 fn background_pid_is_the_command() {
-    sh_c("sleep 30 & p=$!; ps -o comm= -p $p; kill $p", "sleep\n");
+    sh_c(
+        "sleep 30 & p=$!; ps -o comm= -p $p | sed 's|.*/||'; kill $p",
+        "sleep\n",
+    );
     sh_c("sleep 30 & p=$!; kill $p; wait $p; echo $?", "143\n");
     // A subshell or brace group whose last command is the utility: killing
     // `$!` still ends the job, and nothing is left running.
-    sh_c("(sleep 30) & p=$!; ps -o comm= -p $p; kill $p", "sleep\n");
+    sh_c(
+        "(sleep 30) & p=$!; ps -o comm= -p $p | sed 's|.*/||'; kill $p",
+        "sleep\n",
+    );
     sh_c("(sleep 30) & p=$!; kill $p; wait $p; echo $?", "143\n");
     sh_c("{ sleep 30; } & p=$!; kill $p; wait $p; echo $?", "143\n");
 }

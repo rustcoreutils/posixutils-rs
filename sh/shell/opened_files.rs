@@ -72,8 +72,29 @@ impl OpenedFile {
 #[must_use = "the redirections must be undone with OpenedFiles::restore"]
 pub struct SavedDescriptors(Vec<(u32, Option<OpenedFile>)>);
 
-fn io_err_to_redirection_err(err: std::io::Error) -> CommandExecutionError {
-    CommandExecutionError::Redirection(format!("sh: io error ({})", err))
+/// Whether a failed redirection was opening a file to read or creating one.
+#[derive(Clone, Copy)]
+enum OpenPurpose {
+    Read,
+    Create,
+}
+
+/// The diagnostic for a redirection that could not open `target`: which
+/// file, what for, and the system's reason.
+fn open_failure(
+    purpose: OpenPurpose,
+    target: &ShStr,
+    err: &std::io::Error,
+) -> CommandExecutionError {
+    let action = match purpose {
+        OpenPurpose::Read => "cannot open",
+        OpenPurpose::Create => "cannot create",
+    };
+    CommandExecutionError::Redirection(format!(
+        "sh: {action} '{}': {}",
+        target.display(),
+        plib::diag::io_error_text(err)
+    ))
 }
 
 /// A standard descriptor that a pipeline or command substitution replaces
@@ -150,9 +171,9 @@ impl OpenedFiles {
                                 .write(true)
                                 .create(true)
                                 .open(target.as_os_str())
-                                .map_err(io_err_to_redirection_err)?
+                                .map_err(|err| open_failure(OpenPurpose::Create, target, &err))?
                         }
-                        Err(err) => return Err(io_err_to_redirection_err(err)),
+                        Err(err) => return Err(open_failure(OpenPurpose::Create, target, &err)),
                     }
                 } else {
                     File::options()
@@ -162,7 +183,7 @@ impl OpenedFiles {
                         .append(append)
                         .create(true)
                         .open(target.as_os_str())
-                        .map_err(io_err_to_redirection_err)?
+                        .map_err(|err| open_failure(OpenPurpose::Create, target, &err))?
                 };
 
                 let source_fd = file_descriptor.unwrap_or(STDOUT_FILENO);
@@ -224,7 +245,7 @@ impl OpenedFiles {
                     .mode(FILE_CREATION_MODE)
                     .read(true)
                     .open(target.as_os_str())
-                    .map_err(io_err_to_redirection_err)?;
+                    .map_err(|err| open_failure(OpenPurpose::Read, target, &err))?;
                 let source_fd = file_descriptor.unwrap_or(STDIN_FILENO);
                 self.opened_files
                     .insert(source_fd, OpenedFile::ReadFile(Rc::new(file)));
@@ -236,7 +257,7 @@ impl OpenedFiles {
                     .write(true)
                     .create(true)
                     .open(target.as_os_str())
-                    .map_err(io_err_to_redirection_err)?;
+                    .map_err(|err| open_failure(OpenPurpose::Create, target, &err))?;
                 let source_fd = file_descriptor.unwrap_or(STDIN_FILENO);
                 self.opened_files
                     .insert(source_fd, OpenedFile::ReadWriteFile(Rc::from(file)));

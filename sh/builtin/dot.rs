@@ -13,6 +13,7 @@ use crate::shell::opened_files::{OpenedFile, OpenedFiles};
 use crate::shell::{execute_script_source, Shell};
 use crate::shstr::{ShStr, ShString};
 use gettextrs::gettext;
+use plib::diag::io_error_text;
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::AsRawFd;
@@ -56,16 +57,21 @@ fn read_descriptor(fd: u32, opened_files: &OpenedFiles) -> Option<Result<Vec<u8>
     };
     let mut source = Vec::new();
     let read = dup_cloexec(file.as_raw_fd())
-        .map_err(|err| err.to_string())
-        .and_then(|fd| {
-            File::from(fd)
-                .read_to_end(&mut source)
-                .map_err(|err| err.to_string())
-        });
+        .map_err(|err| std::io::Error::from(err.errno))
+        .and_then(|fd| File::from(fd).read_to_end(&mut source));
     Some(match read {
         Ok(_) => Ok(source),
-        Err(err) => Err(format!("dot: io error: {err}\n")),
+        Err(err) => Err(read_failure(&format!("/dev/fd/{fd}"), &err)),
     })
+}
+
+/// The diagnostic for a script `dot` opened but could not read.
+fn read_failure(name: &str, err: &std::io::Error) -> String {
+    format!(
+        "dot: {} '{name}': {}",
+        gettext("cannot read"),
+        io_error_text(err)
+    )
 }
 
 /// Finds the file named by `name` along PATH (XCU dot) and reads it.
@@ -89,7 +95,7 @@ fn read_script_file(name: &ShStr, shell: &Shell) -> Result<Vec<u8>, String> {
     })?;
     let mut source = Vec::new();
     file.read_to_end(&mut source)
-        .map_err(|err| format!("dot: io error: {err}\n"))?;
+        .map_err(|err| read_failure(&file_path.to_string_lossy(), &err))?;
     Ok(source)
 }
 

@@ -167,3 +167,47 @@ fn builtin_write_error_is_reported_once_with_status_1() {
     );
     sh_c("pwd 2>&- >/dev/null; echo $?", "0\n", "", 0);
 }
+
+// "not found" names the command without quotes, as `NAME: not found`, the
+// form dash and bash use. GNU make's test suite captures the message and
+// echoes it inside single quotes, so quotes in it were lost and its
+// functions/shell test failed.
+#[test]
+fn command_not_found_message_form() {
+    sh_c(
+        "no_such_cmd_xyz",
+        "",
+        "sh: no_such_cmd_xyz: not found\n",
+        127,
+    );
+    sh_c(
+        "out=$(no_such_cmd_xyz 2>&1); echo \"$out\"",
+        "sh: no_such_cmd_xyz: not found\n",
+        "",
+        0,
+    );
+}
+
+// The built-ins that search for a command report a failed search in the
+// same unquoted `NAME: not found` form.
+#[test]
+fn builtin_not_found_message_form() {
+    sh_c(
+        "exec no_such_cmd_xyz",
+        "",
+        "exec: no_such_cmd_xyz: not found\n",
+        127,
+    );
+    sh_c(
+        "command no_such_cmd_xyz",
+        "",
+        "command: no_such_cmd_xyz: not found\n",
+        127,
+    );
+    sh_c(
+        "unalias no_such_alias_xyz",
+        "",
+        "unalias: no_such_alias_xyz: not found\n",
+        1,
+    );
+}

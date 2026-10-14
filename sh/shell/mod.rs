@@ -851,8 +851,10 @@ impl Shell {
                     let Some(command) =
                         self.search_for_utility(&expanded_words[0], &simple_command.assignments)
                     else {
+                        // `sh: NAME: not found`, unquoted, as in dash and
+                        // bash: GNU make's tests quote the captured message.
                         opened_files.write_err(format!(
-                            "sh: '{}' {}\n",
+                            "sh: {}: {}\n",
                             expanded_words[0].display(),
                             gettext("not found")
                         ));

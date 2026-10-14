@@ -35,7 +35,7 @@ impl SpecialBuiltinUtility for Exec {
                 "{}: {}: {}\n",
                 gettext("exec"),
                 args[0].display(),
-                gettext("command not found")
+                gettext("not found")
             ));
             if shell.is_interactive && !shell.is_subshell {
                 return Ok(127);

@@ -143,7 +143,7 @@ impl BuiltinUtility for Command {
             }
             // POSIX: a command that cannot be found exits with status 127.
             opened_files.write_err(format!(
-                "command: {} not found\n",
+                "command: {}: not found\n",
                 args.command_name.display()
             ));
             return Ok(127);
@@ -187,7 +187,7 @@ impl BuiltinUtility for Command {
                 ))
             }
         } else {
-            return Err(format!("command: {} not found", args.command_name.display()).into());
+            return Err(format!("command: {}: not found", args.command_name.display()).into());
         }
 
         Ok(0)

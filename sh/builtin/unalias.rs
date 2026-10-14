@@ -34,7 +34,7 @@ impl BuiltinUtility for Unalias {
         let args = skip_option_terminator(args);
         for alias in args {
             if shell.alias_table.remove(*alias).is_none() {
-                opened_files.write_err(format!("unalias: '{alias}' {}\n", gettext("not found")));
+                opened_files.write_err(format!("unalias: {alias}: {}\n", gettext("not found")));
                 status = 1;
             }
         }

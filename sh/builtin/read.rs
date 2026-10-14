@@ -78,6 +78,15 @@ impl Prompt<'_> {
     }
 }
 
+/// Whether `byte` is dropped from the input: a NUL, unless it is the
+/// delimiter (`-d ''`). As in dash and bash (POSIX leaves input holding a
+/// NUL unspecified): no variable can hold one, and it is dropped before
+/// anything else looks at it, so a backslash before a NUL escapes the
+/// byte after it, as in dash.
+fn is_dropped(byte: u8, delimiter: u8) -> bool {
+    byte == 0 && delimiter != 0
+}
+
 struct ReadResult {
     contents: ExpandedWord,
     reached_eof: bool,
@@ -98,6 +107,9 @@ fn read_until_from_non_blocking_fd(
     let mut escape_next = false;
     'outer: loop {
         while let Some(next) = read_byte_non_blocking(fd)? {
+            if is_dropped(next, delimiter) {
+                continue;
+            }
             if escape_next {
                 escape_next = false;
                 if next == delimiter {
@@ -154,6 +166,9 @@ fn read_until_from_file(
     let mut escape_next = false;
     let mut reached_eof = true;
     while let Some(next) = read_byte(shell, fd)? {
+        if is_dropped(next, delimiter) {
+            continue;
+        }
         if escape_next {
             escape_next = false;
             if next == delimiter {
@@ -233,6 +248,9 @@ fn read_from_here_document(content: &[u8], delimiter: u8, backslash_escape: bool
     let mut escape_next = false;
     let mut consumed_bytes = content.len();
     for (offset, c) in content.iter().copied().enumerate() {
+        if is_dropped(c, delimiter) {
+            continue;
+        }
         // An escaped character is taken literally, so the delimiter test must
         // come after this one: backslash-<delimiter> is a line continuation,
         // not the end of the line (same rule as `read_until_from_file`).

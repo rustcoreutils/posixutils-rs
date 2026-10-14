@@ -1808,9 +1808,9 @@ mod audit_regressions {
         });
     }
 
-    // A value `read` from a file can hold a NUL byte, which no pathname can;
-    // `cd` to it fails like any other bad directory (status 1, as in bash)
-    // instead of panicking the shell.
+    // `cd` to a line holding a NUL byte, which no pathname can, used to
+    // panic the shell; `read` now drops the NUL, as dash and bash do, and
+    // `cd` to the directory that does not exist fails with status 1.
     #[test]
     fn cd_to_a_value_holding_a_nul_byte_fails() {
         run_successfully_and(

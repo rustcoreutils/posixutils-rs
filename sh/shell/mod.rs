@@ -1669,6 +1669,16 @@ impl Shell {
             self.eprint(&format!("sh: error updating background jobs ({err})"));
         }
         self.process_signals();
+        // NUL bytes in the shell's input are dropped, as in dash and bash
+        // (POSIX leaves such input unspecified): no word, here-document or
+        // variable can hold one.
+        let without_nuls: Vec<u8>;
+        let program = if program.contains(&0) {
+            without_nuls = program.iter().copied().filter(|&b| b != 0).collect();
+            &without_nuls[..]
+        } else {
+            program
+        };
         let mut parser = CommandParser::new(program, self.last_lineno)?;
         let mut result = 0;
         // the end of the input already echoed (or passed while not verbose)

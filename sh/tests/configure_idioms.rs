@@ -283,3 +283,68 @@ fn lineno_in_heredoc_and_command_substitution() {
     sh(":\necho $LINENO <<EOF\nx\nEOF\necho $LINENO", "2\n5\n");
     sh(":\necho a \\\n$LINENO $(echo $LINENO)", "a 2 2\n");
 }
+
+// `read` drops NUL bytes from its input, as dash and bash do (the user's
+// choice, 2026-10-14; POSIX leaves input with NULs unspecified). A shell
+// variable cannot hold a NUL, and keeping it let `read x <f; cd "$x"` reach
+// a system call with an embedded NUL.
+#[test]
+fn read_drops_nul_bytes() {
+    plib::testing::run_test_u8(plib::testing::TestPlanU8 {
+        cmd: "sh".to_string(),
+        args: vec![
+            "-c".to_string(),
+            "read x y; printf '[%s][%s]\\n' \"$x\" \"$y\"".to_string(),
+        ],
+        stdin_data: b"a\0b c\0d\n".to_vec(),
+        expected_out: b"[ab][cd]\n".to_vec(),
+        expected_err: Vec::new(),
+        expected_exit_code: 0,
+    });
+}
+
+/// Runs `script` with `input` as standard input, expecting `expected_out`.
+fn sh_with_input(script: &str, input: &[u8], expected_out: &str) {
+    plib::testing::run_test_u8(plib::testing::TestPlanU8 {
+        cmd: "sh".to_string(),
+        args: vec!["-c".to_string(), script.to_string()],
+        stdin_data: input.to_vec(),
+        expected_out: expected_out.as_bytes().to_vec(),
+        expected_err: Vec::new(),
+        expected_exit_code: 0,
+    });
+}
+
+// The NUL goes before anything else looks at the input: with `-r` too, a
+// backslash before a NUL escapes the byte after it (dash), a line of NULs
+// is an empty line, and a NUL delimiter (`read -d ''`) is still the
+// delimiter, as in bash.
+#[test]
+fn read_drops_nul_bytes_before_backslashes_and_splitting() {
+    let show = "printf '[%s]\\n' \"$x\"";
+    sh_with_input(&format!("read -r x; {show}"), b"a\0b\\c\n", "[ab\\c]\n");
+    sh_with_input(&format!("read x; {show}"), b"a\\\0b\n", "[ab]\n");
+    sh_with_input(&format!("read x; {show}"), b"a\0\\\nb c\n", "[ab c]\n");
+    sh_with_input(&format!("read x; echo $?; {show}"), b"\0\0\n", "0\n[]\n");
+    sh_with_input(&format!("read -d '' x; {show}"), b"a\0b", "[a]\n");
+    sh_with_input(&format!("read -d b x; {show}"), b"a\0b", "[a]\n");
+    sh_with_input(
+        "while read l; do printf '<%s>' \"$l\"; done; echo",
+        b"x\0y\nz\n",
+        "<xy><z>\n",
+    );
+}
+
+// NUL bytes in a script are dropped too, from its words, here-documents
+// and assignments alike, as in dash (bash drops them after the first line).
+#[test]
+fn script_drops_nul_bytes() {
+    plib::testing::run_test_u8(plib::testing::TestPlanU8 {
+        cmd: "sh".to_string(),
+        args: Vec::new(),
+        stdin_data: b"echo \"a\0b\" c\0d\ncat <<EOF\nh\0i\nEOF\ncat <<'EOF'\nq\0r\nEOF\nx=\"v\0w\"; echo \"$x\" ${#x}\n".to_vec(),
+        expected_out: b"ab cd\nhi\nqr\nvw 2\n".to_vec(),
+        expected_err: Vec::new(),
+        expected_exit_code: 0,
+    });
+}

@@ -368,3 +368,20 @@ fn attached_option_argument_may_begin_with_equals() {
     run_test_join_stdin(&["-t=", "-", &file2], "a=1\nb=x\n", "a=1=2\nb=x=3\n", "", 0);
     plib::testing::assert_equals_option_argument("join", "-t", &["-", &file2], b"a=1\n");
 }
+
+// A failed write to standard output is "join: write error: REASON".
+#[cfg(target_os = "linux")]
+#[test]
+fn write_error_message_on_full_device() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    std::fs::write(&a, "k 1\n").unwrap();
+    std::fs::write(&b, "k 2\n").unwrap();
+    plib::testing::assert_write_error_message_on_full_device(
+        "join",
+        &[a.to_str().unwrap(), b.to_str().unwrap()],
+        b"",
+        1,
+    );
+}

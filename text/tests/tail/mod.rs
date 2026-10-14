@@ -499,3 +499,11 @@ fn test_tail_reports_write_error_on_final_partial_line() {
     plib::testing::assert_write_error_on_full_device("tail", &[], b"x", 1);
     plib::testing::assert_write_error_on_full_device("tail", &["-c", "1"], b"x\ny", 1);
 }
+
+// A failed write to standard output is "tail: write error: REASON".
+#[cfg(target_os = "linux")]
+#[test]
+fn write_error_message_on_full_device() {
+    plib::testing::assert_write_error_message_on_full_device("tail", &[], b"x\n", 1);
+    plib::testing::assert_write_error_message_on_full_device("tail", &["-r"], b"x\n", 1);
+}

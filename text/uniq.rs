@@ -97,6 +97,16 @@ fn uniq(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         _ => Box::new(io::stdout()),
     };
 
+    // A failed write names the output file, or for standard output is a
+    // write error.
+    let out_file = args.output_file.as_ref().filter(|f| f.as_os_str() != "-");
+    let write_failure = |e: io::Error| -> Box<dyn std::error::Error> {
+        match out_file {
+            Some(file) => format!("{}: {}", file.display(), plib::diag::io_error_text(&e)).into(),
+            None => Box::new(plib::diag::WriteError(e)),
+        }
+    };
+
     let lines: Vec<String> = input.lines().collect::<Result<_, _>>()?;
 
     // Track the first line of the current run plus its comparison key; the key
@@ -113,7 +123,8 @@ fn uniq(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 current_count += 1;
             }
             Some((first_line, _)) => {
-                output_result(&mut output, first_line, current_count, args)?;
+                output_result(&mut output, first_line, current_count, args)
+                    .map_err(write_failure)?;
                 current = Some((line.clone(), key));
                 current_count = 1;
             }
@@ -125,7 +136,7 @@ fn uniq(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some((first_line, _)) = current {
-        output_result(&mut output, &first_line, current_count, args)?;
+        output_result(&mut output, &first_line, current_count, args).map_err(write_failure)?;
     }
     Ok(())
 }

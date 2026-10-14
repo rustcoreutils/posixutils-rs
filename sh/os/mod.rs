@@ -347,17 +347,51 @@ impl From<OsError> for ExecError {
     }
 }
 
-/// Duplicates `fd` onto a descriptor strictly greater than `floor`, so that it
-/// cannot collide with any redirection destination.
-fn dup_above(fd: RawFd, floor: RawFd) -> OsResult<RawFd> {
-    let new_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, floor + 1) };
-    if new_fd < 0 {
-        return Err(OsError {
-            command: "fcntl",
-            errno: get_current_errno_value(),
+/// Puts each `(src, dest)` pair's source on its destination, inherited
+/// across exec, as if every `dup2` happened at once.
+///
+/// A source may itself be another pair's destination (`3>&1 1>&2 2>&3`),
+/// so a destination is written only once no pending pair still reads it.
+/// When only cycles remain, one source is copied to the lowest free
+/// descriptor to break its cycle. No descriptor above the destinations is
+/// ever asked for: under a low `RLIMIT_NOFILE` there may be none (`ulimit
+/// -n 10` with 3..9 in use), and the lowest free one cannot be a pending
+/// destination, since in a cycle every pending destination is open.
+fn place_descriptors(mut pending: Vec<(RawFd, RawFd)>) -> OsResult<()> {
+    while !pending.is_empty() {
+        let ready = (0..pending.len()).find(|&i| {
+            let dest = pending[i].1;
+            pending
+                .iter()
+                .enumerate()
+                .all(|(j, &(src, _))| j == i || src != dest)
         });
+        match ready {
+            Some(i) => {
+                let (src, dest) = pending.swap_remove(i);
+                if src == dest {
+                    // dup2 onto itself changes nothing, so a close-on-exec
+                    // source already in place would be closed by the exec.
+                    if unsafe { libc::fcntl(dest, libc::F_SETFD, 0) } < 0 {
+                        return Err(OsError::from_current_errno("fcntl"));
+                    }
+                } else {
+                    dup2(src, dest)?;
+                }
+            }
+            None => {
+                let src = pending[0].0;
+                let copy = dup_cloexec(src)?.into_raw_fd();
+                for pair in pending.iter_mut().filter(|pair| pair.0 == src) {
+                    pair.0 = copy;
+                }
+                // The copy is read by the pairs that took it over and no
+                // longer needed once they are placed; it is close-on-exec,
+                // so the exec drops it.
+            }
+        }
     }
-    Ok(new_fd)
+    Ok(())
 }
 
 pub fn exec(
@@ -366,18 +400,7 @@ pub fn exec(
     opened_files: &OpenedFiles,
     env: &Environment,
 ) -> Result<Infallible, ExecError> {
-    // A source descriptor may itself be another redirection's destination
-    // (`3>&1 1>&2 2>&3`), and the map is iterated in an arbitrary order, so
-    // placing them one at a time can clobber a source before it is read. Move
-    // every source out of the way first, above every destination, then put them
-    // where they belong.
-    let highest_dest = opened_files
-        .opened_files
-        .keys()
-        .map(|id| *id as i32)
-        .max()
-        .unwrap_or(libc::STDERR_FILENO);
-    let mut staged: Vec<(RawFd, RawFd)> = Vec::with_capacity(opened_files.opened_files.len());
+    let mut moves: Vec<(RawFd, RawFd)> = Vec::with_capacity(opened_files.opened_files.len());
     let mut to_close: Vec<RawFd> = Vec::new();
     // Descriptors this function opened and must not leave behind.
     let mut temporaries: Vec<RawFd> = Vec::new();
@@ -409,13 +432,13 @@ pub fn exec(
                 continue;
             }
         };
-        staged.push((dup_above(src, highest_dest)?, dest));
+        moves.push((src, dest));
     }
-    for (src, dest) in staged {
-        dup2(src, dest)?;
-        close(src)?;
-    }
-    for fd in temporaries {
+    let dests: Vec<RawFd> = moves.iter().map(|&(_, dest)| dest).collect();
+    place_descriptors(moves)?;
+    // A here-document that the kernel happened to open on its own
+    // destination is now that descriptor.
+    for fd in temporaries.into_iter().filter(|fd| !dests.contains(fd)) {
         let _ = close(fd);
     }
     for fd in to_close {

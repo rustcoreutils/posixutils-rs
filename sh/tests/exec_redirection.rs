@@ -139,3 +139,28 @@ fn duplication_ignores_direction() {
         expected_exit_code: 1,
     });
 }
+
+// Running a command must not need descriptors at or above some floor the
+// shell picks for itself: after `ulimit -n 10` with 3..9 closed, external
+// commands still run (dash and bash agree). tar's extrac11 test checks
+// that tar works with few descriptors exactly this way.
+#[test]
+fn commands_run_under_a_low_descriptor_limit() {
+    sh_c(
+        "(exec 3<&- 4<&- 5<&- 6<&- 7<&- 8<&- 9<&- && ulimit -n 10 && /bin/echo ok && /bin/echo ok2)",
+        "ok\nok2\n",
+    );
+    sh_c("(ulimit -n 10; x=$(/bin/echo cs); echo $x)", "cs\n");
+    // Redirections of an external command, including a swap that needs a
+    // spare descriptor and a here-document, still work there too. bash
+    // agrees; dash does not, because it saves descriptors at 10 and above.
+    sh_c(
+        "(exec 3<&- 4<&- 5<&- 6<&- 7<&- 8<&- 9<&-; ulimit -n 10; \
+         /bin/echo a >/dev/null; { /bin/echo x 3>&1 1>&2 2>&3; } 2>&1; \
+         /bin/cat 5<<EOF 0<&5
+h5
+EOF
+)",
+        "x\nh5\n",
+    );
+}

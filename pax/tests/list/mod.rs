@@ -678,3 +678,21 @@ fn test_pattern_brackets_follow_a_single_byte_locale() {
         );
     }
 }
+
+// Writing the listing to a full standard output is "pax: write error:
+// REASON", with the system's text for the error.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_list_write_error_on_full_device() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("test.tar");
+    fs::create_dir(&src_dir).unwrap();
+    create_test_files(&src_dir);
+    let output = run_pax_in_dir(&["-w", "-f", archive.to_str().unwrap(), "."], &src_dir);
+    assert_success(&output, "pax write");
+
+    let archive = archive.to_str().unwrap();
+    plib::testing::assert_write_error_message_on_full_device("pax", &["-f", archive], b"", 1);
+    plib::testing::assert_write_error_message_on_full_device("pax", &["-v", "-f", archive], b"", 1);
+}

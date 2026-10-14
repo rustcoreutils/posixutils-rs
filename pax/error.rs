@@ -22,8 +22,9 @@ pub enum PaxError {
     /// archived, this is not about any one member and will recur for every one
     /// after it, so it ends the run.
     ArchiveWrite(io::Error),
-    /// Writing member contents to standard output (`-O`) failed. The stream is
-    /// shared by every member, so this too ends the run.
+    /// Writing standard output -- the listing, or member contents under
+    /// `-O` -- failed. The stream is shared by every member, so this too ends
+    /// the run.
     StdoutWrite(io::Error),
     /// Invalid archive format
     InvalidFormat(String),
@@ -54,10 +55,18 @@ impl fmt::Display for PaxError {
         use gettextrs::gettext;
         match self {
             PaxError::Io(e) => write!(f, "{}: {}", gettext("I/O error"), e),
-            PaxError::ArchiveWrite(e) => write!(f, "{}: {}", gettext("error writing archive"), e),
-            PaxError::StdoutWrite(e) => {
-                write!(f, "{}: {}", gettext("error writing standard output"), e)
-            }
+            PaxError::ArchiveWrite(e) => write!(
+                f,
+                "{}: {}",
+                gettext("error writing archive"),
+                plib::diag::io_error_text(e)
+            ),
+            PaxError::StdoutWrite(e) => write!(
+                f,
+                "{}: {}",
+                gettext("write error"),
+                plib::diag::io_error_text(e)
+            ),
             PaxError::InvalidFormat(msg) => {
                 write!(f, "{}: {}", gettext("Invalid archive format"), msg)
             }

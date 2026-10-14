@@ -2213,3 +2213,36 @@ fn test_directory_name_is_not_split_at_its_trailing_slash() {
     let output = run_pax_in_dir(&["-w", "-x", "ustar", &dir], temp.path());
     assert_exit_code(&output, 1, "pax -w -x ustar of a 120-byte directory name");
 }
+
+// An archive written to a full standard output is diagnosed once, as a
+// failure writing the archive, with the system's text for the error and no
+// "(os error 28)".
+#[cfg(target_os = "linux")]
+#[test]
+fn test_write_archive_to_full_device() {
+    let temp = TempDir::new().unwrap();
+    create_test_files(temp.path());
+    let full = fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let enospc = {
+        let mut probe = full.try_clone().unwrap();
+        plib::diag::io_error_text(&probe.write_all(b"x").unwrap_err())
+    };
+    for format in ["ustar", "cpio", "pax"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+            .args(["-w", "-x", format, "."])
+            .current_dir(temp.path())
+            .env("LC_ALL", "C")
+            .stdout(full.try_clone().unwrap())
+            .output()
+            .unwrap();
+        assert_exit_code(&output, 1, "pax -w >/dev/full");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!("pax: error writing archive: {enospc}\n"),
+            "pax -w -x {format} >/dev/full"
+        );
+    }
+}

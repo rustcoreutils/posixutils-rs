@@ -2818,6 +2818,35 @@ mod audit_regressions {
     }
 
     #[test]
+    fn a_job_that_stops_again_under_fg_keeps_its_number() {
+        // `fg` takes the job out of the table; when it stops again it goes
+        // back under the same number (dash, bash), and `jobs` names a stop
+        // signal other than SIGTSTP. Signal numbers differ between systems,
+        // so statuses are printed by name.
+        run_successfully_and(
+            "set -m\n\
+             sh -c 'kill -STOP $$; kill -STOP $$; echo end' &\n\
+             wait %1; echo w=$(kill -l $?)\n\
+             jobs\n\
+             fg %1 >/dev/null; echo fg=$(kill -l $?)\n\
+             jobs\n\
+             bg >/dev/null; wait %1; echo final=$?\n\
+             jobs\n",
+            |out| {
+                assert_eq!(
+                    out,
+                    "w=STOP\n\
+                     [1] + Stopped (SIGSTOP) sh -c 'kill -STOP $$; kill -STOP $$; echo end' &\n\
+                     fg=STOP\n\
+                     [1] + Stopped (SIGSTOP) sh -c 'kill -STOP $$; kill -STOP $$; echo end' &\n\
+                     end\n\
+                     final=0\n"
+                )
+            },
+        );
+    }
+
+    #[test]
     fn pipelines_do_not_leak_descriptors_to_their_commands() {
         // A pipeline member must see exactly what a plain command sees. That
         // is not a fixed set: a shell passes the descriptors it inherited on

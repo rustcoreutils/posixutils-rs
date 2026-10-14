@@ -231,19 +231,56 @@ pub enum WaitStatus {
     Stopped {
         signal: TermSignal,
     },
+    /// A stopped child was resumed by SIGCONT (only with `continued`).
+    Continued,
     StillAlive,
 }
 
-pub fn waitpid(pid: Pid, no_hang: bool, untraced: bool) -> OsResult<WaitStatus> {
+/// Which changes of a child's state `waitpid` reports besides termination.
+#[derive(Clone, Copy)]
+pub struct WaitOptions {
+    /// Return at once (`StillAlive`) when the child has not changed state.
+    pub no_hang: bool,
+    /// Report a child that has stopped (WUNTRACED).
+    pub untraced: bool,
+    /// Report a stopped child that SIGCONT has resumed (WCONTINUED).
+    pub continued: bool,
+}
+
+impl WaitOptions {
+    /// Blocks until the child terminates, or also until it stops when
+    /// `untraced`.
+    pub fn blocking(untraced: bool) -> Self {
+        Self {
+            no_hang: false,
+            untraced,
+            continued: false,
+        }
+    }
+
+    /// Polls for every change of state a job's process can go through.
+    pub fn poll_all() -> Self {
+        Self {
+            no_hang: true,
+            untraced: true,
+            continued: true,
+        }
+    }
+}
+
+pub fn waitpid(pid: Pid, options: WaitOptions) -> OsResult<WaitStatus> {
     let mut status = 0;
-    let mut options = 0;
-    if no_hang {
-        options |= libc::WNOHANG;
+    let mut flags = 0;
+    if options.no_hang {
+        flags |= libc::WNOHANG;
     }
-    if untraced {
-        options |= libc::WUNTRACED;
+    if options.untraced {
+        flags |= libc::WUNTRACED;
     }
-    let wait_result = unsafe { libc::waitpid(pid, &mut status, options) };
+    if options.continued {
+        flags |= libc::WCONTINUED;
+    }
+    let wait_result = unsafe { libc::waitpid(pid, &mut status, flags) };
     if wait_result < 0 {
         let errno = get_current_errno_value();
         if errno == Errno::EINTR {
@@ -256,7 +293,7 @@ pub fn waitpid(pid: Pid, no_hang: bool, untraced: bool) -> OsResult<WaitStatus> 
             command: "waitpid",
             errno,
         })
-    } else if wait_result == 0 && no_hang {
+    } else if wait_result == 0 && options.no_hang {
         Ok(WaitStatus::StillAlive)
     } else if libc::WIFEXITED(status) {
         let exit_status = libc::WEXITSTATUS(status);
@@ -269,9 +306,11 @@ pub fn waitpid(pid: Pid, no_hang: bool, untraced: bool) -> OsResult<WaitStatus> 
         Ok(WaitStatus::Stopped {
             signal: TermSignal(libc::WSTOPSIG(status)),
         })
+    } else if libc::WIFCONTINUED(status) {
+        Ok(WaitStatus::Continued)
     } else {
-        // WIFCONTINUED, or a status this shell does not ask for; the child is
-        // still around, so report it as such rather than aborting.
+        // A status this shell does not know; the child is still around, so
+        // report it as such rather than aborting.
         Ok(WaitStatus::StillAlive)
     }
 }

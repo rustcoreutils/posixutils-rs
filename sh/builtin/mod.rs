@@ -259,7 +259,7 @@ fn parse_pid(pid: &str, shell: &Shell) -> Result<Pid, String> {
             .background_jobs
             .get_job(job_id)
             .ok_or(format!("'{pid}' no such job"))?;
-        Ok(job.pid)
+        Ok(job.pid())
     } else {
         let pid = pid
             .parse::<libc::pid_t>()

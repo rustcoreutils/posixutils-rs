@@ -20,8 +20,8 @@ fn run_background_job(
     job: &mut Job,
     opened_files: &mut OpenedFiles,
 ) -> Result<(), String> {
-    match job.state {
-        JobState::Stopped => {}
+    match job.state() {
+        JobState::Stopped(_) => {}
         // POSIX: a job that is already running in the background needs no
         // action; this is not an error.
         JobState::Running => return Ok(()),
@@ -30,10 +30,10 @@ fn run_background_job(
             return Err(format!("bg: job {arg} has terminated\n"))
         }
     }
-    kill(job.pid, Some(Signal::SigCont))
+    kill(job.signal_target(), Some(Signal::SigCont))
         .map_err(|err| format!("bg: failed to resume job {arg} ({err})\n"))?;
     opened_files.write_out(format!("[{}] {}\n", job.number, job.command));
-    job.state = JobState::Running;
+    job.mark_continued();
     Ok(())
 }
 pub struct Bg;

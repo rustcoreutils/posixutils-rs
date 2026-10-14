@@ -433,7 +433,8 @@ pub fn expand_parameter_into(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::JobState;
+    use crate::jobs::Job;
+    use crate::os::WaitStatus;
     use crate::parse::word::test_utils::unquoted_literal;
     use crate::parse::word::Word;
     use crate::shstr::ShString;
@@ -533,7 +534,7 @@ mod tests {
         shell.last_background_pid = Some(123);
         shell
             .background_jobs
-            .add_job(123, "cmd".to_string(), JobState::Running);
+            .add_job(Job::new(&[123], None, "cmd".to_string(), false));
         assert_eq!(
             expand_parameter_to_string(
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Bang)),
@@ -541,7 +542,9 @@ mod tests {
             ),
             "123".to_string()
         );
-        shell.background_jobs.current_mut().unwrap().state = JobState::Done(0);
+        shell
+            .background_jobs
+            .record_status(123, &WaitStatus::Exited { exit_status: 0 });
         shell.background_jobs.collect_terminated_jobs();
         assert_eq!(
             expand_parameter_to_string(

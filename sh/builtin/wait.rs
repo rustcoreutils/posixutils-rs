@@ -8,6 +8,7 @@
 //
 
 use crate::builtin::{parse_pid, skip_option_terminator, BuiltinResult, BuiltinUtility};
+use crate::jobs::JobState;
 use crate::os::errno::Errno;
 use crate::os::Pid;
 use crate::shell::opened_files::OpenedFiles;
@@ -24,13 +25,14 @@ fn wait_for_pid(pid: Pid, shell: &mut Shell) -> Result<i32, i32> {
     if let Some(status) = shell.background_jobs.take_collected_status(pid) {
         return Ok(status);
     }
+    if shell.background_jobs.job_with_process(pid).is_some() {
+        return wait_for_job_of(pid, shell);
+    }
     match shell.wait_child_process_interruptibly(pid) {
         Ok(ChildWait::Terminated(status)) => {
-            // Reaped, so it is no longer a job.
             shell.background_jobs.collect(pid, status);
             Ok(status)
         }
-        // A merely stopped child is still alive and stays in the table.
         Ok(ChildWait::Stopped(status)) => Ok(status),
         Ok(ChildWait::Interrupted(status)) => Err(status),
         // No such child: never a child of this shell, or one whose status is
@@ -45,6 +47,43 @@ fn wait_for_pid(pid: Pid, shell: &mut Shell) -> Result<i32, i32> {
     }
 }
 
+/// Waits for every process of the job that has process `pid`, as dash does:
+/// the status is the job's, and a job that stops ends the wait but stays
+/// in the table.
+fn wait_for_job_of(pid: Pid, shell: &mut Shell) -> Result<i32, i32> {
+    loop {
+        let Some(job) = shell.background_jobs.job_with_process(pid) else {
+            return Ok(127);
+        };
+        let state = job.state();
+        if state.is_terminated() {
+            let status = state.exit_status();
+            // Reaped, so it is no longer a job.
+            shell.background_jobs.collect(pid, status);
+            return Ok(status);
+        }
+        // A stopped process has already reported its stop, so waiting for
+        // it would block until something resumed it.
+        if let JobState::Stopped(_) = state {
+            return Ok(state.exit_status());
+        }
+        let Some(next) = job.live_pids().first().copied() else {
+            return Ok(state.exit_status());
+        };
+        // Each status is recorded in the job table as it is collected.
+        match shell.wait_child_process_interruptibly(next) {
+            Ok(ChildWait::Terminated(_)) => {}
+            // A merely stopped job is still alive and stays in the table.
+            Ok(ChildWait::Stopped(status)) => return Ok(status),
+            Ok(ChildWait::Interrupted(status)) => return Err(status),
+            Err(err) if err.errno == Errno::ECHILD => {
+                shell.background_jobs.record_lost(next, 127);
+            }
+            Err(_) => return Ok(127),
+        }
+    }
+}
+
 pub struct Wait;
 
 impl BuiltinUtility for Wait {
@@ -53,13 +92,13 @@ impl BuiltinUtility for Wait {
 
         let mut status = 0;
         if pids.is_empty() {
-            // Not a drain: each pid goes through the same path as an explicit
+            // Not a drain: each job goes through the same path as an explicit
             // `wait`, so a job that has already terminated leaves the table
             // with its real status rather than a fabricated one.
             let pids = shell
                 .background_jobs
                 .iter()
-                .map(|job| job.pid)
+                .filter_map(|job| job.processes.first().map(|process| process.pid))
                 .collect::<Vec<_>>();
             for pid in pids {
                 if let Err(interrupted) = wait_for_pid(pid, shell) {

@@ -14,13 +14,13 @@ use crate::builtin::{
     get_builtin_utility, get_special_builtin_utility, BuiltinUtility, SpecialBuiltinUtility,
 };
 use crate::cli::terminal::Terminal;
-use crate::jobs::{JobManager, JobState};
+use crate::jobs::{Job, JobManager, JobState};
 use crate::nonempty::NonEmpty;
 use crate::os::errno::Errno;
 use crate::os::signals::{PendingSignal, Signal, SignalManager, TermSignal};
 use crate::os::{
     exec, find_command, fork, getpgrp, give_terminal_to, is_process_in_foreground, pipe, setpgid,
-    waitpid, ExecError, ForkResult, OsError, OsResult, Pid, WaitStatus,
+    waitpid, ExecError, ForkResult, OsError, OsResult, Pid, WaitOptions, WaitStatus,
 };
 use crate::parse::command::{
     Assignment, CaseItem, Command, CommandType, CompleteCommand, CompoundCommand, Conjunction,
@@ -343,6 +343,7 @@ impl Shell {
         self.forget_redirections();
         self.signal_manager.reset();
         self.exit_action = TrapAction::Default;
+        self.background_jobs.forget_reports();
         self.is_subshell = true;
     }
 
@@ -424,40 +425,103 @@ impl Shell {
             // wait with EINTR, but its trap is not run here: XCU 2.11 has it
             // wait until the foreground command has completed, and it runs at
             // the end of the pipeline, with `$?` the command's status.
-            match waitpid(child_pid, false, true)? {
-                WaitStatus::Interrupted => {}
+            //
+            // Only a job-control shell is told about a child that stops: one
+            // without job control has no way to resume it, and, as in dash,
+            // goes on waiting until something else continues it.
+            let status = waitpid(child_pid, WaitOptions::blocking(self.job_control_active()))?;
+            if matches!(
+                status,
+                WaitStatus::Interrupted | WaitStatus::StillAlive | WaitStatus::Continued
+            ) {
+                continue;
+            }
+            // A process of a job (`wait`): the job table has to know.
+            let in_job = self.background_jobs.record_status(child_pid, &status);
+            match status {
                 WaitStatus::Exited { exit_status } => {
                     return Ok(ChildWait::Terminated(exit_status))
                 }
                 WaitStatus::Signaled { signal, .. } => {
-                    // Under job control a foreground job has the terminal,
-                    // so the ^C that killed it never reached the shell; as
-                    // in dash, the shell takes it as its own interrupt.
-                    if !trap_interrupts
-                        && signal.is(Signal::SigInt)
-                        && self.job_control_active()
-                        && self.signal_manager.catches_sigint_interactively()
-                    {
-                        unsafe { libc::raise(libc::SIGINT) };
+                    if !trap_interrupts {
+                        self.foreground_job_killed_by(signal);
                     }
                     return Ok(ChildWait::Terminated(signal.exit_status()));
                 }
                 WaitStatus::Stopped { signal } => {
-                    // Only register the job if it is not one already, or the
-                    // table would gain a duplicate under a new number.
-                    if !self.background_jobs.mark_stopped_by_pid(child_pid) {
-                        self.background_jobs.add_job(
-                            child_pid,
+                    if !in_job {
+                        let mut job = Job::new(
+                            &[child_pid],
+                            None,
                             self.last_pipeline_command.clone(),
-                            JobState::Stopped,
+                            false,
                         );
+                        job.record(child_pid, &status);
+                        self.background_jobs.add_job(job);
                     }
                     return Ok(ChildWait::Stopped(signal.exit_status()));
                 }
-                // Only reachable for a status this shell does not ask for
-                // (WIFCONTINUED); the child is still running, so wait again.
-                WaitStatus::StillAlive => {}
+                WaitStatus::Interrupted | WaitStatus::StillAlive | WaitStatus::Continued => {}
             }
+        }
+    }
+
+    /// Under job control a foreground job has the terminal, so the ^C that
+    /// killed it never reached the shell; as in dash, the shell takes it as
+    /// its own interrupt.
+    fn foreground_job_killed_by(&self, signal: TermSignal) {
+        if signal.is(Signal::SigInt)
+            && self.job_control_active()
+            && self.signal_manager.catches_sigint_interactively()
+        {
+            unsafe { libc::raise(libc::SIGINT) };
+        }
+    }
+
+    /// Waits for a job running in the foreground until all of its processes
+    /// have terminated, or, under job control, until one of them stops: the
+    /// job then goes (back) into the job table as a suspended job, keeping
+    /// its job number if it had one (`fg`). Returns the job's status.
+    pub fn wait_for_job(&mut self, mut job: Job) -> OsResult<i32> {
+        let untraced = self.job_control_active();
+        loop {
+            let state = job.state();
+            if state.is_terminated() {
+                return Ok(state.exit_status());
+            }
+            if let JobState::Stopped(_) = state {
+                // The others were stopped by the same signal, most likely;
+                // record whichever already have been.
+                for pid in job.live_pids() {
+                    if let Ok(status) = waitpid(pid, WaitOptions::poll_all()) {
+                        job.record(pid, &status);
+                    }
+                }
+                job.state_should_be_reported = true;
+                if job.number == 0 {
+                    self.background_jobs.add_job(job);
+                } else {
+                    self.background_jobs.reinsert_job(job);
+                }
+                return Ok(state.exit_status());
+            }
+            // Running and not terminated, so some process is still alive.
+            let Some(pid) = job.live_pids().first().copied() else {
+                return Ok(state.exit_status());
+            };
+            let status = match waitpid(pid, WaitOptions::blocking(untraced)) {
+                Ok(status) => status,
+                Err(err) if err.errno == Errno::ECHILD => {
+                    // Not this process's child (any more): nothing to wait for.
+                    job.record_lost(pid, 127);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            if let WaitStatus::Signaled { signal } = status {
+                self.foreground_job_killed_by(signal);
+            }
+            job.record(pid, &status);
         }
     }
 
@@ -1529,8 +1593,12 @@ impl Shell {
                 }
                 Ok(ForkResult::Parent { child }) => {
                     self.last_background_pid = Some(child);
-                    self.background_jobs
-                        .add_job(child, conjunction.to_string(), JobState::Running);
+                    self.background_jobs.add_job(Job::new(
+                        &[child],
+                        None,
+                        conjunction.to_string(),
+                        false,
+                    ));
                     // Reap whatever has already finished, so a loop that starts
                     // background jobs does not accumulate a zombie per
                     // iteration.
@@ -1600,10 +1668,12 @@ impl Shell {
                 // child actually did and leave it unreaped. The trap of a
                 // signal that interrupts it runs at the end of the pipeline.
                 self.last_command_substitution_status = loop {
-                    match waitpid(child, false, false)? {
+                    match waitpid(child, WaitOptions::blocking(false))? {
                         WaitStatus::Exited { exit_status } => break exit_status,
                         WaitStatus::Signaled { signal } => break signal.exit_status(),
-                        WaitStatus::Interrupted | WaitStatus::StillAlive => {}
+                        WaitStatus::Interrupted
+                        | WaitStatus::StillAlive
+                        | WaitStatus::Continued => {}
                         WaitStatus::Stopped { .. } => break 0,
                     }
                 };

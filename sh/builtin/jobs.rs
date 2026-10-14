@@ -36,7 +36,7 @@ fn print_job(
             }
         }
         PrintOptions::Short => {
-            opened_files.write_out(format!("{}\n", job.pid));
+            opened_files.write_out(format!("{}\n", job.pid()));
         }
     }
     Ok(())

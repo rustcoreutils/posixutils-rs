@@ -34,6 +34,7 @@ pub mod optarg;
 pub mod perm;
 #[cfg(unix)]
 pub mod platform;
+pub mod printf;
 #[cfg(unix)]
 pub mod priority;
 #[cfg(unix)]

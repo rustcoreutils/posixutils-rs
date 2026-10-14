@@ -120,10 +120,19 @@ fn failed_redirection_status_follows_xcu_2_8_1() {
 // A file that cannot be created for another reason gets that reason.
 #[test]
 fn failed_redirection_reports_the_reason() {
+    // The reason is the system's: creating "/" is EISDIR on Linux and EEXIST
+    // on macOS, so ask the system with the flags `>` uses.
+    let err = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open("/")
+        .expect_err("/ must not be creatable as a file");
+    let reason = plib::diag::io_error_text(&err);
     sh_c(
         "echo a > /; echo $?",
         "1\n",
-        "sh: cannot create '/': Is a directory\n",
+        &format!("sh: cannot create '/': {reason}\n"),
         0,
     );
 }

@@ -558,7 +558,7 @@ fn copy_convert_file(config: &Config) -> Result<(Stats, bool), Box<dyn std::erro
             Ok(n) => n,
             Err(e) => {
                 if config.noerror {
-                    eprintln!("{}: {}", gettext("read error"), e);
+                    plib::diag::error(&read_error(&e));
                     stats.print();
                     // If sync is specified, replace with nulls
                     let has_sync = config
@@ -578,7 +578,7 @@ fn copy_convert_file(config: &Config) -> Result<(Stats, bool), Box<dyn std::erro
                 } else {
                     // Report the statistics gathered so far before aborting.
                     stats.print();
-                    return Err(e.into());
+                    return Err(read_error(&e).into());
                 }
             }
         };
@@ -646,6 +646,15 @@ fn copy_convert_file(config: &Config) -> Result<(Stats, bool), Box<dyn std::erro
     }
 
     Ok((stats, true))
+}
+
+/// `read error: REASON`, the diagnostic for a failed read of the input.
+fn read_error(e: &io::Error) -> String {
+    format!(
+        "{}: {}",
+        gettext("read error"),
+        plib::diag::io_error_text(e)
+    )
 }
 
 fn parse_conv_list(config: &mut Config, s: &str) -> Result<(), Box<dyn std::error::Error>> {

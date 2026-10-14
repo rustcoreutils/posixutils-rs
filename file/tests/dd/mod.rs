@@ -600,6 +600,33 @@ fn test_operand_errors_are_reported_once() {
     assert_eq!(stderr, "dd: invalid number: 'abc'\n");
 }
 
+// A failed read is "dd: read error: REASON", with the system's text and no
+// Rust "(os error N)" suffix, whether conv=noerror goes on or dd stops.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_read_error_message() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let eisdir = plib::diag::io_error_text(&std::io::Error::from_raw_os_error(libc::EISDIR));
+    let ifile = format!("if={}", dir.path().display());
+
+    let (_, stderr, code) = run_dd(&[&ifile, "conv=noerror", "count=1"], b"");
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        stderr,
+        format!(
+            "dd: read error: {eisdir}\n0+0 records in\n0+0 records out\n\
+             0+1 records in\n0+0 records out\n"
+        )
+    );
+
+    let (_, stderr, code) = run_dd(&[&ifile], b"");
+    assert_eq!(code, Some(1), "{stderr}");
+    assert_eq!(
+        stderr,
+        format!("0+0 records in\n0+0 records out\ndd: read error: {eisdir}\n")
+    );
+}
+
 // DD-2: on SIGINT dd writes its statistics and then terminates *as if by the
 // default action*, so the parent observes a signal death (WIFSIGNALED), not a
 // plain non-zero exit.

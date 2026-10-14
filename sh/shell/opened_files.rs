@@ -201,7 +201,6 @@ impl OpenedFiles {
                 if *target == "-" {
                     self.opened_files.insert(dest_fd, OpenedFile::Closed);
                 } else {
-                    let duplicate_input = *kind == IORedirectionKind::DuplicateInput;
                     // A descriptor number is text by definition.
                     let source_fd = target
                         .to_str()
@@ -212,34 +211,17 @@ impl OpenedFiles {
                                 target.display()
                             ))
                         })?;
-                    match self.opened_files.get(&source_fd) {
-                        Some(OpenedFile::WriteFile(_))
-                        | Some(OpenedFile::Stdout)
-                        | Some(OpenedFile::Stderr)
-                            if duplicate_input =>
-                        {
-                            return Err(CommandExecutionError::Redirection(format!(
-                                "sh: '{source_fd}' is not opened for reading"
-                            )));
-                        }
-                        Some(OpenedFile::ReadFile(_))
-                        | Some(OpenedFile::Stdin)
-                        | Some(OpenedFile::HereDocument(_))
-                            if !duplicate_input =>
-                        {
-                            return Err(CommandExecutionError::Redirection(format!(
-                                "sh: '{source_fd}' is not opened for writing"
-                            )));
-                        }
-                        None => {
-                            return Err(CommandExecutionError::Redirection(format!(
-                                "sh: cannot duplicate unopened file descriptor '{source_fd}'"
-                            )))
-                        }
-                        Some(other) => {
-                            self.opened_files.insert(dest_fd, other.clone());
-                        }
-                    }
+                    // XCU 2.7.5, 2.7.6: both operators make the descriptor a
+                    // copy of `source_fd` whatever it was opened for, as
+                    // dup2() does; the operator only picks the default
+                    // descriptor. Using the copy the other way fails where it
+                    // is used, with the system's error.
+                    let file = self.opened_files.get(&source_fd).cloned().ok_or_else(|| {
+                        CommandExecutionError::Redirection(format!(
+                            "sh: cannot duplicate unopened file descriptor '{source_fd}'"
+                        ))
+                    })?;
+                    self.opened_files.insert(dest_fd, file);
                 }
             }
             IORedirectionKind::RedirectInput => {

@@ -20,6 +20,17 @@ use gettextrs::gettext;
 use std::io::IsTerminal;
 use std::os::fd::{AsRawFd, RawFd};
 
+/// The diagnostic for input `read` could not read (`read <&1` with standard
+/// output a pipe gives EBADF): the system's reason.
+fn read_error(errno: Errno) -> BuiltinError {
+    format!(
+        "read: {}: {}",
+        gettext("read error"),
+        plib::diag::io_error_text(&std::io::Error::from(errno))
+    )
+    .into()
+}
+
 fn read_byte_non_blocking(fd: RawFd) -> Result<Option<u8>, BuiltinError> {
     let mut buffer = [0u8; 1];
     match read(fd, &mut buffer) {
@@ -27,7 +38,7 @@ fn read_byte_non_blocking(fd: RawFd) -> Result<Option<u8>, BuiltinError> {
         Ok(1) => Ok(Some(buffer[0])),
         Ok(_) => unreachable!(),
         Err(err) if err.errno == Errno::EAGAIN => Ok(None),
-        Err(err) => Err(format!("read: failed to read from stdin ({err})").into()),
+        Err(err) => Err(read_error(err.errno)),
     }
 }
 
@@ -37,7 +48,7 @@ fn read_byte(fd: RawFd) -> Result<Option<u8>, BuiltinError> {
         Ok(0) => Ok(None),
         Ok(1) => Ok(Some(buffer[0])),
         Ok(_) => unreachable!(),
-        Err(err) => Err(format!("read: failed to read from stdin ({err})").into()),
+        Err(err) => Err(read_error(err.errno)),
     }
 }
 
@@ -275,8 +286,23 @@ fn read_until(
             backslash_escape,
             continuation_prompt,
         ),
-        OpenedFile::ReadWriteFile(file) => read_until_from_file(
+        // A descriptor duplicated from one opened for writing (`exec 0>&3`,
+        // `read <&1`) is read like any other: the system decides whether it
+        // can be, and a write-only one fails with EBADF.
+        OpenedFile::ReadWriteFile(file) | OpenedFile::WriteFile(file) => read_until_from_file(
             file.as_raw_fd(),
+            delimiter,
+            backslash_escape,
+            continuation_prompt,
+        ),
+        OpenedFile::Stdout => read_until_from_file(
+            libc::STDOUT_FILENO,
+            delimiter,
+            backslash_escape,
+            continuation_prompt,
+        ),
+        OpenedFile::Stderr => read_until_from_file(
+            libc::STDERR_FILENO,
             delimiter,
             backslash_escape,
             continuation_prompt,
@@ -292,7 +318,7 @@ fn read_until(
             *remaining = ShString::from(remaining[consumed..].to_vec());
             Ok(result)
         }
-        _ => Err(gettext("read: invalid standard input").into()),
+        OpenedFile::Closed => Err(read_error(Errno::EBADF)),
     }
 }
 

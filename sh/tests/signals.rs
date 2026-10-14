@@ -53,8 +53,8 @@ fn last_command_runs_in_place_only_when_nothing_follows() {
     sh_c("(trap 'echo bye' EXIT; /bin/echo x)", "x\nbye\n");
     sh_c("trap 'echo bye' EXIT; /bin/echo x", "x\nbye\n");
     sh_c("x=$(trap 'echo cs' EXIT; /bin/echo x); echo $x", "x cs\n");
-    sh_c("(! /bin/false); echo $?", "0\n");
-    sh_c("(/bin/false || /bin/echo or); echo $?", "or\n0\n");
+    sh_c("(! /usr/bin/false); echo $?", "0\n");
+    sh_c("(/usr/bin/false || /bin/echo or); echo $?", "or\n0\n");
     sh_c("(for i in 1 2; do /bin/echo $i; done)", "1\n2\n");
     sh_c("x=$(/bin/sh -c 'exit 3'); echo $?", "3\n");
     sh_c("(/bin/echo a | /bin/cat; /bin/echo b)", "a\nb\n");
@@ -113,7 +113,7 @@ fn signals_ignored_on_entry_cannot_be_trapped_or_reset() {
 #[test]
 fn sigchld_ignored_on_entry_does_not_break_wait() {
     sh_c(
-        &format!("trap '' CHLD; {SH} -c '/bin/false; echo $?; sleep 0 & wait $!; echo $?'"),
+        &format!("trap '' CHLD; {SH} -c '/usr/bin/false; echo $?; sleep 0 & wait $!; echo $?'"),
         "1\n0\n",
     );
 }
@@ -217,14 +217,14 @@ fn trap_waits_for_the_foreground_command() {
 #[test]
 fn trapped_signal_interrupts_wait() {
     sh_c(
-        "trap 'echo t' USR1; sleep 1 & p=$!; (sleep 0.2; kill -USR1 $$) & \
+        "trap 'echo t' HUP; sleep 1 & p=$!; (sleep 0.2; kill -HUP $$) & \
          wait $p; echo wait=$?; wait $p; echo again=$?",
-        "t\nwait=138\nagain=0\n",
+        "t\nwait=129\nagain=0\n",
     );
     sh_c(
-        "trap 'echo t' USR1; sleep 5 & p=$!; (sleep 0.2; kill -USR1 $$) & \
+        "trap 'echo t' HUP; sleep 5 & p=$!; (sleep 0.2; kill -HUP $$) & \
          wait; echo wait=$?; kill $p",
-        "t\nwait=138\n",
+        "t\nwait=129\n",
     );
     // An ignored signal does not.
     sh_c(

@@ -180,6 +180,34 @@ fn printf_output_follows_redirections() {
     );
 }
 
+// A huge field width runs in the shell process itself: building it in
+// memory would kill the user's shell.  The address-space limit (enforced on
+// Linux) is far below the output size, so only streamed output survives.
+#[cfg(target_os = "linux")]
+#[test]
+fn printf_huge_width_is_streamed() {
+    sh_c(
+        "ulimit -v 200000; printf '%300000000d' 1 >/dev/null; echo alive",
+        "alive\n",
+    );
+    // No <newline> anywhere: the line buffering must not hold it either.
+    sh_c(
+        "ulimit -v 200000; printf '%300000000s' x | wc -c; echo alive",
+        "300000000\nalive\n",
+    );
+}
+
+// dash rejects a width that is not a C int; nothing is written for it.
+#[test]
+fn printf_width_above_int_max_is_rejected() {
+    sh_c_full(
+        "printf '%2147483648d' 1; echo st=$?",
+        "st=1\n",
+        "printf: 2147483648: field width or precision too large\n",
+        0,
+    );
+}
+
 #[test]
 fn printf_lookup_order() {
     sh_c("command printf '%s\\n' cmd", "cmd\n");

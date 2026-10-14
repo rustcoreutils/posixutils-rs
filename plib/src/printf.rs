@@ -233,6 +233,27 @@ fn parse_arg_number(peekable: &mut Peekable<Iter<'_, u8>>) -> Option<usize> {
     Some(arg_number)
 }
 
+/// The largest field width or precision: C's `printf()` takes them as an
+/// `int`.  A larger one is rejected, as dash rejects it, rather than wrapped
+/// or saturated.
+const FIELD_NUMBER_MAX: usize = i32::MAX as usize;
+
+fn field_number_too_large(text: &str) -> Box<dyn Error> {
+    Box::from(format!(
+        "{text}: {}",
+        gettext("field width or precision too large")
+    ))
+}
+
+/// Parse the decimal digits of a field width or precision.
+fn parse_field_number(digits: &str) -> Result<usize, Box<dyn Error>> {
+    digits
+        .parse::<usize>()
+        .ok()
+        .filter(|&n| n <= FIELD_NUMBER_MAX)
+        .ok_or_else(|| field_number_too_large(digits))
+}
+
 fn tokenize_format_str(format: &[u8]) -> Result<Vec<Token>, Box<dyn Error>> {
     let mut conv_spec = ConvSpec::default();
     let mut literal = Vec::<u8>::with_capacity(format.len());
@@ -300,7 +321,7 @@ fn tokenize_format_str(format: &[u8]) -> Result<Vec<Token>, Box<dyn Error>> {
                         done_with_char = true;
                     } else {
                         if !width.is_empty() {
-                            conv_spec.width = Some(width.parse()?);
+                            conv_spec.width = Some(parse_field_number(&width)?);
 
                             width.clear();
                         }
@@ -329,7 +350,7 @@ fn tokenize_format_str(format: &[u8]) -> Result<Vec<Token>, Box<dyn Error>> {
                         done_with_char = true;
                     } else {
                         if !precision.is_empty() {
-                            conv_spec.precision = Some(precision.parse()?);
+                            conv_spec.precision = Some(parse_field_number(&precision)?);
 
                             precision.clear();
                         }
@@ -361,16 +382,114 @@ fn tokenize_format_str(format: &[u8]) -> Result<Vec<Token>, Box<dyn Error>> {
     Ok(tokens)
 }
 
+/// One piece of a conversion's output.  A field width or precision can ask
+/// for up to `FIELD_NUMBER_MAX` padding bytes, so padding is described, not
+/// built: [`write_pieces`] streams it in bounded chunks.
+enum Piece {
+    Bytes(Vec<u8>),
+    /// `count` copies of a byte.
+    Fill(u8, usize),
+}
+
+/// The text of a converted value: `head`, then `zeros` '0' bytes, then
+/// `tail`.  The zeros are a precision's padding, inside any field padding.
+struct Body {
+    head: Vec<u8>,
+    zeros: usize,
+    tail: Vec<u8>,
+}
+
+impl Body {
+    fn len(&self) -> usize {
+        self.head.len() + self.zeros + self.tail.len()
+    }
+
+    fn push_into(self, pieces: &mut Vec<Piece>) {
+        pieces.push(Piece::Bytes(self.head));
+        pieces.push(Piece::Fill(b'0', self.zeros));
+        pieces.push(Piece::Bytes(self.tail));
+    }
+}
+
+/// How a conversion fills its field when the value is narrower.
+#[derive(Clone, Copy, PartialEq)]
+enum Justify {
+    /// Spaces after the value (the '-' flag).
+    Left,
+    /// Zeros between the sign or prefix and the value (the '0' flag).
+    ZeroPad,
+    /// Spaces before the value.
+    Right,
+}
+
+/// Lay out `lead` (a sign or radix prefix) and `body` in a field of
+/// `width` bytes.
+fn justify(lead: Vec<u8>, body: Body, width: usize, how: Justify) -> Vec<Piece> {
+    let padding = width.saturating_sub(lead.len() + body.len());
+    let mut pieces = Vec::with_capacity(6);
+    match how {
+        Justify::Left => {
+            pieces.push(Piece::Bytes(lead));
+            body.push_into(&mut pieces);
+            pieces.push(Piece::Fill(b' ', padding));
+        }
+        Justify::ZeroPad => {
+            pieces.push(Piece::Bytes(lead));
+            pieces.push(Piece::Fill(b'0', padding));
+            body.push_into(&mut pieces);
+        }
+        Justify::Right => {
+            pieces.push(Piece::Fill(b' ', padding));
+            pieces.push(Piece::Bytes(lead));
+            body.push_into(&mut pieces);
+        }
+    }
+    pieces
+}
+
+/// Write `pieces`, streaming each fill in chunks of at most `FILL_CHUNK`
+/// bytes so that no field width or precision is ever held in memory.
+fn write_pieces(output: &mut dyn Write, pieces: &[Piece]) -> std::io::Result<()> {
+    const FILL_CHUNK: usize = 8 * 1024;
+    for piece in pieces {
+        match piece {
+            Piece::Bytes(bytes) => output.write_all(bytes)?,
+            Piece::Fill(byte, count) => {
+                let chunk = [*byte; FILL_CHUNK];
+                let mut left = *count;
+                while left > 0 {
+                    let n = left.min(FILL_CHUNK);
+                    output.write_all(&chunk[..n])?;
+                    left -= n;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The field layout the flags ask for.  `zero_allowed` is false where the
+/// '0' flag does not apply (a precision on an integer, an infinity or NaN).
+fn justify_for(conv: &ConvSpec, zero_allowed: bool) -> Justify {
+    if conv.left_justify {
+        Justify::Left
+    } else if conv.zero_pad && zero_allowed {
+        Justify::ZeroPad
+    } else {
+        Justify::Right
+    }
+}
+
 /// Format a signed integer (the `d` and `i` conversions) with all POSIX flags
 /// applied.  The `+` and <space> flags are meaningful only here: XBD 3569-3570
 /// define them in terms of a *signed* conversion.
-fn format_integer_signed(conv: &ConvSpec, value: i64) -> Vec<u8> {
+fn format_integer_signed(conv: &ConvSpec, value: i64) -> Vec<Piece> {
     let sign_char = if value < 0 {
-        Some('-')
+        Some(b'-')
     } else if conv.sign {
-        Some('+')
+        Some(b'+')
     } else if conv.space {
-        Some(' ')
+        Some(b' ')
     } else {
         None
     };
@@ -386,102 +505,58 @@ fn format_integer_signed(conv: &ConvSpec, value: i64) -> Vec<u8> {
 fn format_integer(
     conv: &ConvSpec,
     magnitude: u64,
-    sign_char: Option<char>,
+    sign_char: Option<u8>,
     base: u32,
     upper: bool,
-) -> Vec<u8> {
-    let abs_value = magnitude;
-
+) -> Vec<Piece> {
     // Convert to string in the appropriate base.  XBD 3615-3616: "The result
     // of converting a zero value with a precision of 0 shall be no
     // characters."
-    let digits: String = if abs_value == 0 && conv.precision == Some(0) {
+    let mut digits: String = if magnitude == 0 && conv.precision == Some(0) {
         String::new()
     } else {
         match base {
-            8 => format!("{abs_value:o}"),
-            16 if upper => format!("{abs_value:X}"),
-            16 => format!("{abs_value:x}"),
-            _ => abs_value.to_string(),
+            8 => format!("{magnitude:o}"),
+            16 if upper => format!("{magnitude:X}"),
+            16 => format!("{magnitude:x}"),
+            _ => magnitude.to_string(),
         }
     };
 
-    // Apply precision (minimum digits, zero-padded)
-    let mut digits_with_precision = if let Some(prec) = conv.precision {
-        if digits.len() < prec {
-            format!("{:0>width$}", digits, width = prec)
-        } else {
-            digits
-        }
-    } else {
-        digits
-    };
+    // The precision is the minimum number of digits, reached with leading
+    // zeros.
+    let zeros = conv.precision.unwrap_or(0).saturating_sub(digits.len());
 
     // XBD 3574-3575: for the o conversion, '#' "shall increase the precision
     // to force the first digit of the result to be a zero" — it is not a
     // prefix, so it must not add a zero to a result that already has one.
-    if base == 8 && conv.alt_form && !digits_with_precision.starts_with('0') {
-        digits_with_precision.insert(0, '0');
+    if base == 8 && conv.alt_form && zeros == 0 && !digits.starts_with('0') {
+        digits.insert(0, '0');
     }
 
     // Alternate form prefix (# on x and X only; see above for o)
-    let prefix = if conv.alt_form && abs_value != 0 {
+    let prefix: &[u8] = if conv.alt_form && magnitude != 0 {
         match base {
-            16 if upper => "0X",
-            16 => "0x",
-            _ => "",
+            16 if upper => b"0X",
+            16 => b"0x",
+            _ => b"",
         }
     } else {
-        ""
+        b""
     };
 
-    // Calculate total content length
-    let sign_len = if sign_char.is_some() { 1 } else { 0 };
-    let content_len = sign_len + prefix.len() + digits_with_precision.len();
+    let mut lead = Vec::with_capacity(3);
+    lead.extend(sign_char);
+    lead.extend_from_slice(prefix);
 
-    // Apply width
-    let width = conv.width.unwrap_or(0);
-
-    let mut output = Vec::with_capacity(width.max(content_len));
-
-    if width > content_len {
-        let padding = width - content_len;
-
-        if conv.left_justify {
-            // Left justify: content then spaces
-            if let Some(s) = sign_char {
-                output.push(s as u8);
-            }
-            output.extend_from_slice(prefix.as_bytes());
-            output.extend_from_slice(digits_with_precision.as_bytes());
-            output.resize(output.len() + padding, b' ');
-        } else if conv.zero_pad && conv.precision.is_none() {
-            // Zero pad: sign/prefix, zeros, digits
-            if let Some(s) = sign_char {
-                output.push(s as u8);
-            }
-            output.extend_from_slice(prefix.as_bytes());
-            output.resize(output.len() + padding, b'0');
-            output.extend_from_slice(digits_with_precision.as_bytes());
-        } else {
-            // Right justify with spaces
-            output.resize(output.len() + padding, b' ');
-            if let Some(s) = sign_char {
-                output.push(s as u8);
-            }
-            output.extend_from_slice(prefix.as_bytes());
-            output.extend_from_slice(digits_with_precision.as_bytes());
-        }
-    } else {
-        // No padding needed
-        if let Some(s) = sign_char {
-            output.push(s as u8);
-        }
-        output.extend_from_slice(prefix.as_bytes());
-        output.extend_from_slice(digits_with_precision.as_bytes());
-    }
-
-    output
+    // With a precision, the '0' flag is ignored (XBD 3580-3582).
+    let how = justify_for(conv, conv.precision.is_none());
+    let body = Body {
+        head: Vec::new(),
+        zeros,
+        tail: digits.into_bytes(),
+    };
+    justify(lead, body, conv.width.unwrap_or(0), how)
 }
 
 /// Parse a floating point argument according to POSIX rules
@@ -698,6 +773,9 @@ fn format_fixed(value: f64, precision: usize, upper: bool) -> String {
     format!("{:.prec$}", value, prec = precision)
 }
 
+/// Hexadecimal digits in the fraction of an `f64`.
+const HEX_MANTISSA_DIGITS: usize = 13;
+
 /// Format a floating point number in hexadecimal format (%a/%A).
 ///
 /// `precision` is `None` when the format omitted it, which per XBD 3594-3598
@@ -707,8 +785,6 @@ fn format_hex_float(value: f64, precision: Option<usize>, upper: bool) -> String
     if let Some(text) = format_nonfinite(value, upper) {
         return text;
     }
-
-    const MANTISSA_DIGITS: usize = 13;
 
     let bits = value.to_bits();
     let exp_bits = ((bits >> 52) & 0x7FF) as i32;
@@ -726,8 +802,8 @@ fn format_hex_float(value: f64, precision: Option<usize>, upper: bool) -> String
     // An explicit precision shorter than the mantissa rounds (half-to-even),
     // rather than truncating, so the printed value is the nearest one
     // representable in the requested number of hexadecimal digits.
-    if let Some(prec) = precision.filter(|&p| p < MANTISSA_DIGITS) {
-        let shift = 4 * (MANTISSA_DIGITS - prec) as u32;
+    if let Some(prec) = precision.filter(|&p| p < HEX_MANTISSA_DIGITS) {
+        let shift = 4 * (HEX_MANTISSA_DIGITS - prec) as u32;
         let kept = mantissa >> shift;
         let rest = mantissa & ((1_u64 << shift) - 1);
         let half = 1_u64 << (shift - 1);
@@ -772,7 +848,7 @@ fn format_hex_float(value: f64, precision: Option<usize>, upper: bool) -> String
         Some(prec) => {
             let mut digits = mantissa_hex
                 .chars()
-                .take(prec.min(MANTISSA_DIGITS))
+                .take(prec.min(HEX_MANTISSA_DIGITS))
                 .collect::<String>();
             while digits.len() < prec {
                 digits.push('0');
@@ -791,84 +867,98 @@ fn format_hex_float(value: f64, precision: Option<usize>, upper: bool) -> String
     }
 }
 
-/// Format a floating point number with all POSIX flags applied
-fn format_float(conv: &ConvSpec, value: f64) -> Vec<u8> {
-    let is_negative = value.is_sign_negative() && !value.is_nan();
-    let abs_value = value.abs();
+/// The most fraction digits a decimal rendering of an `f64` needs to be
+/// exact (the smallest subnormal has 1074) and, with room to spare, the most
+/// significant digits one can have (767).  A larger precision only appends
+/// zeros, which are streamed rather than formatted: Rust's formatter would
+/// otherwise build them in memory, and it panics on a precision above
+/// `u16::MAX`.
+const EXACT_DIGITS: usize = 1100;
 
+/// Render a magnitude under a floating-point conversion, with the
+/// precision's excess zeros split out at the end of the digits (before any
+/// exponent).
+fn float_body(conv: &ConvSpec, abs_value: f64) -> Body {
     // Default precision is 6
     let precision = conv.precision.unwrap_or(6);
+    let capped = precision.min(EXACT_DIGITS);
+    let mut excess = precision - capped;
 
-    // Format the number according to specifier
+    let upper = conv.spec.is_ascii_uppercase();
     let formatted = match conv.spec {
-        'F' => format_fixed(abs_value, precision, true),
-        'e' => format_scientific(abs_value, precision, false),
-        'E' => format_scientific(abs_value, precision, true),
-        'g' => format_general(abs_value, precision, false, conv.alt_form),
-        'G' => format_general(abs_value, precision, true, conv.alt_form),
-        'a' => format_hex_float(abs_value, conv.precision, false),
-        'A' => format_hex_float(abs_value, conv.precision, true),
-        _ => format_fixed(abs_value, precision, false),
+        'e' | 'E' => format_scientific(abs_value, capped, upper),
+        'g' | 'G' => {
+            // Without '#', %g removes trailing zeros, the excess included.
+            if !conv.alt_form {
+                excess = 0;
+            }
+            format_general(abs_value, capped, upper, conv.alt_form)
+        }
+        'a' | 'A' => {
+            excess = conv
+                .precision
+                .map_or(0, |p| p.saturating_sub(HEX_MANTISSA_DIGITS));
+            format_hex_float(
+                abs_value,
+                conv.precision.map(|p| p.min(HEX_MANTISSA_DIGITS)),
+                upper,
+            )
+        }
+        _ => format_fixed(abs_value, capped, upper),
     };
+    if !abs_value.is_finite() {
+        excess = 0;
+    }
 
     // POSIX 111924-111926 / XBD 3623-3624: LC_NUMERIC determines the radix
     // character.  Rust's formatting always produces a <period>.
-    let formatted = apply_radix_char(formatted);
+    let formatted = apply_radix_char(formatted).into_bytes();
+
+    // The excess zeros end the digits: they precede an exponent.  (A
+    // hexadecimal mantissa contains 'e', so only 'p' marks its exponent.)
+    let exponent_at = match conv.spec {
+        'a' | 'A' => formatted.iter().rposition(|&b| b == b'p' || b == b'P'),
+        _ => formatted.iter().position(|&b| b == b'e' || b == b'E'),
+    };
+    let mut head = formatted;
+    let tail = match exponent_at {
+        Some(at) => head.split_off(at),
+        None => Vec::new(),
+    };
+    Body {
+        head,
+        zeros: excess,
+        tail,
+    }
+}
+
+/// Format a floating point number with all POSIX flags applied
+fn format_float(conv: &ConvSpec, value: f64) -> Vec<Piece> {
+    let is_negative = value.is_sign_negative() && !value.is_nan();
+    let abs_value = value.abs();
+
+    let body = float_body(conv, abs_value);
 
     // Determine sign
     let sign_char = if is_negative {
-        Some('-')
+        Some(b'-')
     } else if conv.sign {
-        Some('+')
+        Some(b'+')
     } else if conv.space {
-        Some(' ')
+        Some(b' ')
     } else {
         None
     };
 
-    // Calculate total content length
-    let sign_len = if sign_char.is_some() { 1 } else { 0 };
-    let content_len = sign_len + formatted.len();
-
-    // Apply width
-    let width = conv.width.unwrap_or(0);
-
-    let mut output = Vec::with_capacity(width.max(content_len));
-
-    if width > content_len {
-        let padding = width - content_len;
-
-        // XBD 3580-3582: the '0' flag pads with leading zeros "except when
-        // converting an infinity or NaN".
-        let zero_pad = conv.zero_pad && abs_value.is_finite();
-
-        if conv.left_justify {
-            if let Some(s) = sign_char {
-                output.push(s as u8);
-            }
-            output.extend_from_slice(formatted.as_bytes());
-            output.resize(output.len() + padding, b' ');
-        } else if zero_pad {
-            if let Some(s) = sign_char {
-                output.push(s as u8);
-            }
-            output.resize(output.len() + padding, b'0');
-            output.extend_from_slice(formatted.as_bytes());
-        } else {
-            output.resize(output.len() + padding, b' ');
-            if let Some(s) = sign_char {
-                output.push(s as u8);
-            }
-            output.extend_from_slice(formatted.as_bytes());
-        }
-    } else {
-        if let Some(s) = sign_char {
-            output.push(s as u8);
-        }
-        output.extend_from_slice(formatted.as_bytes());
-    }
-
-    output
+    // XBD 3580-3582: the '0' flag pads with leading zeros "except when
+    // converting an infinity or NaN".
+    let how = justify_for(conv, abs_value.is_finite());
+    justify(
+        sign_char.into_iter().collect(),
+        body,
+        conv.width.unwrap_or(0),
+        how,
+    )
 }
 
 /// Remove trailing zeros after decimal point
@@ -894,7 +984,7 @@ fn format_arg_float(
     conv: &ConvSpec,
     arg: &[u8],
     diag: &mut DiagSink,
-) -> Result<(Vec<u8>, bool), Box<dyn Error>> {
+) -> Result<(Vec<Piece>, bool), Box<dyn Error>> {
     let mut had_error = false;
     let value = match parse_float_arg(arg) {
         Ok((n, fully_consumed)) => {
@@ -1061,7 +1151,7 @@ fn format_arg_uint_base(
     base: u32,
     upper: bool,
     diag: &mut DiagSink,
-) -> (Vec<u8>, bool) {
+) -> (Vec<Piece>, bool) {
     let (operand, mut had_error) = eval_integer_arg(arg, diag);
 
     let magnitude = if operand.value < 0 {
@@ -1091,7 +1181,7 @@ fn format_arg_uint_base(
 /// Format an argument under the signed conversions (`d`, `i`).  An
 /// out-of-range operand saturates to `i64::MIN`/`i64::MAX`, which is what
 /// `strtol()` returns and what the spec's EXAMPLES (112117-112120) show.
-fn format_arg_int(conv: &ConvSpec, arg: &[u8], diag: &mut DiagSink) -> (Vec<u8>, bool) {
+fn format_arg_int(conv: &ConvSpec, arg: &[u8], diag: &mut DiagSink) -> (Vec<Piece>, bool) {
     let (operand, mut had_error) = eval_integer_arg(arg, diag);
 
     let value = if operand.value < i128::from(i64::MIN) {
@@ -1109,7 +1199,7 @@ fn format_arg_int(conv: &ConvSpec, arg: &[u8], diag: &mut DiagSink) -> (Vec<u8>,
     (format_integer_signed(conv, value), had_error)
 }
 
-fn format_arg_char(conv: &ConvSpec, arg: &[u8]) -> Vec<u8> {
+fn format_arg_char(conv: &ConvSpec, arg: &[u8]) -> Vec<Piece> {
     let arg_to_use = arg.get(..1_usize).unwrap_or(&[]);
 
     format_arg_string(conv, arg_to_use)
@@ -1181,34 +1271,21 @@ fn process_b_escapes(arg: &[u8]) -> ProcessBResult {
     ProcessBResult::Bytes(output)
 }
 
-fn format_arg_b(conv: &ConvSpec, arg: &[u8]) -> (Vec<u8>, bool) {
+fn format_arg_b(conv: &ConvSpec, arg: &[u8]) -> (Vec<Piece>, bool) {
     match process_b_escapes(arg) {
         ProcessBResult::Bytes(bytes) => (format_arg_string(conv, &bytes), false),
         ProcessBResult::StopOutput(bytes) => (format_arg_string(conv, &bytes), true),
     }
 }
 
-fn format_arg_string(conv: &ConvSpec, arg: &[u8]) -> Vec<u8> {
+fn format_arg_string(conv: &ConvSpec, arg: &[u8]) -> Vec<Piece> {
     // Apply precision to limit string length
-    let arg = if let Some(prec) = conv.precision {
-        if prec < arg.len() {
-            &arg[..prec]
-        } else {
-            arg
-        }
-    } else {
-        arg
+    let arg = match conv.precision {
+        Some(prec) if prec < arg.len() => &arg[..prec],
+        _ => arg,
     };
 
-    let arg_len = arg.len();
-
-    let Some(width) = conv.width else {
-        return arg.to_vec();
-    };
-
-    if width <= arg_len {
-        return arg.to_vec();
-    }
+    let padding = conv.width.unwrap_or(0).saturating_sub(arg.len());
 
     // For strings, zero padding is treated as space padding
     let padding_char = if conv.zero_pad && conv.spec != 's' && conv.spec != 'b' {
@@ -1217,26 +1294,18 @@ fn format_arg_string(conv: &ConvSpec, arg: &[u8]) -> Vec<u8> {
         b' '
     };
 
-    let mut output = Vec::<u8>::with_capacity(width);
-
+    let value = Piece::Bytes(arg.to_vec());
+    let fill = Piece::Fill(padding_char, padding);
     if conv.left_justify {
-        output.extend_from_slice(arg);
-        for _ in 0..(width - arg_len) {
-            output.push(padding_char);
-        }
+        vec![value, fill]
     } else {
-        for _ in 0..(width - arg_len) {
-            output.push(padding_char);
-        }
-        output.extend_from_slice(arg);
+        vec![fill, value]
     }
-
-    output
 }
 
 /// Result of formatting an argument
 struct FormatResult {
-    bytes: Vec<u8>,
+    pieces: Vec<Piece>,
     stop_output: bool,
     had_error: bool,
 }
@@ -1271,7 +1340,7 @@ fn format_arg(
             let (bytes, stop) = format_arg_b(conv, arg);
             (bytes, stop, false)
         }
-        '%' => (vec![b'%'], false, false),
+        '%' => (vec![Piece::Bytes(vec![b'%'])], false, false),
         ch => {
             diag(&format!(
                 "{}: {ch}",
@@ -1282,7 +1351,7 @@ fn format_arg(
     };
 
     Ok(FormatResult {
-        bytes,
+        pieces: bytes,
         stop_output,
         had_error,
     })
@@ -1373,7 +1442,7 @@ pub fn printf(
                     };
 
                     let result = format_arg(co, arg_str, diag)?;
-                    output.write_all(&result.bytes)?;
+                    write_pieces(output, &result.pieces)?;
 
                     if result.had_error {
                         had_error = true;
@@ -1462,5 +1531,123 @@ mod tests {
             result,
             Err("missing hexadecimal number in escape".to_string())
         );
+    }
+
+    /// A sink that keeps only the byte count, the largest single write and
+    /// a short head and tail of the output.
+    #[derive(Default)]
+    struct CountingSink {
+        total: usize,
+        max_write: usize,
+        head: Vec<u8>,
+        tail: Vec<u8>,
+    }
+
+    impl std::io::Write for CountingSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.total += buf.len();
+            self.max_write = self.max_write.max(buf.len());
+            let room = 32_usize.saturating_sub(self.head.len());
+            self.head.extend_from_slice(&buf[..room.min(buf.len())]);
+            self.tail.extend_from_slice(buf);
+            let excess = self.tail.len().saturating_sub(32);
+            self.tail.drain(..excess);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn run_counting(format: &str, args: &[&str]) -> (CountingSink, Result<bool, String>) {
+        let args: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
+        let mut sink = CountingSink::default();
+        let mut diags = |_: &str| {};
+        let result =
+            printf(&mut sink, format.as_bytes(), &args, &mut diags).map_err(|e| e.to_string());
+        (sink, result)
+    }
+
+    /// The most a single write may carry: a huge field width or precision
+    /// must be streamed, never built in memory (in the shell, an allocation
+    /// failure kills the user's shell).
+    const MAX_WRITE: usize = 64 * 1024;
+
+    #[test]
+    fn huge_width_and_precision_are_streamed() {
+        const N: usize = 10_000_000;
+        // (format, operand, total bytes, first bytes, last bytes)
+        type Case = (String, &'static str, usize, &'static [u8], &'static [u8]);
+        let cases: &[Case] = &[
+            (format!("%{N}d"), "1", N, b"    ", b"   1"),
+            (format!("%-{N}s|"), "ab", N + 1, b"ab  ", b"   |"),
+            (format!("%0{N}d"), "-1", N, b"-000", b"0001"),
+            (format!("%.{N}d"), "7", N, b"0000", b"0007"),
+            (format!("%#.{N}o"), "8", N, b"0000", b"0010"),
+            (format!("%{N}c"), "xy", N, b"    ", b"   x"),
+            (format!("%{N}b"), "a\\tb", N, b"    ", b"a\tb"),
+            (format!("%.{N}f"), "1.5", N + 2, b"1.50", b"0000"),
+            (format!("%{N}.2f"), "-1.5", N, b"    ", b"1.50"),
+            (format!("%.{N}e"), "1.5", N + 6, b"1.50", b"0e+00"),
+            (format!("%#.{N}g"), "1.5", N + 1, b"1.50", b"0000"),
+            (format!("%.{N}a"), "1", N + 7, b"0x1.", b"000p+0"),
+        ];
+        for (format, arg, total, head, tail) in cases {
+            let (sink, result) = run_counting(format, &[arg]);
+            assert_eq!(result, Ok(false), "{format}");
+            assert_eq!(sink.total, *total, "{format}");
+            assert!(sink.max_write <= MAX_WRITE, "{format}: {}", sink.max_write);
+            assert!(sink.head.starts_with(head), "{format}");
+            assert!(sink.tail.ends_with(tail), "{format}");
+        }
+    }
+
+    /// Past the digits a double can carry exactly, a larger precision only
+    /// appends zeros, before any exponent.
+    #[test]
+    fn large_float_precision_appends_exact_zeros() {
+        let (short, _, _) = run("%.1100f", &["0.1"]);
+        let (long, _, _) = run("%.1300f", &["0.1"]);
+        assert_eq!(long, format!("{short}{}", "0".repeat(200)));
+
+        let (short, _, _) = run("%.1100e", &["0.1"]);
+        let (long, _, _) = run("%.1300e", &["0.1"]);
+        let (mantissa, exponent) = short.split_at(short.find('e').unwrap());
+        assert_eq!(long, format!("{mantissa}{}{exponent}", "0".repeat(200)));
+
+        let (short, _, _) = run("%#.1100g", &["0.1"]);
+        let (long, _, _) = run("%#.1300g", &["0.1"]);
+        assert_eq!(long, format!("{short}{}", "0".repeat(200)));
+        // Without '#', %g removes the trailing zeros anyway.
+        assert_eq!(run("%.1300g", &["0.1"]).0, run("%.1100g", &["0.1"]).0);
+        assert_eq!(run("%.70000g", &["0.5"]).0, "0.5");
+    }
+
+    /// A field width or precision is a C int: one that does not fit is
+    /// rejected (dash fails the same way), never wrapped or saturated.
+    #[test]
+    fn width_or_precision_above_int_max_is_an_error() {
+        for format in [
+            "%2147483648d",
+            "%.2147483648d",
+            "%.2147483648f",
+            "%99999999999999999999d",
+            "%.99999999999999999999s",
+        ] {
+            let (out, _, result) = run(format, &["1"]);
+            assert_eq!(out, "", "{format}");
+            let err = result.unwrap_err();
+            assert!(
+                err.ends_with("field width or precision too large"),
+                "{format}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_without_conversions_is_used_once() {
+        assert_eq!(run("x", &["a", "b"]).0, "x");
+        assert_eq!(run("%%", &["a", "b"]).0, "%");
     }
 }

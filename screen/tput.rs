@@ -153,9 +153,16 @@ fn tput_reset(info: &Database) -> terminfo::Result<()> {
     Ok(())
 }
 
+/// Write the clear-screen sequence, then, as ncurses' tput and clear do, the
+/// user-defined `E3` capability if the terminal has one: it clears the
+/// scrollback, which `clear` alone leaves behind on terminals such as xterm
+/// and the Linux console. `E3` takes no parameters and is written as stored.
 fn tput_clear(info: &Database) -> terminfo::Result<()> {
     if let Some(clear) = info.get::<cap::ClearScreen>() {
         put(clear.expand().to_vec()?)?;
+    }
+    if let Some(terminfo::Value::String(e3)) = info.raw("E3") {
+        put(e3.clone())?;
     }
 
     Ok(())

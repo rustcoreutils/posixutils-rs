@@ -601,6 +601,15 @@ table is present.
    still separates groups, all as in GNU grep.  `-c`, `-l` and `-q` are
    unchanged.  Forced by util-linux's test suite
    (`tests/ts/libmount/debug`).
+ * `-z` / `--null-data` — input lines end in a NUL byte instead of a
+   newline, and so does each line or `-o` part written; a last line without
+   one gets one.  A newline inside a line is an ordinary character: `.`
+   matches it, `^` and `$` match only at the line's ends, and it is no word
+   character for `-w`.  Patterns are still separated by newlines.  The `--`
+   between context groups, `-c` counts and `-l` names still end in a
+   newline, as in GNU grep.  libxcrypt's debian/rules runs
+   `find * -print0 | egrep --null-data --invert-match ...` to build
+   libxcrypt-source.
 
 ### head
 

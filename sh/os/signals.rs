@@ -322,18 +322,21 @@ pub fn signal_read_fd() -> RawFd {
 fn get_pending_signal() -> Option<Signal> {
     // Empty the pipe before looking at the flags: a signal that arrives in
     // between leaves both its flag and a byte, and the byte wakes the shell
-    // again later, so nothing is missed.
+    // again later, so nothing is missed. The bytes carry no information, so
+    // a failure to read them loses nothing but a wake-up: report it and go on
+    // to the flags.
     let fd = signal_read_fd();
     let mut buf = [0u8; 256];
-    loop {
-        match read(fd, &mut buf) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(err) => {
-                if err.errno == Errno::EAGAIN {
+    if fd >= 0 {
+        loop {
+            match read(fd, &mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(err) if err.errno == Errno::EINTR => {}
+                Err(err) if err.errno == Errno::EAGAIN => break,
+                Err(err) => {
+                    eprintln!("{err}");
                     break;
-                } else {
-                    panic!("failed to read from signal pipe ({err})");
                 }
             }
         }

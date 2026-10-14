@@ -363,9 +363,10 @@ impl<'src> WordParser<'src> {
                         &mut current_literal,
                         &mut word_parts,
                         WordPart::CommandSubstitution {
-                            // `\\\`` inside a backquoted substitution is a
-                            // literal backtick.
-                            commands: ShString::from(replace_escaped_backticks(commands)),
+                            commands: ShString::from(unescape_backquoted(
+                                commands,
+                                inside_double_quotes,
+                            )),
                             inside_double_quotes,
                         },
                         inside_double_quotes,
@@ -438,13 +439,23 @@ impl<'src> WordParser<'src> {
     }
 }
 
-/// Replaces `\\\`` with a literal backtick, byte-wise.
-fn replace_escaped_backticks(bytes: &[u8]) -> Vec<u8> {
+/// Recovers the commands of a backquoted command substitution. Within the
+/// backquotes, a backslash keeps its literal meaning except before `$`, `` ` ``
+/// and `\`, where it is removed (POSIX XCU 2.6.3). When the substitution is
+/// itself inside double quotes, `\"` also stands for `"`, as in dash and
+/// bash.
+fn unescape_backquoted(bytes: &[u8], inside_double_quotes: bool) -> Vec<u8> {
     let mut result = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'\\' && bytes.get(i + 1) == Some(&b'`') {
-            result.push(b'`');
+        let escapes_next = bytes[i] == b'\\'
+            && match bytes.get(i + 1) {
+                Some(b'$' | b'`' | b'\\') => true,
+                Some(b'"') => inside_double_quotes,
+                _ => false,
+            };
+        if escapes_next {
+            result.push(bytes[i + 1]);
             i += 2;
         } else {
             result.push(bytes[i]);

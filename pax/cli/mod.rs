@@ -97,8 +97,14 @@ fn open_name_list(path: &OsStr, nul: bool) -> PaxResult<NameList> {
     if path == "-" {
         return Ok(NameList::stdin(sep));
     }
-    let file = File::open(path)
-        .map_err(|e| PaxError::Usage(format!("{}: {}", Path::new(path).display(), e), None))?;
+    let file = File::open(path).map_err(|e| {
+        let text = format!(
+            "{}: {}",
+            Path::new(path).display(),
+            plib::diag::io_error_text(&e)
+        );
+        PaxError::Usage(text, None)
+    })?;
     Ok(NameList::file(file, sep))
 }
 

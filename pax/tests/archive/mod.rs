@@ -2246,3 +2246,23 @@ fn test_write_archive_to_full_device() {
         );
     }
 }
+
+// An archive that cannot be opened is reported with the system's text
+// for the error, without Rust's "(os error N)" suffix.
+#[test]
+fn test_unopenable_archive_names_the_system_error() {
+    let missing = "/nonexistent/pax-archive";
+    let open_error = plib::diag::io_error_text(&fs::File::open(missing).unwrap_err());
+    for args in [["-r", "-f", missing], ["-w", "-f", missing]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pax"))
+            .args(args)
+            .arg("/dev/null")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_ne!(output.status.code(), Some(0), "{args:?}");
+        assert!(stderr.contains(&open_error), "{args:?}: {stderr:?}");
+        assert!(!stderr.contains("(os error"), "{args:?}: {stderr:?}");
+    }
+}

@@ -54,7 +54,12 @@ impl fmt::Display for PaxError {
         // locale gettext returns the message unchanged, so output is unchanged.
         use gettextrs::gettext;
         match self {
-            PaxError::Io(e) => write!(f, "{}: {}", gettext("I/O error"), e),
+            PaxError::Io(e) => write!(
+                f,
+                "{}: {}",
+                gettext("I/O error"),
+                plib::diag::io_error_text(e)
+            ),
             PaxError::ArchiveWrite(e) => write!(
                 f,
                 "{}: {}",

@@ -236,3 +236,24 @@ fn messages_for_goals_made_in_parallel() {
         "make: 'a' is up to date.\nmake: 'b' is up to date.\nmake: Nothing to be done for 'c'.\n",
     );
 }
+
+// A goal another goal's walk remade first is not "up to date": its command
+// lines count to it, as they would have made one after another, and as GNU
+// make counts them under -j. `make -j4 a b` with `b: a` said
+// `make: 'a' is up to date.` after `built a`, or not, by which thread
+// reached `a` first. Each order is made several times to catch either
+// winner.
+#[test]
+fn a_goal_another_goal_remade_is_not_up_to_date() {
+    let dir = Dir::new("parallel_goal_remade_by_another");
+    dir.write("Makefile", "a b:\n\t@echo built $@\nb: a\nall: a\n");
+    for _ in 0..5 {
+        dir.make(&["-j4", "a", "b"]).ok("built a\nbuilt b\n");
+        dir.make(&["-j4", "b", "a"])
+            .ok("built a\nbuilt b\nmake: 'a' is up to date.\n");
+        dir.make(&["-j4", "a", "all"])
+            .ok("built a\nmake: Nothing to be done for 'all'.\n");
+        dir.make(&["-j4", "all", "a"])
+            .ok("built a\nmake: 'a' is up to date.\n");
+    }
+}

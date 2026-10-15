@@ -202,3 +202,116 @@ fn disabled_comments_stay_disabled_inside_arguments() {
         0,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Command-line options
+// ---------------------------------------------------------------------------
+
+// libtoolize spells `--prefix-builtins` as `--prefix`, a GNU getopt
+// abbreviation.  The predefined text macros keep their names.
+#[test]
+fn prefix_builtins_renames_every_builtin() {
+    for opt in ["-P", "--prefix-builtins", "--prefix"] {
+        m4(
+            &[opt],
+            "m4_define(`x',`X')x define(`y') m4___line__ m4_len(abc) [__gnu__]\n",
+            "X define(y) 1 3 []\n",
+            "",
+            0,
+        );
+    }
+}
+
+#[test]
+fn include_path_is_searched_and_names_the_file_found() {
+    for opt in [
+        "-Ifixtures/integration_tests/include",
+        "--include=fixtures/integration_tests/include",
+    ] {
+        m4(
+            &[opt],
+            "include(`file.m4')\n",
+            "fixtures/integration_tests/include/file.m4\n",
+            "",
+            0,
+        );
+    }
+}
+
+#[test]
+fn sinclude_ignores_a_missing_file_and_a_directory() {
+    m4(
+        &[],
+        "sinclude(`nosuch.m4')sinclude(`fixtures')x\n",
+        "x\n",
+        "",
+        0,
+    );
+}
+
+#[test]
+fn fatal_warnings_once_fails_the_exit_status() {
+    for opt in ["-E", "--fatal-warnings", "--fatal-warning"] {
+        m4(
+            &[opt],
+            "a len(a,b)x\nb\n",
+            "a 1x\nb\n",
+            "m4:stdin:1: Warning: excess arguments to builtin `len' ignored\n",
+            1,
+        );
+    }
+}
+
+#[test]
+fn fatal_warnings_twice_stops_at_the_first() {
+    m4(
+        &["-EE"],
+        "a len(a,b)x\nb\n",
+        "a ",
+        "m4:stdin:1: Warning: excess arguments to builtin `len' ignored\n",
+        1,
+    );
+}
+
+#[test]
+fn nesting_limit_stops_runaway_recursion() {
+    for args in [&["-L", "20"][..], &["--nesting-limit=20"][..]] {
+        m4(
+            args,
+            "define(`r',`r(r)')dnl\nbefore\nr\n",
+            "before\n",
+            "m4:stdin:3: recursion limit of 20 exceeded, use -L<N> to change it\n",
+            1,
+        );
+    }
+    // autom4te passes 1024; ordinary recursion stays well inside it.
+    m4(
+        &["--nesting-limit=1024"],
+        "define(`count',`ifelse($1,0,done,`count(decr($1))')')count(100)\n",
+        "done\n",
+        "",
+        0,
+    );
+}
+
+#[test]
+fn end_of_file_inside_an_argument_list_is_fatal() {
+    m4(
+        &[],
+        "len(abc\n",
+        "",
+        "m4:stdin:1: ERROR: end of file in argument list\n",
+        1,
+    );
+}
+
+#[test]
+fn long_option_spellings_of_define_and_undefine() {
+    m4(
+        &["--define=x=X", "--undefine=len", "--synclines"],
+        "x len\n",
+        "#line 1 \"stdin\"\nX len\n",
+        "",
+        0,
+    );
+}

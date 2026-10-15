@@ -684,6 +684,17 @@ The GNU m4 extensions autoconf, automake and libtoolize cannot run without:
  * `__gnu__` and `__unix__` are predefined as empty (m4sugar refuses to run
    without `__gnu__`), and `__line__` expands to the line a call began on.
  * `-g` / `--gnu` is accepted; GNU mode is the only mode.
+ * Long options, taken in any unambiguous abbreviation as GNU getopt does
+   (libtoolize passes `--prefix`): `--define`, `--undefine`, `--synclines`,
+   and:
+   * `-I DIR` / `--include=DIR` — search `DIR` for input files not found where
+     named (`include`, `sinclude` and file operands), then each directory in
+     `M4PATH`.
+   * `-P` / `--prefix-builtins` — name every built-in with an `m4_` prefix.
+   * `-E` / `--fatal-warnings` — once, any diagnostic makes the exit status 1;
+     twice, the first one stops m4.
+   * `-L N` / `--nesting-limit=N` — a call nested more than `N` deep is fatal
+     (0, the default, is no limit; autom4te passes 1024).
 
 ### make
 

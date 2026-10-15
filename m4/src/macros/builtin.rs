@@ -19,7 +19,7 @@ use gettextrs::gettext;
 use nom::error::{ContextError, FromExternalError};
 use nom::IResult;
 
-use crate::error::{Result, ResultExt};
+use crate::error::Result;
 use crate::input::{Input, InputRead};
 use crate::lexer::{
     MacroName, DEFAULT_COMMENT_CLOSE_TAG, DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG,
@@ -277,23 +277,25 @@ impl MacroImplementation for ErrprintMacro {
 pub struct IncludeMacro;
 
 impl IncludeMacro {
-    fn get_file_path(frame: StackFrame, state: State) -> Result<(Option<PathBuf>, State)> {
-        if let Some(arg) = frame.args.into_iter().next() {
-            let path = PathBuf::from(OsString::from_vec(arg));
-            Ok((Some(path), state))
-        } else {
-            Ok((None, state))
+    /// Push the file named by the first argument as the next input, searched
+    /// for along the include path. Returns the error that kept it from
+    /// opening. A directory opens but cannot be read, so it is refused here,
+    /// where `sinclude` can still ignore it.
+    fn include(
+        state: &State,
+        frame: StackFrame,
+    ) -> std::result::Result<(), (PathBuf, std::io::Error)> {
+        let path = PathBuf::from(OsString::from_vec(
+            frame.args.into_iter().next().unwrap_or_default(),
+        ));
+        let (file, found) = state.open_input(&path).map_err(|e| (path.clone(), e))?;
+        if file.metadata().is_ok_and(|m| m.is_dir()) {
+            return Err((path, std::io::Error::from_raw_os_error(libc::EISDIR)));
         }
-    }
-
-    fn include_impl(path: PathBuf, state: State) -> crate::error::Result<State> {
-        let file = std::fs::File::open(&path)
-            .map_err(crate::Error::from)
-            .add_context(|| format!("Error opening file {path:?}"))?;
         state
             .input
-            .input_push(Input::new(InputRead::File { file, path }));
-        Ok(state)
+            .input_push(Input::new(InputRead::File { file, path: found }));
+        Ok(())
     }
 }
 
@@ -304,25 +306,14 @@ impl MacroImplementation for IncludeMacro {
         stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
-        let path;
-        (path, state) = Self::get_file_path(frame, state)?;
-        if let Some(path) = path {
-            // POSIX: "It shall be an error if the file cannot be read." GNU m4
-            // diagnoses and continues with a non-zero exit status rather than
-            // aborting.
-            match std::fs::File::open(&path) {
-                Ok(file) => {
-                    state
-                        .input
-                        .input_push(Input::new(InputRead::File { file, path }));
-                }
-                Err(error) => {
-                    let msg = gettext("cannot open `{}': {}")
-                        .replacen("{}", &path.display().to_string(), 1)
-                        .replacen("{}", &error.to_string(), 1);
-                    state.emit_error(stderr, format_args!("{msg}"))?;
-                }
-            }
+        // POSIX: "It shall be an error if the file cannot be read." GNU m4
+        // diagnoses and continues with a non-zero exit status rather than
+        // aborting.
+        if let Err((path, error)) = Self::include(&state, frame) {
+            let msg = gettext("cannot open `{}': {}")
+                .replacen("{}", &path.display().to_string(), 1)
+                .replacen("{}", &plib::diag::io_error_text(&error), 1);
+            state.emit_error(stderr, format_args!("{msg}"))?;
         }
         Ok(state)
     }
@@ -334,20 +325,8 @@ impl MacroImplementation for IncludeMacro {
 pub struct SincludeMacro;
 
 impl MacroImplementation for SincludeMacro {
-    fn evaluate(
-        &self,
-        mut state: State,
-        _stderr: &mut dyn Write,
-        frame: StackFrame,
-    ) -> Result<State> {
-        let path;
-        (path, state) = IncludeMacro::get_file_path(frame, state)?;
-        if let Some(path) = path {
-            if path.is_file() {
-                state = IncludeMacro::include_impl(path, state)?;
-            }
-        }
-
+    fn evaluate(&self, state: State, _stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
+        let _ = IncludeMacro::include(&state, frame);
         Ok(state)
     }
 }

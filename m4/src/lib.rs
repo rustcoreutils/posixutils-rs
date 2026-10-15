@@ -78,14 +78,28 @@ pub struct Args {
     pub line_synchronization: bool,
     /// `-D`, `-U`, and file operands in command-line order.
     pub items: Vec<InputItem>,
+    /// `-I`: directories searched, in order, for an input file not found
+    /// where it is named.
+    pub include_dirs: Vec<PathBuf>,
+    /// `-P`: every built-in is named with an `m4_` prefix.
+    pub prefix_builtins: bool,
+    /// `-E` given once (diagnostics make the exit status a failure) or
+    /// twice (the first diagnostic stops m4).
+    pub fatal_warnings: u8,
+    /// `-L`: the deepest macro calls may nest, 0 for no limit.
+    pub nesting_limit: usize,
 }
 
 impl Args {
     fn command() -> clap::Command {
         clap::command!()
+            // GNU getopt takes any unambiguous prefix of a long option, and
+            // libtoolize spells `--prefix-builtins` as `--prefix`.
+            .infer_long_args(true)
             .arg(
                 clap::Arg::new("line_synchronization")
                     .short('s')
+                    .long("synclines")
                     .help(gettext(
                         "Output line synchronization directives, suitable for cpp",
                     ))
@@ -94,6 +108,7 @@ impl Args {
             .arg(
                 clap::Arg::new("define")
                     .short('D')
+                    .long("define")
                     .value_name(crate::lexer::DEFINE_VALUE_NAME)
                     .help(gettext(
                         "Define the symbol name to have some value (or NULL)",
@@ -105,11 +120,47 @@ impl Args {
             .arg(
                 clap::Arg::new("undefine")
                     .short('U')
+                    .long("undefine")
                     .value_name(crate::lexer::UNDEFINE_VALUE_NAME)
                     .help(gettext("Undefine the symbol name"))
                     .num_args(1)
                     .allow_hyphen_values(true)
                     .action(clap::ArgAction::Append),
+            )
+            .arg(
+                clap::Arg::new("include")
+                    .short('I')
+                    .long("include")
+                    .value_name("DIRECTORY")
+                    .help(gettext("Append DIRECTORY to the include path"))
+                    .num_args(1)
+                    .value_parser(clap::value_parser!(PathBuf))
+                    .action(clap::ArgAction::Append),
+            )
+            .arg(
+                clap::Arg::new("prefix_builtins")
+                    .short('P')
+                    .long("prefix-builtins")
+                    .help(gettext("Force a `m4_' prefix to all builtins"))
+                    .action(clap::ArgAction::SetTrue),
+            )
+            .arg(
+                clap::Arg::new("fatal_warnings")
+                    .short('E')
+                    .long("fatal-warnings")
+                    .help(gettext(
+                        "Once: warnings become errors, twice: stop execution at first error",
+                    ))
+                    .action(clap::ArgAction::Count),
+            )
+            .arg(
+                clap::Arg::new("nesting_limit")
+                    .short('L')
+                    .long("nesting-limit")
+                    .value_name("NUMBER")
+                    .help(gettext("Change the nesting limit, 0 for unlimited"))
+                    .num_args(1)
+                    .value_parser(clap::value_parser!(usize)),
             )
             .arg(
                 // autom4te always passes it; the extensions it names are the
@@ -160,6 +211,17 @@ impl Args {
         Self {
             line_synchronization,
             items,
+            include_dirs: matches
+                .get_many::<PathBuf>("include")
+                .unwrap_or_default()
+                .cloned()
+                .collect(),
+            prefix_builtins: matches.get_flag("prefix_builtins"),
+            fatal_warnings: matches.get_count("fatal_warnings"),
+            nesting_limit: matches
+                .get_one::<usize>("nesting_limit")
+                .copied()
+                .unwrap_or(0),
         }
     }
 }
@@ -211,6 +273,7 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
 ) -> crate::error::Result<()> {
     let stdout = Rc::new(RefCell::new(stdout));
     let mut state = State::try_new(stdout.clone(), Vec::new(), args.line_synchronization)?;
+    state.configure(&args);
 
     let has_file = args
         .items
@@ -241,10 +304,9 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
                     let reader = if path.as_os_str() == "-" {
                         Ok(InputRead::Stdin(std::io::stdin()))
                     } else {
-                        std::fs::File::open(&path).map(|file| InputRead::File {
-                            file,
-                            path: path.clone(),
-                        })
+                        state
+                            .open_input(&path)
+                            .map(|(file, path)| InputRead::File { file, path })
                     };
                     match reader {
                         Ok(read) => {

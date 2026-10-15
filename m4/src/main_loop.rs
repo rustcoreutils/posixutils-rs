@@ -9,7 +9,6 @@
 
 use std::io::Write;
 
-use crate::error::{Error, ErrorKind};
 use crate::lexer::{is_alpha, is_space};
 use crate::macros::MacroImplementation;
 use crate::state::{StackFrame, State};
@@ -58,7 +57,7 @@ pub(crate) fn process(mut state: State, stderr: &mut dyn Write) -> crate::error:
                     quotation_level += 1;
                     state.output.write_all(&state.parse_config.quote_open_tag)?;
                 } else if l == EOF {
-                    return Err(crate::Error::new(crate::ErrorKind::UnclosedQuote));
+                    return Err(state.fatal(stderr, format_args!("end of file in string")));
                 } else if quotation_level > 0 {
                     log::trace!(
                         "Writing quoted content to output: {:?}",
@@ -116,6 +115,7 @@ pub(crate) fn process(mut state: State, stderr: &mut dyn Write) -> crate::error:
                 } else {
                     let mut frame =
                         StackFrame::new(0, definition.clone(), state.input.current_location());
+                    state.check_nesting(stderr, state.output.stack.len() + 1)?;
 
                     if l == b'(' {
                         // A parenthesised call always has at least one (possibly
@@ -135,7 +135,7 @@ pub(crate) fn process(mut state: State, stderr: &mut dyn Write) -> crate::error:
         } else if t == EOF {
             if state.input.input_len() == 1 {
                 if !state.output.stack.is_empty() {
-                    return Err(Error::new(ErrorKind::UnclosedParenthesis));
+                    return Err(state.fatal(stderr, format_args!("end of file in argument list")));
                 }
                 break 'main_loop;
             }

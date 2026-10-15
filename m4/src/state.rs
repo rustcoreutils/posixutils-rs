@@ -7,7 +7,14 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::{cell::RefCell, collections::HashMap, io::Write, process::ExitStatus, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    io::Write,
+    path::{Path, PathBuf},
+    process::ExitStatus,
+    rc::Rc,
+};
 
 use crate::{
     input::{Input, InputState, InputStateRef, Location},
@@ -31,8 +38,13 @@ pub struct State {
     /// The call site of the built-in being run, if one is. See
     /// [`State::location`].
     pub call_site: Option<Location>,
-    /// `-E`: any diagnostic makes the final exit status a failure.
-    pub fatal_warnings: bool,
+    /// `-E` given once: any diagnostic makes the final exit status a failure;
+    /// twice: the first one stops m4.
+    pub fatal_warnings: u8,
+    /// `-I` directories, then `M4PATH`. See [`State::open_input`].
+    pub include_dirs: Vec<PathBuf>,
+    /// `-L`. See [`State::check_nesting`].
+    pub nesting_limit: usize,
 }
 
 impl State {
@@ -90,7 +102,7 @@ impl State {
         &mut self,
         stderr: &mut dyn Write,
         args: std::fmt::Arguments<'_>,
-    ) -> std::io::Result<()> {
+    ) -> crate::Result<()> {
         self.diagnose(stderr, format_args!("Warning: {args}"))
     }
 
@@ -101,7 +113,7 @@ impl State {
         &mut self,
         stderr: &mut dyn Write,
         args: std::fmt::Arguments<'_>,
-    ) -> std::io::Result<()> {
+    ) -> crate::Result<()> {
         self.diagnose(stderr, args)
     }
 
@@ -112,7 +124,7 @@ impl State {
         &mut self,
         stderr: &mut dyn Write,
         args: std::fmt::Arguments<'_>,
-    ) -> std::io::Result<()> {
+    ) -> crate::Result<()> {
         self.diagnose(stderr, args)?;
         self.exit_error = true;
         Ok(())
@@ -134,7 +146,7 @@ impl State {
         &mut self,
         stderr: &mut dyn Write,
         args: std::fmt::Arguments<'_>,
-    ) -> std::io::Result<()> {
+    ) -> crate::Result<()> {
         let (name, line) = self.location();
         writeln!(
             stderr,
@@ -143,10 +155,78 @@ impl State {
             line,
             args
         )?;
-        if self.fatal_warnings {
-            self.exit_error = true;
+        match self.fatal_warnings {
+            0 => {}
+            1 => self.exit_error = true,
+            _ => return Err(crate::Error::new(crate::ErrorKind::Exit(1))),
         }
         Ok(())
+    }
+
+    /// Open the input file `path`: as named, or else, unless it is absolute,
+    /// in each `-I` directory in turn. Returns the name it was found under,
+    /// which is what diagnostics and `__file__` then report.
+    pub fn open_input(&self, path: &Path) -> std::io::Result<(std::fs::File, PathBuf)> {
+        let first_error = match std::fs::File::open(path) {
+            Ok(file) => return Ok((file, path.to_path_buf())),
+            Err(error) => error,
+        };
+        if !path.is_absolute() {
+            for dir in &self.include_dirs {
+                let candidate = dir.join(path);
+                if let Ok(file) = std::fs::File::open(&candidate) {
+                    return Ok((file, candidate));
+                }
+            }
+        }
+        Err(first_error)
+    }
+
+    /// Apply the command-line options that shape the initial state.
+    pub fn configure(&mut self, args: &crate::Args) {
+        self.include_dirs = args.include_dirs.clone();
+        // GNU m4 searches `M4PATH` after the `-I` directories.
+        if let Some(path) = std::env::var_os("M4PATH") {
+            self.include_dirs
+                .extend(std::env::split_paths(&path).filter(|dir| !dir.as_os_str().is_empty()));
+        }
+        self.fatal_warnings = args.fatal_warnings;
+        self.nesting_limit = args.nesting_limit;
+        if args.prefix_builtins {
+            for builtin in BuiltinMacro::enumerate() {
+                self.macro_definitions.remove(builtin.as_ref());
+                let mut name = b"m4_".to_vec();
+                name.extend_from_slice(builtin.as_ref());
+                let name = MacroName(name);
+                let definition = Rc::new(MacroDefinition::new_builtin(name.clone(), *builtin));
+                self.macro_definitions.insert(name, vec![definition]);
+            }
+        }
+    }
+
+    /// Diagnose an error m4 cannot continue past, in GNU m4's
+    /// `m4:<file>:<line>: ERROR: ...` form, and give the error that stops it
+    /// with exit status 1.
+    pub fn fatal(&mut self, stderr: &mut dyn Write, args: std::fmt::Arguments<'_>) -> crate::Error {
+        match self.diagnose(stderr, format_args!("ERROR: {args}")) {
+            Err(error) => error,
+            Ok(()) => crate::Error::new(crate::ErrorKind::Exit(1)),
+        }
+    }
+
+    /// Diagnose a macro call nested deeper than `-L` allows, and stop: GNU
+    /// m4 treats it as fatal, since the input is almost certainly recursing
+    /// without end.
+    pub fn check_nesting(&mut self, stderr: &mut dyn Write, depth: usize) -> crate::Result<()> {
+        if self.nesting_limit == 0 || depth <= self.nesting_limit {
+            return Ok(());
+        }
+        let limit = self.nesting_limit;
+        self.diagnose(
+            stderr,
+            format_args!("recursion limit of {limit} exceeded, use -L<N> to change it"),
+        )?;
+        Err(crate::Error::new(crate::ErrorKind::Exit(1)))
     }
 }
 
@@ -192,7 +272,9 @@ impl Default for State {
             input: InputStateRef::default(),
             trace: Trace::default(),
             call_site: None,
-            fatal_warnings: false,
+            fatal_warnings: 0,
+            include_dirs: Vec::new(),
+            nesting_limit: 0,
         }
     }
 }

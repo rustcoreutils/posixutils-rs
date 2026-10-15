@@ -97,6 +97,9 @@ pub struct Make {
     /// The modification times of targets without commands, as they were
     /// before their prerequisites were made; see `prerequisite_mtime`.
     frozen_mtimes: std::sync::Mutex<HashMap<String, Option<SystemTime>>>,
+    /// Targets whose commands ran in this run: known by the name they are
+    /// written under from then on, never by one `VPATH` found.
+    remade: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Targets already known to reach no dependency cycle.
     acyclic: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Target rules (non-special, non-inference).
@@ -295,8 +298,14 @@ impl Make {
     /// directory part is, as in GNU make: automake's subdir-objects builds
     /// out of tree compile `common/force.o` from `$(srcdir)/common/force.c`
     /// (dpkg, gmp, libffi, xz-utils and others).
+    ///
+    /// A target whose commands ran is the file they made here, as in GNU
+    /// make: `$<` then names `parse.c`, not the stale `$(srcdir)/parse.c`.
     pub fn resolve_vpath(&self, name: &str) -> String {
-        if name.starts_with('/') || std::path::Path::new(name).exists() {
+        if name.starts_with('/')
+            || std::path::Path::new(name).exists()
+            || self.remade.lock().unwrap().contains(name)
+        {
             return name.to_string();
         }
         // A `vpath` pattern is more specific than the blanket `VPATH` macro, so
@@ -740,6 +749,7 @@ impl Make {
         if let Some(inference_rule) = inferred {
             let inference_rule = inference_rule.with_prerequisites(&prerequisites);
             self.run_inference(&inference_rule, target, up_to_date, &newer, &scope)?;
+            self.mark_remade(target);
             return Ok(self.changed_since(target, mtime_before));
         }
 
@@ -749,6 +759,7 @@ impl Make {
         if dispatch == Dispatch::Inference {
             let rule = rule.with_prerequisites(&prerequisites);
             self.run_inference(&rule, target, up_to_date, &newer, &scope)?;
+            self.mark_remade(target);
             return Ok(self.changed_since(target, mtime_before));
         }
 
@@ -765,7 +776,16 @@ impl Make {
         }
 
         self.with_env(&scope, |env| rule.run(env, target, up_to_date, &newer))?;
+        self.mark_remade(target);
         Ok(self.changed_since(target, mtime_before))
+    }
+
+    /// Record that `target`'s commands ran; see `resolve_vpath`.
+    fn mark_remade(&self, target: &Target) {
+        self.remade
+            .lock()
+            .unwrap()
+            .insert(target.as_ref().to_string());
     }
 
     /// Whether `target`, whose commands just ran, counts as remade for the
@@ -1389,6 +1409,7 @@ impl TryFrom<(Makefile, Config)> for Make {
             pattern_vars,
             mentioned: Default::default(),
             frozen_mtimes: Default::default(),
+            remade: Default::default(),
             acyclic: Default::default(),
             default_rule: None,
             sccs_get: None,

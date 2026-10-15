@@ -159,3 +159,25 @@ fn an_implicit_rule_for_the_found_name_still_applies() {
     dir.make(&["-C", "b"])
         .ok("yacc ../src/parse.y to parse.c\ncc\n");
 }
+
+// A prerequisite whose commands ran is the file they made here, not the
+// stale one VPATH found, as in GNU make: `$<` and `$^` name `parse.c`.
+#[test]
+fn a_remade_prerequisite_is_named_where_it_was_made() {
+    let dir = Dir::new("am_vpath_remade");
+    dir.write("src/parse.c", "");
+    dir.write("src/parse.y", "");
+    std::fs::File::options()
+        .write(true)
+        .open(dir.path("src/parse.c"))
+        .unwrap()
+        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000))
+        .unwrap();
+    dir.write(
+        "b/Makefile",
+        "VPATH = ../src\nall: parse.o\nparse.o: parse.c\n\t@echo cc $< [$^]\n\
+         %.c: %.y\n\t@echo yacc $< to $@\n",
+    );
+    dir.make(&["-C", "b"])
+        .ok("yacc ../src/parse.y to parse.c\ncc parse.c [parse.c]\n");
+}

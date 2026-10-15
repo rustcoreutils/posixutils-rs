@@ -111,6 +111,15 @@ impl Args {
                     .allow_hyphen_values(true)
                     .action(clap::ArgAction::Append),
             )
+            .arg(
+                // autom4te always passes it; the extensions it names are the
+                // only mode there is.
+                clap::Arg::new("gnu")
+                    .short('g')
+                    .long("gnu")
+                    .help(gettext("Enable the GNU extensions (always enabled)"))
+                    .action(clap::ArgAction::SetTrue),
+            )
             .arg(clap::Arg::new("file").action(clap::ArgAction::Append))
     }
 

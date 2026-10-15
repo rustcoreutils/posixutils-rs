@@ -45,15 +45,26 @@ macro_rules! macro_enums {
         impl MacroImplementation for MacroDefinitionImplementation {
             fn evaluate(
                 &self,
-                state: State,
+                mut state: State,
                 stderr: &mut dyn Write,
                 f: StackFrame,
             ) -> Result<State> {
                 state.trace.trace(&state.output.stack, &f, stderr)?;
-                match self {
-                    $(Self::$variant_name(d) => d.evaluate(state, stderr, f)),*,
-                    Self::UserDefined(d) => d.evaluate(state, stderr, f),
+                let builtin = match self {
+                    Self::UserDefined(d) => return d.evaluate(state, stderr, f),
+                    _ => self.builtin().expect("not user-defined"),
+                };
+                state.call_site = Some(f.location.clone());
+                if !check_arity(&mut state, stderr, builtin, &f)? {
+                    state.call_site = None;
+                    return Ok(state);
                 }
+                let mut state = match self {
+                    $(Self::$variant_name(d) => d.evaluate(state, stderr, f)),*,
+                    Self::UserDefined(_) => unreachable!("handled above"),
+                }?;
+                state.call_site = None;
+                Ok(state)
             }
         }
 
@@ -105,6 +116,7 @@ macro_enums!(
         Incr(IncrMacro),
         Index(IndexMacro),
         Len(LenMacro),
+        Line(LineMacro),
         M4exit(M4exitMacro),
         M4wrap(M4wrapMacro),
         Maketemp(MkstempMacro),
@@ -146,6 +158,7 @@ impl AsRef<[u8]> for BuiltinMacro {
             Incr => b"incr",
             Index => b"index",
             Len => b"len",
+            Line => b"__line__",
             M4exit => b"m4exit",
             M4wrap => b"m4wrap",
             Maketemp => b"maketemp",
@@ -167,6 +180,14 @@ impl AsRef<[u8]> for BuiltinMacro {
 }
 
 impl BuiltinMacro {
+    /// The built-in called `name` before any renaming.
+    pub fn from_name(name: &[u8]) -> Option<Self> {
+        Self::enumerate()
+            .iter()
+            .copied()
+            .find(|b| b.as_ref() == name)
+    }
+
     pub fn name(&self) -> MacroName {
         MacroName::try_from_slice(self.as_ref()).expect("Expected valid builtin macro name")
     }
@@ -194,6 +215,7 @@ impl BuiltinMacro {
             Incr => 1,
             Index => 1,
             Len => 1,
+            Line => 0,
             M4exit => 0,
             M4wrap => 1,
             Maketemp => 1,
@@ -213,6 +235,38 @@ impl BuiltinMacro {
         }
     }
 
+    /// How many arguments the built-in takes, least and most, as GNU m4
+    /// counts them. Fewer is diagnosed and the call expands to nothing;
+    /// more is diagnosed and the rest ignored.
+    fn arity(&self) -> (usize, Option<usize>) {
+        use BuiltinMacro::*;
+        match self {
+            Divnum | Dnl | File | Line | Sysval => (0, Some(0)),
+            Changecom | Changequote => (0, Some(2)),
+            Divert | M4exit => (0, Some(1)),
+            Dumpdef | Traceoff | Traceon | Undivert => (0, None),
+            // Handles its own short argument lists.
+            Ifelse => (0, None),
+            Decr | Incr | Include | Len | Maketemp | Mkstemp | Sinclude | Syscmd => (1, Some(1)),
+            Define | Pushdef => (1, Some(2)),
+            Defn | Errprint | M4wrap | Popdef | Shift | Undefine => (1, None),
+            Eval => (1, Some(3)),
+            Ifdef => (2, Some(3)),
+            Index => (2, Some(2)),
+            Substr | Translit => (2, Some(3)),
+        }
+    }
+
+    /// Whether a call with too few arguments still runs, after the
+    /// diagnostic: GNU m4 makes `index(abc)` 0, and `substr(abc)` and
+    /// `translit(abc)` abc.
+    fn runs_when_short(&self) -> bool {
+        matches!(
+            self,
+            BuiltinMacro::Index | BuiltinMacro::Substr | BuiltinMacro::Translit
+        )
+    }
+
     pub fn parse_config(&self) -> MacroParseConfig {
         MacroParseConfig {
             name: self.name(),
@@ -227,6 +281,17 @@ pub(crate) struct MacroDefinition {
 }
 
 impl MacroDefinition {
+    /// `builtin`, under the name `name`.
+    pub fn new_builtin(name: MacroName, builtin: BuiltinMacro) -> Self {
+        Self {
+            parse_config: MacroParseConfig {
+                name,
+                min_args: builtin.min_args(),
+            },
+            implementation: builtin.implementation(),
+        }
+    }
+
     pub fn new_user_defined(name: MacroName, definition: Vec<u8>) -> Self {
         Self {
             parse_config: MacroParseConfig { name, min_args: 0 },
@@ -243,6 +308,34 @@ impl std::fmt::Debug for MacroDefinition {
             .field("parse_config", &self.parse_config)
             .finish()
     }
+}
+
+/// Diagnose a call to `builtin` with arguments outside its
+/// [`BuiltinMacro::arity`], in GNU m4's words, naming it as it was called.
+/// Returns whether the built-in should run.
+fn check_arity(
+    state: &mut State,
+    stderr: &mut dyn Write,
+    builtin: BuiltinMacro,
+    frame: &StackFrame,
+) -> Result<bool> {
+    let (min, max) = builtin.arity();
+    let n_args = frame.args.len();
+    let name = &frame.definition.parse_config.name;
+    if n_args < min {
+        state.emit_warning(
+            stderr,
+            format_args!("too few arguments to builtin `{name}'"),
+        )?;
+        return Ok(builtin.runs_when_short());
+    }
+    if max.is_some_and(|max| n_args > max) {
+        state.emit_warning(
+            stderr,
+            format_args!("excess arguments to builtin `{name}' ignored"),
+        )?;
+    }
+    Ok(true)
 }
 
 pub trait MacroImplementation {

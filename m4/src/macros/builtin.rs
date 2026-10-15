@@ -22,10 +22,8 @@ use nom::IResult;
 use crate::error::{Result, ResultExt};
 use crate::input::{Input, InputRead};
 use crate::lexer::{
-    MacroName, MacroParseConfig, DEFAULT_COMMENT_CLOSE_TAG, DEFAULT_QUOTE_CLOSE_TAG,
-    DEFAULT_QUOTE_OPEN_TAG,
+    MacroName, DEFAULT_COMMENT_CLOSE_TAG, DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG,
 };
-use crate::macros::user_defined::UserDefinedMacro;
 use crate::macros::MacroDefinition;
 use crate::output::{DivertBufferNumber, BUILTIN_DEFN_PREFIX, BUILTIN_DEFN_SUFFIX};
 use crate::state::{StackFrame, State};
@@ -90,87 +88,43 @@ impl MacroImplementation for DnlMacro {
 pub struct DefineMacro;
 
 impl DefineMacro {
-    fn define(
-        state: State,
-        stderr: &mut dyn Write,
-        frame: StackFrame,
-    ) -> Result<(State, Option<MacroDefinition>)> {
+    /// The definition `define(name, text)` or `pushdef(name, text)` makes.
+    ///
+    /// Any string names a macro, as in GNU m4: one that is not a name token
+    /// can never be called by name, but `defn`, `indir`, `ifdef` and the rest
+    /// reach it, and m4sugar keeps its state in macros such as
+    /// `_m4_divert(KILL)`. A missing text defines the macro as empty.
+    fn define(frame: StackFrame) -> MacroDefinition {
         let mut args = frame.args.into_iter();
-        let name = if let Some(name_bytes) = args.next() {
-            if let Ok(name) = MacroName::try_from_slice(&name_bytes) {
-                name
-            } else {
-                let msg = gettext("invalid macro name `{}' in builtin `define'").replacen(
-                    "{}",
-                    &String::from_utf8_lossy(&name_bytes),
-                    1,
-                );
-                state.emit_warning(stderr, format_args!("{msg}"))?;
-                return Ok((state, None));
-            }
-        } else {
-            state.emit_warning(
-                stderr,
-                format_args!("{}", gettext("too few arguments to builtin `define'")),
-            )?;
-            return Ok((state, None));
-        };
-        let definition = if let Some(definition) = args.next() {
-            definition
-        } else {
-            state.emit_warning(
-                stderr,
-                format_args!("{}", gettext("too few arguments to builtin `define'")),
-            )?;
-            return Ok((state, None));
-        };
-        log::debug!(
-            "DefineMacro::define() defined macro {name}: {:?}",
-            String::from_utf8_lossy(&definition)
-        );
+        let name = MacroName(args.next().unwrap_or_default());
+        let definition = args.next().unwrap_or_default();
         // `defn(<built-in>)` produces a marker; reconstruct that built-in under
-        // the new name (preserving its argument-parsing requirement).
-        if let Some(builtin_name) = decode_builtin_defn(&definition) {
-            if let Some(builtin) = BuiltinMacro::enumerate()
-                .iter()
-                .find(|b| b.name().0.as_slice() == builtin_name)
-            {
-                let definition = MacroDefinition {
-                    parse_config: MacroParseConfig {
-                        name,
-                        min_args: builtin.min_args(),
-                    },
-                    implementation: builtin.implementation(),
-                };
-                return Ok((state, Some(definition)));
-            }
+        // the new name.
+        if let Some(builtin) = decode_builtin_defn(&definition).and_then(BuiltinMacro::from_name) {
+            return MacroDefinition::new_builtin(name, builtin);
         }
-        let definition = MacroDefinition {
-            parse_config: MacroParseConfig { name, min_args: 0 },
-            implementation: MacroDefinitionImplementation::UserDefined(UserDefinedMacro {
-                definition,
-            }),
-        };
-        Ok((state, Some(definition)))
+        MacroDefinition::new_user_defined(name, definition)
     }
 }
 
 impl MacroImplementation for DefineMacro {
-    fn evaluate(&self, state: State, stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
-        let (mut state, definition) = DefineMacro::define(state, stderr, frame)?;
-        let definition = match definition {
-            Some(definition) => definition,
-            None => return Ok(state),
-        };
+    fn evaluate(
+        &self,
+        mut state: State,
+        _stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
+        let definition = Rc::new(DefineMacro::define(frame));
         let name = definition.parse_config.name.clone();
-        log::trace!("DefineMacro::evaluate() inserting new macro definition for {name}");
-
-        let definition = Rc::new(definition);
-        if let Some(e) = state.macro_definitions.get_mut(&name) {
-            let last = e.last_mut().expect(AT_LEAST_ONE_MACRO_DEFINITION_EXPECT);
-            *last = definition;
-        } else {
-            state.macro_definitions.insert(name, vec![definition]);
+        match state.macro_definitions.get_mut(&name) {
+            Some(stack) => {
+                *stack
+                    .last_mut()
+                    .expect(AT_LEAST_ONE_MACRO_DEFINITION_EXPECT) = definition
+            }
+            None => {
+                state.macro_definitions.insert(name, vec![definition]);
+            }
         }
         Ok(state)
     }
@@ -182,20 +136,19 @@ impl MacroImplementation for DefineMacro {
 pub struct PushdefMacro;
 
 impl MacroImplementation for PushdefMacro {
-    fn evaluate(&self, state: State, stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
-        let (mut state, definition) = DefineMacro::define(state, stderr, frame)?;
-        let definition = match definition {
-            Some(definition) => definition,
-            None => return Ok(state),
-        };
+    fn evaluate(
+        &self,
+        mut state: State,
+        _stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
+        let definition = Rc::new(DefineMacro::define(frame));
         let name = definition.parse_config.name.clone();
-        log::debug!("PushdefMacro::evaluate() pushing new macro definition for {name}");
-        let definition = Rc::new(definition);
-        if let Some(e) = state.macro_definitions.get_mut(&name) {
-            e.push(definition);
-        } else {
-            state.macro_definitions.insert(name, vec![definition]);
-        }
+        state
+            .macro_definitions
+            .entry(name)
+            .or_default()
+            .push(definition);
         Ok(state)
     }
 }
@@ -212,18 +165,13 @@ impl MacroImplementation for PopdefMacro {
         _stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
-        if let Some(arg) = frame.args.into_iter().next() {
-            if let Ok(name) = MacroName::try_from_slice(&arg) {
-                if let Some(n_remaining_definitions) =
-                    state.macro_definitions.get_mut(&name).map(|e| {
-                        e.pop();
-                        e.len()
-                    })
-                {
-                    // This was the last definition, so the entry should be removed entirely.
-                    if n_remaining_definitions == 0 {
-                        state.macro_definitions.remove(&name);
-                    }
+        for arg in frame.args {
+            let name = MacroName(arg);
+            if let Some(stack) = state.macro_definitions.get_mut(&name) {
+                stack.pop();
+                // That was the last definition: the macro is now undefined.
+                if stack.is_empty() {
+                    state.macro_definitions.remove(&name);
                 }
             }
         }
@@ -243,10 +191,8 @@ impl MacroImplementation for UndefineMacro {
         _stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
-        if let Some(arg) = frame.args.into_iter().next() {
-            if let Ok(name) = MacroName::try_from_slice(&arg) {
-                state.macro_definitions.remove(&name);
-            }
+        for arg in frame.args {
+            state.macro_definitions.remove(&MacroName(arg));
         }
         Ok(state)
     }
@@ -258,7 +204,12 @@ impl MacroImplementation for UndefineMacro {
 pub struct DefnMacro;
 
 impl MacroImplementation for DefnMacro {
-    fn evaluate(&self, state: State, stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
         // The quoted definitions of every named macro, in order; an undefined
         // name contributes nothing. A built-in has no text, so it can only be
         // the whole result: with one argument it becomes the marker that
@@ -407,54 +358,23 @@ impl MacroImplementation for ChangecomMacro {
     fn evaluate(
         &self,
         mut state: State,
-        stderr: &mut dyn Write,
+        _stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
-        let args_len = frame.args.len();
-
-        if args_len == 0 {
+        // GNU m4: an empty or missing start string disables comments, and a
+        // missing end string is the <newline> (POSIX), not the previous one.
+        let mut args = frame.args.into_iter();
+        let open_tag = args.next().unwrap_or_default();
+        if open_tag.is_empty() {
             state.parse_config.comment_enabled = false;
-            log::trace!("ChangecomMacro::evaluate() reset to default");
             return Ok(state);
         }
-
-        let mut args = frame.args.into_iter();
-        let open_tag = args.next().expect("1 argument should be present");
-        if !open_tag.is_empty() {
-            log::trace!(
-                "ChangecomMacro::evaluate() comment_open_tag set to {:?}",
-                String::from_utf8_lossy(&open_tag)
-            );
-            state.parse_config.comment_enabled = true;
-            state.parse_config.comment_open_tag = open_tag;
-            // POSIX: with a single argument, the <newline> becomes the
-            // end-comment string (don't retain a previously set close tag).
-            if args_len < 2 {
-                state.parse_config.comment_close_tag = DEFAULT_COMMENT_CLOSE_TAG.to_vec();
-            }
-        }
-
-        if args_len >= 2 {
-            let close_tag = args.next().expect("2 arguments should be present");
-            if !close_tag.is_empty() {
-                log::trace!(
-                    "ChangecomMacro::evaluate() comment_close_tag set to {:?}",
-                    String::from_utf8_lossy(&close_tag)
-                );
-                state.parse_config.comment_close_tag = close_tag;
-            }
-        }
-
-        if args_len > 2 {
-            state.emit_warning(
-                stderr,
-                format_args!(
-                    "{}",
-                    gettext("excess arguments to builtin `changecom' ignored")
-                ),
-            )?;
-        }
-
+        state.parse_config.comment_enabled = true;
+        state.parse_config.comment_open_tag = open_tag;
+        state.parse_config.comment_close_tag = match args.next() {
+            Some(close_tag) if !close_tag.is_empty() => close_tag,
+            _ => DEFAULT_COMMENT_CLOSE_TAG.to_vec(),
+        };
         Ok(state)
     }
 }
@@ -465,7 +385,7 @@ impl MacroImplementation for ChangequoteMacro {
     fn evaluate(
         &self,
         mut state: State,
-        stderr: &mut dyn Write,
+        _stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
         match frame.args.len() {
@@ -474,16 +394,7 @@ impl MacroImplementation for ChangequoteMacro {
                 DEFAULT_QUOTE_CLOSE_TAG.clone_into(&mut state.parse_config.quote_close_tag);
             }
             1 => {}
-            args_len @ 2.. => {
-                if args_len > 2 {
-                    state.emit_warning(
-                        stderr,
-                        format_args!(
-                            "{}",
-                            gettext("excess arguments to builtin `changequote' ignored")
-                        ),
-                    )?;
-                }
+            2.. => {
                 let mut args = frame.args.into_iter();
                 let open_tag = args.next().expect("2 arguments should be present");
                 let close_tag = args.next().expect("2 arguments should be present");
@@ -572,7 +483,12 @@ impl MacroImplementation for DecrMacro {
 pub struct IfelseMacro;
 
 impl MacroImplementation for IfelseMacro {
-    fn evaluate(&self, state: State, stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
         let mut args_len = frame.args.len();
         if args_len < 3 {
             // POSIX 103940 says ifelse "takes three or more arguments" and
@@ -655,11 +571,7 @@ impl MacroImplementation for IfdefMacro {
         let second_arg = args
             .next()
             .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
-        let name = MacroName::try_from_slice(&first_arg).ok();
-        if name
-            .map(|name| state.macro_definitions.contains_key(&name))
-            .unwrap_or(false)
-        {
+        if state.macro_definitions.contains_key(first_arg.as_slice()) {
             state.input.pushback_string(&second_arg);
         } else if let Some(third_arg) = args.next() {
             state.input.pushback_string(&third_arg);
@@ -714,18 +626,15 @@ impl MacroImplementation for LenMacro {
 pub struct IndexMacro;
 
 impl MacroImplementation for IndexMacro {
-    fn evaluate(&self, state: State, stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
+    fn evaluate(&self, state: State, _stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
         let mut args = frame.args.into_iter();
         let first_arg = args
             .next()
             .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
         let second_arg = match args.next() {
             Some(second_arg) => second_arg,
+            // Already diagnosed: `index(abc)` is 0.
             None => {
-                state.emit_warning(
-                    stderr,
-                    format_args!("{}", gettext("too few arguments to builtin `index'")),
-                )?;
                 state.input.pushback_character(b'0');
                 return Ok(state);
             }
@@ -887,31 +796,36 @@ impl MacroImplementation for SubstrMacro {
 pub struct DumpdefMacro;
 
 impl MacroImplementation for DumpdefMacro {
-    fn evaluate(&self, state: State, stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
         // Collect first, then print sorted by name -- with no arguments every
         // macro, otherwise the named ones -- as GNU m4 does; autom4te reads
         // the list of built-ins out of a bare `dumpdef`.
-        let mut found: Vec<(&MacroName, &MacroDefinition)> = Vec::new();
+        let current = |definitions: &Vec<Rc<MacroDefinition>>| {
+            definitions
+                .last()
+                .expect(AT_LEAST_ONE_MACRO_DEFINITION_EXPECT)
+                .clone()
+        };
+        let mut found: Vec<(MacroName, Rc<MacroDefinition>)> = Vec::new();
         if frame.args.is_empty() {
             for (name, definitions) in state.macro_definitions.iter() {
-                let definition = definitions
-                    .last()
-                    .expect(AT_LEAST_ONE_MACRO_DEFINITION_EXPECT);
-                found.push((name, definition));
+                found.push((name.clone(), current(definitions)));
             }
         }
-        for arg in &frame.args {
-            match state
-                .macro_definitions
-                .get_key_value(&MacroName(arg.clone()))
-            {
-                Some((name, definitions)) => found.push((
-                    name,
-                    definitions
-                        .last()
-                        .expect(AT_LEAST_ONE_MACRO_DEFINITION_EXPECT),
-                )),
+        for arg in frame.args {
+            let name = MacroName(arg);
+            match state.macro_definitions.get(&name) {
+                Some(definitions) => {
+                    let definition = current(definitions);
+                    found.push((name, definition));
+                }
                 None => {
+                    let arg = &name.0;
                     let msg = gettext("undefined macro `{}'").replacen(
                         "{}",
                         &String::from_utf8_lossy(arg),
@@ -1279,17 +1193,30 @@ impl MacroImplementation for UndivertMacro {
     }
 }
 
+/// `__file__`: the quoted name of the input the call began in.
 pub struct FileMacro;
 
 impl MacroImplementation for FileMacro {
     fn evaluate(&self, state: State, _stderr: &mut dyn Write, _frame: StackFrame) -> Result<State> {
-        let name = state.input.with(|input_state| {
-            match &input_state.input.last().expect("At least one input").input {
-                InputRead::File { path, .. } => path.as_os_str().as_encoded_bytes().to_vec(),
-                InputRead::Stdin(_) => b"stdin".to_vec(),
-            }
-        });
+        let (name, _) = state.location();
+        state
+            .input
+            .pushback_string(&state.parse_config.quote_close_tag);
         state.input.pushback_string(&name);
+        state
+            .input
+            .pushback_string(&state.parse_config.quote_open_tag);
+        Ok(state)
+    }
+}
+
+/// `__line__`: the line the call began on.
+pub struct LineMacro;
+
+impl MacroImplementation for LineMacro {
+    fn evaluate(&self, state: State, _stderr: &mut dyn Write, _frame: StackFrame) -> Result<State> {
+        let (_, line) = state.location();
+        state.input.pushback_string(line.to_string().as_bytes());
         Ok(state)
     }
 }

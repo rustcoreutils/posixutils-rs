@@ -105,3 +105,100 @@ fn copied_builtin_keeps_its_identity() {
         0,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Macro names, one-argument define, predefined macros
+// ---------------------------------------------------------------------------
+
+// m4sugar keeps state in macros whose names are not name tokens, such as
+// `_m4_divert(KILL)`, and reaches them through defn, ifdef and the like.
+#[test]
+fn any_string_names_a_macro() {
+    m4(
+        &[],
+        "define(`a-b',`AB')define(`',`empty')dnl
+1 ifdef(`a-b',yes,no) ifdef(`',yes,no) [defn(`a-b')] [defn(`')]
+pushdef(`a-b',`2')pushdef(`x y',`3')dnl
+2 defn(`a-b') defn(`x y')
+popdef(`a-b',`x y')dnl
+3 defn(`a-b') ifdef(`x y',yes,no)
+undefine(`a-b',`')dnl
+4 ifdef(`a-b',yes,no) ifdef(`',yes,no)
+",
+        "1 yes yes [AB] [empty]\n2 2 3\n3 AB no\n4 no no\n",
+        "",
+        0,
+    );
+}
+
+#[test]
+fn one_argument_define_defines_an_empty_macro() {
+    m4(
+        &[],
+        "define(`one')[one] ifdef(`one',yes,no)\n",
+        "[] yes\n",
+        "",
+        0,
+    );
+}
+
+// m4sugar refuses to run unless `__gnu__` is defined.
+#[test]
+fn gnu_predefined_macros() {
+    m4(
+        &["--gnu"],
+        "[__gnu__] [__unix__] __line__ [ifdef(`unix',u)]\ndefine(`L',`__line__')L __line__(
+)
+dumpdef(`__gnu__',`__unix__',`__line__')",
+        "[] [] 1 []\n2 2\n",
+        "m4:stdin:2: Warning: excess arguments to builtin `__line__' ignored\n__gnu__:\t\n__line__:\t<__line__>\n__unix__:\t\n",
+        0,
+    );
+}
+
+#[test]
+fn builtin_argument_counts_are_checked() {
+    m4(
+        &[],
+        "ifdef(`a') len(a,b) translit(abc) define(`a',`b',`c')a\n",
+        " 1 abc b\n",
+        "m4:stdin:1: Warning: too few arguments to builtin `ifdef'
+m4:stdin:1: Warning: excess arguments to builtin `len' ignored
+m4:stdin:1: Warning: too few arguments to builtin `translit'
+m4:stdin:1: Warning: excess arguments to builtin `define' ignored
+",
+        0,
+    );
+}
+
+// A diagnostic names the line the call began on, not the line its
+// arguments ended on.
+#[test]
+fn diagnostics_name_the_line_a_call_began_on() {
+    m4(
+        &[],
+        "\nlen(a,\nb)\n",
+        "\n1\n",
+        "m4:stdin:2: Warning: excess arguments to builtin `len' ignored\n",
+        0,
+    );
+}
+
+// changecom with no arguments disables comments inside macro arguments too.
+#[test]
+fn disabled_comments_stay_disabled_inside_arguments() {
+    m4(
+        &[],
+        "changecom(`1')changecom index(a 1b,b)\n",
+        " 3\n",
+        "",
+        0,
+    );
+    m4(
+        &[],
+        "changecom(`1')changecom() index(a 1b,b)\n",
+        " 3\n",
+        "",
+        0,
+    );
+}

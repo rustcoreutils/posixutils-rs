@@ -73,6 +73,15 @@ impl Default for ParseConfig {
 #[derive(PartialEq, Clone, Hash, Eq)]
 pub struct MacroName(pub Vec<u8>);
 
+/// Lets the macro table be searched with a byte slice, without building a
+/// `MacroName` for every word read. `Vec<u8>` hashes as its slice, so the two
+/// agree.
+impl std::borrow::Borrow<[u8]> for MacroName {
+    fn borrow(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 impl std::fmt::Debug for MacroName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("MacroName")

@@ -114,7 +114,8 @@ pub(crate) fn process(mut state: State, stderr: &mut dyn Write) -> crate::error:
                 if l != b'(' && definition.parse_config.min_args > 0 {
                     state.output.write_all(&token)?;
                 } else {
-                    let mut frame = StackFrame::new(0, definition.clone());
+                    let mut frame =
+                        StackFrame::new(0, definition.clone(), state.input.current_location());
 
                     if l == b'(' {
                         // A parenthesised call always has at least one (possibly
@@ -199,9 +200,10 @@ pub(crate) fn process(mut state: State, stderr: &mut dyn Write) -> crate::error:
                 }
                 _ => {
                     // Output comment
-                    if state
-                        .input
-                        .look_ahead(t, &state.parse_config.comment_open_tag)?
+                    if state.parse_config.comment_enabled
+                        && state
+                            .input
+                            .look_ahead(t, &state.parse_config.comment_open_tag)?
                     {
                         state.input.enter_literal_scan();
                         state

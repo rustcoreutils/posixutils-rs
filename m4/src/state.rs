@@ -10,7 +10,7 @@
 use std::{cell::RefCell, collections::HashMap, io::Write, process::ExitStatus, rc::Rc};
 
 use crate::{
-    input::{Input, InputState, InputStateRef},
+    input::{Input, InputState, InputStateRef, Location},
     lexer::{is_alphnumeric, MacroName, ParseConfig},
     macros::{trace::Trace, BuiltinMacro, MacroDefinition},
     output::{Output, OutputState},
@@ -28,6 +28,11 @@ pub struct State {
     pub output: OutputState,
     pub input: InputStateRef,
     pub trace: Trace,
+    /// The call site of the built-in being run, if one is. See
+    /// [`State::location`].
+    pub call_site: Option<Location>,
+    /// `-E`: any diagnostic makes the final exit status a failure.
+    pub fatal_warnings: bool,
 }
 
 impl State {
@@ -73,7 +78,7 @@ impl State {
 
         Ok(self
             .macro_definitions
-            .get(&MacroName::try_from_slice(token).expect("valid macro name"))
+            .get(token.as_slice())
             .map(|v| v.last())
             .unwrap_or_default()
             .cloned())
@@ -82,36 +87,22 @@ impl State {
     /// Emit a non-fatal warning to stderr in the GNU `m4:<file>:<line>: Warning:`
     /// form. Warnings do not affect the exit status (see [`State::emit_error`]).
     pub fn emit_warning(
-        &self,
+        &mut self,
         stderr: &mut dyn Write,
         args: std::fmt::Arguments<'_>,
     ) -> std::io::Result<()> {
-        let (name, line) = self.input.current_location();
-        writeln!(
-            stderr,
-            "m4:{}:{}: Warning: {}",
-            String::from_utf8_lossy(&name),
-            line,
-            args
-        )
+        self.diagnose(stderr, format_args!("Warning: {args}"))
     }
 
     /// Emit a non-fatal diagnostic that GNU m4 words without the `Warning:`
     /// tag, in the `m4:<file>:<line>:` form. Like a warning, it does not
     /// affect the exit status.
     pub fn emit_message(
-        &self,
+        &mut self,
         stderr: &mut dyn Write,
         args: std::fmt::Arguments<'_>,
     ) -> std::io::Result<()> {
-        let (name, line) = self.input.current_location();
-        writeln!(
-            stderr,
-            "m4:{}:{}: {}",
-            String::from_utf8_lossy(&name),
-            line,
-            args
-        )
+        self.diagnose(stderr, args)
     }
 
     /// Emit a recoverable error diagnostic to stderr (GNU `m4:<file>:<line>:`
@@ -122,7 +113,29 @@ impl State {
         stderr: &mut dyn Write,
         args: std::fmt::Arguments<'_>,
     ) -> std::io::Result<()> {
-        let (name, line) = self.input.current_location();
+        self.diagnose(stderr, args)?;
+        self.exit_error = true;
+        Ok(())
+    }
+
+    /// Where a diagnostic happens: the line a macro call began on while a
+    /// built-in runs, as GNU m4 reports it (and `__line__` expands to),
+    /// otherwise the current input position.
+    pub fn location(&self) -> Location {
+        match &self.call_site {
+            Some(location) => location.clone(),
+            None => self.input.current_location(),
+        }
+    }
+
+    /// Write `m4:<file>:<line>: <args>` and apply `--fatal-warnings`: every
+    /// diagnostic then makes the final exit status a failure.
+    fn diagnose(
+        &mut self,
+        stderr: &mut dyn Write,
+        args: std::fmt::Arguments<'_>,
+    ) -> std::io::Result<()> {
+        let (name, line) = self.location();
         writeln!(
             stderr,
             "m4:{}:{}: {}",
@@ -130,7 +143,9 @@ impl State {
             line,
             args
         )?;
-        self.exit_error = true;
+        if self.fatal_warnings {
+            self.exit_error = true;
+        }
         Ok(())
     }
 }
@@ -144,22 +159,31 @@ impl std::fmt::Debug for State {
     }
 }
 
+/// Text macros defined at startup, as GNU m4 defines them, so that input can
+/// test which m4 it runs under: m4sugar refuses to run without `__gnu__`.
+const PREDEFINED_TEXT_MACROS: &[&[u8]] = &[b"__gnu__", b"__unix__"];
+
 impl Default for State {
     fn default() -> Self {
+        let builtins = BuiltinMacro::enumerate().iter().map(|builtin| {
+            let parse_config = builtin.parse_config();
+            (
+                parse_config.name.clone(),
+                vec![Rc::new(MacroDefinition {
+                    parse_config,
+                    implementation: builtin.implementation(),
+                })],
+            )
+        });
+        let predefined = PREDEFINED_TEXT_MACROS.iter().map(|name| {
+            let name = MacroName(name.to_vec());
+            (
+                name.clone(),
+                vec![Rc::new(MacroDefinition::new_user_defined(name, Vec::new()))],
+            )
+        });
         Self {
-            macro_definitions: BuiltinMacro::enumerate()
-                .iter()
-                .map(|builtin| {
-                    let parse_config = builtin.parse_config();
-                    (
-                        parse_config.name.clone(),
-                        vec![Rc::new(MacroDefinition {
-                            parse_config,
-                            implementation: builtin.implementation(),
-                        })],
-                    )
-                })
-                .collect(),
+            macro_definitions: builtins.chain(predefined).collect(),
             parse_config: ParseConfig::default(),
             exit_error: false,
             m4wrap: Vec::new(),
@@ -167,6 +191,8 @@ impl Default for State {
             output: OutputState::default(),
             input: InputStateRef::default(),
             trace: Trace::default(),
+            call_site: None,
+            fatal_warnings: false,
         }
     }
 }
@@ -175,14 +201,22 @@ pub struct StackFrame {
     pub parenthesis_level: usize,
     pub args: Vec<Vec<u8>>,
     pub definition: Rc<MacroDefinition>,
+    /// Where the macro's name was read: GNU m4 reports a call, and runs it,
+    /// at the line it began on rather than the line its arguments ended on.
+    pub location: Location,
 }
 
 impl StackFrame {
-    pub fn new(parenthesis_level: usize, definition: Rc<MacroDefinition>) -> Self {
+    pub fn new(
+        parenthesis_level: usize,
+        definition: Rc<MacroDefinition>,
+        location: Location,
+    ) -> Self {
         Self {
             parenthesis_level,
             args: Vec::new(),
             definition,
+            location,
         }
     }
 }

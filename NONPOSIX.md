@@ -676,6 +676,15 @@ table is present.
  * `eval` accepts `0b` / `0B` binary literals.
  * Diversion numbers greater than 9.
 
+The GNU m4 extensions autoconf, automake and libtoolize cannot run without:
+
+ * Any string names a macro for `define`, `pushdef`, `popdef`, `undefine`,
+   `defn`, `ifdef` and `dumpdef`; m4sugar keeps state in macros such as
+   `_m4_divert(KILL)`.  `define` with one argument defines an empty macro.
+ * `__gnu__` and `__unix__` are predefined as empty (m4sugar refuses to run
+   without `__gnu__`), and `__line__` expands to the line a call began on.
+ * `-g` / `--gnu` is accepted; GNU mode is the only mode.
+
 ### make
 
  * `-C dir` / `--directory dir` — change directory before reading the makefile.

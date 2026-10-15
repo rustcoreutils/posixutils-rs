@@ -16,6 +16,9 @@ use std::{
 
 use crate::EOF;
 
+/// An input's name and a line number in it, as diagnostics print them.
+pub type Location = (Rc<[u8]>, usize);
+
 /// Sentinel for [`InputState::output_current_line`] meaning "the input file
 /// changed": the next directive emitted must carry the file name.
 const SYNCLINE_FILE_CHANGED: i64 = -1;
@@ -223,16 +226,10 @@ impl InputState {
     /// The name and current line number of the active input, for diagnostics
     /// (`stdin` when reading standard input). Used to format GNU-style
     /// `m4:<file>:<line>:` messages.
-    pub fn current_location(&self) -> (Vec<u8>, usize) {
+    pub fn current_location(&self) -> Location {
         match self.input.last() {
-            Some(input) => {
-                let name = match &input.input {
-                    InputRead::File { path, .. } => path.as_os_str().as_encoded_bytes().to_vec(),
-                    InputRead::Stdin(_) => b"stdin".to_vec(),
-                };
-                (name, input.line_number)
-            }
-            None => (b"stdin".to_vec(), 0),
+            Some(input) => (input.name.clone(), input.line_number),
+            None => (b"stdin".as_slice().into(), 0),
         }
     }
 }
@@ -243,13 +240,6 @@ pub struct InputStateRef(Rc<RefCell<InputState>>);
 impl InputStateRef {
     pub fn new(input_state: InputState) -> Self {
         Self(Rc::new(RefCell::new(input_state)))
-    }
-
-    pub fn with<F, T>(&self, f: F) -> T
-    where
-        F: Fn(&InputState) -> T,
-    {
-        f(&self.0.borrow())
     }
 
     pub fn input_pop(&self) -> Option<Input> {
@@ -300,13 +290,16 @@ impl InputStateRef {
         self.0.borrow_mut().leave_literal_scan()
     }
 
-    pub fn current_location(&self) -> (Vec<u8>, usize) {
+    pub fn current_location(&self) -> Location {
         self.0.borrow().current_location()
     }
 }
 
 pub struct Input {
     pub input: InputRead,
+    /// The name diagnostics and `__file__` give this input: its path as
+    /// given, or `stdin`. Shared, because every macro call records it.
+    pub name: Rc<[u8]>,
     pub pushback_buffer: Vec<u8>,
     pub line_number: usize,
     /// A `<newline>` has been consumed but not yet accounted for. See
@@ -316,8 +309,13 @@ pub struct Input {
 
 impl Input {
     pub fn new(input: InputRead) -> Self {
+        let name: Rc<[u8]> = match &input {
+            InputRead::File { path, .. } => path.as_os_str().as_encoded_bytes().into(),
+            InputRead::Stdin(_) => b"stdin".as_slice().into(),
+        };
         Self {
             input,
+            name,
             pushback_buffer: Vec::new(),
             line_number: 1,
             pending_newline: false,

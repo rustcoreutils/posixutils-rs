@@ -378,9 +378,14 @@ impl Processor<'_> {
     }
 
     /// `.NOTPARALLEL` forces make to update one target at a time regardless of
-    /// `-j`. It must have no prerequisites or commands.
+    /// `-j`. It must have no commands.
+    ///
+    /// POSIX says an application shall not give it prerequisites, but bash's
+    /// debian/rules has `.NOTPARALLEL: build`, run by this make. GNU make
+    /// 4.4 makes only those targets' prerequisites serial, and earlier
+    /// versions ignore them; either way serialising everything is a correct
+    /// build, so the prerequisites are accepted and the whole run is serial.
     fn process_not_parallel(self) -> Result<(), Error> {
-        self.without_prerequisites()?;
         self.without_recipes()?;
         self.make.config.not_parallel = true;
         Ok(())

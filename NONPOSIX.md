@@ -793,6 +793,9 @@ value) m4 does as POSIX says instead:
  * A `%` pattern rule without commands is not used: in GNU make it cancels
    a built-in pattern rule.  automake ends every Makefile with
    `%:: %,v`, `%:: SCCS/s.%` and three more of them.
+ * `.NOTPARALLEL` with prerequisites is accepted, and the whole run is
+   serial.  POSIX says an application shall not give it any; bash's
+   debian/rules, run by this make, has `.NOTPARALLEL: build`.
 
 ### man
 

@@ -27,6 +27,7 @@ mod escaped_hash;
 mod include_remaking;
 mod makeflags;
 mod no_rule;
+mod not_parallel;
 mod order_only;
 mod recipe_continuation;
 mod shell_status;

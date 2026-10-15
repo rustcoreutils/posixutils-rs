@@ -23,13 +23,16 @@ this m4 does as GNU m4 does by default, and as POSIX says when
   `m4_substr`: tar's testsuite, which autotest generates from `.at` files
   containing UTF-8 text, came out with a test group that no shell could
   parse when m4 counted characters under `LANG=C.UTF-8`.
+* `m4wrap` text runs last in, first out, as in GNU m4 1.4; under
+  `POSIXLY_CORRECT`, in the order the `m4wrap` calls were made.  GNU
+  autoconf's m4sugar calls `m4wrap` once and orders its own hooks, but
+  autoconf-dickey (the autoconf 2.52 fork ncurses' `configure` is generated
+  with) does not: its `m4_init` wraps a check that every `m4_divert_push`
+  was popped, then pushes `KILL` and wraps the matching pop, which must run
+  first.  It does not pass `--gnu`, so this has to be the default.
 
 One difference remains: `regexp` and `patsubst` take the first alternative
 that matches where GNU regex takes the longest.
-
-`m4wrap` text runs first-in first-out, as POSIX says; GNU m4 1.4 runs it
-last-in first-out.  m4sugar calls `m4wrap` once and orders its own hooks, so
-this does not reach autoconf.
 
 ## [`sendmail`](https://www.proofpoint.com/us/products/email-protection/open-source-email-solution)
 
@@ -90,19 +93,21 @@ documentation drifting away from the code, and did not.
 no two runs agree. Only stdout is compared; diagnostic wording is deliberately
 ours.
 
-### Known intentional divergence
+### `m4wrap` order
 
-`m4wrap` is FIFO here and LIFO in GNU m4 1.4.x:
+`m4wrap` is LIFO by default, as in GNU m4 1.4.x, and FIFO under
+`POSIXLY_CORRECT`:
 
 ```
 m4wrap(`W1 ')m4wrap(`W2 ')body
-  ours:  body / W1 W2
-  GNU:   body / W2 W1
+  default, and GNU m4 1.4:  body / W2 W1
+  POSIXLY_CORRECT:          body / W1 W2
 ```
 
 POSIX says the wrapped text is "processed in the order in which the `m4wrap`
-macros were processed", which is FIFO. GNU 2.0 changed to match. This one is
-deliberate and is not a sendmail-compatibility question.
+macros were processed", which is FIFO, but autoconf-dickey depends on GNU's
+order (see the autoconf section above).  Neither is a sendmail-compatibility
+question.
 
 ### Unverified
 

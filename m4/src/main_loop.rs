@@ -297,17 +297,28 @@ fn write_plain(state: &mut State, t: u8, bulk: bool, run: &mut Vec<u8>) -> crate
     state.output.write_all(run)
 }
 
-/// Run queued m4wrap text at the true end of all input, rescanned, in the
-/// order the m4wrap calls were made (POSIX).
+/// Run queued m4wrap text at the true end of all input, rescanned: last
+/// queued first, as GNU m4 1.4 does, or under `POSIXLY_CORRECT` in the order
+/// the m4wrap calls were made, as POSIX says. autoconf-dickey's `m4_init`,
+/// which ncurses builds with, wraps a balance check and then a
+/// `m4_divert_pop` that must run before it.
 pub(crate) fn run_wrapped(mut state: State, stderr: &mut dyn Write) -> crate::error::Result<State> {
     // Wrapped text may itself expand macros, divert, or queue further m4wrap
     // text, so loop until the queue is empty. It runs in whatever diversion
     // is current, as in GNU m4, and each piece keeps the location of its
-    // m4wrap call.
+    // m4wrap call. The pieces are read as one text, so a call may begin in
+    // one and end in the next, as in GNU m4.
     while !state.m4wrap.is_empty() {
         let wrapped: Vec<(Vec<u8>, Location)> = std::mem::take(&mut state.m4wrap);
-        for (text, location) in wrapped.iter().rev() {
-            state.input.pushback_string_at(text, location);
+        // Pushed back last to first: the piece pushed last is read first.
+        if state.posixly_correct {
+            for (text, location) in wrapped.iter().rev() {
+                state.input.pushback_string_at(text, location);
+            }
+        } else {
+            for (text, location) in &wrapped {
+                state.input.pushback_string_at(text, location);
+            }
         }
         state = process(state, stderr)?;
     }

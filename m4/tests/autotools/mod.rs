@@ -10,7 +10,7 @@
 //! What autoconf, automake and libtoolize need from m4.  Every expected
 //! output below was produced by GNU m4 1.4.19 from the same input.
 
-use plib::testing::{run_test, run_test_base, run_test_base_with_env, TestPlan};
+use plib::testing::{run_test, run_test_base, run_test_base_with_env, run_test_with_env, TestPlan};
 
 /// Run m4 with `args` on `stdin` and require exactly this stdout, stderr and
 /// exit status.
@@ -798,5 +798,86 @@ fn len_index_substr_translit_count_characters_under_posixly_correct() {
             MULTIBYTE_COUNTING
         ),
         "1 2 é|b aXb XéY\n".as_bytes()
+    );
+}
+
+/// Run m4 on `stdin` with `env` set and require exactly this stdout,
+/// stderr and exit status.
+fn m4_env(env: &[(&str, &str)], stdin: &str, stdout: &str, stderr: &str, status: i32) {
+    run_test_with_env(
+        TestPlan {
+            cmd: String::from("m4"),
+            args: Vec::new(),
+            stdin_data: String::from(stdin),
+            expected_out: String::from(stdout),
+            expected_err: String::from(stderr),
+            expected_exit_code: status,
+        },
+        env,
+    );
+}
+
+// Wrapped text queued while wrapped text runs is a second round, ordered the
+// same way.
+const M4WRAP_ORDER: &str =
+    "m4wrap(`W1 ')m4wrap(`W2 ')m4wrap(`[a m4wrap(`c ')m4wrap(`d ')] ')m4wrap(`W3 ')body\n";
+
+// GNU m4 1.4 runs m4wrap text last in, first out.
+#[test]
+fn m4wrap_runs_last_in_first_out_by_default() {
+    m4(&[], M4WRAP_ORDER, "body\nW3 [a ] W2 W1 d c ", "", 0);
+    // The pieces of a round are read as one text, so a call can begin in
+    // one and end in the next.
+    m4(
+        &[],
+        "define(`x', `<$1>')m4wrap(`)')m4wrap(`x(')body\n",
+        "body\n<>",
+        "",
+        0,
+    );
+}
+
+// POSIX: "in the order in which the m4wrap macros were processed".
+#[test]
+fn m4wrap_runs_in_order_under_posixly_correct() {
+    m4_env(
+        &[("POSIXLY_CORRECT", "1")],
+        M4WRAP_ORDER,
+        "body\nW1 W2 [a ] W3 c d ",
+        "",
+        0,
+    );
+}
+
+/// autoconf-dickey's `m4_init`, which ncurses' configure is generated with,
+/// reduced to the macros it uses: it wraps a check that every
+/// `m4_divert_push` was popped, then pushes `KILL` and wraps the pop, which
+/// must run first.  autoconf-dickey does not pass `--gnu`.
+const DICKEY_M4_INIT: &str = "changequote([,])dnl
+define([_m4_divert(KILL)], -1)dnl
+define([_m4_divert], [ifdef([_m4_divert($1)], [indir([_m4_divert($1)])], [$1])])dnl
+define([m4_divert_push], [pushdef([_m4_divert_diversion], [$1])\
+divert(_m4_divert(_m4_divert_diversion))])dnl
+define([m4_divert_pop], [popdef([_m4_divert_diversion])\
+divert(ifdef([_m4_divert_diversion], [_m4_divert(_m4_divert_diversion)], -1))])dnl
+define([m4_init], [m4wrap([ifdef([_m4_divert_diversion], [errprint([m4_init: unbalanced m4_divert_push
+])m4exit(1)])[]])dnl
+m4_divert_push([KILL])
+m4wrap([m4_divert_pop([KILL])[]])])dnl
+before
+m4_init()dnl
+killed
+";
+
+#[test]
+fn autoconf_dickey_m4_init_balances() {
+    m4(&[], DICKEY_M4_INIT, "before\n", "", 0);
+    // In POSIX order the check runs before the pop it checks for.
+    m4_env(
+        &[("POSIXLY_CORRECT", "1")],
+        DICKEY_M4_INIT,
+        "before\n",
+        "m4_init: unbalanced m4_divert_push\n",
+        1,
     );
 }

@@ -1019,6 +1019,9 @@ impl MacroImplementation for M4exitMacro {
 /// times, the arguments specified shall be processed in the order in which the `m4wrap` macros were
 /// processed. The behavior is unspecified if `m4wrap` is not immediately followed by a
 /// `<left-parenthesis>`.
+///
+/// That order holds under `POSIXLY_CORRECT`; by default the last text queued runs first, as in
+/// GNU m4 1.4: see `main_loop::run_wrapped`.
 pub struct M4wrapMacro;
 
 impl MacroImplementation for M4wrapMacro {

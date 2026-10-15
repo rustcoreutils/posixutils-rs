@@ -564,7 +564,7 @@ fn take_till_eol(letters: &mut Peekable<impl Iterator<Item = char>>) -> String {
     let mut content = String::new();
 
     while let Some(letter) = letters.peek() {
-        if matches!(letter, '\n' | '#') {
+        if *letter == '\n' {
             break;
         };
         content.push(*letter);
@@ -1285,10 +1285,10 @@ impl Reader {
             // A command line reaches the shell verbatim, `#` included.
             self.out.push_str(line);
         } else {
-            // Strip the comment *before* expanding, so a reference inside one
-            // is never evaluated -- a commented-out `$(shell rm -rf ...)`
-            // must not run (audit #51).
-            let code = super::scan::strip_comment(line);
+            // `handle_line` stripped the comment *before* this expansion, so a
+            // reference inside one is never evaluated -- a commented-out
+            // `$(shell rm -rf ...)` must not run (audit #51).
+            let code = line;
             // A command after the rule line's `;` is a command line, and like
             // any other is expanded by the rule stage, not here: expanding it
             // with the rest of the line used macros defined only so far.
@@ -1298,8 +1298,10 @@ impl Reader {
             // header emitted by an eval on a rule line would otherwise close
             // the enclosing rule and steal its recipe.
             self.drain_evals()?;
-            self.out.push_str(&expanded);
-            self.out.push_str(command);
+            // A `#` here is literal -- it was written `\#`, or came from a
+            // macro -- and the rule parser strips comments again.
+            self.out.push_str(&super::scan::escape_hashes(&expanded));
+            self.out.push_str(&super::scan::escape_hashes(command));
         }
         self.out.push('\n');
         Ok(())
@@ -1616,9 +1618,13 @@ impl Reader {
         // conditional at all -- the comment used to reach `parse_directive`
         // as part of the condition, so the makefile failed outright, and
         // `ifdef X  # why` silently took the `else` arm (audit #81).
+        let stripped;
         let line = match lines[i].starts_with('\t') {
             true => lines[i],
-            false => super::scan::strip_comment(lines[i]),
+            false => {
+                stripped = super::scan::strip_comment(lines[i]);
+                stripped.as_ref()
+            }
         };
 
         if let Some(directive) = parse_directive(line) {

@@ -178,7 +178,7 @@ enum Line<'a> {
     /// A macro definition or include line, already handled upstream.
     Consumed,
     /// Any other non-empty line, which begins a new entry.
-    Entry(&'a str),
+    Entry(std::borrow::Cow<'a, str>),
 }
 
 /// Classify one physical line.
@@ -197,7 +197,7 @@ fn classify(line: &str) -> Line<'_> {
     if code.trim().is_empty() {
         return Line::Ignorable;
     }
-    if is_macro_definition(code) || is_include_line(code) {
+    if is_macro_definition(&code) || is_include_line(&code) {
         return Line::Consumed;
     }
     Line::Entry(code)
@@ -322,7 +322,7 @@ impl Builder {
             return;
         }
         if let Line::Entry(code) = classify(body) {
-            self.open(code, lineno);
+            self.open(&code, lineno);
         }
     }
 
@@ -378,7 +378,7 @@ fn parse_scanned(
         match classify(line) {
             Line::Command(body) => builder.push_command(body, lineno),
             Line::Ignorable | Line::Consumed => {}
-            Line::Entry(code) => builder.open(code, lineno),
+            Line::Entry(code) => builder.open(&code, lineno),
         }
     }
 

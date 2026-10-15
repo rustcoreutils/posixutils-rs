@@ -760,6 +760,9 @@ The GNU m4 extensions autoconf, automake and libtoolize cannot run without:
    flags per library and per pattern (`%-mt : CPPFLAGS_DYNLIB := ...`).
    Command lines are therefore expanded just before they run, with the
    target's macros, as GNU make does.
+ * `\#` outside a command line is a literal `#`, not the start of a
+   comment, as in GNU make.  libzstd writes `NUM_SYMBOL := \#`, and
+   build-essential's debian/rules `$(shell grep -v '^\#' ...)`.
  * A `%` pattern rule without commands is not used: in GNU make it cancels
    a built-in pattern rule.  automake ends every Makefile with
    `%:: %,v`, `%:: SCCS/s.%` and three more of them.

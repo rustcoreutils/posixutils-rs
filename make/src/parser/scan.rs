@@ -33,11 +33,35 @@ pub(crate) struct RuleLine {
 ///
 /// Must not be applied to command lines — POSIX 105629 hands those to the shell
 /// verbatim, where `#` is meaningful (`@echo '#!/bin/sh'`).
-pub(crate) fn strip_comment(line: &str) -> &str {
-    match line.find('#') {
-        Some(i) => &line[..i],
-        None => line,
+///
+/// A `#` after a backslash is a literal `#`, and the backslash goes (GNU
+/// make): libzstd writes `NUM_SYMBOL := \#`, and build-essential
+/// `$(shell grep -v '^\#' ...)`, where a comment would cut the reference in
+/// half.
+pub(crate) fn strip_comment(line: &str) -> std::borrow::Cow<'_, str> {
+    let mut escaped = false;
+    let mut end = line.len();
+    for (i, c) in line.char_indices() {
+        match c {
+            '#' if !escaped => {
+                end = i;
+                break;
+            }
+            '\\' => escaped = !escaped,
+            _ => escaped = false,
+        }
     }
+    let code = &line[..end];
+    match code.contains("\\#") {
+        true => std::borrow::Cow::Owned(code.replace("\\#", "#")),
+        false => std::borrow::Cow::Borrowed(code),
+    }
+}
+
+/// Write each `#` of `text` as `\#`, so that [`strip_comment`] gives it
+/// back as it is rather than taking it for a comment.
+pub(crate) fn escape_hashes(text: &str) -> String {
+    text.replace('#', "\\#")
 }
 
 /// Split on runs of `<blank>`. Deliberately not `split_whitespace`, which also
@@ -143,6 +167,10 @@ mod tests {
         assert_eq!(strip_comment("comment: # this is a comment"), "comment: ");
         assert_eq!(strip_comment("no comment here"), "no comment here");
         assert_eq!(strip_comment("# whole line"), "");
+        // An escaped `#` is literal; an escaped backslash escapes nothing.
+        assert_eq!(strip_comment("X := \\# # c"), "X := # ");
+        assert_eq!(strip_comment("X := a\\\\# c"), "X := a\\\\");
+        assert_eq!(strip_comment(&escape_hashes("a#b")), "a#b");
     }
 
     #[test]

@@ -20,6 +20,7 @@ mod computed_names;
 mod curdir;
 mod double_colon;
 mod empty_targets;
+mod escaped_hash;
 mod include_remaking;
 mod makeflags;
 mod order_only;

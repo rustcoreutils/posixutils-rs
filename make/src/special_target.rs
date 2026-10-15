@@ -161,26 +161,35 @@ impl TryFrom<(Target, Config)> for InferenceTarget {
     /// suffix, which filed `.config:` as an inference rule for `.c` and made a
     /// bare `make` build the wrong target (audit #38). It also computed `from`
     /// and `to` from the same expression, so both were the same string.
+    ///
+    /// The name is split where both halves are known suffixes, rather than at
+    /// its second `.`: perl's Makefile declares `.SUFFIXES: .c .o .i .s
+    /// .c.depends` and has a `.c.c.depends:` rule, which the split at the dot
+    /// read as a `.c.c` rule making every `.c` file from itself.
     fn try_from((target, config): (Target, Config)) -> Result<Self, Self::Error> {
-        let Target::Inference { from, to, .. } = Target::new(target.to_string()) else {
+        let Target::Inference { .. } = Target::new(target.to_string()) else {
             return Err(ParseError);
         };
-        let known = |suffix: &str| {
-            config
-                .suffixes
-                .iter()
-                .any(|s| s.trim_start_matches('.') == suffix)
+        let name = target.as_ref();
+        let known = |suffix: &str| config.suffixes.iter().any(|s| s == suffix);
+        let mut splits = config
+            .suffixes
+            .iter()
+            .filter(|from| from.len() > 1 && name.starts_with(from.as_str()));
+        let found = splits.find_map(|from| {
+            let to = &name[from.len()..];
+            match to.is_empty() {
+                true => Some((from.clone(), None)),
+                false => known(to).then(|| (from.clone(), Some(to.to_string()))),
+            }
+        });
+        let Some((from, to)) = found else {
+            return Err(ParseError);
         };
-        if !known(&from) {
-            return Err(ParseError);
-        }
-        if to.is_empty() {
-            return Ok(Self { from, to: None });
-        }
-        if !known(&to) {
-            return Err(ParseError);
-        }
-        Ok(Self { from, to: Some(to) })
+        Ok(Self {
+            from: from[1..].to_string(),
+            to: to.map(|to| to[1..].to_string()),
+        })
     }
 }
 

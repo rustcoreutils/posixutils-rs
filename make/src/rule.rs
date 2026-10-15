@@ -196,6 +196,19 @@ impl Rule {
         merged
     }
 
+    /// This inference rule with its target's two suffixes given: `from`, and
+    /// `to` (empty for a single-suffix rule), each without its leading dot.
+    pub fn with_suffixes(mut self, from: &str, to: &str) -> Rule {
+        if let Some(target) = self.targets.first_mut() {
+            *target = Target::Inference {
+                name: target.as_ref().to_string(),
+                from: from.to_string(),
+                to: to.to_string(),
+            };
+        }
+        self
+    }
+
     /// This rule with `names` as its prerequisites: an inference rule run
     /// for a target rule without commands, so that `$^`, `$+` and `$?` see
     /// the source and the target rule's prerequisites.

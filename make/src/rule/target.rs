@@ -133,7 +133,10 @@ impl Target {
                     }
                     break;
                 }
-                '.' | ' ' | '\t' | ':' => break,
+                // A suffix may itself hold a dot: perl's Makefile has a
+                // `.c.depends` suffix and a `.c.c.depends:` rule.
+                '.' if !to.is_empty() => to.push('.'),
+                ' ' | '\t' | ':' => break,
                 _ => None?,
             }
             source.next();

@@ -1387,8 +1387,13 @@ impl TryFrom<(Makefile, Config)> for Make {
 
             if SpecialTarget::try_from(target.clone()).is_ok() {
                 special_rules.push(rule);
-            } else if InferenceTarget::try_from((target.clone(), make.config.clone())).is_ok() {
-                make.inference_rules.push(rule);
+            } else if let Ok(inference) =
+                InferenceTarget::try_from((target.clone(), make.config.clone()))
+            {
+                // The suffixes as the known ones split the name, which only
+                // the suffix list can say for `.c.depends.o`.
+                make.inference_rules
+                    .push(rule.with_suffixes(inference.from(), inference.to().unwrap_or("")));
             } else {
                 // POSIX 105653: several rules may name the same target, with
                 // prerequisites accumulating. The old lookup returned the first

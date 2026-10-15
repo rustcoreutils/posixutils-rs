@@ -740,17 +740,17 @@ impl MacroTable {
     /// `None` means undefined, which is what `?=` and `ifdef` test; an
     /// explicitly empty value is defined.
     pub(crate) fn resolve(&self, name: &str, env_wins: bool) -> Option<String> {
+        let entry = self.values.get(name);
+        // The environment is not read for a definition it cannot outrank,
+        // which is nearly every one; `getenv` walks the whole environment.
+        let env_rank = MacroSource::Environment.rank(env_wins);
+        if let Some(entry) = entry.filter(|entry| entry.source.rank(env_wins) >= env_rank) {
+            return Some(entry.value.clone());
+        }
         let from_env = std::env::var(name).ok();
-        let Some(entry) = self.values.get(name) else {
-            return from_env;
-        };
-        match from_env {
-            Some(value)
-                if MacroSource::Environment.rank(env_wins) > entry.source.rank(env_wins) =>
-            {
-                Some(value)
-            }
-            _ => Some(entry.value.clone()),
+        match entry {
+            None => from_env,
+            Some(entry) => from_env.or_else(|| Some(entry.value.clone())),
         }
     }
 

@@ -15,6 +15,7 @@ pub mod parser;
 pub mod rule;
 pub mod signal_handler;
 pub mod special_target;
+mod stat_cache;
 
 use std::os::unix::fs::PermissionsExt;
 use std::{
@@ -100,6 +101,8 @@ pub struct Make {
     /// Targets whose commands ran in this run: known by the name they are
     /// written under from then on, never by one `VPATH` found.
     remade: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// `stat` results since the last command ran.
+    stats: stat_cache::StatCache,
     /// Targets already known to reach no dependency cycle.
     acyclic: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Target rules (non-special, non-inference).
@@ -338,7 +341,7 @@ impl Make {
     /// make: `$<` then names `parse.c`, not the stale `$(srcdir)/parse.c`.
     pub fn resolve_vpath(&self, name: &str) -> String {
         if name.starts_with('/')
-            || std::path::Path::new(name).exists()
+            || self.stats.exists(name)
             || self.remade.lock().unwrap().contains(name)
         {
             return name.to_string();
@@ -348,7 +351,8 @@ impl Make {
         if let Some(found) = self.search_vpath_patterns(name) {
             return found;
         }
-        search_dirs(&self.vpath_dirs(), name).unwrap_or_else(|| name.to_string())
+        self.search_dirs(&self.vpath_dirs(), name)
+            .unwrap_or_else(|| name.to_string())
     }
 
     /// Look `name` up in the directories of the first `vpath` pattern it
@@ -359,7 +363,7 @@ impl Make {
                 continue;
             }
             let dirs: Vec<&str> = entry.dirs.iter().map(String::as_str).collect();
-            if let Some(found) = search_dirs(&dirs, name) {
+            if let Some(found) = self.search_dirs(&dirs, name) {
                 return Some(found);
             }
         }
@@ -415,7 +419,7 @@ impl Make {
     /// some target rule names it as its target or as a prerequisite (GNU
     /// make's term).
     fn exists_or_ought_to(&self, name: &str) -> bool {
-        self.mentioned.contains(name) || std::path::Path::new(&self.resolve_vpath(name)).exists()
+        self.mentioned.contains(name) || self.stats.exists(&self.resolve_vpath(name))
     }
 
     pub fn first_target(&self) -> Result<&Target, ErrorCode> {
@@ -608,7 +612,11 @@ impl Make {
                     // nor an inference rule for the target, the target shall be considered
                     // up-to-date."  Resolved through VPATH: a file supplied by a
                     // search directory exists (audit #66).
-                    if get_modified_time(self.resolve_vpath(name.as_ref())).is_some() {
+                    if self
+                        .stats
+                        .modified(&self.resolve_vpath(name.as_ref()))
+                        .is_some()
+                    {
                         return Ok(false);
                     }
                     // No rule and file doesn't exist - try .DEFAULT or fail
@@ -688,7 +696,7 @@ impl Make {
     /// search directory exists, and treating it as missing is what made
     /// `VPATH` useless for a prerequisite with no rule of its own (audit #66).
     fn newer_prerequisites(&self, target: &str, prerequisites: &[String]) -> Vec<String> {
-        let Some(target_modified) = get_modified_time(self.resolve_vpath(target)) else {
+        let Some(target_modified) = self.stats.modified(&self.resolve_vpath(target)) else {
             // The target does not exist, so everything it needs counts.
             return prerequisites.to_vec();
         };
@@ -716,7 +724,7 @@ impl Make {
         if let Some(frozen) = self.frozen_mtimes.lock().unwrap().get(name) {
             return *frozen;
         }
-        get_modified_time(self.resolve_vpath(name))
+        self.stats.modified(&self.resolve_vpath(name))
     }
 
     /// Runs a rule after bringing its prerequisites up to date.
@@ -738,7 +746,7 @@ impl Make {
             return Err(RecursivePrerequisite { origin });
         }
         let scope = self.scope_for(target.as_ref(), inherited);
-        let mtime_before = get_modified_time(self.resolve_vpath(target.as_ref()));
+        let mtime_before = self.stats.modified(&self.resolve_vpath(target.as_ref()));
 
         let mut prerequisites = self.effective_prerequisites(rule, target, dispatch);
 
@@ -780,7 +788,10 @@ impl Make {
 
         // `$?` is the prerequisites newer than the target.
         let newer = self.newer_prerequisites(target.as_ref(), &prerequisites);
-        let exists = get_modified_time(self.resolve_vpath(target.as_ref())).is_some();
+        let exists = self
+            .stats
+            .modified(&self.resolve_vpath(target.as_ref()))
+            .is_some();
         let phony = self.attributes.is_phony(target.as_ref());
         // A double-colon rule with no prerequisites always runs (GNU make).
         let always = rule.is_double_colon() && prerequisites.is_empty();
@@ -845,7 +856,7 @@ impl Make {
         if self.config.dry_run {
             return true;
         }
-        let after = get_modified_time(self.resolve_vpath(target.as_ref()));
+        let after = self.stats.modified(&self.resolve_vpath(target.as_ref()));
         after.is_none() || after != before
     }
 
@@ -879,7 +890,7 @@ impl Make {
         let Some(rule) = self.sccs_get.as_ref() else {
             return Ok(false);
         };
-        let Some(history) = sccs_history(name) else {
+        let Some(history) = sccs_history(name, &self.stats) else {
             return Ok(false);
         };
         if !needs_sccs_get(name, &history) {
@@ -924,13 +935,16 @@ impl Make {
         };
         let mut exports = self.exports.clone();
         exports.extend(scope.iter().filter(|v| v.exported).map(|v| v.name.clone()));
-        f(&rule::Env {
+        let result = f(&rule::Env {
             config: &self.config,
             table: &table,
             exports: &exports,
             resolve: &resolve,
             attributes: &self.attributes,
-        })
+        });
+        // Commands may have run, failed or not, and changed any file.
+        self.stats.invalidate();
+        result
     }
 
     /// The target-specific assignments in force for `target`: those it
@@ -1180,7 +1194,7 @@ impl Make {
         for include in includes {
             let path = rule::prerequisite::without_dot_slash(include.path.clone());
             let path = path.as_str();
-            let before = get_modified_time(path);
+            let before = self.stats.modified(path);
             if !self.has_rule_for(path) {
                 if before.is_none() && !include.optional {
                     return Err(missing_include(path));
@@ -1193,7 +1207,7 @@ impl Make {
                 Err(_) if include.optional => continue,
                 Err(err) => return Err(err),
             }
-            let after = get_modified_time(path);
+            let after = self.stats.modified(path);
             if after.is_none() && !include.optional {
                 return Err(missing_include(path));
             }
@@ -1285,10 +1299,12 @@ fn inference_source(rule: &Rule, target: &Target) -> Option<String> {
 }
 
 /// Return `name` found under one of `dirs`, if any.
-fn search_dirs(dirs: &[&str], name: &str) -> Option<String> {
-    dirs.iter()
-        .map(|dir| format!("{dir}/{name}"))
-        .find(|candidate| std::path::Path::new(candidate).exists())
+impl Make {
+    fn search_dirs(&self, dirs: &[&str], name: &str) -> Option<String> {
+        dirs.iter()
+            .map(|dir| format!("{dir}/{name}"))
+            .find(|candidate| self.stats.exists(candidate))
+    }
 }
 
 /// The default macros and inference rules POSIX requires make to start with.
@@ -1468,6 +1484,7 @@ impl TryFrom<(Makefile, Config)> for Make {
             mentioned: Default::default(),
             frozen_mtimes: Default::default(),
             remade: Default::default(),
+            stats: Default::default(),
             acyclic: Default::default(),
             default_rule: None,
             sccs_get: None,
@@ -1600,21 +1617,20 @@ fn index_target_vars(vars: &[TargetVar]) -> TargetVarIndex {
 /// This does not touch the `~`-suffix rules' `s.foo.c` form in
 /// `suffix_source_name`: 105481-82 scopes `PROJECTDIR` to "files with a
 /// component named SCCS", and that form has none.
-fn sccs_history(name: &str) -> Option<String> {
+fn sccs_history(name: &str, stats: &stat_cache::StatCache) -> Option<String> {
     let (dir, file) = match name.rfind('/') {
         Some(at) => (&name[..=at], &name[at + 1..]),
         None => ("", name),
     };
     let path = format!("{dir}SCCS/s.{file}");
-    if fs::metadata(&path).is_ok() {
+    if stats.exists(&path) {
         return Some(path);
     }
 
     let project = plib::projectdir::from_env()?;
     let path = plib::projectdir::sccs_dir(&project).join(format!("s.{file}"));
-    fs::metadata(&path)
-        .is_ok()
-        .then(|| path.to_string_lossy().into_owned())
+    let path = path.to_string_lossy().into_owned();
+    stats.exists(&path).then_some(path)
 }
 
 /// Whether `target` should be retrieved from its SCCS history.
@@ -1649,7 +1665,7 @@ fn get_modified_time(path: impl AsRef<str>) -> Option<SystemTime> {
 }
 
 /// Splits an `archive(member)` target into its `(archive, member)` parts.
-fn parse_archive_target(s: &str) -> Option<(&str, &str)> {
+pub(crate) fn parse_archive_target(s: &str) -> Option<(&str, &str)> {
     let s = s.strip_suffix(')')?;
     let open = s.find('(')?;
     let (archive, member) = (&s[..open], &s[open + 1..]);
@@ -1663,7 +1679,7 @@ fn parse_archive_target(s: &str) -> Option<(&str, &str)> {
 /// `archive_path`. Supports the common System V / GNU short-name format (member
 /// names terminated by `/`). Returns `None` if the archive or member is absent
 /// or the header cannot be parsed.
-fn archive_member_mtime(archive_path: &str, member: &str) -> Option<SystemTime> {
+pub(crate) fn archive_member_mtime(archive_path: &str, member: &str) -> Option<SystemTime> {
     const MAGIC: &[u8] = b"!<arch>\n";
     const HEADER_LEN: usize = 60;
 

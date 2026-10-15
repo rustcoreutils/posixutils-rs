@@ -35,11 +35,13 @@ pub enum ErrorCode {
     NotUpToDateError {
         target: String,
     },
-    NoTarget {
-        target: Option<String>,
-    },
+    /// The makefile names no target to build by default.
+    NoTargets,
+    /// `target` has no rule, does not exist, and there is no `.DEFAULT`.
+    /// `needed_by` is the target it is a prerequisite of, if any.
     NoRule {
-        rule: String,
+        target: String,
+        needed_by: Option<String>,
     },
     RecursivePrerequisite {
         origin: String,
@@ -72,8 +74,9 @@ impl From<&ErrorCode> for i32 {
             ParserError { .. } => 4,
             MixedColons { .. } => 4,
             NoMakefile => 5,
-            NoTarget { .. } => 6,
-            NoRule { .. } => 7,
+            NoTargets => 6,
+            // GNU make's status, which nothing in POSIX contradicts.
+            NoRule { .. } => 2,
             RecursivePrerequisite { .. } => 8,
             SpecialTargetConstraintNotFulfilled { .. } => 9,
         }
@@ -107,11 +110,32 @@ impl fmt::Display for ErrorCode {
             IoError(err) => write!(f, "{}: {}", gettext("io error"), err),
             NoMakefile => write!(f, "{}", gettext("no makefile")),
             ParserError { constraint } => write!(f, "{}: {}", gettext("parse error"), constraint),
-            NoTarget { target } => match target {
-                Some(target) => write!(f, "{} '{}'", gettext("no target"), target),
-                None => write!(f, "{}", gettext("no targets to execute")),
-            },
-            NoRule { rule } => write!(f, "{} '{}'", gettext("no rule"), rule),
+            NoTargets => write!(f, "{}", gettext("no targets to execute")),
+            // GNU make's wording, word for word: debhelper decides whether a
+            // makefile has a `test` or `distclean` target by matching it in
+            // the output of `make -n TARGET` (Debian's `exists_make_target`).
+            NoRule {
+                target,
+                needed_by: None,
+            } => write!(
+                f,
+                "*** {} '{}'.  {}",
+                gettext("No rule to make target"),
+                target,
+                gettext("Stop.")
+            ),
+            NoRule {
+                target,
+                needed_by: Some(parent),
+            } => write!(
+                f,
+                "*** {} '{}', {} '{}'.  {}",
+                gettext("No rule to make target"),
+                target,
+                gettext("needed by"),
+                parent,
+                gettext("Stop.")
+            ),
             MixedColons { target } => write!(
                 f,
                 "{} '{}' {}",

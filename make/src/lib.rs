@@ -389,7 +389,7 @@ impl Make {
                 let name = target.as_ref();
                 !name.starts_with('.') || name.contains('/')
             })
-            .ok_or(NoTarget { target: None })
+            .ok_or(NoTargets)
     }
 
     /// Finds a matching inference rule for the given target name.
@@ -544,8 +544,9 @@ impl Make {
                     match &self.default_rule {
                         Some(rule) => rule,
                         None => {
-                            return Err(NoTarget {
-                                target: Some(name.as_ref().to_string()),
+                            return Err(NoRule {
+                                target: name.as_ref().to_string(),
+                                needed_by: None,
                             })
                         }
                     }
@@ -691,7 +692,9 @@ impl Make {
         // was actually rebuilt makes this target stale whatever the timestamps
         // say, and one that is merely older must still be visited -- it may be
         // phony, or stale against its own sources.
-        let rebuilt = self.build_prerequisites(&prerequisites, &scope)?;
+        let rebuilt = self
+            .build_prerequisites(&prerequisites, &scope)
+            .map_err(|err| needed_by(err, target.as_ref()))?;
 
         // Order-only prerequisites (GNU make) are brought up to date too, but
         // whether they were remade, or are newer, says nothing about this
@@ -701,7 +704,8 @@ impl Make {
             .map(|p| p.as_ref().to_string())
             .filter(|name| !prerequisites.contains(name))
             .collect();
-        self.build_prerequisites(&order_only, &scope)?;
+        self.build_prerequisites(&order_only, &scope)
+            .map_err(|err| needed_by(err, target.as_ref()))?;
 
         // `$?` is the prerequisites newer than the target.
         let newer = self.newer_prerequisites(target.as_ref(), &prerequisites);
@@ -1115,6 +1119,22 @@ impl Make {
     }
 }
 
+/// Name `parent` as the target a missing prerequisite was needed by, unless
+/// a target nearer to it is named already: GNU make's `No rule to make target
+/// 'X', needed by 'Y'` names the immediate dependent.
+fn needed_by(err: ErrorCode, parent: &str) -> ErrorCode {
+    match err {
+        NoRule {
+            target,
+            needed_by: None,
+        } => NoRule {
+            target,
+            needed_by: Some(parent.to_string()),
+        },
+        other => other,
+    }
+}
+
 /// The error for an `include` whose file neither exists nor can be made.
 fn missing_include(path: &str) -> ErrorCode {
     let reason = std::io::Error::from_raw_os_error(libc::ENOENT);
@@ -1330,7 +1350,7 @@ impl TryFrom<(Makefile, Config)> for Make {
         for parsed_rule in parsed_rules {
             let rule = Rule::from(parsed_rule);
             let Some(target) = rule.targets().next() else {
-                return Err(NoTarget { target: None });
+                return Err(NoTargets);
             };
             if let Ok(SpecialTarget::Suffixes) = SpecialTarget::try_from(target.clone()) {
                 suffixes_rules.push(rule);
@@ -1387,7 +1407,7 @@ impl TryFrom<(Makefile, Config)> for Make {
 
         for rule in remaining_parsed_rules {
             let Some(target) = rule.targets().next() else {
-                return Err(NoTarget { target: None });
+                return Err(NoTargets);
             };
 
             if SpecialTarget::try_from(target.clone()).is_ok() {

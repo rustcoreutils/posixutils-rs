@@ -620,7 +620,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Err(err) => {
-                eprintln!("make: {}", err);
+                // Under -k, make does not stop, so it does not say it does.
+                let message = err.to_string();
+                let stop = format!("  {}", gettext("Stop."));
+                match keep_going {
+                    true => eprintln!("make: {}", message.strip_suffix(&stop).unwrap_or(&message)),
+                    false => eprintln!("make: {message}"),
+                }
                 had_error = true;
                 if keep_going {
                     // `-k`: report this target, then keep building the

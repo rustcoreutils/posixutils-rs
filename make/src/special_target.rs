@@ -200,7 +200,7 @@ pub struct Processor<'make> {
 
 pub fn process(rule: Rule, make: &mut Make) -> Result<(), ErrorCode> {
     let Some(target) = rule.targets().next().cloned() else {
-        return Err(ErrorCode::NoTarget { target: None });
+        return Err(ErrorCode::NoTargets);
     };
 
     let this = Processor { rule, make };

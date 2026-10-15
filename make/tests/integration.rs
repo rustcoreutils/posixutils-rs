@@ -568,7 +568,7 @@ mod parsing {
             &["-f", "tests/makefiles/parsing/suffixes_with_no_targets.mk"],
             "",
             "make: no targets to execute\n",
-            ErrorCode::NoTarget { target: None }.into(),
+            ErrorCode::NoTargets.into(),
         );
     }
 

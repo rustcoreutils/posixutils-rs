@@ -26,6 +26,7 @@ mod empty_targets;
 mod escaped_hash;
 mod include_remaking;
 mod makeflags;
+mod no_rule;
 mod order_only;
 mod recipe_continuation;
 mod shell_status;

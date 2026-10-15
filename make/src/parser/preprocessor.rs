@@ -36,8 +36,11 @@ pub enum PreprocError {
     BadConditional(String),
     /// `else`/`endif` without a matching `if`, or an unterminated `if`.
     UnmatchedConditional(String),
-    /// A macro whose expansion re-introduces its own reference.
-    RecursiveMacro,
+    /// A delayed-expansion macro whose value refers to itself, directly or
+    /// through other macros: `A = $(A)x`.
+    SelfReference(String),
+    /// Delayed-expansion macros nested deeper than make allows.
+    NestedTooDeep,
     /// A function reported an error, or does not exist.
     FunctionFailed(String),
     /// `$(eval ...)` re-entered the reader too many times.
@@ -58,12 +61,18 @@ impl Display for PreprocError {
             PreprocError::UnmatchedConditional(word) => {
                 writeln!(f, "unmatched '{word}'")
             }
-            PreprocError::RecursiveMacro => {
-                writeln!(
+            // GNU make's words. `write!` for the reason given below.
+            PreprocError::SelfReference(name) => {
+                write!(
                     f,
-                    "macro expansion does not terminate (recursive definition?)"
+                    "Recursive variable '{name}' references itself (eventually)"
                 )
             }
+            PreprocError::NestedTooDeep => write!(
+                f,
+                "macro references nested more than {} deep",
+                func::MAX_MACRO_NESTING
+            ),
             // `write!`, not `writeln!`: a function error crosses the
             // `Result<String, String>` boundary between `func` and here once
             // per nesting level, and each `to_string()` would otherwise append
@@ -662,31 +671,39 @@ fn expand_macro(
     ctx: &func::Ctx,
     out: &mut String,
 ) -> Result<()> {
-    match ctx.lookup(name) {
-        // What expanding the value left for the rule stage is expanded
-        // there; the rest of it expands to itself.
-        Some((value, Flavour::Simple)) if ctx.automatic.is_some() && value.contains('$') => {
-            expand_into(&value, ctx, out)?;
-        }
-        Some((value, Flavour::Simple)) => out.push_str(&value),
-        Some((value, Flavour::Recursive)) => {
-            let _nesting = ctx
-                .state
-                .enter_macro()
-                .ok_or(PreprocError::RecursiveMacro)?;
-            expand_into(&value, ctx, out)?;
-        }
+    let Some(found) = ctx.lookup(name) else {
         // The special `MAKE` macro, when not otherwise defined, is passed
         // through to the rule stage (it expands to the make program and
         // marks the command line for recursive execution).
-        None if name == "MAKE" => {
+        if name == "MAKE" {
             out.push('$');
             out.push(open);
             out.push_str(name);
             out.push(close);
         }
         // POSIX 105833: an undefined macro is the empty string, not an error.
-        None => {}
+        return Ok(());
+    };
+    let value = found.value;
+    match found.flavour {
+        // A value with no `$` in it is what it expands to.
+        _ if !value.contains('$') => out.push_str(&value),
+        // What expanding the value left for the rule stage is expanded
+        // there; the rest of it expands to itself.
+        Flavour::Simple if ctx.automatic.is_some() => expand_into(&value, ctx, out)?,
+        Flavour::Simple => out.push_str(&value),
+        // A macro met again while its own value is being expanded would be
+        // expanded forever: an error, as in GNU make, when it is used.
+        Flavour::Recursive => {
+            let _expanding = ctx
+                .state
+                .enter_macro(name, found.index)
+                .map_err(|reentry| match reentry {
+                    func::Reentry::SelfReference => PreprocError::SelfReference(name.to_string()),
+                    func::Reentry::TooDeep => PreprocError::NestedTooDeep,
+                })?;
+            expand_into(&value, ctx, out)?;
+        }
     }
     Ok(())
 }
@@ -826,6 +843,18 @@ struct MacroEntry {
     value: String,
     source: MacroSource,
     flavour: Flavour,
+    /// Where the name is in the table's definition order: a number for the
+    /// macro that stays the same when it is defined again.
+    index: usize,
+}
+
+/// What a reference to a macro finds.
+pub(crate) struct Found<'a> {
+    pub value: Cow<'a, str>,
+    pub flavour: Flavour,
+    /// The table entry's number, unless only the environment defines the
+    /// macro or a function binds it.
+    pub index: Option<usize>,
 }
 
 /// A macro table that remembers first-definition order, so the macros handed
@@ -868,15 +897,20 @@ impl MacroTable {
     /// assignment, and by `override`, which passes [`MacroSource::Override`]
     /// so that what it establishes outranks a command-line macro.
     fn force(&mut self, name: String, body: String, source: MacroSource, flavour: Flavour) {
-        if !self.values.contains_key(&name) {
-            self.order.push(name.clone());
-        }
+        let index = match self.values.get(&name) {
+            Some(entry) => entry.index,
+            None => {
+                self.order.push(name.clone());
+                self.order.len() - 1
+            }
+        };
         self.values.insert(
             name,
             MacroEntry {
                 value: body,
                 source,
                 flavour,
+                index,
             },
         );
     }
@@ -911,16 +945,20 @@ impl MacroTable {
         env_wins: bool,
     ) -> Option<(String, Flavour)> {
         self.lookup(name, env_wins)
-            .map(|(value, flavour)| (value.into_owned(), flavour))
+            .map(|found| (found.value.into_owned(), found.flavour))
     }
 
     /// [`Self::resolve_flavoured`], borrowing the value from the table when
     /// it comes from there, as it nearly always does: expansion asks this
     /// for every reference.
-    pub(crate) fn lookup(&self, name: &str, env_wins: bool) -> Option<(Cow<'_, str>, Flavour)> {
+    pub(crate) fn lookup(&self, name: &str, env_wins: bool) -> Option<Found<'_>> {
         let entry = self.values.get(name);
-        fn from_table(entry: &MacroEntry) -> (Cow<'_, str>, Flavour) {
-            (Cow::Borrowed(entry.value.as_str()), entry.flavour)
+        fn from_table(entry: &MacroEntry) -> Found<'_> {
+            Found {
+                value: Cow::Borrowed(entry.value.as_str()),
+                flavour: entry.flavour,
+                index: Some(entry.index),
+            }
         }
         // The environment is not read for a definition it cannot outrank,
         // which is nearly every one; `getenv` walks the whole environment.
@@ -928,9 +966,11 @@ impl MacroTable {
         if let Some(entry) = entry.filter(|entry| entry.source.rank(env_wins) >= env_rank) {
             return Some(from_table(entry));
         }
-        let from_env = std::env::var(name)
-            .ok()
-            .map(|v| (Cow::Owned(v), Flavour::Recursive));
+        let from_env = std::env::var(name).ok().map(|value| Found {
+            value: Cow::Owned(value),
+            flavour: Flavour::Recursive,
+            index: entry.map(|entry| entry.index),
+        });
         match entry {
             None => from_env,
             Some(entry) => from_env.or_else(|| Some(from_table(entry))),

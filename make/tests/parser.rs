@@ -576,10 +576,28 @@ mod conditionals {
         assert!(preprocess(&src).is_err(), "self-include must not loop");
     }
 
-    // Audit #32: `A = $(A)x` used to grow the text forever.
+    // Audit #32: `A = $(A)x` used to grow the text forever. It is found the
+    // first time `A` is met inside its own value.
     #[test]
     fn recursive_macro_is_capped() {
-        assert!(preprocess("A = $(A)x\nall:\n\techo $(A)\n").is_err());
+        let err = preprocess("A = $(A)x\nall:\n\techo $(A)\n").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Recursive variable 'A' references itself (eventually)"
+        );
+    }
+
+    // Delayed macros nested deeper than the stack can hold are an error, not
+    // a crash.
+    #[test]
+    fn a_too_deep_chain_of_macros_is_an_error() {
+        let mut src = String::new();
+        for i in 1..=500 {
+            src.push_str(&format!("V{i} = $(V{})\n", i + 1));
+        }
+        src.push_str("all: $(V1)\n");
+        let err = preprocess(&src).unwrap_err();
+        assert!(err.to_string().contains("nested more than"), "{err}");
     }
 
     // Audit #34: an undefined macro is the empty string, not a fatal error.
@@ -676,11 +694,11 @@ mod functions {
         assert!(out.contains("[hi a and b]"), "got: {out:?}");
     }
 
-    // A self-referential $(call) recursed through
-    // substitute -> func::call -> expand -> substitute until the stack was
-    // exhausted: "fatal runtime error: stack overflow", core dumped.
-    // MAX_EXPANSION_ROUNDS bounds the rounds within one frame, not the depth of
-    // that cycle, so a separate depth guard was needed.
+    // A self-referential $(call) recursed through expansion -> func::call ->
+    // expansion until the stack was exhausted: "fatal runtime error: stack
+    // overflow", core dumped. `call` expands the body without marking the
+    // macro, as GNU make lets a function recurse, so the depth guard is what
+    // stops it.
     #[test]
     fn self_referential_call_is_capped_not_a_crash() {
         let err = preprocess("A = $(call A)\nall:\n\t@echo $(A)\n");

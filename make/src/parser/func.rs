@@ -18,7 +18,7 @@
 //! three that need their arguments *unexpanded* (`if`, `foreach`, `call`) are
 //! handled separately, before argument expansion.
 
-use crate::parser::preprocessor::{escape_dollars, unescape_dollars, Flavour, MacroTable};
+use crate::parser::preprocessor::{escape_dollars, unescape_dollars, Flavour, Found, MacroTable};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 
@@ -31,11 +31,10 @@ use std::cell::{Cell, RefCell};
 const MAX_EXPANSION_DEPTH: usize = 200;
 
 /// How deep delayed-expansion macros may nest, one expanded inside the
-/// value of another, before we call the expansion non-terminating. POSIX
-/// 105785 asks for at least 100 levels. Each level is a few stack frames,
-/// and a thread Rust starts, a test's among them, has 2 MiB of stack: in a
-/// debug build about 550 levels fill it.
-const MAX_MACRO_NESTING: usize = 400;
+/// value of another. POSIX 105785 asks for at least 100 levels. Each level
+/// is a few stack frames, and a thread Rust starts, a test's among them, has
+/// 2 MiB of stack: in a debug build about 550 levels fill it.
+pub(crate) const MAX_MACRO_NESTING: usize = 400;
 
 /// Per-expansion state shared by every nested `Ctx`.
 ///
@@ -50,7 +49,21 @@ const MAX_MACRO_NESTING: usize = 400;
 pub(crate) struct Expansion {
     depth: Cell<usize>,
     macro_depth: Cell<usize>,
+    /// The delayed-expansion macros whose values are being expanded, one
+    /// bit per table entry, as GNU make flags a variable while it expands
+    /// it: meeting one again means the value refers to itself.
+    expanding: RefCell<Vec<u64>>,
+    /// The same for macros only the environment defines, by name.
+    expanding_env: RefCell<Vec<String>>,
     pending: Option<RefCell<Vec<String>>>,
+}
+
+/// Why a macro's value cannot be expanded where it is referenced.
+pub(crate) enum Reentry {
+    /// Its value is being expanded already: it refers to itself.
+    SelfReference,
+    /// Macros are nested more than [`MAX_MACRO_NESTING`] deep.
+    TooDeep,
 }
 
 impl Expansion {
@@ -105,15 +118,59 @@ impl Expansion {
         Ok(DepthGuard(&self.depth))
     }
 
-    /// Enter the value of one more delayed-expansion macro, or `None` if
-    /// they are nested too deep.
-    pub(crate) fn enter_macro(&self) -> Option<DepthGuard<'_>> {
+    /// Enter the value of the delayed-expansion macro `name`, whose table
+    /// entry is `index` (`None` for one only the environment defines),
+    /// until the guard returned is dropped.
+    pub(crate) fn enter_macro(
+        &self,
+        name: &str,
+        index: Option<usize>,
+    ) -> Result<MacroGuard<'_>, Reentry> {
         let depth = self.macro_depth.get();
         if depth >= MAX_MACRO_NESTING {
-            return None;
+            return Err(Reentry::TooDeep);
+        }
+        match index {
+            Some(index) => {
+                let mut expanding = self.expanding.borrow_mut();
+                let (word, bit) = (index / 64, 1u64 << (index % 64));
+                if word >= expanding.len() {
+                    expanding.resize(word + 1, 0);
+                }
+                if expanding[word] & bit != 0 {
+                    return Err(Reentry::SelfReference);
+                }
+                expanding[word] |= bit;
+            }
+            None => {
+                let mut expanding = self.expanding_env.borrow_mut();
+                if expanding.iter().any(|n| n == name) {
+                    return Err(Reentry::SelfReference);
+                }
+                expanding.push(name.to_string());
+            }
         }
         self.macro_depth.set(depth + 1);
-        Some(DepthGuard(&self.macro_depth))
+        Ok(MacroGuard { state: self, index })
+    }
+}
+
+/// Marks a macro as no longer being expanded when dropped.
+pub(crate) struct MacroGuard<'a> {
+    state: &'a Expansion,
+    index: Option<usize>,
+}
+
+impl Drop for MacroGuard<'_> {
+    fn drop(&mut self) {
+        let state = self.state;
+        state.macro_depth.set(state.macro_depth.get() - 1);
+        match self.index {
+            Some(index) => state.expanding.borrow_mut()[index / 64] &= !(1u64 << (index % 64)),
+            None => {
+                state.expanding_env.borrow_mut().pop();
+            }
+        }
     }
 }
 
@@ -164,9 +221,13 @@ impl<'a> Ctx<'a> {
     /// What `name` holds here, and its flavour: a `foreach` or `call`
     /// binding shadows every definition, and its value is already
     /// expanded, as GNU make binds it.
-    pub(crate) fn lookup(&self, name: &str) -> Option<(Cow<'a, str>, Flavour)> {
+    pub(crate) fn lookup(&self, name: &str) -> Option<Found<'a>> {
         if let Some(value) = self.locals.and_then(|locals| locals.get(name)) {
-            return Some((Cow::Borrowed(value), Flavour::Simple));
+            return Some(Found {
+                value: Cow::Borrowed(value),
+                flavour: Flavour::Simple,
+                index: None,
+            });
         }
         self.table.lookup(name, self.env_wins)
     }
@@ -746,7 +807,12 @@ fn f_call(raw: &str, ctx: &Ctx, expand: Expand) -> Result<String, String> {
     let name = expand(name, ctx)?.trim().to_string();
     // Looked up as a reference would be: a function defined only in the
     // environment is as callable as any other, and `$(F)` already finds it.
-    let Some((body, flavour)) = ctx.lookup(&name) else {
+    let Some(Found {
+        value: body,
+        flavour,
+        ..
+    }) = ctx.lookup(&name)
+    else {
         return Ok(String::new());
     };
     // An immediate-expansion macro was expanded when it was defined; there

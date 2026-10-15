@@ -201,7 +201,6 @@ fn a_long_chain_of_macros_expands() {
 
 /// A macro whose value refers to itself is an error, named, when used.
 #[test]
-#[ignore = "fails until self-reference is detected"]
 fn a_self_referencing_macro_is_named() {
     let dir = Dir::new("expand_self_reference");
     dir.write("Makefile", "A = $(A)x\nall:\n\t@echo $(A)\n");
@@ -219,6 +218,21 @@ fn a_self_referencing_macro_is_named() {
     assert!(
         run.stderr
             .contains("Recursive variable 'A' references itself (eventually)"),
+        "{run:?}"
+    );
+}
+
+/// A macro from the environment is a delayed-expansion one, and can refer
+/// to itself too.
+#[test]
+fn a_self_referencing_environment_macro_is_named() {
+    let dir = Dir::new("expand_self_reference_env");
+    dir.write("Makefile", "all:\n\t@echo $(EV)\n");
+    let run = dir.make_env(&[], &[("EV", "$(EV)x")]);
+    assert_ne!(run.code, Some(0), "{run:?}");
+    assert!(
+        run.stderr
+            .contains("Recursive variable 'EV' references itself (eventually)"),
         "{run:?}"
     );
 }

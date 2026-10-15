@@ -324,9 +324,23 @@ fn f_join(a: &str, b: &str) -> String {
     }))
 }
 
-fn f_shell(command: &str) -> Result<String, String> {
-    let output = std::process::Command::new("sh")
+/// The shell running `command` for `$(shell ...)` or `!=`, "as if it were
+/// passed as the argument to the system() interface" (POSIX 105744-105746):
+/// only its standard output is captured, and it shares make's standard
+/// input and standard error, so its diagnostics are seen. libselinux's
+/// `$(shell $(PKG_CONFIG) --cflags ...)` said nothing when pkg-config could
+/// not find the package.
+pub(crate) fn shell_command(command: &str) -> std::process::Command {
+    let mut shell = std::process::Command::new("sh");
+    shell
         .args(["-c", command])
+        .stdin(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+    shell
+}
+
+fn f_shell(command: &str) -> Result<String, String> {
+    let output = shell_command(command)
         .output()
         .map_err(|e| format!("shell: {}", plib::diag::io_error_text(&e)))?;
     let text = String::from_utf8_lossy(&output.stdout);

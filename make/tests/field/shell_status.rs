@@ -35,3 +35,21 @@ fn a_failing_shell_command_in_a_conditional_is_not_fatal() {
     );
     dir.make(&[]).ok("yes\n");
 }
+
+/// POSIX 105744-105746: the command runs "as if it were passed as the
+/// argument to the system() interface", and only its standard output is
+/// captured, so what it writes to standard error reaches make's. libselinux
+/// runs `$(shell $(PKG_CONFIG) --cflags $(PCRE_MODULE))`, and pkg-config's
+/// "Package ... was not found" was lost. GNU make agrees for both forms.
+#[test]
+fn a_shell_command_writes_its_diagnostics_to_standard_error() {
+    let dir = Dir::new("shell_stderr");
+    dir.write(
+        "Makefile",
+        "X != echo one >&2; echo x\nY := $(shell echo two >&2; echo y)\n\
+         all:\n\t@echo [$(X)] [$(Y)]\n",
+    );
+    let run = dir.make(&[]);
+    run.ok("[x] [y]\n");
+    assert_eq!(run.stderr, "one\ntwo\n");
+}

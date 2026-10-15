@@ -954,7 +954,7 @@ pub(crate) fn unescape_dollars(text: &str) -> String {
 
 /// Run `body` through the shell and convert its stdout to a macro value (`!=`).
 fn shell_assign(body: &str) -> Result<String> {
-    let Ok(result) = std::process::Command::new("sh").args(["-c", body]).output() else {
+    let Ok(result) = func::shell_command(body).output() else {
         return Err(PreprocError::CommandFailed);
     };
     Ok(shell_output_to_macro_value(&String::from_utf8_lossy(

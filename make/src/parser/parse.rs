@@ -88,6 +88,29 @@ impl Rule {
     pub fn line(&self) -> usize {
         self.line
     }
+
+    /// The rule taken apart, so that its names move rather than being
+    /// copied.
+    pub(crate) fn into_parts(self) -> RuleParts {
+        RuleParts {
+            targets: self.targets,
+            prerequisites: self.prerequisites,
+            order_only: self.order_only,
+            recipes: self.recipes,
+            double_colon: self.double_colon,
+            stem: self.stem,
+        }
+    }
+}
+
+/// What a [`Rule`] holds, as [`Rule::into_parts`] hands it over.
+pub(crate) struct RuleParts {
+    pub targets: Vec<String>,
+    pub prerequisites: Vec<String>,
+    pub order_only: Vec<String>,
+    pub recipes: Vec<String>,
+    pub double_colon: bool,
+    pub stem: Option<String>,
 }
 
 impl Display for Rule {

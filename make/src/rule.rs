@@ -876,13 +876,22 @@ impl fmt::Display for Rule {
 
 impl From<ParsedRule> for Rule {
     fn from(parsed: ParsedRule) -> Self {
+        let parts = parsed.into_parts();
         Rule {
-            targets: parsed.targets().map(Target::new).collect(),
-            prerequisites: parsed.prerequisites().map(Prerequisite::new).collect(),
-            order_only: parsed.order_only().map(Prerequisite::new).collect(),
-            recipes: parsed.recipes().map(Recipe::new).collect(),
-            double_colon: parsed.is_double_colon(),
-            stem: parsed.stem().map(String::from),
+            targets: parts.targets.into_iter().map(Target::new).collect(),
+            prerequisites: parts
+                .prerequisites
+                .into_iter()
+                .map(Prerequisite::new)
+                .collect(),
+            order_only: parts
+                .order_only
+                .into_iter()
+                .map(Prerequisite::new)
+                .collect(),
+            recipes: parts.recipes.into_iter().map(Recipe::new).collect(),
+            double_colon: parts.double_colon,
+            stem: parts.stem,
             input: None,
         }
     }

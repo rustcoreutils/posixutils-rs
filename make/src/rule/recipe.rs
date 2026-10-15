@@ -62,8 +62,12 @@ impl Recipe {
             start = i + c.len_utf8();
         }
 
+        let inner = match start {
+            0 => inner,
+            _ => inner[start..].to_string(),
+        };
         Recipe {
-            inner: inner[start..].to_string(),
+            inner,
             config: Config::from(prefixes),
         }
     }

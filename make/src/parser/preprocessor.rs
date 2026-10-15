@@ -1929,12 +1929,14 @@ impl Reader {
     /// Record a target-specific assignment, `targets: [override] [export]
     /// name op value`.
     ///
-    /// The targets are expanded now, as a rule's are. The value is kept as
-    /// written for `=`, `+=` and `?=`, to be expanded with the target's
-    /// macros when its commands are; the other operators do their work now,
-    /// against what is defined at this point, as for any macro definition.
+    /// The targets are expanded now, as a rule's are, and are names from
+    /// then on. The value is kept as written for `=`, `+=` and `?=`, to be
+    /// expanded with the target's macros when its commands are; the other
+    /// operators do their work now, against what is defined at this point,
+    /// as for any macro definition.
     fn define_target_var(&mut self, targets: &str, assignment: &str) -> Result<()> {
-        let targets = super::scan::split_words(&self.expand(targets)?);
+        // Names, like a rule's targets: `$$` is the `$` it stands for.
+        let targets = super::scan::split_words(&unescape_dollars(&self.expand(targets)?));
         let mut text = assignment.trim_start();
         let (mut overriding, mut exported) = (false, false);
         loop {

@@ -14,8 +14,8 @@
 //! time.
 
 use super::preprocessor::{
-    is_include_line, is_macro_definition, preprocess_with, Include, MacroTable, TargetVar,
-    VPathEntry,
+    is_include_line, is_macro_definition, preprocess_with, unescape_dollars, Include, MacroTable,
+    TargetVar, VPathEntry,
 };
 use super::scan::{self, RuleLine};
 use crate::Macro;
@@ -233,7 +233,13 @@ fn classify(line: &str) -> Line<'_> {
 
 /// Start a rule from a parsed rule line, seeding its inline command if present.
 ///
-/// Each target and prerequisite word holding a wildcard is globbed here, as
+/// The header was expanded by the preprocessor, which writes a literal `$`
+/// as `$$` (see [`unescape_dollars`]). Its words are names of files from
+/// here on, so each `$$` becomes the `$` it stands for: `a$$b:` makes the
+/// target `a$b`, as in GNU make. The line was split into its parts first,
+/// so a `$` cannot turn into a `:`, `;` or `|`.
+///
+/// Each target and prerequisite word holding a wildcard is then globbed, as
 /// the line is read, as in GNU make (see [`super::func::glob_name`]).
 fn rule_from(header: RuleLine, line: usize) -> Rule {
     let RuleLine {
@@ -247,7 +253,7 @@ fn rule_from(header: RuleLine, line: usize) -> Rule {
     let glob = |words: Vec<String>| -> Vec<String> {
         words
             .iter()
-            .flat_map(|word| super::func::glob_name(word))
+            .flat_map(|word| super::func::glob_name(&unescape_dollars(word)))
             .collect()
     };
     Rule {
@@ -256,7 +262,7 @@ fn rule_from(header: RuleLine, line: usize) -> Rule {
         order_only: glob(order_only),
         recipes: inline.into_iter().collect(),
         double_colon,
-        target_pattern,
+        target_pattern: target_pattern.map(|pattern| unescape_dollars(&pattern)),
         stem: None,
         line,
     }

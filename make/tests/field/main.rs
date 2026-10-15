@@ -28,6 +28,7 @@ mod empty_targets;
 mod escaped_hash;
 mod expansion;
 mod files_commands_make;
+mod header_dollars;
 mod include_remaking;
 mod makeflags;
 mod no_rule;

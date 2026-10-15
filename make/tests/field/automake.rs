@@ -73,3 +73,48 @@ fn a_silent_recursive_command_is_shown_under_dash_n() {
     assert!(lines[0].starts_with("echo sub; "), "{run:?}");
     assert_eq!(&lines[1..], ["sub", "echo in sub"], "{run:?}");
 }
+
+// An out-of-tree build with subdir-objects: `common/force.o` is compiled by
+// `.c.o` from `common/force.c`, which only `VPATH` finds, in
+// `$(srcdir)/common`. A name with a directory part was never searched for,
+// so the object had no source, and dpkg, gmp, guile, libffi, libgc, make,
+// mpfr, xz-utils and libxcrypt (`$(srcdir)/lib/hashes.conf`, written
+// `lib/hashes.conf` as a prerequisite) could not build.
+#[test]
+fn vpath_finds_a_prerequisite_with_a_directory_part() {
+    let dir = Dir::new("am_vpath_subdir");
+    dir.write("src/common/force.c", "");
+    dir.write("src/lib/hashes.conf", "");
+    dir.write(
+        "b/Makefile",
+        "VPATH = ../src\n.SUFFIXES: .c .o\nall: common/force.o hashes.h\n\
+         common/.dirstamp:\n\t@mkdir -p common && touch $@\n\
+         common/force.o: common/.dirstamp\n\
+         .c.o:\n\t@echo cc $< -o $@\n\t@touch $@\n\
+         hashes.h: lib/hashes.conf\n\t@echo gen $^ $?\n\t@touch $@\n",
+    );
+    dir.make(&["-C", "b"])
+        .ok("cc ../src/common/force.c -o common/force.o\n\
+         gen ../src/lib/hashes.conf ../src/lib/hashes.conf\n");
+    // Everything is up to date now.
+    let run = dir.make(&["-C", "b"]);
+    assert_eq!(run.code, Some(0), "{run:?}");
+    assert!(
+        !run.stdout.contains("cc ") && !run.stdout.contains("gen "),
+        "{run:?}"
+    );
+}
+
+// An absolute name is never searched for.
+#[test]
+fn vpath_does_not_search_for_an_absolute_name() {
+    let dir = Dir::new("am_vpath_absolute");
+    dir.write("src/nosuch/file.c", "");
+    dir.write(
+        "b/Makefile",
+        "VPATH = ../src\nall: /nosuch/file.c\n\t@echo [$<]\n",
+    );
+    let run = dir.make(&["-C", "b"]);
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert!(run.stderr.contains("'/nosuch/file.c'"), "{run:?}");
+}

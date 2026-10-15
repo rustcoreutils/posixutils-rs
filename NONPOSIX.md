@@ -793,6 +793,13 @@ value) m4 does as POSIX says instead:
  * A `%` pattern rule without commands is not used: in GNU make it cancels
    a built-in pattern rule.  automake ends every Makefile with
    `%:: %,v`, `%:: SCCS/s.%` and three more of them.
+ * The `VPATH` macro and the `vpath` directive, as in GNU make: a
+   prerequisite that does not exist as named is looked for in the
+   directories they list, and the name found is the one `$<`, `$^`, `$+`
+   and `$?` give.  A relative name with a directory part is searched for
+   too, an absolute one never.  automake's out-of-tree builds depend on
+   it; dpkg, gmp, libffi and xz-utils compile `sub/file.o` from
+   `$(srcdir)/sub/file.c` this way.
  * `.NOTPARALLEL` with prerequisites is accepted, and the whole run is
    serial.  POSIX says an application shall not give it any; bash's
    debian/rules, run by this make, has `.NOTPARALLEL: build`.

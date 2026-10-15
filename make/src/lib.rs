@@ -290,9 +290,13 @@ impl Make {
     /// Resolve a prerequisite through `VPATH`.
     ///
     /// A name that exists as written, or that no `VPATH` directory supplies, is
-    /// returned unchanged, so this is transparent when `VPATH` is unset.
+    /// returned unchanged, so this is transparent when `VPATH` is unset. An
+    /// absolute name is never searched for, but a relative one with a
+    /// directory part is, as in GNU make: automake's subdir-objects builds
+    /// out of tree compile `common/force.o` from `$(srcdir)/common/force.c`
+    /// (dpkg, gmp, libffi, xz-utils and others).
     pub fn resolve_vpath(&self, name: &str) -> String {
-        if name.contains('/') || std::path::Path::new(name).exists() {
+        if name.starts_with('/') || std::path::Path::new(name).exists() {
             return name.to_string();
         }
         // A `vpath` pattern is more specific than the blanket `VPATH` macro, so

@@ -98,7 +98,6 @@ fn a_function_sees_an_automatic_macro_through_a_macro() {
 /// POSIX 105759-105761: appending to an immediate-expansion macro appends
 /// the evaluation of the new text, now.
 #[test]
-#[ignore = "fails until macros have a flavour"]
 fn appending_to_an_immediate_macro_expands_now() {
     let dir = Dir::new("expand_append_simple");
     dir.write(
@@ -134,7 +133,6 @@ fn a_target_specific_append_expands_when_used() {
 
 /// `define NAME :=` is an immediate-expansion definition.
 #[test]
-#[ignore = "fails until macros have a flavour"]
 fn define_honours_its_operator() {
     let dir = Dir::new("expand_define_simple");
     dir.write(

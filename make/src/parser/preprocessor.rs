@@ -659,10 +659,25 @@ impl MacroSource {
     }
 }
 
+/// How a macro's value is used when the macro is referenced (POSIX
+/// 105730-105749).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flavour {
+    /// Delayed expansion -- `=`, `?=`, `!=`, `:::=`, `define`, the
+    /// environment and the command line: the value is expanded each time
+    /// the macro is referenced.
+    Recursive,
+    /// Immediate expansion -- `:=` and `::=`: the value was expanded when it
+    /// was assigned, each literal `$` written `$$`, and is not expanded
+    /// again (POSIX 105779-105781).
+    Simple,
+}
+
 #[derive(Debug, Clone)]
 struct MacroEntry {
     value: String,
     source: MacroSource,
+    flavour: Flavour,
 }
 
 /// A macro table that remembers first-definition order, so the macros handed
@@ -679,7 +694,7 @@ impl MacroTable {
     pub fn from_macros(macros: &[Macro], source: MacroSource) -> Self {
         let mut table = Self::default();
         for (name, body) in macros {
-            table.force(name.clone(), body.clone(), source);
+            table.force(name.clone(), body.clone(), source, Flavour::Recursive);
         }
         table
     }
@@ -689,14 +704,14 @@ impl MacroTable {
     /// Equal ranks assign, which is POSIX 105851: "Macro definitions from a
     /// single source ... shall override previous macro definitions from the
     /// same source."
-    fn set(&mut self, name: String, body: String, source: MacroSource) {
+    fn set(&mut self, name: String, body: String, source: MacroSource, flavour: Flavour) {
         let env_wins = ENV_MACROS.load(Acquire);
         if let Some(existing) = self.values.get(&name) {
             if source.rank(env_wins) < existing.source.rank(env_wins) {
                 return;
             }
         }
-        self.force(name, body, source);
+        self.force(name, body, source, flavour);
     }
 
     /// Assign regardless of precedence, recording `source` as given.
@@ -704,7 +719,7 @@ impl MacroTable {
     /// Used to establish a seed, whose rank is then honoured by every later
     /// assignment, and by `override`, which passes [`MacroSource::Override`]
     /// so that what it establishes outranks a command-line macro.
-    fn force(&mut self, name: String, body: String, source: MacroSource) {
+    fn force(&mut self, name: String, body: String, source: MacroSource, flavour: Flavour) {
         if !self.values.contains_key(&name) {
             self.order.push(name.clone());
         }
@@ -713,19 +728,22 @@ impl MacroTable {
             MacroEntry {
                 value: body,
                 source,
+                flavour,
             },
         );
     }
 
-    /// Seed a definition from `source` before the makefile is read.
+    /// Seed a delayed-expansion definition from `source` before the
+    /// makefile is read.
     pub fn seed(&mut self, name: String, body: String, source: MacroSource) {
-        self.force(name, body, source);
+        self.force(name, body, source, Flavour::Recursive);
     }
 
     /// Bind `name` for the duration of a `foreach` or `call` expansion,
-    /// shadowing any definition whatever its source.
+    /// shadowing any definition whatever its source. The value is already
+    /// expanded, as GNU make binds it.
     pub(crate) fn bind_local(&mut self, name: String, value: String) {
-        self.force(name, value, MacroSource::Local);
+        self.force(name, value, MacroSource::Local, Flavour::Simple);
     }
 
     /// What `name` holds, weighing the table against the environment.
@@ -740,17 +758,28 @@ impl MacroTable {
     /// `None` means undefined, which is what `?=` and `ifdef` test; an
     /// explicitly empty value is defined.
     pub(crate) fn resolve(&self, name: &str, env_wins: bool) -> Option<String> {
+        self.resolve_flavoured(name, env_wins)
+            .map(|(value, _)| value)
+    }
+
+    /// What `name` holds, as [`Self::resolve`] says, and its flavour. A
+    /// value from the environment is a delayed-expansion one.
+    pub(crate) fn resolve_flavoured(
+        &self,
+        name: &str,
+        env_wins: bool,
+    ) -> Option<(String, Flavour)> {
         let entry = self.values.get(name);
         // The environment is not read for a definition it cannot outrank,
         // which is nearly every one; `getenv` walks the whole environment.
         let env_rank = MacroSource::Environment.rank(env_wins);
         if let Some(entry) = entry.filter(|entry| entry.source.rank(env_wins) >= env_rank) {
-            return Some(entry.value.clone());
+            return Some((entry.value.clone(), entry.flavour));
         }
-        let from_env = std::env::var(name).ok();
+        let from_env = std::env::var(name).ok().map(|v| (v, Flavour::Recursive));
         match entry {
             None => from_env,
-            Some(entry) => from_env.or_else(|| Some(entry.value.clone())),
+            Some(entry) => from_env.or_else(|| Some((entry.value.clone(), entry.flavour))),
         }
     }
 
@@ -780,6 +809,7 @@ impl MacroTable {
             if let Ok(value) = std::env::var(name) {
                 entry.value = value;
                 entry.source = MacroSource::Environment;
+                entry.flavour = Flavour::Recursive;
             }
         }
     }
@@ -812,27 +842,32 @@ impl MacroTable {
     /// it is written `override`, a command-line macro -- or the environment
     /// under `-e` -- replaces it in turn, `+=` and all, as in GNU make, where
     /// `make CFLAGS=-O0` holds for `foo: CFLAGS += -g` too.
+    ///
+    /// A `+=` defines a delayed-expansion macro whatever it adds to, as in
+    /// GNU make, where `foo: A += $(X)` reads `X` when the commands are
+    /// expanded even if `A` was defined with `:=`. An immediate macro's
+    /// value expands to itself, so it can begin a delayed one.
     pub fn apply(&mut self, var: &TargetVar, global: &MacroTable) {
         let env_wins = ENV_MACROS.load(Acquire);
         if !var.overriding && global.pins(&var.name, env_wins) {
-            if let Some(value) = global.resolve(&var.name, env_wins) {
-                self.force(var.name.clone(), value, MacroSource::CommandLine);
+            if let Some((value, flavour)) = global.resolve_flavoured(&var.name, env_wins) {
+                self.force(var.name.clone(), value, MacroSource::CommandLine, flavour);
             }
             return;
         }
         let current = self.resolve(&var.name, env_wins);
-        let value = match (var.op, current) {
+        let (value, flavour) = match (var.op, current) {
             (TargetAssign::IfUnset, Some(_)) => return,
             (TargetAssign::Append, Some(current)) if !current.is_empty() => {
-                format!("{current} {}", var.value)
+                (format!("{current} {}", var.value), Flavour::Recursive)
             }
-            _ => var.value.clone(),
+            _ => (var.value.clone(), var.flavour),
         };
         let source = match var.overriding {
             true => MacroSource::Override,
             false => MacroSource::Makefile,
         };
-        self.force(var.name.clone(), value, source);
+        self.force(var.name.clone(), value, source, flavour);
     }
 
     /// The value the makefile, the command line or the built-ins gave
@@ -992,33 +1027,47 @@ fn shell_assign(body: &str) -> Result<String> {
     )))
 }
 
-/// Turn a raw definition body into the value the operator assigns.
+/// Turn a raw definition body into the value the operator assigns, and the
+/// flavour of the macro it defines (POSIX 105730-105764).
 fn apply_operator(
     operator: Operator,
     name: &str,
     body: String,
     table: &MacroTable,
     state: &func::Expansion,
-) -> Result<String> {
+) -> Result<(String, Flavour)> {
+    let recursive = |value| Ok((value, Flavour::Recursive));
     match operator {
-        Operator::Equals => Ok(body),
-        Operator::Colon | Operator::Colon2 => expand_to_fixpoint(&body, table, state),
-        Operator::Colon3 => Ok(substitute(&body, table, state)?.0),
+        Operator::Equals => recursive(body),
+        Operator::Colon | Operator::Colon2 => {
+            Ok((expand_to_fixpoint(&body, table, state)?, Flavour::Simple))
+        }
+        // A delayed-expansion macro whose value is expanded now as well.
+        Operator::Colon3 => recursive(substitute(&body, table, state)?.0),
+        // A delayed-expansion macro too: the command's output is expanded
+        // when the macro is, unlike what `$(shell ...)` returns.
         Operator::Bang => {
-            shell_assign(&unescape_dollars(&expand_to_fixpoint(&body, table, state)?))
+            let command = unescape_dollars(&expand_to_fixpoint(&body, table, state)?);
+            recursive(shell_assign(&command)?)
         }
         // `?=` and `+=` ask what the macro is *now*, and the environment is a
         // macro source (POSIX 105845) -- consulting only the table made
         // `CC ?= gcc` ignore an inherited `CC=clang`, and `CC += -Wall` drop it
         // entirely (audit #73).
-        Operator::QuestionMark => Ok(match existing_value(name, table) {
-            Some(existing) => existing,
-            None => body,
-        }),
-        Operator::Plus => Ok(match existing_value(name, table) {
-            Some(existing) => format!("{existing} {body}"),
-            None => body,
-        }),
+        Operator::QuestionMark => match existing_value(name, table) {
+            Some(existing) => Ok(existing),
+            None => recursive(body),
+        },
+        // POSIX 105759-105764: what is appended to an immediate-expansion
+        // macro is evaluated now, to a delayed-expansion one when used.
+        Operator::Plus => match existing_value(name, table) {
+            Some((existing, Flavour::Simple)) => {
+                let body = expand_to_fixpoint(&body, table, state)?;
+                Ok((format!("{existing} {body}"), Flavour::Simple))
+            }
+            Some((existing, Flavour::Recursive)) => recursive(format!("{existing} {body}")),
+            None => recursive(body),
+        },
     }
 }
 
@@ -1036,17 +1085,18 @@ fn parse_macro_name(text: &mut Peekable<impl Iterator<Item = char>>) -> Result<S
 ///
 /// `None` means undefined, which is what `?=` tests; an explicitly empty value
 /// is defined and is left alone.
-fn existing_value(name: &str, table: &MacroTable) -> Option<String> {
-    table.resolve(name, ENV_MACROS.load(Acquire))
+fn existing_value(name: &str, table: &MacroTable) -> Option<(String, Flavour)> {
+    table.resolve_flavoured(name, ENV_MACROS.load(Acquire))
 }
 
-/// Parse one macro-definition line into the name and the value its operator
-/// assigns, resolving against what is already defined.
+/// Parse one macro-definition line into the name, the value its operator
+/// assigns and the flavour that gives the macro, resolving against what is
+/// already defined.
 fn parse_macro_definition(
     line: &str,
     table: &MacroTable,
     state: &func::Expansion,
-) -> Result<(String, String)> {
+) -> Result<(String, String, Flavour)> {
     let mut text = line.chars().peekable();
     // A definition may be indented with spaces, which is common inside a
     // conditional. (A <tab> would make it a command line, handled elsewhere.)
@@ -1056,8 +1106,8 @@ fn parse_macro_definition(
     let operator = parse_operator(&mut text)?;
     skip_blank(&mut text);
     let body = take_till_eol(&mut text);
-    let body = apply_operator(operator, &name, body, table, state)?;
-    Ok((name, body))
+    let (body, flavour) = apply_operator(operator, &name, body, table, state)?;
+    Ok((name, body, flavour))
 }
 
 pub static ENV_MACROS: AtomicBool = AtomicBool::new(false);
@@ -1225,6 +1275,8 @@ pub struct TargetVar {
     /// target's macros when used; for the other operators the value the
     /// operator gave when the line was read.
     pub value: String,
+    /// The flavour of the macro it defines: immediate for `:=` and `::=`.
+    pub flavour: Flavour,
     /// Written `override`: beats a command-line macro.
     pub overriding: bool,
     /// Written `export`: the macro goes into the environment of the
@@ -1523,8 +1575,17 @@ impl Reader {
         Ok(())
     }
 
-    /// Capture a `define ... endef` body, returning the lines consumed.
-    fn capture_define(&mut self, name: &str, lines: &[&str], start: usize) -> usize {
+    /// Capture a `define ... endef` body, returning the index of the last
+    /// line consumed. `op` is the operator written after the name, which
+    /// assigns the body as it would a one-line definition's value:
+    /// `define NAME :=` expands it now.
+    fn capture_define(
+        &mut self,
+        name: &str,
+        op: &str,
+        lines: &[&str],
+        start: usize,
+    ) -> Result<usize> {
         let mut body: Vec<&str> = Vec::new();
         let mut i = start + 1;
         while i < lines.len() {
@@ -1535,14 +1596,20 @@ impl Reader {
             i += 1;
         }
         if self.active() {
+            let operator = match op.is_empty() {
+                true => Operator::Equals,
+                false => parse_operator(&mut op.chars().peekable())?,
+            };
+            let body = body.join("\n");
+            let (value, flavour) = apply_operator(operator, name, body, &self.table, &self.state)?;
             self.table
-                .set(name.to_string(), body.join("\n"), MacroSource::Makefile);
+                .set(name.to_string(), value, MacroSource::Makefile, flavour);
         }
         // Blank out the whole construct, header and terminator included.
         for _ in start..=i.min(lines.len() - 1) {
             self.drop_line();
         }
-        i
+        Ok(i)
     }
 
     /// Read the files an `include` line names.
@@ -1602,8 +1669,9 @@ impl Reader {
             Some(list) if !list.is_empty() => format!("{list} {path}"),
             _ => path.clone(),
         };
+        let (source, flavour) = (MacroSource::Makefile, Flavour::Recursive);
         self.table
-            .set(MAKEFILE_LIST.to_string(), list, MacroSource::Makefile);
+            .set(MAKEFILE_LIST.to_string(), list, source, flavour);
 
         self.depth += 1;
         let folded = fold_continuations(&contents);
@@ -1719,7 +1787,9 @@ impl Reader {
                 self.in_rule = false;
             }
             match directive {
-                Directive::Define(name) => return Ok(self.capture_define(&name, lines, i)),
+                Directive::Define { name, op } => {
+                    return self.capture_define(&name, &op, lines, i);
+                }
                 Directive::EndDef => self.drop_line(),
                 Directive::Else(chained) => {
                     self.handle_else(chained.as_deref())?;
@@ -1804,20 +1874,23 @@ impl Reader {
         let operator = parse_operator(&mut letters)?;
         skip_blank(&mut letters);
         let body: String = letters.collect();
-        let (op, value) = match operator {
-            Operator::Equals => (TargetAssign::Set, body),
-            Operator::Plus => (TargetAssign::Append, body),
-            Operator::QuestionMark => (TargetAssign::IfUnset, body),
-            other => (
-                TargetAssign::Set,
-                apply_operator(other, &name, body, &self.table, &self.state)?,
-            ),
+        let recursive = Flavour::Recursive;
+        let (op, value, flavour) = match operator {
+            Operator::Equals => (TargetAssign::Set, body, recursive),
+            Operator::Plus => (TargetAssign::Append, body, recursive),
+            Operator::QuestionMark => (TargetAssign::IfUnset, body, recursive),
+            other => {
+                let (value, flavour) =
+                    apply_operator(other, &name, body, &self.table, &self.state)?;
+                (TargetAssign::Set, value, flavour)
+            }
         };
         self.target_vars.push(TargetVar {
             targets,
             name,
             op,
             value,
+            flavour,
             overriding,
             exported,
         });
@@ -1832,10 +1905,10 @@ impl Reader {
             Some(rest) => (rest, true),
             None => (line, false),
         };
-        let (name, body) = parse_macro_definition(line, &self.table, &self.state)?;
+        let (name, body, flavour) = parse_macro_definition(line, &self.table, &self.state)?;
         match overriding {
-            true => self.table.force(name, body, MacroSource::Override),
-            false => self.table.set(name, body, MacroSource::Makefile),
+            true => self.table.force(name, body, MacroSource::Override, flavour),
+            false => self.table.set(name, body, MacroSource::Makefile, flavour),
         }
         Ok(())
     }

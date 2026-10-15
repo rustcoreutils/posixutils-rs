@@ -131,10 +131,28 @@ pub trait Edges {
 /// and stack sets with the root and never inserted during the walk, so only a
 /// cycle passing back through the root was caught.
 pub fn find_cycle(graph: &impl Edges, root: &str) -> Option<String> {
+    find_cycle_beyond(graph, root, &mut HashSet::new())
+}
+
+/// [`find_cycle`], taking every target in `acyclic` as already known to
+/// reach no cycle, and adding to it every target found so.
+///
+/// make checks before building each target; without the memory each check
+/// walked the target's whole subgraph again, and an automake directory
+/// whose hundred objects each list a hundred headers spent most of a no-op
+/// run re-walking the same headers.
+pub fn find_cycle_beyond(
+    graph: &impl Edges,
+    root: &str,
+    acyclic: &mut HashSet<String>,
+) -> Option<String> {
+    if acyclic.contains(root) {
+        return None;
+    }
     // (target, next prerequisite index)
     let mut stack: Vec<(String, usize)> = vec![(root.to_string(), 0)];
     let mut on_stack: HashSet<String> = HashSet::from([root.to_string()]);
-    let mut done: HashSet<String> = HashSet::new();
+    let done = acyclic;
     let mut children: HashMap<String, Vec<String>> =
         HashMap::from([(root.to_string(), graph.prerequisites_of(root))]);
 
@@ -179,6 +197,23 @@ mod tests {
 
     fn graph(edges: &[(&'static str, Vec<&'static str>)]) -> Fixture {
         Fixture(edges.iter().cloned().collect())
+    }
+
+    // What one walk learns, the next takes as known: a cycle that reaches a
+    // known-acyclic target is still found, through its own back edge.
+    #[test]
+    fn a_remembered_walk_still_finds_a_later_cycle() {
+        let g = graph(&[
+            ("a", vec!["b"]),
+            ("b", vec![]),
+            ("c", vec!["b", "d"]),
+            ("d", vec!["c"]),
+        ]);
+        let mut acyclic = HashSet::new();
+        assert_eq!(find_cycle_beyond(&g, "a", &mut acyclic), None);
+        assert!(acyclic.contains("a") && acyclic.contains("b"));
+        assert!(find_cycle_beyond(&g, "c", &mut acyclic).is_some());
+        assert!(!acyclic.contains("c"));
     }
 
     #[test]

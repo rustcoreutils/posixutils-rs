@@ -97,6 +97,8 @@ pub struct Make {
     /// The modification times of targets without commands, as they were
     /// before their prerequisites were made; see `prerequisite_mtime`.
     frozen_mtimes: std::sync::Mutex<HashMap<String, Option<SystemTime>>>,
+    /// Targets already known to reach no dependency cycle.
+    acyclic: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Target rules (non-special, non-inference).
     /// Invariant: inference rules are never stored here, so `first_target()`
     /// always returns a valid default target per POSIX.
@@ -658,7 +660,9 @@ impl Make {
         dispatch: Dispatch,
         inherited: &[TargetVar],
     ) -> Result<bool, ErrorCode> {
-        if let Some(origin) = graph::find_cycle(self, target.as_ref()) {
+        let cycle =
+            graph::find_cycle_beyond(self, target.as_ref(), &mut self.acyclic.lock().unwrap());
+        if let Some(origin) = cycle {
             return Err(RecursivePrerequisite { origin });
         }
         let scope = self.scope_for(target.as_ref(), inherited);
@@ -1347,6 +1351,7 @@ impl TryFrom<(Makefile, Config)> for Make {
             pattern_vars,
             mentioned: Default::default(),
             frozen_mtimes: Default::default(),
+            acyclic: Default::default(),
             default_rule: None,
             sccs_get: None,
             pool,

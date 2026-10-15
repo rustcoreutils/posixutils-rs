@@ -106,6 +106,13 @@ pub struct Make {
     /// Invariant: inference rules are never stored here, so `first_target()`
     /// always returns a valid default target per POSIX.
     rules: Vec<Rule>,
+    /// Where each target name appears in `rules`: the positions of every
+    /// rule with that name among its targets, in `rules` order. Looking a
+    /// target up by scanning `rules` made a makefile of n targets O(n^2) to
+    /// read and to walk.
+    rule_index: HashMap<String, Vec<usize>>,
+    /// The positions of the `%` pattern rules in `rules`, in order.
+    pattern_rules: Vec<usize>,
     /// Inference rules (e.g. `.c.o:`, `.txt.out:`).
     inference_rules: Vec<Rule>,
     default_rule: Option<Rule>, // .DEFAULT
@@ -196,10 +203,38 @@ impl Make {
     /// - Some(rule) if a rule with the target exists.
     /// - None if no rule with the target exists.
     fn rule_by_target_name(&self, target: impl AsRef<str>) -> Option<&Rule> {
-        self.rules
-            .iter()
-            .filter(|rule| !rule.is_pattern())
-            .find(|rule| rule.targets().any(|t| t.as_ref() == target.as_ref()))
+        self.rules_named(target.as_ref())
+            .find(|rule| !rule.is_pattern())
+    }
+
+    /// Every rule with `name` among its targets, in the order filed.
+    fn rules_named<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a Rule> + 'a {
+        let at: &[usize] = self.rule_index.get(name).map_or(&[], Vec::as_slice);
+        at.iter().map(|&i| &self.rules[i])
+    }
+
+    /// The `%` pattern rules, in the order filed.
+    fn pattern_rules(&self) -> impl Iterator<Item = &Rule> {
+        self.pattern_rules.iter().map(|&i| &self.rules[i])
+    }
+
+    /// File `rule` at the end of `rules`, and index it.
+    fn push_rule(&mut self, rule: Rule) {
+        let at = self.rules.len();
+        for target in rule.targets() {
+            let positions = self
+                .rule_index
+                .entry(target.as_ref().to_string())
+                .or_default();
+            // A target named twice in one rule is still one rule.
+            if positions.last() != Some(&at) {
+                positions.push(at);
+            }
+        }
+        if rule.is_pattern() {
+            self.pattern_rules.push(at);
+        }
+        self.rules.push(rule);
     }
 
     /// Every macro definition in force, in first-definition order.
@@ -348,9 +383,7 @@ impl Make {
 
     fn find_pattern_rule_within(&self, name: &str, depth: usize) -> Option<Rule> {
         let candidates: Vec<Rule> = self
-            .rules
-            .iter()
-            .filter(|rule| rule.is_pattern())
+            .pattern_rules()
             .filter_map(|rule| rule.instantiate_pattern(name))
             .collect();
         let needs = |rule: &Rule| -> Vec<String> {
@@ -1053,21 +1086,25 @@ impl Make {
         // one used is the one whose prerequisites exist. One with the same
         // prerequisites as an earlier one replaces it, as in GNU make.
         if rule.is_pattern() {
-            let same = |r: &&mut Rule| {
-                r.is_pattern()
-                    && r.targets().eq(rule.targets())
-                    && r.prerequisites().eq(rule.prerequisites())
+            let same = |r: &Rule| {
+                r.targets().eq(rule.targets()) && r.prerequisites().eq(rule.prerequisites())
             };
-            match self.rules.iter_mut().find(same) {
-                Some(existing) => *existing = rule,
-                None => self.rules.push(rule),
+            let found = self
+                .pattern_rules
+                .iter()
+                .copied()
+                .find(|&at| same(&self.rules[at]));
+            match found {
+                Some(at) => self.rules[at] = rule,
+                None => self.push_rule(rule),
             }
             return Ok(());
         }
         let existing = self
-            .rules
-            .iter_mut()
-            .find(|existing| existing.targets().any(|t| t.as_ref() == name));
+            .rule_index
+            .get(&name)
+            .and_then(|at| at.first().copied())
+            .map(|at| &mut self.rules[at]);
         match existing {
             Some(existing) if existing.is_double_colon() != rule.is_double_colon() => {
                 Err(MixedColons { target: name })
@@ -1077,7 +1114,7 @@ impl Make {
                 Ok(())
             }
             _ => {
-                self.rules.push(rule);
+                self.push_rule(rule);
                 Ok(())
             }
         }
@@ -1085,10 +1122,8 @@ impl Make {
 
     /// Every `::` rule for `name`, in the order written.
     fn double_colon_rules(&self, name: &str) -> Vec<&Rule> {
-        self.rules
-            .iter()
+        self.rules_named(name)
             .filter(|rule| rule.is_double_colon())
-            .filter(|rule| rule.targets().any(|t| t.as_ref() == name))
             .collect()
     }
 
@@ -1423,6 +1458,8 @@ impl TryFrom<(Makefile, Config)> for Make {
         let pool = TokenPool::new(config.jobs.saturating_sub(1));
         let mut make = Self {
             rules: vec![],
+            rule_index: HashMap::new(),
+            pattern_rules: Vec::new(),
             inference_rules: vec![],
             macros,
             table,

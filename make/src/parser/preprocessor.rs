@@ -435,6 +435,17 @@ impl Reference<'_> {
         }
 
         let (name_part, spec) = self.substitution();
+        // A name computed from an automatic variable, `$($@)` or
+        // `$(TEST_$@)`, is left for the rule stage, which knows the target,
+        // as a function call reading one is. dpkg's tests of its own .mk
+        // files check every variable with `test '$($@)' = '$(TEST_$@)'`.
+        if mentions_automatic(name_part) {
+            result.push('$');
+            result.push(self.open);
+            result.push_str(self.raw);
+            result.push(self.close);
+            return Ok(0);
+        }
         let name = match name_part.contains('$') {
             true => expand_to_fixpoint(name_part, table, state)?,
             false => name_part.to_string(),

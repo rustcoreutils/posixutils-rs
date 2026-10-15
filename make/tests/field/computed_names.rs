@@ -68,3 +68,18 @@ fn a_computed_name_in_a_rule_line() {
     );
     dir.make(&[]).ok("one two\n");
 }
+
+// POSIX 105803: an inner expansion in a macro name is performed first, and
+// `$@` is a macro. dpkg's tests of its own .mk files check each variable
+// with `test '$($@)' = '$(TEST_$@)'`; both sides expanded to nothing, so
+// every such check passed whatever the values were.
+#[test]
+fn a_name_computed_from_an_automatic_macro() {
+    let dir = Dir::new("computed_automatic");
+    dir.write(
+        "Makefile",
+        "A := va\nTEST_A := ta\nSRC_A = x.c y.c\nall: A\n\
+         A:\n\t@echo [$($@)] [$(TEST_$@)] [${TEST_$@}] [$(TEST_$(@F))] [$(SRC_$@:.c=.o)]\n",
+    );
+    dir.make(&[]).ok("[va] [ta] [ta] [ta] [x.o y.o]\n");
+}

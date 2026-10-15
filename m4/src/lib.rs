@@ -25,6 +25,7 @@ mod debug;
 mod emacs_regex;
 pub mod error;
 mod format;
+mod freeze;
 mod input;
 mod lexer;
 mod macros;
@@ -104,6 +105,10 @@ pub struct Args {
     pub debugfile: Option<Option<Vec<u8>>>,
     /// `-t`: macros to trace.
     pub trace: Vec<Vec<u8>>,
+    /// `-R`: a frozen state file to start from.
+    pub reload_state: Option<PathBuf>,
+    /// `-F`: where to write the frozen state at the end.
+    pub freeze_state: Option<PathBuf>,
 }
 
 /// What clap records for a `--debugfile` without `=FILE`: standard error.
@@ -213,6 +218,24 @@ impl Args {
                     .value_parser(clap::value_parser!(OsString)),
             )
             .arg(
+                clap::Arg::new("reload_state")
+                    .short('R')
+                    .long("reload-state")
+                    .value_name("FILE")
+                    .help(gettext("Reload a frozen state from FILE at start"))
+                    .num_args(1)
+                    .value_parser(clap::value_parser!(PathBuf)),
+            )
+            .arg(
+                clap::Arg::new("freeze_state")
+                    .short('F')
+                    .long("freeze-state")
+                    .value_name("FILE")
+                    .help(gettext("Produce a frozen state on FILE at end"))
+                    .num_args(1)
+                    .value_parser(clap::value_parser!(PathBuf)),
+            )
+            .arg(
                 clap::Arg::new("trace")
                     .short('t')
                     .long("trace")
@@ -293,6 +316,8 @@ impl Args {
             debugfile: matches
                 .get_one::<OsString>("debugfile")
                 .map(|name| (name != DEBUGFILE_STDERR).then(|| bytes(name))),
+            reload_state: matches.get_one::<PathBuf>("reload_state").cloned(),
+            freeze_state: matches.get_one::<PathBuf>("freeze_state").cloned(),
             trace: matches
                 .get_many::<OsString>("trace")
                 .unwrap_or_default()
@@ -350,6 +375,9 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
     let stdout = Rc::new(RefCell::new(stdout));
     let mut state = State::try_new(stdout.clone(), Vec::new(), args.line_synchronization)?;
     state.configure(&args, &mut stderr)?;
+    if let Some(path) = &args.reload_state {
+        reload_state(&mut state, path, &mut stderr)?;
+    }
 
     let has_file = args
         .items
@@ -370,7 +398,7 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
         // Process -D/-U options and file operands in command-line order so a
         // -D/-U takes effect for the operands that follow it. Each file is
         // processed to completion before the next item; m4wrap text and
-        // diversions are flushed once, after all input (see finalize below).
+        // diversions are flushed once, after all input (see run_wrapped below).
         for item in args.items {
             match item {
                 InputItem::Define(_) | InputItem::Undefine(_) => {
@@ -389,7 +417,7 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
                             // Discard the previous (now exhausted) input only once
                             // the next one has opened. Popping before the open
                             // would, on a failed open, leave the input stack empty
-                            // and cause finalize() to be skipped — dropping any
+                            // and cause run_wrapped() to be skipped — dropping any
                             // m4wrap text or diversions queued by earlier files.
                             while state.input.input_len() > 0 {
                                 state.input.input_pop();
@@ -413,12 +441,27 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
     }
 
     let exit_error = state.exit_error;
-    // Flush m4wrap text (rescanned) and any remaining diversions, once, at the
-    // true end of input. Skipped only if no input was ever opened.
+    // Run m4wrap text (rescanned), once, at the true end of input, then flush
+    // the diversions or freeze them. No input ever opened means no m4wrap text.
     if state.input.input_len() > 0 {
-        state = main_loop::finalize(state, &mut stderr)?;
+        state = main_loop::run_wrapped(state, &mut stderr)?;
     }
     state.debug.flush()?;
+    match &args.freeze_state {
+        // The diversions go into the frozen file, not to the output.
+        Some(path) => {
+            if let Err(error) = freeze::freeze(&state, path) {
+                writeln!(
+                    stderr,
+                    "m4: cannot write frozen state to `{}': {}",
+                    path.display(),
+                    plib::diag::io_error_text(&error)
+                )?;
+                return Err(Error::new(ErrorKind::Exit(1)));
+            }
+        }
+        None => main_loop::undivert_all(&mut state)?,
+    }
 
     // A recoverable error (a diagnostic emitted via State::emit_error, e.g. a
     // bad eval expression, or an unreadable file operand) leaves processing
@@ -428,6 +471,33 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
     }
 
     Ok(())
+}
+
+/// Start from the frozen state at `path` (`-R`), in GNU m4's words when it
+/// cannot: exit status 63 for a version this m4 does not read, else 1.
+fn reload_state(state: &mut State, path: &std::path::Path, stderr: &mut dyn Write) -> Result<()> {
+    let file = path.display();
+    let (message, status) = match freeze::reload(state, path, stderr) {
+        Ok(()) => return Ok(()),
+        Err(freeze::ReloadError::Io(error)) => (
+            format!(
+                "m4: cannot open `{file}': {}",
+                plib::diag::io_error_text(&error)
+            ),
+            1,
+        ),
+        Err(freeze::ReloadError::Version(version, line)) => (
+            format!(
+                "m4:{file}:{line}: frozen file version {version} greater than max supported of 1"
+            ),
+            freeze::VERSION_MISMATCH_STATUS,
+        ),
+        Err(freeze::ReloadError::Malformed(line)) => {
+            (format!("m4:{file}:{line}: ill-formed frozen file"), 1)
+        }
+    };
+    writeln!(stderr, "{message}")?;
+    Err(Error::new(ErrorKind::Exit(status)))
 }
 
 /// Apply a `-D`/`-U` directive to the macro table. (File items are handled by

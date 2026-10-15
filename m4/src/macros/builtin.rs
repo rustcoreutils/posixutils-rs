@@ -1241,3 +1241,18 @@ impl MacroImplementation for LineMacro {
         Ok(state)
     }
 }
+
+/// `__program__`: the quoted name m4 was invoked by. autoconf's frozen
+/// files define a copy of it.
+pub struct ProgramMacro;
+
+impl MacroImplementation for ProgramMacro {
+    fn evaluate(&self, state: State, _stderr: &mut dyn Write, _frame: StackFrame) -> Result<State> {
+        let program = std::env::args_os().next().unwrap_or_else(|| "m4".into());
+        let mut text = state.parse_config.quote_open_tag.clone();
+        text.extend_from_slice(program.as_bytes());
+        text.extend_from_slice(&state.parse_config.quote_close_tag);
+        state.input.pushback_string(&text);
+        Ok(state)
+    }
+}

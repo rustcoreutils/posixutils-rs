@@ -152,6 +152,7 @@ macro_enums!(
         Index(IndexMacro),
         Len(LenMacro),
         Line(LineMacro),
+        Program(ProgramMacro),
         M4exit(M4exitMacro),
         M4wrap(M4wrapMacro),
         Maketemp(MkstempMacro),
@@ -205,6 +206,7 @@ impl AsRef<[u8]> for BuiltinMacro {
             Index => b"index",
             Len => b"len",
             Line => b"__line__",
+            Program => b"__program__",
             M4exit => b"m4exit",
             M4wrap => b"m4wrap",
             Maketemp => b"maketemp",
@@ -270,6 +272,7 @@ impl BuiltinMacro {
             Index => 1,
             Len => 1,
             Line => 0,
+            Program => 0,
             M4exit => 0,
             M4wrap => 1,
             Maketemp => 1,
@@ -295,7 +298,7 @@ impl BuiltinMacro {
     fn arity(&self) -> (usize, Option<usize>) {
         use BuiltinMacro::*;
         match self {
-            Divnum | Dnl | File | Line | Sysval => (0, Some(0)),
+            Divnum | Dnl | File | Line | Program | Sysval => (0, Some(0)),
             Changecom | Changequote => (0, Some(2)),
             Debugfile | Debugmode => (0, Some(1)),
             Esyscmd => (1, Some(1)),

@@ -712,6 +712,12 @@ The GNU m4 extensions autoconf, automake and libtoolize cannot run without:
    macros.  POSIX reads `$10` as `$1` followed by `0`: a deviation.
  * `translit` expands `a-z` ranges, and `eval` reads `0rRADIX:DIGITS`
    numbers; autoconf uses both.
+ * Frozen state files in GNU m4's version 1 format: `-R FILE` /
+   `--reload-state=FILE` starts from one instead of the built-in table (every
+   autom4te language reloads one, frozen by GNU m4), `-F FILE` /
+   `--freeze-state=FILE` writes one at the end instead of the diversions.
+   A file of another version exits with status 63.  `__program__` expands
+   to the name m4 was invoked by, since those files copy it.
 
 ### make
 

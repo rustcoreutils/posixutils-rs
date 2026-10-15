@@ -82,6 +82,32 @@ impl OutputRef {
     pub fn stdout(&self) -> Rc<RefCell<dyn Write>> {
         self.0.borrow().stdout()
     }
+
+    /// Every non-empty diversion buffer, in numerical order, for a frozen
+    /// state file.
+    pub fn diversions(&self) -> Vec<(usize, Vec<u8>)> {
+        self.0
+            .borrow()
+            .divert_buffers
+            .iter()
+            .map(|(n, buffer)| (*n, buffer.borrow().0.get_ref().clone()))
+            .filter(|(_, text)| !text.is_empty())
+            .collect()
+    }
+
+    /// Append `text` to diversion buffer `n` (positive), as a frozen state
+    /// file restores it.
+    pub fn append_to_diversion(&self, n: usize, text: &[u8]) -> Result<()> {
+        let buffer = self
+            .0
+            .borrow_mut()
+            .divert_buffers
+            .entry(n)
+            .or_default()
+            .clone();
+        buffer.borrow_mut().0.write_all(text)?;
+        Ok(())
+    }
 }
 
 impl Write for OutputRef {

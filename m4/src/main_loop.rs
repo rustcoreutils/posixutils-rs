@@ -16,10 +16,11 @@ use crate::state::{StackFrame, State};
 use crate::EOF;
 
 /// Process the current input stack until it is exhausted, expanding macros and
-/// writing to the output. Does NOT run m4wrap or flush diversions — those happen
-/// once, at the true end of all input, in [`finalize`]. This lets the driver in
-/// `run_impl` process file operands one at a time (interspersed with `-D`/`-U`)
-/// while keeping a single end-of-input finalization.
+/// writing to the output. Does NOT run m4wrap or flush diversions: those happen
+/// once, at the true end of all input, in [`run_wrapped`] and [`undivert_all`].
+/// This lets the driver in `run_impl` process file operands one at a time
+/// (interspersed with `-D`/`-U`) while keeping a single end-of-input
+/// finalization.
 pub(crate) fn process(mut state: State, stderr: &mut dyn Write) -> crate::error::Result<State> {
     let mut token: Vec<u8> = Vec::new();
 
@@ -246,10 +247,9 @@ pub(crate) fn process(mut state: State, stderr: &mut dyn Write) -> crate::error:
     Ok(state)
 }
 
-/// Finalize processing at the true end of all input: run queued m4wrap text
-/// (rescanned, in the order the m4wrap calls were made — POSIX), then flush any
-/// remaining diversion buffers to standard output in numerical order.
-pub(crate) fn finalize(mut state: State, stderr: &mut dyn Write) -> crate::error::Result<State> {
+/// Run queued m4wrap text at the true end of all input, rescanned, in the
+/// order the m4wrap calls were made (POSIX).
+pub(crate) fn run_wrapped(mut state: State, stderr: &mut dyn Write) -> crate::error::Result<State> {
     // Wrapped text may itself expand macros, divert, or queue further m4wrap
     // text, so loop until the queue is empty. It runs in whatever diversion
     // is current, as in GNU m4, and each piece keeps the location of its
@@ -261,9 +261,12 @@ pub(crate) fn finalize(mut state: State, stderr: &mut dyn Write) -> crate::error
         }
         state = process(state, stderr)?;
     }
-
-    state.output.output.divert(0)?;
-    state.output.output.undivert_all()?;
-
     Ok(state)
+}
+
+/// Write every diversion buffer to standard output, in numerical order: the
+/// last step of a run that does not freeze its state.
+pub(crate) fn undivert_all(state: &mut State) -> crate::error::Result<()> {
+    state.output.output.divert(0)?;
+    state.output.output.undivert_all()
 }

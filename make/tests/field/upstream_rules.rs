@@ -119,8 +119,11 @@ fn a_command_line_value_loses_its_leading_blanks() {
 #[test]
 fn makefile_list_and_realpath() {
     let dir = Dir::new("up_makefile_list");
+    // `makefile`, the first name make looks for: on a case-insensitive file
+    // system (macOS) a `Makefile` is found under that first name too, and
+    // MAKEFILE_LIST records the name used, as in GNU make.
     dir.write(
-        "Makefile",
+        "makefile",
         "include sub/inc.mk\nall:\n\t@echo [$(notdir $(MAKEFILE_LIST))] [$(SRCDIR)]\n\t@echo [$(realpath . nosuch)]\n",
     );
     dir.write(
@@ -132,5 +135,5 @@ fn makefile_list_and_realpath() {
         .to_string_lossy()
         .into_owned();
     dir.make(&[])
-        .ok(&format!("[Makefile inc.mk] [sub]\n[{here}]\n"));
+        .ok(&format!("[makefile inc.mk] [sub]\n[{here}]\n"));
 }

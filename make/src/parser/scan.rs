@@ -17,8 +17,15 @@
 pub(crate) struct RuleLine {
     pub targets: Vec<String>,
     pub prerequisites: Vec<String>,
+    /// The prerequisites after a `|` word: GNU make's order-only ones.
+    pub order_only: Vec<String>,
     /// A command given inline after a `<semicolon>`, if any.
     pub inline: Option<String>,
+    /// Written `target::`, the GNU double-colon form.
+    pub double_colon: bool,
+    /// The target pattern of a GNU static pattern rule,
+    /// `targets: target-pattern: prereq-patterns`.
+    pub target_pattern: Option<String>,
 }
 
 /// Drop a trailing comment. POSIX 105551: a `#` and everything after it, up to
@@ -26,10 +33,55 @@ pub(crate) struct RuleLine {
 ///
 /// Must not be applied to command lines — POSIX 105629 hands those to the shell
 /// verbatim, where `#` is meaningful (`@echo '#!/bin/sh'`).
-pub(crate) fn strip_comment(line: &str) -> &str {
-    match line.find('#') {
-        Some(i) => &line[..i],
-        None => line,
+///
+/// A `#` after a backslash is a literal `#`, and the backslash goes (GNU
+/// make): libzstd writes `NUM_SYMBOL := \#`, and build-essential
+/// `$(shell grep -v '^\#' ...)`, where a comment would cut the reference in
+/// half.
+pub(crate) fn strip_comment(line: &str) -> std::borrow::Cow<'_, str> {
+    // Most lines have no `#` at all, and then nothing is stripped.
+    let Some(first_hash) = line.find('#') else {
+        return std::borrow::Cow::Borrowed(line);
+    };
+    // Bytes rather than characters: `#` and `\` are ASCII, and every byte
+    // of a multibyte character ends an escape just as the character does.
+    // The scan starts at the backslashes just before the first `#`, if
+    // any, as the escape state there depends only on them.
+    let backslashes = line[..first_hash]
+        .bytes()
+        .rev()
+        .take_while(|&b| b == b'\\')
+        .count();
+    let mut escaped = false;
+    let mut end = line.len();
+    for (i, &b) in line
+        .as_bytes()
+        .iter()
+        .enumerate()
+        .skip(first_hash - backslashes)
+    {
+        match b {
+            b'#' if !escaped => {
+                end = i;
+                break;
+            }
+            b'\\' => escaped = !escaped,
+            _ => escaped = false,
+        }
+    }
+    let code = &line[..end];
+    match code.contains("\\#") {
+        true => std::borrow::Cow::Owned(code.replace("\\#", "#")),
+        false => std::borrow::Cow::Borrowed(code),
+    }
+}
+
+/// Write each `#` of `text` as `\#`, so that [`strip_comment`] gives it
+/// back as it is rather than taking it for a comment.
+pub(crate) fn escape_hashes(text: &str) -> std::borrow::Cow<'_, str> {
+    match text.contains('#') {
+        true => std::borrow::Cow::Owned(text.replace('#', "\\#")),
+        false => std::borrow::Cow::Borrowed(text),
     }
 }
 
@@ -52,6 +104,36 @@ fn split_inline_command(rhs: &str) -> (&str, Option<String>) {
     }
 }
 
+/// Split off the target pattern of a GNU static pattern rule.
+///
+/// `$(OBJS): %.o: %.c` (bzip2) has a second `:` on the prerequisite side,
+/// and the single word before it is a `%` pattern. Anything else -- a `:` in
+/// an ordinary prerequisite, `all: a:b` -- is left alone.
+fn split_static_pattern(text: &str) -> (Option<String>, &str) {
+    let Some(colon) = text.find(':') else {
+        return (None, text);
+    };
+    let words = split_words(&text[..colon]);
+    match words.as_slice() {
+        [pattern] if pattern.contains('%') => (Some(pattern.clone()), &text[colon + 1..]),
+        _ => (None, text),
+    }
+}
+
+/// Split the prerequisite words at a `|` word into the normal and the
+/// order-only prerequisites (GNU make). libzstd writes
+/// `$(ZSTD_DYNLIB_DIR)/%.o : %.c | $(ZSTD_DYNLIB_DIR)`.
+fn split_order_only(mut words: Vec<String>) -> (Vec<String>, Vec<String>) {
+    match words.iter().position(|w| w == "|") {
+        Some(bar) => {
+            let order_only = words.split_off(bar + 1);
+            words.pop();
+            (words, order_only)
+        }
+        None => (words, Vec::new()),
+    }
+}
+
 /// Parse `target [target...]: [prerequisite...][; command]` (POSIX 105639).
 ///
 /// Every character that is not a `<blank>`, `:`, `;` or `#` is an ordinary name
@@ -61,14 +143,13 @@ pub(crate) fn split_rule_line(line: &str) -> Result<RuleLine, String> {
     let colon = line.find(':').ok_or("expected ':'")?;
     let (lhs, rhs) = (&line[..colon], &line[colon + 1..]);
 
-    // `target:: prerequisites` is the GNU double-colon rule: several rules for
-    // one target, each with its own commands, all of which run. POSIX has no
-    // such construct and we do not implement it. Say so: taking the first `:`
-    // made the second one a prerequisite literally named `:`, and the makefile
-    // failed with `no target ':'` (audit #86).
-    if rhs.starts_with(':') {
-        return Err("double-colon rules are not supported".to_string());
-    }
+    // `target:: prerequisites` is the GNU double-colon rule. Taking the first
+    // `:` alone made the second one a prerequisite literally named `:`, and the
+    // makefile failed with `no target ':'` (audit #86).
+    let (rhs, double_colon) = match rhs.strip_prefix(':') {
+        Some(rest) => (rest, true),
+        None => (rhs, false),
+    };
 
     // A semicolon left of the colon would otherwise yield a target literally
     // named `a;b`, silently.
@@ -76,16 +157,21 @@ pub(crate) fn split_rule_line(line: &str) -> Result<RuleLine, String> {
         return Err("';' before ':'".to_string());
     }
 
+    // An empty target list is returned, not refused: the line was expanded
+    // before it got here, and a list that expanded to nothing is a rule for
+    // no target (see `Builder::close`).
     let targets = split_words(lhs);
-    if targets.is_empty() {
-        return Err("missing target before ':'".to_string());
-    }
 
     let (prereq_text, inline) = split_inline_command(rhs);
+    let (target_pattern, prereq_text) = split_static_pattern(prereq_text);
+    let (prerequisites, order_only) = split_order_only(split_words(prereq_text));
     Ok(RuleLine {
         targets,
-        prerequisites: split_words(prereq_text),
+        prerequisites,
+        order_only,
         inline,
+        double_colon,
+        target_pattern,
     })
 }
 
@@ -102,6 +188,41 @@ mod tests {
         assert_eq!(strip_comment("comment: # this is a comment"), "comment: ");
         assert_eq!(strip_comment("no comment here"), "no comment here");
         assert_eq!(strip_comment("# whole line"), "");
+        // An escaped `#` is literal; an escaped backslash escapes nothing.
+        assert_eq!(strip_comment("X := \\# # c"), "X := # ");
+        assert_eq!(strip_comment("X := a\\\\# c"), "X := a\\\\");
+        assert_eq!(strip_comment(&escape_hashes("a#b")), "a#b");
+    }
+
+    /// The scan starts near the first `#`; it must still see the
+    /// backslashes before it, however many, and non-ASCII text.
+    #[test]
+    fn strips_comments_as_a_character_by_character_scan_does() {
+        fn by_characters(line: &str) -> String {
+            let mut escaped = false;
+            let mut end = line.len();
+            for (i, c) in line.char_indices() {
+                match c {
+                    '#' if !escaped => {
+                        end = i;
+                        break;
+                    }
+                    '\\' => escaped = !escaped,
+                    _ => escaped = false,
+                }
+            }
+            line[..end].replace("\\#", "#")
+        }
+        for slashes in 0..6 {
+            for line in [
+                format!("a{}# c", "\\".repeat(slashes)),
+                format!("{}#b # c", "\\".repeat(slashes)),
+                format!("é{}#ü\\# # ö", "\\".repeat(slashes)),
+                format!("x\\y{}#", "\\".repeat(slashes)),
+            ] {
+                assert_eq!(strip_comment(&line), by_characters(&line), "{line:?}");
+            }
+        }
     }
 
     #[test]
@@ -122,9 +243,12 @@ mod tests {
     // second one a prerequisite literally named `:`, which failed later with
     // `no target ':'` -- a diagnostic about the wrong thing entirely.
     #[test]
-    fn rejects_a_double_colon_rule() {
-        let err = split_rule_line("all:: a").expect_err("must be rejected");
-        assert!(err.contains("double-colon"), "err: {err}");
+    fn recognizes_a_double_colon_rule() {
+        let r = rule("all:: a");
+        assert!(r.double_colon);
+        assert_eq!(r.targets, vec!["all"]);
+        assert_eq!(r.prerequisites, vec!["a"]);
+        assert!(!rule("all: a").double_colon);
     }
 
     // A `:` on the prerequisite side is not the double-colon form.
@@ -168,6 +292,30 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_a_static_pattern_rule() {
+        let r = rule("a.o b.o: %.o: %.c common.h");
+        assert_eq!(r.targets, vec!["a.o", "b.o"]);
+        assert_eq!(r.target_pattern.as_deref(), Some("%.o"));
+        assert_eq!(r.prerequisites, vec!["%.c", "common.h"]);
+        // Without a `%` before the second colon it is not one.
+        let r = rule("all: a:b");
+        assert_eq!(r.target_pattern, None);
+        assert_eq!(r.prerequisites, vec!["a:b"]);
+    }
+
+    #[test]
+    fn splits_off_order_only_prerequisites() {
+        let r = rule("obj/a.o: a.c a.h | obj");
+        assert_eq!(r.prerequisites, vec!["a.c", "a.h"]);
+        assert_eq!(r.order_only, vec!["obj"]);
+        let r = rule("lib: | dir1 dir2");
+        assert!(r.prerequisites.is_empty());
+        assert_eq!(r.order_only, vec!["dir1", "dir2"]);
+        let r = rule("%.o: %.c | %.d");
+        assert_eq!(r.order_only, vec!["%.d"]);
+    }
+
+    #[test]
     fn inference_targets_parse() {
         assert_eq!(rule(".c.o:").targets, vec![".c.o"]);
         assert!(rule(".txt.out:  ").prerequisites.is_empty());
@@ -184,7 +332,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_an_empty_target_list() {
-        assert!(split_rule_line(": c").is_err());
+    fn an_empty_target_list_is_returned_empty() {
+        let r = rule(": c");
+        assert!(r.targets.is_empty());
+        assert_eq!(r.prerequisites, vec!["c"]);
     }
 }

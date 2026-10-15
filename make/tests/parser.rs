@@ -87,12 +87,18 @@ all:
         assert!(result.contains("@echo a b"), "got: {result:?}");
     }
 
-    // Audit #7: backslash-newline continuation in a recipe line is spliced
-    // (the leading tab of the continuation is removed).
+    // Audit #7: backslash-newline continuation in a recipe line joins the two
+    // lines into one command line, the leading tab of the continuation
+    // removed. POSIX 105559-105562 keeps the backslash and the newline in
+    // the command executed; until the rule stage the newline is held as a
+    // private-use marker, U+E000, so the text stays one line.
     #[test]
     fn test_continuation_recipe() {
         let result = preprocess("all:\n\t@echo one \\\n\ttwo\n").unwrap().text;
-        assert!(result.contains("@echo one two"), "got: {result:?}");
+        assert!(
+            result.contains("\t@echo one \\\u{E000}two\n"),
+            "got: {result:?}"
+        );
     }
 
     // Audit #15: internal-macro references survive preprocessing for the
@@ -117,10 +123,15 @@ all:
         assert!(result.unwrap().text.contains("@echo ok"));
     }
 
+    // POSIX 105587-105600: a missing `include` is read as empty and recorded,
+    // so that once the makefiles are read a rule can make it; only then is it
+    // an error if nothing could.
     #[test]
-    fn test_include_missing_errors() {
-        let result = preprocess("include /nonexistent_xyz.mk\nall:\n\t@echo ok\n");
-        assert!(result.is_err());
+    fn test_include_missing_is_recorded() {
+        let result = preprocess("include /nonexistent_xyz.mk\nall:\n\t@echo ok\n").unwrap();
+        assert_eq!(result.includes.len(), 1);
+        assert_eq!(result.includes[0].path, "/nonexistent_xyz.mk");
+        assert!(!result.includes[0].optional);
     }
 
     // Audit #19: `includedir = ...` is a macro definition, not an include
@@ -137,7 +148,7 @@ all:
     // swallowed into a misleading empty path.
     #[test]
     fn test_include_path_substitution_error_propagates() {
-        let result = preprocess("include $(UNDEF)/x.mk\nall:\n\t@echo hi\n");
+        let result = preprocess("include $(error bad)/x.mk\nall:\n\t@echo hi\n");
         assert!(result.is_err(), "expected an error, got: {result:?}");
     }
 
@@ -172,6 +183,19 @@ all:
         assert!(result.is_err(), "expected an error, got: {result:?}");
     }
 
+    // POSIX 105772: a macro name may use any character of the portable
+    // filename character set, `-` among them. binutils' top-level Makefile
+    // defines `PGO-TRAINING-TARGETS`, and the line was a parse error.
+    #[test]
+    fn a_macro_name_may_contain_a_hyphen() {
+        let source = "PGO-TRAINING-TARGETS = a b\nX-Y := $(PGO-TRAINING-TARGETS:a=c)\n\
+                      X-Y += d\nall:\n\t@echo $(PGO-TRAINING-TARGETS) ${X-Y}\n";
+        assert_eq!(value_of(source, "PGO-TRAINING-TARGETS"), "a b");
+        assert_eq!(value_of(source, "X-Y"), "c b d");
+        let result = preprocess(source).unwrap().text;
+        assert!(result.contains("@echo a b c b d"), "got: {result:?}");
+    }
+
     fn macros_of(source: &str) -> Vec<(String, String)> {
         preprocess(source).expect("must preprocess").macros
     }
@@ -202,6 +226,7 @@ all:
         let names: Vec<String> = macros_of("B = 2\nA = 1\nB = 3\nall:\n\techo hi\n")
             .into_iter()
             .map(|(n, _)| n)
+            .filter(|n| n != "CURDIR")
             .collect();
         assert_eq!(names, vec!["B".to_string(), "A".to_string()]);
     }
@@ -285,7 +310,9 @@ mod parse {
         let (targets, prerequisites, recipes) = only_rule(SIMPLE);
         assert_eq!(targets, vec!["rule"]);
         assert_eq!(prerequisites, vec!["dependency"]);
-        assert_eq!(recipes, vec!["command", "command2"]);
+        // Command lines are kept as written; the rule stage expands them
+        // with the macros in force for the target being made.
+        assert_eq!(recipes, vec!["command", "${VARIABLE}"]);
     }
 
     #[test]
@@ -549,10 +576,28 @@ mod conditionals {
         assert!(preprocess(&src).is_err(), "self-include must not loop");
     }
 
-    // Audit #32: `A = $(A)x` used to grow the text forever.
+    // Audit #32: `A = $(A)x` used to grow the text forever. It is found the
+    // first time `A` is met inside its own value.
     #[test]
     fn recursive_macro_is_capped() {
-        assert!(preprocess("A = $(A)x\nall:\n\techo $(A)\n").is_err());
+        let err = preprocess("A = $(A)x\nall:\n\techo $(A)\n").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Recursive variable 'A' references itself (eventually)"
+        );
+    }
+
+    // Delayed macros nested deeper than the stack can hold are an error, not
+    // a crash.
+    #[test]
+    fn a_too_deep_chain_of_macros_is_an_error() {
+        let mut src = String::new();
+        for i in 1..=500 {
+            src.push_str(&format!("V{i} = $(V{})\n", i + 1));
+        }
+        src.push_str("all: $(V1)\n");
+        let err = preprocess(&src).unwrap_err();
+        assert!(err.to_string().contains("nested more than"), "{err}");
     }
 
     // Audit #34: an undefined macro is the empty string, not a fatal error.
@@ -649,11 +694,11 @@ mod functions {
         assert!(out.contains("[hi a and b]"), "got: {out:?}");
     }
 
-    // A self-referential $(call) recursed through
-    // substitute -> func::call -> expand -> substitute until the stack was
-    // exhausted: "fatal runtime error: stack overflow", core dumped.
-    // MAX_EXPANSION_ROUNDS bounds the rounds within one frame, not the depth of
-    // that cycle, so a separate depth guard was needed.
+    // A self-referential $(call) recursed through expansion -> func::call ->
+    // expansion until the stack was exhausted: "fatal runtime error: stack
+    // overflow", core dumped. `call` expands the body without marking the
+    // macro, as GNU make lets a function recurse, so the depth guard is what
+    // stops it.
     #[test]
     fn self_referential_call_is_capped_not_a_crash() {
         let err = preprocess("A = $(call A)\nall:\n\t@echo $(A)\n");
@@ -750,9 +795,14 @@ mod functions {
         assert!(preprocess("A = $(and 1,$(A))\nall:\n\t@echo $(A)\n").is_err());
     }
 
+    // Not a function, so a macro whose name has a blank in it -- which is
+    // not defined, and expands to nothing (POSIX 105833), as in GNU make.
     #[test]
-    fn an_unknown_function_name_is_refused() {
-        assert!(preprocess("all:\n\t@echo $(nosuchthing foo)\n").is_err());
+    fn an_unknown_function_name_is_an_undefined_macro() {
+        let text = preprocess("all:\n\t@echo [$(nosuchthing foo)]\n")
+            .unwrap()
+            .text;
+        assert!(text.contains("@echo []"), "got: {text:?}");
     }
 }
 

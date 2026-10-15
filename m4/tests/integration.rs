@@ -7,6 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod autotools;
+
 use plib::testing::{get_binary_path, run_test, run_test_with_checker, TestPlan};
 use std::fs;
 use std::path::Path;

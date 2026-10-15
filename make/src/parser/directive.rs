@@ -32,8 +32,13 @@ pub(crate) enum Directive {
     /// `else`, optionally carrying a further condition (`else ifeq (...)`).
     Else(Option<Box<Directive>>),
     EndIf,
-    /// `define NAME` — begins a multi-line macro body.
-    Define(String),
+    /// `define NAME [op]` — begins a multi-line macro body. `op` is the
+    /// assignment operator written after the name (GNU make), empty for
+    /// none, which is `=`.
+    Define {
+        name: String,
+        op: String,
+    },
     /// `endef` — ends one.
     EndDef,
     /// `vpath` with its raw argument text: a pattern and its directories, a
@@ -43,6 +48,20 @@ pub(crate) enum Directive {
     Export(String),
     /// `unexport NAME...`: the inverse.
     Unexport(String),
+}
+
+impl Directive {
+    /// Whether this is part of a conditional: `ifeq`, `ifneq`, `ifdef`,
+    /// `ifndef`, `else` or `endif`.
+    pub(crate) fn is_conditional(&self) -> bool {
+        matches!(
+            self,
+            Directive::IfCompare { .. }
+                | Directive::IfDefined { .. }
+                | Directive::Else(_)
+                | Directive::EndIf
+        )
+    }
 }
 
 /// Split a directive line into its keyword and the rest.
@@ -57,14 +76,16 @@ fn split_keyword(line: &str) -> Option<(&str, &str)> {
     Some((keyword, rest.trim()))
 }
 
-/// `define NAME`, `define NAME =`, `define NAME :=` — the trailing operator is
-/// a GNU form; the name is what matters.
-fn define_name(rest: &str) -> String {
-    rest.split(['=', ':', '?', '+', '!'])
-        .next()
-        .unwrap_or(rest)
-        .trim()
-        .to_string()
+/// `define NAME`, `define NAME =`, `define NAME :=`: the name, and the
+/// assignment operator after it, a GNU form that gives the definition the
+/// flavour the operator gives a one-line one.
+fn define_directive(rest: &str) -> Directive {
+    let end = rest.find(['=', ':', '?', '+', '!']).unwrap_or(rest.len());
+    let (name, op) = rest.split_at(end);
+    Directive::Define {
+        name: name.trim().to_string(),
+        op: op.trim().to_string(),
+    }
 }
 
 /// Recognize a control directive, or `None` for an ordinary line.
@@ -91,7 +112,7 @@ pub(crate) fn parse_directive(line: &str) -> Option<Directive> {
         // `else ifeq (...)` chains a further condition onto the else branch.
         "else" => Some(Directive::Else(parse_directive(rest).map(Box::new))),
         "endif" => Some(Directive::EndIf),
-        "define" => Some(Directive::Define(define_name(rest))),
+        "define" => Some(define_directive(rest)),
         "endef" => Some(Directive::EndDef),
         "vpath" => Some(Directive::VPath(rest.to_string())),
         // Only the valueless form: `export NAME = v` is a macro definition that
@@ -213,14 +234,16 @@ mod tests {
 
     #[test]
     fn recognizes_define_forms() {
-        assert_eq!(
-            parse_directive("define BODY"),
-            Some(Directive::Define("BODY".to_string()))
-        );
-        assert_eq!(
-            parse_directive("define BODY ="),
-            Some(Directive::Define("BODY".to_string()))
-        );
+        let define = |name: &str, op: &str| {
+            Some(Directive::Define {
+                name: name.to_string(),
+                op: op.to_string(),
+            })
+        };
+        assert_eq!(parse_directive("define BODY"), define("BODY", ""));
+        assert_eq!(parse_directive("define BODY ="), define("BODY", "="));
+        assert_eq!(parse_directive("define BODY :="), define("BODY", ":="));
+        assert_eq!(parse_directive("define BODY+="), define("BODY", "+="));
         assert_eq!(parse_directive("endef"), Some(Directive::EndDef));
     }
 

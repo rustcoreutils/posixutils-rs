@@ -73,6 +73,15 @@ impl Default for ParseConfig {
 #[derive(PartialEq, Clone, Hash, Eq)]
 pub struct MacroName(pub Vec<u8>);
 
+/// Lets the macro table be searched with a byte slice, without building a
+/// `MacroName` for every word read. `Vec<u8>` hashes as its slice, so the two
+/// agree.
+impl std::borrow::Borrow<[u8]> for MacroName {
+    fn borrow(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 impl std::fmt::Debug for MacroName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("MacroName")
@@ -176,10 +185,10 @@ pub(crate) fn invalid_name_error(arg: &str, value: &[u8]) -> clap::Error {
 // create that divergence rather than remove one.
 //
 // Character semantics belong to the built-ins that count or index characters,
-// where POSIX 103776 puts them, and they already have them: `len`, `substr`,
-// `index` and `translit` go through `plib::locale::mb_char_slices`. That is
-// where m4 is ahead of GNU, not behind it -- `len(café)` is 4 here and 5
-// there, and GNU's `substr` will hand back half a UTF-8 sequence.
+// where POSIX 103776 puts them: under POSIXLY_CORRECT `len`, `substr`, `index`
+// and `translit` go through `plib::locale::mb_char_slices`. By default they
+// count bytes, as GNU m4 does (`len(café)` is 5), because autotools output
+// depends on it.
 fn is_word_char_end(c: u8) -> bool {
     (unsafe { libc::isalnum(c.into()) } != 0) || c == b'_'
 }
@@ -196,10 +205,34 @@ pub(crate) fn is_space(c: u8) -> bool {
     unsafe { libc::isspace(c.into()) != 0 }
 }
 
-pub(crate) fn is_alphnumeric(c: u8) -> bool {
-    unsafe { libc::isalnum(c.into()) != 0 }
+/// Which bytes start and continue a name token, looked up once: the main
+/// loop asks for every byte it reads, and the locale is fixed by then.
+struct NameBytes {
+    start: [bool; 256],
+    rest: [bool; 256],
 }
 
-pub(crate) fn is_alpha(c: u8) -> bool {
-    unsafe { libc::isalpha(c.into()) != 0 }
+fn name_bytes() -> &'static NameBytes {
+    static TABLE: std::sync::OnceLock<NameBytes> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = NameBytes {
+            start: [false; 256],
+            rest: [false; 256],
+        };
+        for c in 0..=255u8 {
+            table.start[usize::from(c)] = is_word_char_start(c);
+            table.rest[usize::from(c)] = is_word_char_end(c);
+        }
+        table
+    })
+}
+
+/// Whether `c` can start a name token: a letter or `_`.
+pub(crate) fn is_name_start(c: u8) -> bool {
+    name_bytes().start[usize::from(c)]
+}
+
+/// Whether `c` can continue a name token: a letter, digit or `_`.
+pub(crate) fn is_name_byte(c: u8) -> bool {
+    name_bytes().rest[usize::from(c)]
 }

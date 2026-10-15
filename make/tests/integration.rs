@@ -568,7 +568,7 @@ mod parsing {
             &["-f", "tests/makefiles/parsing/suffixes_with_no_targets.mk"],
             "",
             "make: no targets to execute\n",
-            ErrorCode::NoTarget { target: None }.into(),
+            ErrorCode::NoTargets.into(),
         );
     }
 
@@ -585,23 +585,18 @@ mod parsing {
         );
     }
 
-    // Audit #86: `all:: dep` is GNU's double-colon rule, which we do not
-    // implement. Splitting on the first `:` made the second one a prerequisite
-    // literally named `:`, so the makefile failed with `no target ':'` --
-    // a diagnostic about the wrong thing entirely.
+    // Audit #86: `all:: dep` is GNU's double-colon rule. Splitting on the
+    // first `:` made the second one a prerequisite literally named `:`, so the
+    // makefile failed with `no target ':'`. The rule is implemented now; its
+    // behaviour is tested in tests/field/double_colon.rs.
     #[test]
-    fn double_colon_rule_is_diagnosed() {
-        let bin = get_binary_path("make");
-        let output = Command::new(bin)
-            .args(["-f", "tests/makefiles/parsing/double_colon.mk", "all"])
-            .output()
-            .expect("failed to run make");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("double-colon rules are not supported"),
-            "stderr: {stderr}"
+    fn double_colon_rule_is_read() {
+        run_test_helper(
+            &["-f", "tests/makefiles/parsing/double_colon.mk", "all"],
+            "DEP\nDC\n",
+            "",
+            0,
         );
-        assert_eq!(output.status.code(), Some(4));
     }
 
     // Audit #3: a missing `include` file must produce a graceful error, not
@@ -1185,13 +1180,14 @@ mod special_targets {
             destruct,
         );
 
-        // With the clearing line, the rule is gone and nothing runs.
+        // With the clearing line, the rule is gone and nothing runs:
+        // copied.out has no commands, so there is nothing to be done.
         run_test_helper_with_setup_and_destruct(
             &[
                 "-f",
                 "tests/makefiles/special_targets/suffixes/clear_suffixes.mk",
             ],
-            "",
+            "make: Nothing to be done for 'copied.out'.\n",
             "",
             0,
             setup,
@@ -2449,7 +2445,8 @@ mod sccs {
 
         let (with, _) = run(&["-C", dir, "-p", "all"]);
         assert!(with.contains(".SCCS_GET:"), "stdout: {with}");
-        assert!(with.contains("get -s $@"), "stdout: {with}");
+        // Shown as written: command lines are expanded when they run.
+        assert!(with.contains("get $(SCCSGETFLAGS) $@"), "stdout: {with}");
 
         let (without, _) = run(&["-C", dir, "-rp", "all"]);
         assert!(!without.contains(".SCCS_GET:"), "stdout: {without}");
@@ -2502,6 +2499,18 @@ mod tilde_suffix_rules {
             "#!/bin/sh\nprintf 'int tilde_probe(void){return 0;}\\n'\n",
         );
         let _ = fs::set_permissions(&stub, fs::Permissions::from_mode(0o755));
+        // `execve` refuses a file any process holds open for writing, and
+        // every other test here forks: a `fork` during the write leaves the
+        // descriptor open in the child until that child's `exec`. Wait out
+        // `ETXTBSY` here rather than have make report it.
+        for attempt in 0..10 {
+            match Command::new(&stub).output() {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10 << attempt.min(4)));
+                }
+                _ => break,
+            }
+        }
     }
 
     // The `$<` a `~` rule sees is the SCCS history file, and `$*` is the stem

@@ -13,7 +13,10 @@
 //! is left is rule lines and command lines, which this walks one line at a
 //! time.
 
-use super::preprocessor::{is_include_line, is_macro_definition, preprocess_with, VPathEntry};
+use super::preprocessor::{
+    is_include_line, is_macro_definition, preprocess_with, unescape_dollars, Include, MacroTable,
+    TargetVar, VPathEntry,
+};
 use super::scan::{self, RuleLine};
 use crate::Macro;
 use std::fmt::{self, Display, Formatter};
@@ -38,9 +41,18 @@ impl std::error::Error for ParseError {}
 pub struct Rule {
     targets: Vec<String>,
     prerequisites: Vec<String>,
+    /// GNU make's order-only prerequisites, written after a `|`.
+    order_only: Vec<String>,
     /// Command lines with their leading `<tab>` removed. Prefix characters
     /// (`@`, `-`, `+`) are still attached; `rule::Recipe` strips those.
     recipes: Vec<String>,
+    /// Written `target::`, the GNU double-colon form.
+    double_colon: bool,
+    /// The target pattern of a static pattern rule, until `Builder::close`
+    /// makes one rule per target out of it.
+    target_pattern: Option<String>,
+    /// The stem a static pattern rule matched, which `$*` names.
+    stem: Option<String>,
     /// 1-based line in the preprocessed text, for diagnostics.
     line: usize,
 }
@@ -54,14 +66,51 @@ impl Rule {
         self.prerequisites.iter().map(String::as_str)
     }
 
+    pub fn order_only(&self) -> impl Iterator<Item = &str> {
+        self.order_only.iter().map(String::as_str)
+    }
+
     pub fn recipes(&self) -> impl Iterator<Item = &str> {
         self.recipes.iter().map(String::as_str)
+    }
+
+    /// The stem, for a rule made from a static pattern rule.
+    pub fn stem(&self) -> Option<&str> {
+        self.stem.as_deref()
+    }
+
+    /// Whether the rule was written `target::`.
+    pub fn is_double_colon(&self) -> bool {
+        self.double_colon
     }
 
     /// Line in the preprocessed text where this rule's header appeared.
     pub fn line(&self) -> usize {
         self.line
     }
+
+    /// The rule taken apart, so that its names move rather than being
+    /// copied.
+    pub(crate) fn into_parts(self) -> RuleParts {
+        RuleParts {
+            targets: self.targets,
+            prerequisites: self.prerequisites,
+            order_only: self.order_only,
+            recipes: self.recipes,
+            double_colon: self.double_colon,
+            stem: self.stem,
+        }
+    }
+}
+
+/// What a [`Rule`] holds, as [`Rule::into_parts`] hands it over.
+pub(crate) struct RuleParts {
+    pub targets: Vec<String>,
+    pub prerequisites: Vec<String>,
+    pub order_only: Vec<String>,
+    pub recipes: Vec<String>,
+    pub double_colon: bool,
+    pub stem: Option<String>,
 }
 
 impl Display for Rule {
@@ -80,7 +129,7 @@ impl Display for Rule {
 }
 
 /// A parsed makefile: its rules, and the macros the preprocessor consumed.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct Makefile {
     rules: Vec<Rule>,
     macros: Vec<Macro>,
@@ -88,6 +137,12 @@ pub struct Makefile {
     vpaths: Vec<VPathEntry>,
     /// Macros an `export` directive named.
     exports: Vec<String>,
+    /// Every file an `include` line named; see [`Include`].
+    includes: Vec<Include>,
+    /// The macros again, with the source of each.
+    table: MacroTable,
+    /// Target- and pattern-specific macro assignments, in the order read.
+    target_vars: Vec<TargetVar>,
 }
 
 impl Makefile {
@@ -105,6 +160,25 @@ impl Makefile {
 
     pub fn exports(&self) -> &[String] {
         &self.exports
+    }
+
+    pub fn includes(&self) -> &[Include] {
+        &self.includes
+    }
+
+    /// The macros with the source of each, which decides whether a
+    /// target-specific assignment may replace one.
+    pub fn table(&self) -> &MacroTable {
+        &self.table
+    }
+
+    /// Take the macro table out, leaving an empty one.
+    pub fn take_table(&mut self) -> MacroTable {
+        std::mem::take(&mut self.table)
+    }
+
+    pub fn target_vars(&self) -> &[TargetVar] {
+        &self.target_vars
     }
 
     /// Consume the makefile, yielding its rules, macros, search paths and
@@ -132,7 +206,7 @@ enum Line<'a> {
     /// A macro definition or include line, already handled upstream.
     Consumed,
     /// Any other non-empty line, which begins a new entry.
-    Entry(&'a str),
+    Entry(std::borrow::Cow<'a, str>),
 }
 
 /// Classify one physical line.
@@ -151,25 +225,84 @@ fn classify(line: &str) -> Line<'_> {
     if code.trim().is_empty() {
         return Line::Ignorable;
     }
-    if is_macro_definition(code) || is_include_line(code) {
+    if is_macro_definition(&code) || is_include_line(&code) {
         return Line::Consumed;
     }
     Line::Entry(code)
 }
 
 /// Start a rule from a parsed rule line, seeding its inline command if present.
+///
+/// The header was expanded by the preprocessor, which writes a literal `$`
+/// as `$$` (see [`unescape_dollars`]). Its words are names of files from
+/// here on, so each `$$` becomes the `$` it stands for: `a$$b:` makes the
+/// target `a$b`, as in GNU make. The line was split into its parts first,
+/// so a `$` cannot turn into a `:`, `;` or `|`.
+///
+/// Each target and prerequisite word holding a wildcard is then globbed, as
+/// the line is read, as in GNU make (see [`super::func::glob_name`]).
 fn rule_from(header: RuleLine, line: usize) -> Rule {
     let RuleLine {
         targets,
         prerequisites,
+        order_only,
         inline,
+        double_colon,
+        target_pattern,
     } = header;
+    let glob = |words: Vec<String>| -> Vec<String> {
+        words
+            .iter()
+            .flat_map(|word| super::func::glob_name(&unescape_dollars(word)))
+            .collect()
+    };
     Rule {
-        targets,
-        prerequisites,
+        targets: glob(targets),
+        prerequisites: glob(prerequisites),
+        order_only: glob(order_only),
         recipes: inline.into_iter().collect(),
+        double_colon,
+        target_pattern: target_pattern.map(|pattern| unescape_dollars(&pattern)),
+        stem: None,
         line,
     }
+}
+
+/// Make one ordinary target rule per target of a static pattern rule.
+///
+/// GNU make: `targets: target-pattern: prereq-patterns` gives each target
+/// that matches the target pattern the prerequisites the patterns name for
+/// its stem, the commands, and the stem as `$*`. bzip2 builds every object
+/// this way. A target that does not match is warned about and gets no
+/// prerequisites, as in GNU make.
+fn expand_static_pattern(rule: Rule) -> Vec<Rule> {
+    let pattern = rule.target_pattern.clone().unwrap_or_default();
+    rule.targets
+        .iter()
+        .map(|target| {
+            let stem = crate::rule::pattern_stem(&pattern, target).map(String::from);
+            let expand = |names: &[String]| -> Vec<String> {
+                match &stem {
+                    Some(stem) => names
+                        .iter()
+                        .map(|p| crate::rule::pattern_expand(p, stem))
+                        .collect(),
+                    None => Vec::new(),
+                }
+            };
+            if stem.is_none() {
+                eprintln!("make: target '{target}' doesn't match the target pattern");
+            }
+            Rule {
+                targets: vec![target.clone()],
+                prerequisites: expand(&rule.prerequisites),
+                order_only: expand(&rule.order_only),
+                target_pattern: None,
+                stem,
+                ..rule.clone()
+            }
+        })
+        .collect()
 }
 
 /// Accumulates rules while walking the file.
@@ -182,10 +315,40 @@ struct Builder {
 
 impl Builder {
     /// Close the rule under construction, if any.
+    ///
+    /// A rule whose target list expanded to nothing names no target, and is
+    /// dropped along with its command lines: `$(EXTRA_PROGRAMS): dep` with an
+    /// empty `EXTRA_PROGRAMS` is a rule for nothing, which automake output
+    /// writes routinely. POSIX asks the application for a non-null list
+    /// (105643) but says nothing of one that expands to null; GNU make
+    /// ignores it, and rejecting it failed the whole makefile.
+    ///
+    /// A `%` pattern rule without commands is dropped too. In GNU make it
+    /// cancels the built-in rule of that shape; it never makes anything, so
+    /// keeping it would let it "make" every target it matches by running no
+    /// commands. automake ends every Makefile with five of them
+    /// (`%:: %,v`, `%:: SCCS/s.%`, ...), cancelling GNU rules this make does
+    /// not have.
     fn close(&mut self) {
-        if let Some(rule) = self.current.take() {
-            self.rules.push(rule);
+        let Some(rule) = self.current.take() else {
+            return;
+        };
+        if rule.target_pattern.is_some() {
+            self.rules.extend(expand_static_pattern(rule));
+            return;
         }
+        let pattern = rule.targets.iter().any(|t| t.contains('%'));
+        if rule.targets.is_empty() || (pattern && rule.recipes.is_empty()) {
+            return;
+        }
+        if rule.double_colon && pattern {
+            self.errors.push(format!(
+                "{}: double-colon pattern rules are not supported",
+                rule.line
+            ));
+            return;
+        }
+        self.rules.push(rule);
     }
 
     /// Add a command line to the rule under construction.
@@ -202,7 +365,7 @@ impl Builder {
             return;
         }
         if let Line::Entry(code) = classify(body) {
-            self.open(code, lineno);
+            self.open(&code, lineno);
         }
     }
 
@@ -231,6 +394,7 @@ impl Builder {
                 macros,
                 vpaths,
                 exports,
+                ..Makefile::default()
             })
         } else {
             Err(ParseError(self.errors))
@@ -257,7 +421,7 @@ fn parse_scanned(
         match classify(line) {
             Line::Command(body) => builder.push_command(body, lineno),
             Line::Ignorable | Line::Consumed => {}
-            Line::Entry(code) => builder.open(code, lineno),
+            Line::Entry(code) => builder.open(&code, lineno),
         }
     }
 
@@ -282,11 +446,15 @@ impl Makefile {
     ) -> Result<Makefile, ParseError> {
         let scanned = preprocess_with(text, cmdline, builtins)
             .map_err(|e| ParseError(vec![e.to_string()]))?;
-        parse_scanned(
+        let mut makefile = parse_scanned(
             &scanned.text,
             scanned.macros,
             scanned.vpaths,
             scanned.exports,
-        )
+        )?;
+        makefile.includes = scanned.includes;
+        makefile.table = scanned.table;
+        makefile.target_vars = scanned.target_vars;
+        Ok(makefile)
     }
 }

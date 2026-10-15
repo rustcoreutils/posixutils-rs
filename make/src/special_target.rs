@@ -151,7 +151,7 @@ impl TryFrom<Target> for SpecialTarget {
     }
 }
 
-impl TryFrom<(Target, Config)> for InferenceTarget {
+impl TryFrom<(&Target, &Config)> for InferenceTarget {
     type Error = ParseError;
 
     /// A dot-target is an inference rule only if it *parses* as `.s1` or
@@ -161,26 +161,40 @@ impl TryFrom<(Target, Config)> for InferenceTarget {
     /// suffix, which filed `.config:` as an inference rule for `.c` and made a
     /// bare `make` build the wrong target (audit #38). It also computed `from`
     /// and `to` from the same expression, so both were the same string.
-    fn try_from((target, config): (Target, Config)) -> Result<Self, Self::Error> {
-        let Target::Inference { from, to, .. } = Target::new(target.to_string()) else {
+    ///
+    /// The name is split where both halves are known suffixes, rather than at
+    /// its second `.`: perl's Makefile declares `.SUFFIXES: .c .o .i .s
+    /// .c.depends` and has a `.c.c.depends:` rule, which the split at the dot
+    /// read as a `.c.c` rule making every `.c` file from itself.
+    fn try_from((target, config): (&Target, &Config)) -> Result<Self, Self::Error> {
+        // Every suffix begins with a dot; most targets are ruled out here,
+        // before their name is parsed again.
+        if !target.as_ref().starts_with('.') {
+            return Err(ParseError);
+        }
+        let Target::Inference { .. } = Target::new(target.to_string()) else {
             return Err(ParseError);
         };
-        let known = |suffix: &str| {
-            config
-                .suffixes
-                .iter()
-                .any(|s| s.trim_start_matches('.') == suffix)
+        let name = target.as_ref();
+        let known = |suffix: &str| config.suffixes.iter().any(|s| s == suffix);
+        let mut splits = config
+            .suffixes
+            .iter()
+            .filter(|from| from.len() > 1 && name.starts_with(from.as_str()));
+        let found = splits.find_map(|from| {
+            let to = &name[from.len()..];
+            match to.is_empty() {
+                true => Some((from.clone(), None)),
+                false => known(to).then(|| (from.clone(), Some(to.to_string()))),
+            }
+        });
+        let Some((from, to)) = found else {
+            return Err(ParseError);
         };
-        if !known(&from) {
-            return Err(ParseError);
-        }
-        if to.is_empty() {
-            return Ok(Self { from, to: None });
-        }
-        if !known(&to) {
-            return Err(ParseError);
-        }
-        Ok(Self { from, to: Some(to) })
+        Ok(Self {
+            from: from[1..].to_string(),
+            to: to.map(|to| to[1..].to_string()),
+        })
     }
 }
 
@@ -191,7 +205,7 @@ pub struct Processor<'make> {
 
 pub fn process(rule: Rule, make: &mut Make) -> Result<(), ErrorCode> {
     let Some(target) = rule.targets().next().cloned() else {
-        return Err(ErrorCode::NoTarget { target: None });
+        return Err(ErrorCode::NoTargets);
     };
 
     let this = Processor { rule, make };
@@ -369,9 +383,14 @@ impl Processor<'_> {
     }
 
     /// `.NOTPARALLEL` forces make to update one target at a time regardless of
-    /// `-j`. It must have no prerequisites or commands.
+    /// `-j`. It must have no commands.
+    ///
+    /// POSIX says an application shall not give it prerequisites, but bash's
+    /// debian/rules has `.NOTPARALLEL: build`, run by this make. GNU make
+    /// 4.4 makes only those targets' prerequisites serial, and earlier
+    /// versions ignore them; either way serialising everything is a correct
+    /// build, so the prerequisites are accepted and the whole run is serial.
     fn process_not_parallel(self) -> Result<(), Error> {
-        self.without_prerequisites()?;
         self.without_recipes()?;
         self.make.config.not_parallel = true;
         Ok(())

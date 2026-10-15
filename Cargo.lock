@@ -1035,6 +1035,7 @@ dependencies = [
  "nom",
  "plib",
  "regex",
+ "regex-automata",
  "similar-asserts",
  "test-log",
 ]

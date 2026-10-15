@@ -19,12 +19,21 @@ use gettextrs::gettext;
 use posixutils_make::{
     config::Config,
     error_code::ErrorCode::{self, *},
-    parser::{preprocessor::ENV_MACROS, Makefile},
+    jobserver::{self, Jobs},
+    parser::{
+        preprocessor::{ENV_MACROS, MAKEFILE_LIST},
+        Makefile,
+    },
+    rule::COMMANDS_SEEN,
     Make,
 };
 
 const MAKEFILE_NAME: [&str; 2] = ["makefile", "Makefile"];
 const MAKEFILE_PATH: [&str; 2] = ["./makefile", "./Makefile"];
+
+/// How many times the makefiles are read again because an included file was
+/// remade.
+const MAX_RESTARTS: usize = 16;
 
 /// `MAKEFILE_PATH[i]` must stay `MAKEFILE_NAME[i]` prefixed with `./`; the two
 /// are spelled out separately rather than derived, so pin the invariant here.
@@ -140,6 +149,12 @@ struct Args {
     )]
     touch: bool,
 
+    /// GNU make's option to stop announcing directory changes. This make
+    /// never announces them, so there is nothing to turn off; it is accepted
+    /// because libzstd's Makefile passes it to `$(MAKE)`.
+    #[arg(long, hide = true)]
+    no_print_directory: bool,
+
     #[arg(help = "Targets to build")]
     targets: Vec<OsString>,
 }
@@ -163,20 +178,26 @@ fn target_not_remade(target: &str) -> String {
     )
 }
 
-/// Build the effective argument vector, seeding options from the `MAKEFLAGS`
-/// environment variable ahead of the real command line (POSIX). The letters-only
-/// first word (e.g. `MAKEFLAGS=kn`) becomes a combined short option (`-kn`);
-/// words containing `=` are macro operands; words already starting with `-` are
-/// passed verbatim. `MAKEFLAGS` is inherited by recipe sub-processes via the
-/// environment, so it propagates to sub-makes.
+/// The single-letter options a parent make may pass down in `MAKEFLAGS`.
+///
+/// `-f` and `-p` are left out by POSIX 105856 itself, `-C` belongs to the
+/// invocation, `-j` is passed with the token pool (`makeflags_jobs`), and a
+/// letter this make does not implement -- GNU's `w`, `B`, `R` and the rest
+/// -- is passed over when it arrives.
+const INHERITED_LETTERS: &str = "inqksSetr";
+
 /// Build the `MAKEFLAGS` value a sub-make should inherit.
 ///
-/// POSIX 105866 requires make to pass its options down through `MAKEFLAGS`.
-/// Only options that make sense to inherit are forwarded; `-f`, `-C` and the
-/// target operands are specific to this invocation. The letters-only first word
-/// is the form POSIX describes and the form `args_with_makeflags` parses back.
-fn makeflags_for_children(config: &Config) -> String {
-    let mut letters = String::new();
+/// POSIX 105856-105865: make's options, and its command-line macro
+/// definitions "quoted in an implementation-defined manner such that when
+/// MAKEFLAGS is read by another instance of the make command, the original
+/// macro's value is recovered". The form is GNU make's, so that either make
+/// reads the other's: the option letters, then `--`, then the macros, with a
+/// blank or a backslash in a value escaped by a backslash. `jobs` is the
+/// `-j` and token pool words from `jobserver::setup`, which go between the
+/// two (POSIX 105378-105384).
+fn makeflags_for_children(config: &Config, jobs: &str, macros: &[String]) -> String {
+    let mut out = String::new();
     for (flag, ch) in [
         (config.ignore, 'i'),
         (config.dry_run, 'n'),
@@ -189,37 +210,194 @@ fn makeflags_for_children(config: &Config) -> String {
         (config.clear, 'r'),
     ] {
         if flag {
-            letters.push(ch);
+            out.push(ch);
         }
     }
-    letters
+    if !jobs.is_empty() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(jobs);
+    }
+    // The last definition of a name is the one in force; it alone is passed.
+    let name_of = |m: &str| -> String {
+        let name = m.split_once('=').map_or(m, |(name, _)| name);
+        name.trim_end_matches([':', '?', '+', '!'])
+            .trim()
+            .to_string()
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut macros: Vec<&String> = macros
+        .iter()
+        .rev()
+        .filter(|m| name_of(m) != "MAKEFLAGS" && seen.insert(name_of(m)))
+        .collect();
+    macros.reverse();
+    if macros.is_empty() {
+        return out;
+    }
+    if !out.is_empty() {
+        out.push(' ');
+    }
+    out.push_str("--");
+    for definition in macros {
+        out.push(' ');
+        for c in definition.chars() {
+            if matches!(c, ' ' | '\t' | '\\') {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+    }
+    out
 }
 
+/// Split a `MAKEFLAGS` value into words at unescaped blanks, removing the
+/// backslash from an escaped character.
+fn makeflags_words(flags: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut chars = flags.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => word.extend(chars.next()),
+            ' ' | '\t' => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            _ => word.push(c),
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+/// The options and macros a `MAKEFLAGS` value carries, as arguments.
+///
+/// POSIX's forms are a first word of option letters (`kn`), option words
+/// (`-k -n`) and macro definitions. A GNU make parent adds long options
+/// (`--jobserver-auth=3,4`, `--no-print-directory`), option words with an
+/// argument attached (`-j4`, `-Onone`, `-I/dir`), letters this make does not
+/// have (`w`), and a `--` before its macros. A Debian build runs debian/rules
+/// under GNU make and this make below it, so each of those reaches here; what
+/// this make does not implement is passed over rather than refused, since
+/// the parent's options were never addressed to it.
+fn makeflags_args(flags: &str) -> Vec<OsString> {
+    let known = |letters: &str| -> Option<OsString> {
+        let kept: String = letters
+            .chars()
+            .filter(|c| INHERITED_LETTERS.contains(*c))
+            .collect();
+        (!kept.is_empty()).then(|| OsString::from(format!("-{kept}")))
+    };
+
+    let mut args = Vec::new();
+    let mut macros_only = false;
+    for (i, word) in makeflags_words(flags).iter().enumerate() {
+        if macros_only || (word.contains('=') && !word.starts_with('-')) {
+            if word.contains('=') {
+                args.push(OsString::from(word));
+            }
+        } else if word == "--" {
+            macros_only = true;
+        } else if word.starts_with("--") {
+            // A GNU long option: nothing this make implements.
+        } else if let Some(letters) = word.strip_prefix('-') {
+            // An option word. One whose first letter takes an argument
+            // (`-j4`, `-Onone`) is dropped whole, so the argument is not read
+            // as more letters.
+            if letters.starts_with(|c: char| INHERITED_LETTERS.contains(c)) {
+                args.extend(known(letters));
+            }
+        } else if i == 0 {
+            args.extend(known(word));
+        }
+    }
+    args
+}
+
+/// The `-j` count and the token pool a `MAKEFLAGS` value passes down, as
+/// this make and GNU make write them: `-j4 --jobserver-auth=3,4` (an older
+/// GNU make writes `--jobserver-fds=3,4`). `makeflags_args` leaves both out,
+/// so that the `-j` clap sees is the command line's alone: a sub-make given
+/// a `-j` of its own makes a pool of its own.
+fn makeflags_jobs(flags: &str) -> (Option<usize>, Option<String>) {
+    let mut jobs = None;
+    let mut auth = None;
+    for word in makeflags_words(flags) {
+        if word == "--" {
+            break;
+        } else if let Some(value) = word
+            .strip_prefix("--jobserver-auth=")
+            .or_else(|| word.strip_prefix("--jobserver-fds="))
+        {
+            auth = Some(value.to_string());
+        } else if let Some(count) = word.strip_prefix("-j") {
+            jobs = count.parse::<usize>().ok().or(jobs);
+        }
+    }
+    (jobs, auth)
+}
+
+/// Build the effective argument vector, seeding options and macros from the
+/// `MAKEFLAGS` environment variable ahead of the real command line, so that
+/// the command line wins (POSIX 105839-105851: source 1 before source 2).
 fn args_with_makeflags() -> Vec<OsString> {
     let mut args: Vec<OsString> = env::args_os().collect();
     let Ok(flags) = env::var("MAKEFLAGS") else {
         return args;
     };
-    let flags = flags.trim();
-    if flags.is_empty() {
-        return args;
-    }
-
-    let mut injected: Vec<OsString> = Vec::new();
-    for (i, word) in flags.split_whitespace().enumerate() {
-        if i == 0 && !word.starts_with('-') && !word.contains('=') {
-            // Letters-only form: `kn` -> `-kn`.
-            injected.push(OsString::from(format!("-{word}")));
-        } else {
-            injected.push(OsString::from(word));
-        }
-    }
-
-    // Insert the seeded options just after argv[0], before the real arguments.
     let tail = args.split_off(1);
-    args.extend(injected);
+    args.extend(makeflags_args(&flags));
     args.extend(tail);
     args
+}
+
+/// `-j` with no number after it, as GNU make takes it: as many jobs as it
+/// likes. POSIX gives `-j` a required `maxjobs`, but libzstd's `make test`
+/// runs `$(MAKE) -j -C programs allVariants`, which read `-C` as the job
+/// count and failed. Such a `-j` becomes `-jN`, N the processors there are:
+/// a bound, unlike GNU make's, but the same build.
+///
+/// It is bare when nothing follows, or what follows is an operand or one of
+/// this make's own options. Any other word beginning with `-` is still its
+/// option-argument (XBD 12.2, Guideline 7), and refused as a count.
+fn bare_jobs(args: Vec<OsString>) -> Vec<OsString> {
+    let letters: Vec<char> = <Args as clap::CommandFactory>::command()
+        .get_arguments()
+        .filter_map(|arg| arg.get_short())
+        .collect();
+    let is_option_or_operand = |word: &str| match word.strip_prefix('-') {
+        Some(rest) => rest.starts_with(|c: char| letters.contains(&c)),
+        None => true,
+    };
+    let mut out = Vec::with_capacity(args.len());
+    let mut iter = args.into_iter().peekable();
+    if let Some(program) = iter.next() {
+        out.push(program);
+    }
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            out.push(arg);
+            out.extend(iter);
+            break;
+        }
+        let bare = match iter.peek().map(|next| next.to_str()) {
+            None => true,
+            Some(Some(next)) => next.parse::<usize>().is_err() && is_option_or_operand(next),
+            Some(None) => false,
+        };
+        if arg == "-j" && bare {
+            let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+            out.push(OsString::from(format!("-j{cpus}")));
+        } else {
+            out.push(arg);
+        }
+    }
+    out
 }
 
 /// Read one makefile operand into a string, honoring `-` as standard input.
@@ -251,6 +429,7 @@ fn parse_makefile(
     builtins: &[(String, String)],
 ) -> Result<Makefile, ErrorCode> {
     let mut contents = String::new();
+    let mut names: Vec<String> = Vec::new();
 
     if paths.is_empty() {
         let default = MAKEFILE_PATH
@@ -259,11 +438,22 @@ fn parse_makefile(
             .find(|p| p.exists())
             .ok_or(NoMakefile)?;
         append_part(&mut contents, &read_makefile(default)?);
+        names.push(
+            default
+                .to_string_lossy()
+                .trim_start_matches("./")
+                .to_string(),
+        );
     } else {
         for path in paths {
             append_part(&mut contents, &read_makefile(path)?);
+            names.push(path.to_string_lossy().into_owned());
         }
     }
+    // GNU make's MAKEFILE_LIST starts with the makefiles named here; each
+    // include adds its file.
+    let mut builtins = builtins.to_vec();
+    builtins.push((MAKEFILE_LIST.to_string(), names.join(" ")));
 
     // Command-line macros are *seeded*, not appended: a rule header is expanded
     // where it appears, so appending left `all: $(OBJ)` already expanded by the
@@ -273,15 +463,23 @@ fn parse_makefile(
         .filter_map(|def| def.split_once('='))
         .map(|(name, value)| {
             let name = name.trim_end_matches([':', '?', '+', '!']).trim();
-            (name.to_string(), value.to_string())
+            (name.to_string(), cmdline_value(value).to_string())
         })
         .filter(|(name, _)| !name.is_empty())
         .collect();
 
-    match Makefile::parse_with_macros(&contents, &seeded, builtins) {
+    match Makefile::parse_with_macros(&contents, &seeded, &builtins) {
         Ok(makefile) => Ok(makefile),
         Err(err) => Err(ErrorCode::ParserError { constraint: err }),
     }
+}
+
+/// The value of a command-line `macro=value` operand: as for a definition
+/// in a makefile, the blanks after the `=` are not part of it (GNU make
+/// reads it the same way). libzstd passes `LDFLAGS="$(LDFLAGS)"` to a
+/// sub-make with a value that starts with a blank.
+fn cmdline_value(value: &str) -> &str {
+    value.trim_start_matches([' ', '\t'])
 }
 
 /// Reads the makefile from `stdin` until EOF (Ctrl + D)
@@ -308,16 +506,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         terminate,
         keep_going,
         jobs,
+        no_print_directory: _,
         mut targets,
-    } = plib::optarg::parse_from::<Args>(plib::optarg::keep_leading_equals::<Args>(
+    } = plib::optarg::parse_from::<Args>(plib::optarg::keep_leading_equals::<Args>(bare_jobs(
         args_with_makeflags(),
-    ));
+    )));
 
     let mut status_code = 0;
 
-    // -j maxjobs: a non-positive value is unspecified; treat it (and absence)
-    // as 1 (no parallelism).
-    let jobs = jobs.filter(|&j| j >= 1).unwrap_or(1);
+    // -j maxjobs: a non-positive value is unspecified; treat it as 1 (no
+    // parallelism). With none on the command line, a parent's comes from
+    // MAKEFLAGS, with its token pool (POSIX 105378-105384).
+    let (inherited_jobs, inherited_pool) = env::var("MAKEFLAGS")
+        .map(|flags| makeflags_jobs(&flags))
+        .unwrap_or_default();
+    let (jobs, job_flags) = jobserver::setup(match (jobs, inherited_jobs) {
+        (Some(jobs), _) => Jobs::CommandLine(jobs.max(1)),
+        (None, Some(jobs)) => Jobs::Inherited(jobs, inherited_pool.as_deref()),
+        (None, None) => Jobs::None,
+    });
 
     // -C flag
     if let Some(dir) = directory {
@@ -346,14 +553,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     ENV_MACROS.store(env_macros, Relaxed);
 
-    // POSIX 105866: make passes its options to sub-makes through MAKEFLAGS.
-    // Only the flags worth inheriting go in; -f, -C and the target operands
-    // belong to this invocation (audit #40).
-    let inherited = makeflags_for_children(&config);
-    if !inherited.is_empty() {
-        env::set_var("MAKEFLAGS", inherited);
-    }
-
     // Separate command-line `macro=value` operands from target operands
     // (POSIX SYNOPSIS allows them to be intermixed).
     let mut cmdline_macros: Vec<String> = Vec::new();
@@ -366,6 +565,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             true
         }
     });
+
+    // POSIX 105856: make passes its options and command-line macros to
+    // sub-makes through MAKEFLAGS. -f, -C and the target operands belong to
+    // this invocation (audit #40). The value replaces whatever was
+    // inherited; `-j` and the token pool are this make's own.
+    env::set_var(
+        "MAKEFLAGS",
+        makeflags_for_children(&config, &job_flags, &cmdline_macros),
+    );
 
     // POSIX 105866: "all of the make utility command line macro definitions
     // (except the MAKEFLAGS macro or the SHELL macro) shall be added to the
@@ -380,7 +588,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if name.is_empty() || name == "MAKEFLAGS" || name == "SHELL" {
             continue;
         }
-        env::set_var(name, value);
+        env::set_var(name, cmdline_value(value));
     }
 
     // POSIX source 4: the macros the built-in inference rules refer to. They
@@ -392,31 +600,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         false => posixutils_make::builtin_macros(),
     };
 
-    let parsed = match parse_makefile(&makefile, &cmdline_macros, &builtins) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            // -p with no usable makefile still has a database to show: the
-            // built-in macros and inference rules. POSIX's own example is
-            // `make -p -f /dev/null`, which has no targets and so does not
-            // parse. Build an empty makefile to get the built-ins seeded.
-            if print {
-                let empty = Make::try_from((Makefile::default(), config)).map_err(|err| {
-                    eprintln!("make: {err}");
-                    err
-                })?;
-                print_database(&empty);
-                return Ok(());
-            } else {
-                eprintln!("make: {}", err);
+    // Read the makefiles, then bring the files they include up to date; if
+    // any of those changed, read everything again (POSIX "delayed remaking",
+    // 105587-105600). The bound only stops a rule that changes its own
+    // makefile on every run from looping forever.
+    let mut restarts = 0;
+    let make = loop {
+        let parsed = match parse_makefile(&makefile, &cmdline_macros, &builtins) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                // -p with no usable makefile still has a database to show:
+                // the built-in macros and inference rules. POSIX's own example
+                // is `make -p -f /dev/null`, which has no targets and so does
+                // not parse. Build an empty makefile to get the built-ins
+                // seeded.
+                if print {
+                    let empty = Make::try_from((Makefile::default(), config)).map_err(|err| {
+                        eprintln!("make: {err}");
+                        err
+                    })?;
+                    print_database(&empty);
+                    return Ok(());
+                } else {
+                    eprintln!("make: {}", err);
+                    process::exit(err.into());
+                }
+            }
+        };
+        let includes = parsed.includes().to_vec();
+
+        let mut make = Make::try_from((parsed, config.clone())).unwrap_or_else(|err| {
+            eprintln!("make: {err}");
+            process::exit(err.into());
+        });
+
+        match make.remake_includes(&includes) {
+            Ok(true) if restarts < MAX_RESTARTS => restarts += 1,
+            Ok(_) => break make,
+            Err(err) => {
+                eprintln!("make: {err}");
                 process::exit(err.into());
             }
         }
     };
-
-    let make = Make::try_from((parsed, config)).unwrap_or_else(|err| {
-        eprintln!("make: {err}");
-        process::exit(err.into());
-    });
 
     // -p: POSIX does not say this suppresses the build, unlike -q, so the
     // dump is written and the targets are still made.
@@ -437,13 +663,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         targets.push(target);
     }
 
+    let targets: Vec<Result<String, OsString>> =
+        targets.into_iter().map(OsString::into_string).collect();
+    // Under -j the goals are made together first, each then answered below
+    // from what was made, in order.
+    let goals: Vec<&str> = targets.iter().flatten().map(String::as_str).collect();
+    let mut goal_commands = make.make_goals_in_parallel(&goals).map(Vec::into_iter);
+
     let mut had_error = false;
     for target in targets {
         // A target is a filename, so it need not be valid UTF-8. Diagnose it
         // rather than panicking (audit #39); the rest of the crate is
         // String-based, so a non-UTF-8 operand cannot be built, but it can at
         // least be reported.
-        let target = match target.into_string() {
+        let target = match target {
             Ok(target) => target,
             Err(raw) => {
                 eprintln!(
@@ -455,6 +688,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
         };
+        let seen = COMMANDS_SEEN.load(Relaxed);
+        let made_in_parallel = goal_commands.as_mut().and_then(Iterator::next);
         match make.build_target(&target) {
             // -q asks a question and prints nothing: the answer is the exit
             // status. The build reports "not up to date" rather than calling
@@ -465,18 +700,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
             Ok(_) if quit => {}
-            Ok(updated) => {
-                if !updated {
-                    println!(
-                        "{}: `{}` {}",
-                        gettext("make"),
-                        target,
-                        gettext("is up to date.")
-                    );
+            // POSIX leaves the message for a goal that needed nothing done
+            // unspecified. It is GNU make's: written only when no command
+            // was shown or run for the goal, never under -s or a `.SILENT`
+            // with no prerequisites, and worded by whether the goal has
+            // commands of its own.
+            Ok(_) => {
+                let none_seen = match made_in_parallel {
+                    Some(commands) => commands == 0,
+                    None => COMMANDS_SEEN.load(Relaxed) == seen,
+                };
+                if !make.config.silent && none_seen {
+                    let message = match make.goal_has_commands(&target) {
+                        true => gettext("'%s' is up to date."),
+                        false => gettext("Nothing to be done for '%s'."),
+                    };
+                    println!("make: {}", message.replace("%s", &target));
                 }
             }
             Err(err) => {
-                eprintln!("make: {}", err);
+                // Under -k, make does not stop, so it does not say it does.
+                let message = err.to_string();
+                let stop = format!("  {}", gettext("Stop."));
+                match keep_going {
+                    true => eprintln!("make: {}", message.strip_suffix(&stop).unwrap_or(&message)),
+                    false => eprintln!("make: {message}"),
+                }
                 had_error = true;
                 if keep_going {
                     // `-k`: report this target, then keep building the

@@ -37,7 +37,13 @@ fn suffix_ends_here(next: Option<&char>) -> bool {
 impl Target {
     /// Creates a new target with the given name.
     pub fn new(name: impl Into<String>) -> Self {
-        let name = name.into();
+        let name = super::prerequisite::without_dot_slash(name.into());
+
+        // Special targets and suffix rules all begin with a dot, and most
+        // targets do not.
+        if !name.starts_with('.') {
+            return Target::Simple { name };
+        }
 
         if let Some(t) = Self::try_parse_special(&name) {
             return t;
@@ -133,7 +139,10 @@ impl Target {
                     }
                     break;
                 }
-                '.' | ' ' | '\t' | ':' => break,
+                // A suffix may itself hold a dot: perl's Makefile has a
+                // `.c.depends` suffix and a `.c.c.depends:` rule.
+                '.' if !to.is_empty() => to.push('.'),
+                ' ' | '\t' | ':' => break,
                 _ => None?,
             }
             source.next();

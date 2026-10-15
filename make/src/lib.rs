@@ -10,19 +10,26 @@
 pub mod attributes;
 pub mod config;
 pub mod error_code;
+pub mod fast_hash;
 pub mod graph;
+pub mod jobserver;
 pub mod parser;
 pub mod rule;
 pub mod signal_handler;
 pub mod special_target;
+mod stat_cache;
 
+use std::borrow::Cow;
 use std::os::unix::fs::PermissionsExt;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::{
     fs::{self},
     time::{Duration, SystemTime},
 };
 
-use parser::{preprocessor, Makefile, VPathEntry};
+use fast_hash::Map as HashMap;
+use parser::preprocessor::{self, MacroSource, MacroTable};
+use parser::{Makefile, TargetVar, VPathEntry};
 
 /// An owned macro definition `(name, value)`. Owning the data (rather than
 /// holding a rowan AST node) keeps `Make` `Send`/`Sync` for parallel builds.
@@ -43,33 +50,91 @@ const DEFAULT_SHELL: &str = "/bin/sh";
 /// The `.WAIT` special target, used as a prerequisite-list barrier.
 const WAIT_TARGET: &str = ".WAIT";
 
-/// A pool of build tokens bounding how many targets are updated concurrently
-/// under `-j`. Acquisition is non-blocking: a caller that cannot get a token
-/// builds the target inline instead, which keeps the recursive build
-/// deadlock-free (the inline path always makes progress).
-struct TokenPool {
-    available: std::sync::Mutex<usize>,
+/// How many pattern rules may be chained to make a prerequisite of a
+/// pattern rule (GNU make chains them; POSIX allows it as an extension).
+const MAX_PATTERN_CHAIN: usize = 2;
+
+/// The stack of a thread make starts to walk the dependency graph on.
+///
+/// The walk recurses once for each link of a prerequisite chain, and the
+/// default stacks (8 MiB for the main thread, 2 MiB for others) overflowed
+/// on a chain of a few thousand, where GNU make goes on. The memory is only
+/// reserved; pages are used as the walk reaches them.
+const BUILD_STACK_SIZE: usize = 512 << 20;
+
+/// How deep the walk goes on a thread before it continues on a new one
+/// with a stack of `BUILD_STACK_SIZE`: on the main thread, whose stack
+/// may be as small as the system's limit, and on such a thread itself.
+///
+/// A link costs a few KiB of stack (several times that in a debug build).
+/// Moving to a new thread only when a chain is this deep keeps the cost of
+/// starting one -- about a quarter of a millisecond, as much as the rest of
+/// make's start-up -- off every ordinary run.
+const DEPTH_ON_MAIN_STACK: usize = 200;
+const DEPTH_ON_BUILD_STACK: usize = 16_000;
+
+std::thread_local! {
+    /// How deep the walk is on this thread, and how deep it may go.
+    static WALK_DEPTH: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, DEPTH_ON_MAIN_STACK)) };
 }
 
-impl TokenPool {
-    fn new(tokens: usize) -> Self {
-        TokenPool {
-            available: std::sync::Mutex::new(tokens),
-        }
+/// Holds one level of the walk on this thread for as long as it lives.
+struct WalkLevel;
+
+impl WalkLevel {
+    /// Enter a level, unless this thread is as deep as it may go.
+    fn enter() -> Option<WalkLevel> {
+        WALK_DEPTH.with(|cell| {
+            let (depth, limit) = cell.get();
+            (depth < limit).then(|| {
+                cell.set((depth + 1, limit));
+                WalkLevel
+            })
+        })
     }
 
-    fn try_acquire(&self) -> bool {
-        let mut available = self.available.lock().unwrap();
-        if *available > 0 {
-            *available -= 1;
-            true
-        } else {
-            false
-        }
+    /// Mark this thread, just started with `BUILD_STACK_SIZE`, as having
+    /// room for `DEPTH_ON_BUILD_STACK` levels.
+    fn on_build_stack() {
+        WALK_DEPTH.with(|cell| cell.set((0, DEPTH_ON_BUILD_STACK)));
     }
+}
 
-    fn release(&self) {
-        *self.available.lock().unwrap() += 1;
+impl Drop for WalkLevel {
+    fn drop(&mut self) {
+        WALK_DEPTH.with(|cell| {
+            let (depth, limit) = cell.get();
+            cell.set((depth - 1, limit));
+        });
+    }
+}
+
+/// One run of independent prerequisites being made under `-j`: a queue
+/// that the thread owning it and the workers it starts all take from.
+struct Segment<'a> {
+    names: &'a [&'a str],
+    /// The position of the next prerequisite nobody has taken.
+    next: AtomicUsize,
+    /// Set once a failure means no more are to be started.
+    stop: AtomicBool,
+    updated: AtomicBool,
+    errors: std::sync::Mutex<Vec<ErrorCode>>,
+    /// For goals named on the command line, the count of command lines
+    /// shown or run for each, by position.
+    goals: Option<&'a [std::sync::Arc<AtomicUsize>]>,
+}
+
+impl<'a> Segment<'a> {
+    fn new(names: &'a [&'a str], goals: Option<&'a [std::sync::Arc<AtomicUsize>]>) -> Self {
+        Segment {
+            names,
+            next: AtomicUsize::new(0),
+            stop: AtomicBool::new(false),
+            updated: AtomicBool::new(false),
+            errors: std::sync::Mutex::new(Vec::new()),
+            goals,
+        }
     }
 }
 
@@ -78,10 +143,37 @@ impl TokenPool {
 /// The only way to create a Make is from a Makefile and a Config.
 pub struct Make {
     macros: Vec<Macro>,
+    /// The same macros with the source of each: what command lines are
+    /// expanded against, and what target-specific assignments are applied to.
+    table: MacroTable,
+    /// Target-specific macro assignments, by target, in the order read.
+    target_vars: HashMap<String, Vec<TargetVar>>,
+    /// Pattern-specific ones (a `%` target), with the pattern, in order.
+    pattern_vars: Vec<(String, TargetVar)>,
+    /// Every name a target rule has as a target or a prerequisite: what
+    /// GNU make says "ought to exist" when it picks a pattern rule.
+    mentioned: fast_hash::Set<String>,
+    /// The modification times of targets without commands, as they were
+    /// before their prerequisites were made; see `prerequisite_mtime`.
+    frozen_mtimes: std::sync::Mutex<HashMap<String, Option<SystemTime>>>,
+    /// Targets whose commands ran in this run: known by the name they are
+    /// written under from then on, never by one `VPATH` found.
+    remade: std::sync::Mutex<fast_hash::Set<String>>,
+    /// `stat` results since the last command ran.
+    stats: stat_cache::StatCache,
+    /// Targets already known to reach no dependency cycle.
+    acyclic: std::sync::Mutex<fast_hash::Set<String>>,
     /// Target rules (non-special, non-inference).
     /// Invariant: inference rules are never stored here, so `first_target()`
     /// always returns a valid default target per POSIX.
     rules: Vec<Rule>,
+    /// Where each target name appears in `rules`: the positions of every
+    /// rule with that name among its targets, in `rules` order. Looking a
+    /// target up by scanning `rules` made a makefile of n targets O(n^2) to
+    /// read and to walk.
+    rule_index: HashMap<String, Vec<usize>>,
+    /// The positions of the `%` pattern rules in `rules`, in order.
+    pattern_rules: Vec<usize>,
     /// Inference rules (e.g. `.c.o:`, `.txt.out:`).
     inference_rules: Vec<Rule>,
     default_rule: Option<Rule>, // .DEFAULT
@@ -89,13 +181,15 @@ pub struct Make {
     /// makefile supplies its own `.SCCS_GET`.
     sccs_get: Option<Rule>,
     /// Token pool bounding concurrent target updates under `-j` (maxjobs - 1
-    /// tokens; the inline build needs no token).
-    pool: TokenPool,
+    /// tokens; the inline build needs no token), shared with sub-makes.
+    pool: std::sync::Arc<jobserver::Pool>,
     /// Which targets are built, building, or failed. Gives single-build under
     /// `-j` and memoization across repeated visits.
     ledger: graph::Ledger,
     /// `vpath` search paths, in declaration order.
     vpaths: Vec<VPathEntry>,
+    /// The directories of the `VPATH` macro, in search order.
+    vpath_dirs: Vec<String>,
     /// Macros an `export` directive put in the recipe environment.
     exports: Vec<String>,
     /// What the attribute special targets say about each target.
@@ -119,10 +213,23 @@ impl graph::Edges for Make {
     /// are the edges that will actually be walked.
     fn prerequisites_of(&self, target: &str) -> Vec<String> {
         let named = self.rule_by_target_name(target);
+        if named.is_some_and(Rule::is_double_colon) {
+            return self
+                .double_colon_rules(target)
+                .into_iter()
+                .flat_map(|rule| edge_names(rule.prerequisites().chain(rule.order_only())))
+                .collect();
+        }
+        if let Some(rule) = named {
+            if let Some(pattern) = self.pattern_rule_for_commandless(rule, target) {
+                let merged = pattern.with_prerequisites_of(rule);
+                return edge_names(merged.prerequisites().chain(merged.order_only()));
+            }
+        }
         let mut edges = match named {
-            Some(rule) => edge_names(rule.prerequisites()),
+            Some(rule) => edge_names(rule.prerequisites().chain(rule.order_only())),
             None => match self.find_pattern_rule(target) {
-                Some(rule) => return edge_names(rule.prerequisites()),
+                Some(rule) => return edge_names(rule.prerequisites().chain(rule.order_only())),
                 None => Vec::new(),
             },
         };
@@ -159,10 +266,38 @@ impl Make {
     /// - Some(rule) if a rule with the target exists.
     /// - None if no rule with the target exists.
     fn rule_by_target_name(&self, target: impl AsRef<str>) -> Option<&Rule> {
-        self.rules
-            .iter()
-            .filter(|rule| !rule.is_pattern())
-            .find(|rule| rule.targets().any(|t| t.as_ref() == target.as_ref()))
+        self.rules_named(target.as_ref())
+            .find(|rule| !rule.is_pattern())
+    }
+
+    /// Every rule with `name` among its targets, in the order filed.
+    fn rules_named<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a Rule> + 'a {
+        let at: &[usize] = self.rule_index.get(name).map_or(&[], Vec::as_slice);
+        at.iter().map(|&i| &self.rules[i])
+    }
+
+    /// The `%` pattern rules, in the order filed.
+    fn pattern_rules(&self) -> impl Iterator<Item = &Rule> {
+        self.pattern_rules.iter().map(|&i| &self.rules[i])
+    }
+
+    /// File `rule` at the end of `rules`, and index it.
+    fn push_rule(&mut self, rule: Rule) {
+        let at = self.rules.len();
+        for target in rule.targets() {
+            let positions = self
+                .rule_index
+                .entry(target.as_ref().to_string())
+                .or_default();
+            // A target named twice in one rule is still one rule.
+            if positions.last() != Some(&at) {
+                positions.push(at);
+            }
+        }
+        if rule.is_pattern() {
+            self.pattern_rules.push(at);
+        }
+        self.rules.push(rule);
     }
 
     /// Every macro definition in force, in first-definition order.
@@ -240,14 +375,18 @@ impl Make {
     /// POSIX has no `VPATH`, but it is the conventional way to keep sources in
     /// one tree and build in another. Both the `:`-separated and
     /// blank-separated spellings are accepted, as GNU does.
-    fn vpath_dirs(&self) -> Vec<&str> {
-        self.macros
+    ///
+    /// Read once, when the makefile has been: every name not found as
+    /// written is looked for here.
+    fn vpath_dirs(macros: &[Macro]) -> Vec<String> {
+        macros
             .iter()
             .find(|(name, _)| name == "VPATH")
             .map(|(_, value)| {
                 value
                     .split([':', ' ', '\t'])
                     .filter(|d| !d.is_empty())
+                    .map(String::from)
                     .collect()
             })
             .unwrap_or_default()
@@ -256,17 +395,33 @@ impl Make {
     /// Resolve a prerequisite through `VPATH`.
     ///
     /// A name that exists as written, or that no `VPATH` directory supplies, is
-    /// returned unchanged, so this is transparent when `VPATH` is unset.
-    pub fn resolve_vpath(&self, name: &str) -> String {
-        if name.contains('/') || std::path::Path::new(name).exists() {
-            return name.to_string();
+    /// returned unchanged, so this is transparent when `VPATH` is unset. An
+    /// absolute name is never searched for, but a relative one with a
+    /// directory part is, as in GNU make: automake's subdir-objects builds
+    /// out of tree compile `common/force.o` from `$(srcdir)/common/force.c`
+    /// (dpkg, gmp, libffi, xz-utils and others).
+    ///
+    /// A target whose commands ran is the file they made here, as in GNU
+    /// make: `$<` then names `parse.c`, not the stale `$(srcdir)/parse.c`.
+    ///
+    /// The name is borrowed back when it is the answer, which it nearly
+    /// always is: every name the walk looks at comes through here.
+    pub fn resolve_vpath<'a>(&self, name: &'a str) -> Cow<'a, str> {
+        if name.starts_with('/')
+            || self.stats.exists(name)
+            || self.remade.lock().unwrap().contains(name)
+        {
+            return Cow::Borrowed(name);
         }
         // A `vpath` pattern is more specific than the blanket `VPATH` macro, so
         // it is consulted first; the first matching pattern wins, as GNU does.
         if let Some(found) = self.search_vpath_patterns(name) {
-            return found;
+            return Cow::Owned(found);
         }
-        search_dirs(&self.vpath_dirs(), name).unwrap_or_else(|| name.to_string())
+        match self.search_dirs(&self.vpath_dirs, name) {
+            Some(found) => Cow::Owned(found),
+            None => Cow::Borrowed(name),
+        }
     }
 
     /// Look `name` up in the directories of the first `vpath` pattern it
@@ -276,24 +431,70 @@ impl Make {
             if rule::pattern_stem(&entry.pattern, name).is_none() {
                 continue;
             }
-            let dirs: Vec<&str> = entry.dirs.iter().map(String::as_str).collect();
-            if let Some(found) = search_dirs(&dirs, name) {
+            if let Some(found) = self.search_dirs(&entry.dirs, name) {
                 return Some(found);
             }
         }
         None
     }
 
+    /// Return `name` found under one of `dirs`, if any.
+    fn search_dirs(&self, dirs: &[String], name: &str) -> Option<String> {
+        dirs.iter()
+            .map(|dir| format!("{dir}/{name}"))
+            .find(|candidate| self.stats.exists(candidate))
+    }
+
     /// Find a `%` pattern rule matching `name` and instantiate it for that
-    /// target. The first matching pattern in file order wins, as GNU does.
+    /// target.
     ///
     /// Pattern rules are not POSIX -- the standard has only suffix inference
-    /// rules -- but they are how real makefiles express the same thing.
+    /// rules -- but they are how real makefiles express the same thing. As in
+    /// GNU make, a rule applies only if each of its prerequisites exists
+    /// (`VPATH` searched) or ought to exist, being named by some rule; the
+    /// first such rule in file order wins. Failing that, the first whose
+    /// missing prerequisites another pattern or inference rule can make.
+    /// libzstd has `$(D)/%.o : %.c` and `$(D)/%.o : %.S`, and which one
+    /// builds an object depends on which source there is.
     fn find_pattern_rule(&self, name: &str) -> Option<Rule> {
-        self.rules
+        self.find_pattern_rule_within(name, MAX_PATTERN_CHAIN)
+    }
+
+    fn find_pattern_rule_within(&self, name: &str, depth: usize) -> Option<Rule> {
+        let candidates: Vec<Rule> = self
+            .pattern_rules()
+            .filter_map(|rule| rule.instantiate_pattern(name))
+            .collect();
+        let needs = |rule: &Rule| -> Vec<String> {
+            rule.prerequisites()
+                .chain(rule.order_only())
+                .map(|p| p.as_ref().to_string())
+                .filter(|p| p != WAIT_TARGET)
+                .collect()
+        };
+        if let Some(found) = candidates
             .iter()
-            .filter(|rule| rule.is_pattern())
-            .find_map(|rule| rule.instantiate_pattern(name))
+            .find(|rule| needs(rule).iter().all(|p| self.exists_or_ought_to(p)))
+        {
+            return Some(found.clone());
+        }
+        if depth == 0 {
+            return None;
+        }
+        candidates.into_iter().find(|rule| {
+            needs(rule).iter().all(|p| {
+                self.exists_or_ought_to(p)
+                    || self.find_inference_rule(p).is_some()
+                    || self.find_pattern_rule_within(p, depth - 1).is_some()
+            })
+        })
+    }
+
+    /// Whether `name` exists, here or through `VPATH`, or ought to exist:
+    /// some target rule names it as its target or as a prerequisite (GNU
+    /// make's term).
+    fn exists_or_ought_to(&self, name: &str) -> bool {
+        self.mentioned.contains(name) || self.stats.exists(&self.resolve_vpath(name))
     }
 
     pub fn first_target(&self) -> Result<&Target, ErrorCode> {
@@ -313,7 +514,7 @@ impl Make {
                 let name = target.as_ref();
                 !name.starts_with('.') || name.contains('/')
             })
-            .ok_or(NoTarget { target: None })
+            .ok_or(NoTargets)
     }
 
     /// Finds a matching inference rule for the given target name.
@@ -332,6 +533,8 @@ impl Make {
             .max_by_key(|s| s.len())
         {
             let stem = &name[..name.len() - target_suffix.len()];
+            // The rule's `to`, as its target spells it, without the dot.
+            let to_name = target_suffix.strip_prefix('.');
             // POSIX 105920/105930: "The order in which the suffixes are
             // specified defines the order in which the inference rules ... are
             // used", so the search iterates `.SUFFIXES`, not the order the
@@ -342,12 +545,13 @@ impl Make {
                     matches!(rule.targets().next(),
                         Some(Target::Inference { from, to, .. })
                             if !to.is_empty()
-                                && format!(".{to}") == *target_suffix
+                                && to_name == Some(to.as_str())
                                 && from == from_name)
                 });
                 if let Some(rule) = hit {
-                    let prereq_path = self.resolve_vpath(&suffix_source_name(stem, source_suffix));
-                    if std::path::Path::new(&prereq_path).exists() {
+                    let source = suffix_source_name(stem, source_suffix);
+                    let prereq_path = self.resolve_vpath(&source);
+                    if self.exists_or_ought_to(&prereq_path) {
                         return Some(rule);
                     }
                 }
@@ -364,8 +568,9 @@ impl Make {
                         if to.is_empty() && from == from_name)
             });
             if let Some(rule) = hit {
-                let prereq_path = self.resolve_vpath(&suffix_source_name(name, source_suffix));
-                if std::path::Path::new(&prereq_path).exists() {
+                let source = suffix_source_name(name, source_suffix);
+                let prereq_path = self.resolve_vpath(&source);
+                if self.exists_or_ought_to(&prereq_path) {
                     return Some(rule);
                 }
             }
@@ -385,16 +590,92 @@ impl Make {
     /// - Ok(false) if the target was already up to date.
     /// - Err(_) if any errors occur.
     pub fn build_target(&self, name: impl AsRef<str>) -> Result<bool, ErrorCode> {
-        match self.ledger.claim(name.as_ref()) {
+        self.build_target_in(name.as_ref(), &[])
+    }
+
+    /// Whether the goal `name` has commands of its own to bring it up to
+    /// date, wherever they come from: its own rules, the pattern or
+    /// inference rule that supplies them, or `.DEFAULT`. A phony target has
+    /// none. It decides between GNU make's two messages for a goal that
+    /// needed nothing done, and follows the choice `build_target` makes.
+    pub fn goal_has_commands(&self, name: &str) -> bool {
+        let name = rule::prerequisite::dot_slash_stripped(name);
+        if self.attributes.is_phony(name) {
+            return false;
+        }
+        let has_recipes = |rule: &Rule| rule.recipes().next().is_some();
+        if let Some(rule) = self.rule_by_target_name(name) {
+            if rule.is_double_colon() {
+                return self.double_colon_rules(name).into_iter().any(has_recipes);
+            }
+            return has_recipes(rule) || self.pattern_rule_for_commandless(rule, name).is_some();
+        }
+        if let Some(rule) = self
+            .inference_rules
+            .iter()
+            .find(|rule| rule.targets().any(|t| t.as_ref() == name))
+        {
+            return has_recipes(rule);
+        }
+        let found = self.resolve_vpath(name);
+        if found.as_ref() != name
+            && self.find_pattern_rule(&found).is_none()
+            && self.find_inference_rule(&found).is_none()
+        {
+            return false;
+        }
+        self.find_pattern_rule(name).is_some()
+            || self.find_inference_rule(name).is_some()
+            || self.default_rule.as_ref().is_some_and(has_recipes)
+    }
+
+    /// Build `name` as a prerequisite of a target whose target-specific
+    /// assignments are `inherited` (GNU make): they are in force for this
+    /// target's commands too, under its own.
+    ///
+    /// A target reached by several paths is built once, in the context of
+    /// the first, as in GNU make.
+    fn build_target_in(&self, name: &str, inherited: &[TargetVar]) -> Result<bool, ErrorCode> {
+        let Some(_level) = WalkLevel::enter() else {
+            return self.build_target_on_new_stack(name, inherited);
+        };
+        let name = rule::prerequisite::dot_slash_stripped(name);
+        match self.ledger.claim(name) {
             graph::Claim::Done(outcome) => return outcome.into_result(),
             graph::Claim::Build => {}
         }
-        let result = self.build_target_uncached(name.as_ref());
-        self.ledger.finish(name.as_ref(), &result);
+        let result = self.build_target_uncached(name, inherited);
+        self.ledger.finish(name, &result);
         result
     }
 
-    fn build_target_uncached(&self, name: impl AsRef<str>) -> Result<bool, ErrorCode> {
+    /// Continue the walk at `name` on a new thread with a stack of
+    /// `BUILD_STACK_SIZE`, this one waiting for it; see `WalkLevel`.
+    fn build_target_on_new_stack(
+        &self,
+        name: &str,
+        inherited: &[TargetVar],
+    ) -> Result<bool, ErrorCode> {
+        let goal = rule::goal_commands();
+        std::thread::scope(|scope| {
+            let walk = std::thread::Builder::new()
+                .stack_size(BUILD_STACK_SIZE)
+                .spawn_scoped(scope, || {
+                    WalkLevel::on_build_stack();
+                    rule::set_goal_commands(goal);
+                    self.build_target_in(name, inherited)
+                })
+                .expect("cannot start a thread to continue a deep build");
+            walk.join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })
+    }
+
+    fn build_target_uncached(
+        &self,
+        name: impl AsRef<str>,
+        inherited: &[TargetVar],
+    ) -> Result<bool, ErrorCode> {
         // Search both regular rules and inference rules
         let rule = match self.rule_by_target_name(&name) {
             Some(rule) => rule,
@@ -405,6 +686,20 @@ impl Make {
             {
                 Some(rule) => rule,
                 None => {
+                    // A file `VPATH` finds elsewhere is known by the name it
+                    // was found under, and that is the name an implicit rule
+                    // must match, as in GNU make. binutils' bfd has
+                    // `doc/%.texi: doc/%.stamp` for the texinfo files it
+                    // generates, and `doc/bfd.texi`, a source in
+                    // `$(srcdir)/doc`, is not one of them: matched by the
+                    // name it is written under, the rule "remade" it.
+                    let found = self.resolve_vpath(name.as_ref());
+                    if found.as_ref() != name.as_ref()
+                        && self.find_pattern_rule(&found).is_none()
+                        && self.find_inference_rule(&found).is_none()
+                    {
+                        return Ok(false);
+                    }
                     // A `%.o: %.c` pattern rule, instantiated for this target.
                     // Pattern rules are tried before suffix inference: a
                     // makefile that writes `%.o: %.c` means it, and must not
@@ -422,6 +717,7 @@ impl Make {
                             &rule,
                             &target,
                             Dispatch::Explicit,
+                            inherited,
                         );
                     }
                     // No target rule named `name`: try to infer one (single- or
@@ -432,6 +728,7 @@ impl Make {
                             inference_rule,
                             &target,
                             Dispatch::Inference,
+                            inherited,
                         );
                     }
                     // XSI: a source file with an SCCS history is retrieved
@@ -440,19 +737,35 @@ impl Make {
                     if self.retrieve_from_sccs(name.as_ref())? {
                         return Ok(true);
                     }
+                    // POSIX 105672: a prerequisite of `.PHONY` is a target
+                    // itself, so one with no rule of its own is a target
+                    // with no commands, and `.DEFAULT` is not for it. It is
+                    // always out of date, so it is made, by doing nothing,
+                    // and its dependents are remade after it, as in GNU
+                    // make. binutils' top-level Makefile declares
+                    // `.PHONY: clean-stage1` with no rule, under `do-clean:
+                    // clean-stage1`.
+                    if self.attributes.is_phony(name.as_ref()) {
+                        return Ok(true);
+                    }
                     // Per POSIX: "If a target exists and there is neither a target rule
                     // nor an inference rule for the target, the target shall be considered
                     // up-to-date."  Resolved through VPATH: a file supplied by a
                     // search directory exists (audit #66).
-                    if get_modified_time(self.resolve_vpath(name.as_ref())).is_some() {
+                    if self
+                        .stats
+                        .modified(&self.resolve_vpath(name.as_ref()))
+                        .is_some()
+                    {
                         return Ok(false);
                     }
                     // No rule and file doesn't exist - try .DEFAULT or fail
                     match &self.default_rule {
                         Some(rule) => rule,
                         None => {
-                            return Err(NoTarget {
-                                target: Some(name.as_ref().to_string()),
+                            return Err(NoRule {
+                                target: name.as_ref().to_string(),
+                                needed_by: None,
                             })
                         }
                     }
@@ -461,7 +774,31 @@ impl Make {
         };
         let target = Target::new(name.as_ref());
 
-        self.run_rule_with_prerequisites(rule, &target, Dispatch::Explicit)
+        if rule.is_double_colon() {
+            return self.run_double_colon_rules(&target, inherited);
+        }
+        if let Some(pattern) = self.pattern_rule_for_commandless(rule, name.as_ref()) {
+            let merged = pattern.with_prerequisites_of(rule);
+            return self.run_rule_with_prerequisites(
+                &merged,
+                &target,
+                Dispatch::Explicit,
+                inherited,
+            );
+        }
+        self.run_rule_with_prerequisites(rule, &target, Dispatch::Explicit, inherited)
+    }
+
+    /// The pattern rule that supplies the commands of `rule`, a target rule
+    /// for `name` that has none (GNU make). libzstd's default target is
+    /// `lib-release:`, made by `%-release : %`. A phony target is not
+    /// searched for, as in GNU make.
+    fn pattern_rule_for_commandless(&self, rule: &Rule, name: &str) -> Option<Rule> {
+        let named = self.rule_by_target_name(name).is_some();
+        if !named || rule.recipes().count() > 0 || self.attributes.is_phony(name) {
+            return None;
+        }
+        self.find_pattern_rule(name)
     }
 
     /// The prerequisites that decide whether `target` is out of date.
@@ -499,19 +836,35 @@ impl Make {
     /// search directory exists, and treating it as missing is what made
     /// `VPATH` useless for a prerequisite with no rule of its own (audit #66).
     fn newer_prerequisites(&self, target: &str, prerequisites: &[String]) -> Vec<String> {
-        let Some(target_modified) = get_modified_time(self.resolve_vpath(target)) else {
+        let Some(target_modified) = self.stats.modified(&self.resolve_vpath(target)) else {
             // The target does not exist, so everything it needs counts.
             return prerequisites.to_vec();
         };
         prerequisites
             .iter()
             .filter(|name| *name != WAIT_TARGET)
-            .filter(|name| match get_modified_time(self.resolve_vpath(name)) {
+            .filter(|name| match self.prerequisite_mtime(name) {
                 Some(modified) => modified > target_modified,
                 None => true,
             })
             .cloned()
             .collect()
+    }
+
+    /// The modification time a prerequisite is judged by.
+    ///
+    /// For a target without commands it is the time it had before its own
+    /// prerequisites were made: no command of its own ran, so as far as make
+    /// knows it did not change, as in GNU make, which does not look again.
+    /// automake relies on it -- `$(srcdir)/version.texi:
+    /// $(srcdir)/stamp-vti` has no commands, the stamp's commands rewrite
+    /// version.texi, and the manual made from it is not remade, so a build
+    /// from a release needs no makeinfo.
+    fn prerequisite_mtime(&self, name: &str) -> Option<SystemTime> {
+        if let Some(frozen) = self.frozen_mtimes.lock().unwrap().get(name) {
+            return *frozen;
+        }
+        self.stats.modified(&self.resolve_vpath(name))
     }
 
     /// Runs a rule after bringing its prerequisites up to date.
@@ -525,10 +878,15 @@ impl Make {
         rule: &Rule,
         target: &Target,
         dispatch: Dispatch,
+        inherited: &[TargetVar],
     ) -> Result<bool, ErrorCode> {
-        if let Some(origin) = graph::find_cycle(self, target.as_ref()) {
+        let cycle =
+            graph::find_cycle_beyond(self, target.as_ref(), &mut self.acyclic.lock().unwrap());
+        if let Some(origin) = cycle {
             return Err(RecursivePrerequisite { origin });
         }
+        let scope = self.scope_for(target.as_ref(), inherited);
+        let mtime_before = self.stats.modified(&self.resolve_vpath(target.as_ref()));
 
         let mut prerequisites = self.effective_prerequisites(rule, target, dispatch);
 
@@ -540,7 +898,7 @@ impl Make {
         // `.c.o:` idiom never saw `foo.c` at all, and a changed source never
         // recompiled (audit #83).
         let inferred = match rule.recipes().count() {
-            0 => self.find_inference_rule(target.as_ref()),
+            0 if !rule.is_double_colon() => self.find_inference_rule(target.as_ref()),
             _ => None,
         };
         if let Some(source) = inferred.and_then(|rule| inference_source(rule, target)) {
@@ -553,38 +911,100 @@ impl Make {
         // was actually rebuilt makes this target stale whatever the timestamps
         // say, and one that is merely older must still be visited -- it may be
         // phony, or stale against its own sources.
-        let rebuilt = self.build_prerequisites(&prerequisites)?;
+        let rebuilt = self
+            .build_prerequisites(&prerequisites, &scope)
+            .map_err(|err| needed_by(err, target.as_ref()))?;
+
+        // Order-only prerequisites (GNU make) are brought up to date too, but
+        // whether they were remade, or are newer, says nothing about this
+        // target. A name that is also a normal prerequisite is a normal one.
+        let order_only: Vec<String> = rule
+            .order_only()
+            .map(|p| p.as_ref().to_string())
+            .filter(|name| !prerequisites.contains(name))
+            .collect();
+        self.build_prerequisites(&order_only, &scope)
+            .map_err(|err| needed_by(err, target.as_ref()))?;
 
         // `$?` is the prerequisites newer than the target.
         let newer = self.newer_prerequisites(target.as_ref(), &prerequisites);
-        let exists = get_modified_time(self.resolve_vpath(target.as_ref())).is_some();
+        let exists = self
+            .stats
+            .modified(&self.resolve_vpath(target.as_ref()))
+            .is_some();
         let phony = self.attributes.is_phony(target.as_ref());
-        let up_to_date = !rebuilt && newer.is_empty() && exists && !phony;
+        // A double-colon rule with no prerequisites always runs (GNU make).
+        let always = rule.is_double_colon() && prerequisites.is_empty();
+        let up_to_date = !rebuilt && newer.is_empty() && exists && !phony && !always;
 
         if up_to_date {
             return Ok(false);
         }
 
         if let Some(inference_rule) = inferred {
-            return self.run_inference(inference_rule, target, up_to_date, &newer);
+            let inference_rule = inference_rule.with_prerequisites(&prerequisites);
+            self.run_inference(&inference_rule, target, up_to_date, &newer, &scope)?;
+            self.mark_remade(target);
+            return Ok(self.changed_since(target, mtime_before));
         }
 
         // An inference rule derives `$<` from its suffixes rather than from a
         // prerequisite list, so it must go through `run_for_target`; handing it
         // to `run` would leave `$<` empty.
         if dispatch == Dispatch::Inference {
-            return self.run_inference(rule, target, up_to_date, &newer);
+            let rule = rule.with_prerequisites(&prerequisites);
+            self.run_inference(&rule, target, up_to_date, &newer, &scope)?;
+            self.mark_remade(target);
+            return Ok(self.changed_since(target, mtime_before));
         }
 
-        self.with_env(|env| rule.run(env, target, up_to_date, &newer))?;
-        Ok(true)
+        // A rule without commands remakes nothing itself, so it counts as
+        // remade for its dependents only if its file does not exist, and they
+        // judge it by the time it had before (GNU make; see
+        // `prerequisite_mtime`).
+        if rule.recipes().count() == 0 {
+            self.frozen_mtimes
+                .lock()
+                .unwrap()
+                .insert(target.as_ref().to_string(), mtime_before);
+            return Ok(mtime_before.is_none());
+        }
+
+        self.with_env(&scope, |env| rule.run(env, target, up_to_date, &newer))?;
+        self.mark_remade(target);
+        Ok(self.changed_since(target, mtime_before))
     }
 
-    /// Register the built-in inference rules, expanded against the macros in
-    /// force, skipping any the makefile already defines.
+    /// Record that `target`'s commands ran; see `resolve_vpath`.
+    fn mark_remade(&self, target: &Target) {
+        self.remade
+            .lock()
+            .unwrap()
+            .insert(target.as_ref().to_string());
+    }
+
+    /// Whether `target`, whose commands just ran, counts as remade for the
+    /// targets that depend on it: it does not exist (a phony target), its
+    /// file changed, or under -n, where nothing is run and everything that
+    /// would have been is taken as remade (GNU make).
+    ///
+    /// A target whose commands left it alone is not: automake's
+    /// `config.h: stamp-h1` runs `@test -f $@ || ...` whenever the stamp is
+    /// newer, and every object that includes config.h was compiled again on
+    /// every run.
+    fn changed_since(&self, target: &Target, before: Option<SystemTime>) -> bool {
+        if self.config.dry_run {
+            return true;
+        }
+        let after = self.stats.modified(&self.resolve_vpath(target.as_ref()));
+        after.is_none() || after != before
+    }
+
+    /// Register the built-in inference rules, skipping any the makefile already
+    /// defines. Their commands are expanded when they run, like any others.
     fn seed_builtin_rules(&mut self) -> Result<(), ErrorCode> {
-        let text = expand_rules(BUILTIN_RULES, &self.macros)?;
-        let parsed = parser::parse(&text).map_err(|constraint| ParserError { constraint })?;
+        let text = BUILTIN_RULES;
+        let parsed = parser::parse(text).map_err(|constraint| ParserError { constraint })?;
         for parsed_rule in parsed.rules() {
             let rule = Rule::from(parsed_rule.clone());
             let Some(name) = rule.targets().next().map(Target::to_string) else {
@@ -610,14 +1030,14 @@ impl Make {
         let Some(rule) = self.sccs_get.as_ref() else {
             return Ok(false);
         };
-        let Some(history) = sccs_history(name) else {
+        let Some(history) = sccs_history(name, &self.stats) else {
             return Ok(false);
         };
         if !needs_sccs_get(name, &history) {
             return Ok(false);
         }
         let target = Target::new(name);
-        self.with_env(|env| rule.run(env, &target, false, &[]))?;
+        self.with_env(&[], |env| rule.run(env, &target, false, &[]))?;
         Ok(true)
     }
 
@@ -626,8 +1046,8 @@ impl Make {
         if self.sccs_get.is_some() {
             return Ok(());
         }
-        let text = expand_rules(SCCS_GET_RULE, &self.macros)?;
-        let parsed = parser::parse(&text).map_err(|constraint| ParserError { constraint })?;
+        let text = SCCS_GET_RULE;
+        let parsed = parser::parse(text).map_err(|constraint| ParserError { constraint })?;
         self.sccs_get = parsed.rules().next().map(|r| Rule::from(r.clone()));
         Ok(())
     }
@@ -637,15 +1057,51 @@ impl Make {
     /// The `VPATH` resolver borrows `self`, so it cannot outlive the call; a
     /// callback keeps that borrow local instead of asking every caller to
     /// spell the closure out.
-    fn with_env<R>(&self, f: impl FnOnce(&rule::Env<'_>) -> R) -> R {
-        let resolve = |name: &str| self.resolve_vpath(name);
-        f(&rule::Env {
+    ///
+    /// The macros are the makefile's with `scope` -- the target-specific
+    /// assignments in force for the target -- applied in order. Without any,
+    /// the makefile's own table is used as it is.
+    fn with_env<R>(&self, scope: &[TargetVar], f: impl FnOnce(&rule::Env<'_>) -> R) -> R {
+        let resolve = |name: &str| self.resolve_vpath(name).into_owned();
+        let table = match scope.is_empty() {
+            true => std::borrow::Cow::Borrowed(&self.table),
+            false => {
+                let mut table = self.table.clone();
+                for var in scope {
+                    table.apply(var, &self.table);
+                }
+                std::borrow::Cow::Owned(table)
+            }
+        };
+        let mut exports = self.exports.clone();
+        exports.extend(scope.iter().filter(|v| v.exported).map(|v| v.name.clone()));
+        let result = f(&rule::Env {
             config: &self.config,
-            macros: &self.macros,
-            exports: &self.exports,
+            table: &table,
+            exports: &exports,
             resolve: &resolve,
             attributes: &self.attributes,
-        })
+        });
+        // Commands may have run, failed or not, and changed any file.
+        self.stats.invalidate();
+        result
+    }
+
+    /// The target-specific assignments in force for `target`: those it
+    /// inherits from the target it is made for, then those of each `%`
+    /// pattern it matches, then its own -- each overriding the ones before,
+    /// as in GNU make.
+    fn scope_for(&self, target: &str, inherited: &[TargetVar]) -> Vec<TargetVar> {
+        let mut scope = inherited.to_vec();
+        for (pattern, var) in &self.pattern_vars {
+            if rule::pattern_stem(pattern, target).is_some() {
+                scope.push(var.clone());
+            }
+        }
+        if let Some(own) = self.target_vars.get(target) {
+            scope.extend(own.iter().cloned());
+        }
+        scope
     }
 
     fn run_inference(
@@ -654,9 +1110,11 @@ impl Make {
         target: &Target,
         up_to_date: bool,
         newer: &[String],
-    ) -> Result<bool, ErrorCode> {
-        self.with_env(|env| rule.run_for_target(env, target, up_to_date, newer))?;
-        Ok(true)
+        scope: &[TargetVar],
+    ) -> Result<(), ErrorCode> {
+        self.with_env(scope, |env| {
+            rule.run_for_target(env, target, up_to_date, newer)
+        })
     }
 
     /// Builds a target's prerequisites, honoring `.WAIT` barriers and, under
@@ -665,12 +1123,12 @@ impl Make {
     /// `.WAIT` prerequisites split the list into segments that must be built in
     /// order: every prerequisite to the left of a `.WAIT` is brought up to date
     /// before any to its right. Within a segment, prerequisites are independent.
-    fn build_prerequisites(&self, prerequisites: &[String]) -> Result<bool, ErrorCode> {
-        let parallel = self.config.jobs > 1
-            && !self.config.not_parallel
-            && !self.config.dry_run
-            && !self.config.quit
-            && !self.config.touch;
+    fn build_prerequisites(
+        &self,
+        prerequisites: &[String],
+        scope: &[TargetVar],
+    ) -> Result<bool, ErrorCode> {
+        let parallel = self.parallel();
 
         let mut updated = false;
         let mut segment: Vec<&str> = Vec::new();
@@ -678,27 +1136,32 @@ impl Make {
             let name = prerequisite.as_str();
             if name == WAIT_TARGET {
                 // Barrier: finish the current segment before continuing.
-                updated |= self.build_segment(&segment, parallel)?;
+                updated |= self.build_segment(&segment, parallel, scope)?;
                 segment.clear();
             } else {
                 segment.push(name);
             }
         }
-        updated |= self.build_segment(&segment, parallel)?;
+        updated |= self.build_segment(&segment, parallel, scope)?;
         Ok(updated)
     }
 
     /// Builds one segment of independent prerequisites, in parallel when `-j`
     /// allows it. Parallelism is bounded by the token pool; a prerequisite that
     /// cannot obtain a token is built inline so the build always progresses.
-    fn build_segment(&self, names: &[&str], parallel: bool) -> Result<bool, ErrorCode> {
+    fn build_segment(
+        &self,
+        names: &[&str],
+        parallel: bool,
+        scope: &[TargetVar],
+    ) -> Result<bool, ErrorCode> {
         if !parallel || names.len() <= 1 {
             // Under -k a failed prerequisite must not stop its *siblings*; the
             // first error is still returned, so the dependent target is skipped.
             let mut first_error = None;
             let mut updated = false;
             for name in names {
-                match self.build_target(name) {
+                match self.build_target_in(name, scope) {
                     Ok(built) => updated |= built,
                     Err(err) => {
                         if !self.config.keep_going || self.config.terminate {
@@ -714,48 +1177,296 @@ impl Make {
             };
         }
 
-        let updated = std::sync::atomic::AtomicBool::new(false);
-        let errors: std::sync::Mutex<Vec<ErrorCode>> = std::sync::Mutex::new(Vec::new());
-        std::thread::scope(|scope| {
-            let mut handles = Vec::new();
-            let mut inline: Vec<&str> = Vec::new();
-            // Spawn a worker for each prerequisite that can obtain a token; the
-            // rest are built inline in this thread. Spawning first (before any
-            // inline build) is what lets the work actually overlap.
-            for &name in names {
-                if self.pool.try_acquire() {
-                    let errors = &errors;
-                    let updated = &updated;
-                    handles.push(scope.spawn(move || {
-                        let result = self.build_target(name);
-                        self.pool.release();
-                        match result {
-                            Ok(true) => updated.store(true, std::sync::atomic::Ordering::Relaxed),
-                            Ok(false) => {}
-                            Err(err) => errors.lock().unwrap().push(err),
-                        }
-                    }));
-                } else {
-                    inline.push(name);
-                }
-            }
-            for name in inline {
-                match self.build_target(name) {
-                    Ok(true) => updated.store(true, std::sync::atomic::Ordering::Relaxed),
-                    Ok(false) => {}
-                    Err(err) => errors.lock().unwrap().push(err),
-                }
-            }
-            for handle in handles {
-                let _ = handle.join();
-            }
-        });
+        let segment = Segment::new(names, None);
+        std::thread::scope(|threads| self.work_on(&segment, scope, threads));
 
         // Report the first error (if any).
-        match errors.into_inner().unwrap().into_iter().next() {
+        match segment.errors.into_inner().unwrap().into_iter().next() {
             Some(err) => Err(err),
-            None => Ok(updated.into_inner()),
+            None => Ok(segment.updated.into_inner()),
         }
+    }
+
+    /// Whether independent targets are made in parallel: `-j` above 1, and
+    /// no option or `.NOTPARALLEL` that keeps the run serial.
+    fn parallel(&self) -> bool {
+        self.config.jobs > 1
+            && !self.config.not_parallel
+            && !self.config.dry_run
+            && !self.config.quit
+            && !self.config.touch
+    }
+
+    /// Make the goals named on the command line in parallel, as `-j` allows
+    /// and as GNU make does, before the caller asks for each in turn;
+    /// `build_target` then answers from what was made. automake's check-am
+    /// names hundreds of test programs to one `$(MAKE)`.
+    ///
+    /// Returns how many command lines were shown or run for each goal --
+    /// what decides whether it gets a "nothing to be done" message -- or
+    /// `None` when the goals are not made in parallel. Without `-k` a
+    /// failure stops more goals being started, as a serial run stops.
+    pub fn make_goals_in_parallel(&self, goals: &[&str]) -> Option<Vec<usize>> {
+        if !self.parallel() || goals.len() <= 1 {
+            return None;
+        }
+        let counts: Vec<std::sync::Arc<AtomicUsize>> =
+            goals.iter().map(|_| Default::default()).collect();
+        let segment = Segment::new(goals, Some(&counts));
+        std::thread::scope(|threads| self.work_on(&segment, &[], threads));
+        Some(counts.iter().map(|count| count.load(Relaxed)).collect())
+    }
+
+    /// Make prerequisites of `segment` until none is left, first starting a
+    /// worker for each further one a token can be had for.
+    ///
+    /// Every thread working on the segment does this, the one that owns it
+    /// as well as its workers, so a token given back anywhere is put to use
+    /// as soon as any of them finishes a prerequisite. Workers used to be
+    /// started once, for the first prerequisites, and the owning thread made
+    /// all the rest one after another: automake's `check-TESTS`, one target
+    /// with hundreds of `.log` prerequisites, ran its tests one at a time
+    /// after the first few, whatever `-j` said.
+    fn work_on<'scope, 'env>(
+        &'env self,
+        segment: &'env Segment<'env>,
+        scope: &'env [TargetVar],
+        threads: &'scope std::thread::Scope<'scope, 'env>,
+    ) {
+        loop {
+            self.start_workers(segment, scope, threads);
+            if segment.stop.load(Relaxed) {
+                return;
+            }
+            let next = segment.next.fetch_add(1, Relaxed);
+            if next >= segment.names.len() {
+                return;
+            }
+            self.make_one(segment, next, scope);
+        }
+    }
+
+    /// Start a worker for each prerequisite of `segment` after the next one
+    /// that a token can be had for. A worker makes its prerequisite, works on
+    /// the segment as its starter does, and gives its token back.
+    fn start_workers<'scope, 'env>(
+        &'env self,
+        segment: &'env Segment<'env>,
+        scope: &'env [TargetVar],
+        threads: &'scope std::thread::Scope<'scope, 'env>,
+    ) {
+        // The next prerequisite is the calling thread's own.
+        while segment.names.len() > segment.next.load(Relaxed) + 1
+            && !segment.stop.load(Relaxed)
+            && self.pool.try_acquire()
+        {
+            let next = segment.next.fetch_add(1, Relaxed);
+            if next >= segment.names.len() {
+                self.pool.release();
+                return;
+            }
+            let goal = rule::goal_commands();
+            let spawned = std::thread::Builder::new()
+                .stack_size(BUILD_STACK_SIZE)
+                .spawn_scoped(threads, move || {
+                    WalkLevel::on_build_stack();
+                    rule::set_goal_commands(goal);
+                    self.make_one(segment, next, scope);
+                    self.work_on(segment, scope, threads);
+                    self.pool.release();
+                });
+            if spawned.is_err() {
+                // No thread to be had: the target is made here instead.
+                self.pool.release();
+                self.make_one(segment, next, scope);
+            }
+        }
+    }
+
+    /// Make prerequisite `index` of `segment` and record the outcome. Without
+    /// `-k` a failure stops the segment starting any more, as when it is made
+    /// serially.
+    fn make_one(&self, segment: &Segment<'_>, index: usize, scope: &[TargetVar]) {
+        let name = segment.names[index];
+        // A goal's command lines are counted as its own.
+        let outer = segment.goals.map(|goals| {
+            let outer = rule::goal_commands();
+            rule::set_goal_commands(Some(std::sync::Arc::clone(&goals[index])));
+            outer
+        });
+        let result = self.build_target_in(name, scope);
+        if let Some(outer) = outer {
+            rule::set_goal_commands(outer);
+        }
+        match result {
+            Ok(true) => segment.updated.store(true, Relaxed),
+            Ok(false) => {}
+            Err(err) => {
+                if !self.config.keep_going || self.config.terminate {
+                    segment.stop.store(true, Relaxed);
+                }
+                segment.errors.lock().unwrap().push(err);
+            }
+        }
+    }
+
+    /// File a single-target rule.
+    ///
+    /// A second ordinary rule for a target is folded into the first
+    /// (POSIX 105653). A double-colon rule never is: each is independent,
+    /// with its own prerequisites and commands, and they run in the order
+    /// written. GNU make refuses a target that has both kinds, as here.
+    fn add_target_rule(&mut self, rule: Rule) -> Result<(), ErrorCode> {
+        let Some(name) = rule.targets().next().map(|t| t.to_string()) else {
+            return Ok(());
+        };
+        // Pattern rules with one target pattern are alternatives, not one
+        // rule: libzstd has `$(D)/%.o : %.c` and `$(D)/%.o : %.S`, and the
+        // one used is the one whose prerequisites exist. One with the same
+        // prerequisites as an earlier one replaces it, as in GNU make.
+        if rule.is_pattern() {
+            let same = |r: &Rule| {
+                r.targets().eq(rule.targets()) && r.prerequisites().eq(rule.prerequisites())
+            };
+            let found = self
+                .pattern_rules
+                .iter()
+                .copied()
+                .find(|&at| same(&self.rules[at]));
+            match found {
+                Some(at) => self.rules[at] = rule,
+                None => self.push_rule(rule),
+            }
+            return Ok(());
+        }
+        let existing = self
+            .rule_index
+            .get(&name)
+            .and_then(|at| at.first().copied())
+            .map(|at| &mut self.rules[at]);
+        match existing {
+            Some(existing) if existing.is_double_colon() != rule.is_double_colon() => {
+                Err(MixedColons { target: name })
+            }
+            Some(existing) if !rule.is_double_colon() => {
+                existing.absorb(rule);
+                Ok(())
+            }
+            _ => {
+                self.push_rule(rule);
+                Ok(())
+            }
+        }
+    }
+
+    /// Every `::` rule for `name`, in the order written.
+    fn double_colon_rules(&self, name: &str) -> Vec<&Rule> {
+        self.rules_named(name)
+            .filter(|rule| rule.is_double_colon())
+            .collect()
+    }
+
+    /// Run each double-colon rule for `target` in turn.
+    ///
+    /// Each brings its own prerequisites up to date and runs its commands
+    /// when one of them is newer than the target, or always when it has none
+    /// (GNU make). Reports whether any rule ran.
+    fn run_double_colon_rules(
+        &self,
+        target: &Target,
+        inherited: &[TargetVar],
+    ) -> Result<bool, ErrorCode> {
+        let mut ran = false;
+        for rule in self.double_colon_rules(target.as_ref()) {
+            ran |= self.run_rule_with_prerequisites(rule, target, Dispatch::Explicit, inherited)?;
+        }
+        Ok(ran)
+    }
+
+    /// Whether some rule can make `name`: a target rule, a pattern rule or an
+    /// inference rule.
+    fn has_rule_for(&self, name: &str) -> bool {
+        self.rule_by_target_name(name).is_some()
+            || self.find_pattern_rule(name).is_some()
+            || self.find_inference_rule(name).is_some()
+    }
+
+    /// Bring every included file up to date, after the makefiles are read.
+    ///
+    /// POSIX 105587-105600 ("delayed remaking"): once the makefiles have been
+    /// read, make uses any rule for an included file to create it or bring it
+    /// up to date, and the new contents are then used. Returns whether any
+    /// included file changed, in which case the caller reads the makefiles
+    /// again from the start.
+    ///
+    /// The recipes run even under `-n`, `-q` and `-t`: what is being made is
+    /// the makefile itself, which those options cannot answer for without
+    /// reading. GNU make does the same.
+    ///
+    /// A file is reported as changed only if its modification time did, so a
+    /// rule that runs and makes nothing -- `$(DEPFILES):` with no commands --
+    /// cannot restart the read forever.
+    pub fn remake_includes(&mut self, includes: &[parser::Include]) -> Result<bool, ErrorCode> {
+        let saved = (self.config.dry_run, self.config.quit, self.config.touch);
+        (self.config.dry_run, self.config.quit, self.config.touch) = (false, false, false);
+        let result = self.remake_each_include(includes);
+        (self.config.dry_run, self.config.quit, self.config.touch) = saved;
+        result
+    }
+
+    fn remake_each_include(&self, includes: &[parser::Include]) -> Result<bool, ErrorCode> {
+        let mut changed = false;
+        for include in includes {
+            let path = rule::prerequisite::without_dot_slash(include.path.clone());
+            let path = path.as_str();
+            let before = self.stats.modified(path);
+            if !self.has_rule_for(path) {
+                if before.is_none() && !include.optional {
+                    return Err(missing_include(path));
+                }
+                continue;
+            }
+            match self.build_target(path) {
+                Ok(_) => {}
+                // GNU: a `-include` that cannot be made is passed over.
+                Err(_) if include.optional => continue,
+                Err(err) => return Err(err),
+            }
+            let after = self.stats.modified(path);
+            if after.is_none() && !include.optional {
+                return Err(missing_include(path));
+            }
+            changed |= after != before;
+        }
+        Ok(changed)
+    }
+}
+
+/// Name `parent` as the target a missing prerequisite was needed by, unless
+/// a target nearer to it is named already: GNU make's `No rule to make target
+/// 'X', needed by 'Y'` names the immediate dependent.
+fn needed_by(err: ErrorCode, parent: &str) -> ErrorCode {
+    match err {
+        NoRule {
+            target,
+            needed_by: None,
+        } => NoRule {
+            target,
+            needed_by: Some(parent.to_string()),
+        },
+        other => other,
+    }
+}
+
+/// The error for an `include` whose file neither exists nor can be made.
+fn missing_include(path: &str) -> ErrorCode {
+    let reason = std::io::Error::from_raw_os_error(libc::ENOENT);
+    let message = preprocessor::PreprocError::IncludeFailed {
+        path: path.to_string(),
+        reason: reason.to_string(),
+    };
+    ParserError {
+        constraint: parser::ParseError(vec![message.to_string()]),
     }
 }
 
@@ -812,13 +1523,6 @@ fn inference_source(rule: &Rule, target: &Target) -> Option<String> {
     Some(suffix_source_name(stem, &format!(".{from}")))
 }
 
-/// Return `name` found under one of `dirs`, if any.
-fn search_dirs(dirs: &[&str], name: &str) -> Option<String> {
-    dirs.iter()
-        .map(|dir| format!("{dir}/{name}"))
-        .find(|candidate| std::path::Path::new(candidate).exists())
-}
-
 /// The default macros and inference rules POSIX requires make to start with.
 ///
 /// These existed only as display strings in the `-p` dump table, so `make f.o`
@@ -827,14 +1531,30 @@ fn search_dirs(dirs: &[&str], name: &str) -> Option<String> {
 ///
 /// Written as makefile text so it goes through the same reader as anything
 /// else. `-r` (`config.clear`) suppresses it, as POSIX requires.
+///
+/// POSIX 106035 lets an implementation "provide additional macros and
+/// rules", and two of GNU make's are here because sysvinit's Makefile
+/// cannot build without them: `.o:` links a program from its objects
+/// (`init: init.o init_utmp.o runlevellog.o` has no commands), and `.c.o`
+/// passes `$(CPPFLAGS)`, which sysvinit sets per object
+/// (`init.o: CPPFLAGS += $(SELINUX_DEF)`). With `CPPFLAGS` empty, `.c.o`
+/// gives what POSIX's gives.
+///
+/// `.c:` links, as GNU make's `%: %.c` does, every prerequisite (`$^`)
+/// with `$(CPPFLAGS)` and `$(LDLIBS)`: libselinux links each of its utils
+/// from its source with `override LDLIBS += -lselinux`, and libzstd's
+/// `fuzzer:` has no commands, only its objects and sources. With one
+/// prerequisite and both macros empty it runs what POSIX's runs.
 const BUILTIN_RULES: &str = r#"
+.o:
+	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
 .c:
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
 .sh:
 	cp $< $@
 	chmod a+x $@
 .c.o:
-	$(CC) $(CFLAGS) -c $<
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $<
 .y.o:
 	$(YACC) $(YFLAGS) $<
 	$(CC) $(CFLAGS) -c y.tab.c
@@ -894,7 +1614,11 @@ const SCCS_GET_RULE: &str = ".SCCS_GET:\n\tsccs $(SCCSFLAGS) get $(SCCSGETFLAGS)
 
 /// The macros those rules refer to. A makefile definition overrides them, so
 /// they are seeded first and only kept where the makefile is silent.
-const BUILTIN_MACROS: [(&str, &str); 12] = [
+///
+/// The last five are GNU make's, which libzstd's Makefiles compile, link
+/// and clean with (`$(COMPILE.c) $(DEPFLAGS) $(OUTPUT_OPTION) $<`,
+/// `$(LINK.c) $^ -o $@`, `$(RM)`); POSIX 106035 allows additional macros.
+const BUILTIN_MACROS: [(&str, &str); 17] = [
     ("CC", "c17"),
     ("CFLAGS", "-O 1"),
     ("AR", "ar"),
@@ -907,6 +1631,17 @@ const BUILTIN_MACROS: [(&str, &str); 12] = [
     ("GFLAGS", ""),
     ("SCCSFLAGS", ""),
     ("SCCSGETFLAGS", "-s"),
+    ("COMPILE.c", "$(CC) $(CFLAGS) $(CPPFLAGS) $(TARGET_ARCH) -c"),
+    (
+        "COMPILE.S",
+        "$(CC) $(ASFLAGS) $(CPPFLAGS) $(TARGET_MACH) -c",
+    ),
+    (
+        "LINK.c",
+        "$(CC) $(CFLAGS) $(CPPFLAGS) $(LDFLAGS) $(TARGET_ARCH)",
+    ),
+    ("OUTPUT_OPTION", "-o $@"),
+    ("RM", "rm -f"),
 ];
 
 /// The macros POSIX's built-in inference rules refer to (source 4).
@@ -923,12 +1658,14 @@ pub fn builtin_macros() -> Vec<Macro> {
 impl TryFrom<(Makefile, Config)> for Make {
     type Error = ErrorCode;
 
-    fn try_from((makefile, config): (Makefile, Config)) -> Result<Self, Self::Error> {
+    fn try_from((mut makefile, config): (Makefile, Config)) -> Result<Self, Self::Error> {
         // Two-pass classification: .SUFFIXES must be processed before inference
         // rule classification so that user-defined suffixes (especially with -r)
         // are available when determining whether a rule like `.txt.out:` is an
         // inference rule.
 
+        let table = makefile.take_table();
+        let (target_vars, pattern_vars) = index_target_vars(makefile.target_vars());
         let (parsed_rules, macros, vpaths, exports) = makefile.into_parts();
 
         let mut suffixes_rules = vec![];
@@ -939,7 +1676,7 @@ impl TryFrom<(Makefile, Config)> for Make {
         for parsed_rule in parsed_rules {
             let rule = Rule::from(parsed_rule);
             let Some(target) = rule.targets().next() else {
-                return Err(NoTarget { target: None });
+                return Err(NoTargets);
             };
             if let Ok(SpecialTarget::Suffixes) = SpecialTarget::try_from(target.clone()) {
                 suffixes_rules.push(rule);
@@ -950,16 +1687,27 @@ impl TryFrom<(Makefile, Config)> for Make {
 
         // Build the Make struct early so we can process .SUFFIXES via the
         // normal special_target::process path (which writes to make.config).
-        let pool = TokenPool::new(config.jobs.saturating_sub(1));
+        let pool = jobserver::pool_for(config.jobs);
         let mut make = Self {
             rules: vec![],
+            rule_index: HashMap::default(),
+            pattern_rules: Vec::new(),
             inference_rules: vec![],
             macros,
+            table,
+            target_vars,
+            pattern_vars,
+            mentioned: Default::default(),
+            frozen_mtimes: Default::default(),
+            remade: Default::default(),
+            stats: Default::default(),
+            acyclic: Default::default(),
             default_rule: None,
             sccs_get: None,
             pool,
             ledger: graph::Ledger::new(),
             vpaths,
+            vpath_dirs: Vec::new(),
             exports,
             attributes: attributes::Attributes::default(),
             config,
@@ -974,9 +1722,13 @@ impl TryFrom<(Makefile, Config)> for Make {
             for (name, value) in BUILTIN_MACROS {
                 if !make.macros.iter().any(|(n, _)| n == name) {
                     make.macros.push((name.to_string(), value.to_string()));
+                    make.table
+                        .seed(name.to_string(), value.to_string(), MacroSource::BuiltIn);
                 }
             }
         }
+
+        make.vpath_dirs = Self::vpath_dirs(&make.macros);
 
         for rule in suffixes_rules {
             special_target::process(rule, &mut make)?;
@@ -988,13 +1740,16 @@ impl TryFrom<(Makefile, Config)> for Make {
 
         for rule in remaining_parsed_rules {
             let Some(target) = rule.targets().next() else {
-                return Err(NoTarget { target: None });
+                return Err(NoTargets);
             };
 
             if SpecialTarget::try_from(target.clone()).is_ok() {
                 special_rules.push(rule);
-            } else if InferenceTarget::try_from((target.clone(), make.config.clone())).is_ok() {
-                make.inference_rules.push(rule);
+            } else if let Ok(inference) = InferenceTarget::try_from((target, &make.config)) {
+                // The suffixes as the known ones split the name, which only
+                // the suffix list can say for `.c.depends.o`.
+                make.inference_rules
+                    .push(rule.with_suffixes(inference.from(), inference.to().unwrap_or("")));
             } else {
                 // POSIX 105653: several rules may name the same target, with
                 // prerequisites accumulating. The old lookup returned the first
@@ -1008,17 +1763,7 @@ impl TryFrom<(Makefile, Config)> for Make {
                 // `extra` to `b` as well -- the same leak `.IGNORE: a` had
                 // before attributes were keyed by target (audit #84).
                 for rule in rule.split_targets() {
-                    let Some(name) = rule.targets().next().map(|t| t.to_string()) else {
-                        continue;
-                    };
-                    match make
-                        .rules
-                        .iter_mut()
-                        .find(|existing| existing.targets().any(|t| t.as_ref() == name))
-                    {
-                        Some(existing) => existing.absorb(rule),
-                        None => make.rules.push(rule),
-                    }
+                    make.add_target_rule(rule)?;
                 }
             }
         }
@@ -1026,6 +1771,20 @@ impl TryFrom<(Makefile, Config)> for Make {
         for rule in special_rules {
             special_target::process(rule, &mut make)?;
         }
+
+        make.mentioned = make
+            .rules
+            .iter()
+            .filter(|rule| !rule.is_pattern())
+            .flat_map(|rule| {
+                let targets = rule.targets().map(|t| t.as_ref().to_string());
+                let prerequisites = rule
+                    .prerequisites()
+                    .chain(rule.order_only())
+                    .map(|p| p.as_ref().to_string());
+                targets.chain(prerequisites).collect::<Vec<_>>()
+            })
+            .collect();
 
         // Built-in inference rules come last, so a rule of the same name in
         // the makefile is found first.
@@ -1038,35 +1797,26 @@ impl TryFrom<(Makefile, Config)> for Make {
     }
 }
 
-/// Expand the built-in recipes against the macros actually in force.
-///
-/// The rule text is a constant, so it always parses; only the recipe lines
-/// need the makefile's macros. The previous arrangement pasted every macro
-/// back into that text as `NAME ::= value` and re-parsed the lot, so any value
-/// containing a newline -- every `define` body -- made the whole thing fail to
-/// parse, and an `if let Ok` swallowed the error. Every built-in rule
-/// disappeared without a word (audit #67).
-fn expand_rules(text: &str, macros: &[Macro]) -> Result<String, ErrorCode> {
-    let mut out = String::with_capacity(text.len());
-    for line in text.lines() {
-        match line.strip_prefix('\t') {
-            Some(body) => {
-                out.push('\t');
-                out.push_str(&expand_builtin_recipe(body, macros)?);
-            }
-            None => out.push_str(line),
-        }
-        out.push('\n');
-    }
-    Ok(out)
-}
+/// Target-specific macro assignments indexed by target, and the
+/// pattern-specific ones (a `%` target) with their patterns, each in the
+/// order read.
+type TargetVarIndex = (HashMap<String, Vec<TargetVar>>, Vec<(String, TargetVar)>);
 
-/// Expand one built-in recipe line. `$@`, `$<` and `$*` are left for the rule
-/// stage, which is the only place that knows the target.
-fn expand_builtin_recipe(line: &str, macros: &[Macro]) -> Result<String, ErrorCode> {
-    preprocessor::expand_recipe(line, macros).map_err(|message| ParserError {
-        constraint: parser::ParseError(vec![message]),
-    })
+fn index_target_vars(vars: &[TargetVar]) -> TargetVarIndex {
+    let mut by_target: HashMap<String, Vec<TargetVar>> = HashMap::default();
+    let mut by_pattern = Vec::new();
+    for var in vars {
+        for target in &var.targets {
+            match target.contains('%') {
+                true => by_pattern.push((target.clone(), var.clone())),
+                false => by_target
+                    .entry(target.clone())
+                    .or_default()
+                    .push(var.clone()),
+            }
+        }
+    }
+    (by_target, by_pattern)
 }
 
 /// The SCCS history file for `name`, if there is one.
@@ -1084,21 +1834,20 @@ fn expand_builtin_recipe(line: &str, macros: &[Macro]) -> Result<String, ErrorCo
 /// This does not touch the `~`-suffix rules' `s.foo.c` form in
 /// `suffix_source_name`: 105481-82 scopes `PROJECTDIR` to "files with a
 /// component named SCCS", and that form has none.
-fn sccs_history(name: &str) -> Option<String> {
+fn sccs_history(name: &str, stats: &stat_cache::StatCache) -> Option<String> {
     let (dir, file) = match name.rfind('/') {
         Some(at) => (&name[..=at], &name[at + 1..]),
         None => ("", name),
     };
     let path = format!("{dir}SCCS/s.{file}");
-    if fs::metadata(&path).is_ok() {
+    if stats.exists(&path) {
         return Some(path);
     }
 
     let project = plib::projectdir::from_env()?;
     let path = plib::projectdir::sccs_dir(&project).join(format!("s.{file}"));
-    fs::metadata(&path)
-        .is_ok()
-        .then(|| path.to_string_lossy().into_owned())
+    let path = path.to_string_lossy().into_owned();
+    stats.exists(&path).then_some(path)
 }
 
 /// Whether `target` should be retrieved from its SCCS history.
@@ -1133,7 +1882,7 @@ fn get_modified_time(path: impl AsRef<str>) -> Option<SystemTime> {
 }
 
 /// Splits an `archive(member)` target into its `(archive, member)` parts.
-fn parse_archive_target(s: &str) -> Option<(&str, &str)> {
+pub(crate) fn parse_archive_target(s: &str) -> Option<(&str, &str)> {
     let s = s.strip_suffix(')')?;
     let open = s.find('(')?;
     let (archive, member) = (&s[..open], &s[open + 1..]);
@@ -1147,7 +1896,7 @@ fn parse_archive_target(s: &str) -> Option<(&str, &str)> {
 /// `archive_path`. Supports the common System V / GNU short-name format (member
 /// names terminated by `/`). Returns `None` if the archive or member is absent
 /// or the header cannot be parsed.
-fn archive_member_mtime(archive_path: &str, member: &str) -> Option<SystemTime> {
+pub(crate) fn archive_member_mtime(archive_path: &str, member: &str) -> Option<SystemTime> {
     const MAGIC: &[u8] = b"!<arch>\n";
     const HEADER_LEN: usize = 60;
 

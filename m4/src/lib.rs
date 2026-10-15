@@ -13,9 +13,19 @@ use input::{Input, InputRead};
 use lexer::MacroName;
 use macros::MacroDefinition;
 use state::State;
-use std::{cell::RefCell, ffi::OsStr, io::Write, path::PathBuf, rc::Rc};
+use std::{
+    cell::RefCell,
+    ffi::{OsStr, OsString},
+    io::Write,
+    path::PathBuf,
+    rc::Rc,
+};
 
+mod debug;
+mod emacs_regex;
 pub mod error;
+mod format;
+mod freeze;
 mod input;
 mod lexer;
 mod macros;
@@ -78,14 +88,43 @@ pub struct Args {
     pub line_synchronization: bool,
     /// `-D`, `-U`, and file operands in command-line order.
     pub items: Vec<InputItem>,
+    /// `-I`: directories searched, in order, for an input file not found
+    /// where it is named.
+    pub include_dirs: Vec<PathBuf>,
+    /// `-P`: every built-in is named with an `m4_` prefix.
+    pub prefix_builtins: bool,
+    /// `-E` given once (diagnostics make the exit status a failure) or
+    /// twice (the first diagnostic stops m4).
+    pub fatal_warnings: u8,
+    /// `-L`: the deepest macro calls may nest, 0 for no limit.
+    pub nesting_limit: usize,
+    /// `-d`: the debug flags, as given.
+    pub debug_flags: Option<Vec<u8>>,
+    /// `--debugfile`: `Some(None)` for standard error, `Some(Some(name))`
+    /// for a file, nowhere if the name is empty.
+    pub debugfile: Option<Option<Vec<u8>>>,
+    /// `-t`: macros to trace.
+    pub trace: Vec<Vec<u8>>,
+    /// `-R`: a frozen state file to start from.
+    pub reload_state: Option<PathBuf>,
+    /// `-F`: where to write the frozen state at the end.
+    pub freeze_state: Option<PathBuf>,
 }
+
+/// What clap records for a `--debugfile` without `=FILE`: standard error.
+/// No file operand can contain a NUL, so no name is mistaken for it.
+const DEBUGFILE_STDERR: &str = "\0";
 
 impl Args {
     fn command() -> clap::Command {
         clap::command!()
+            // GNU getopt takes any unambiguous prefix of a long option, and
+            // libtoolize spells `--prefix-builtins` as `--prefix`.
+            .infer_long_args(true)
             .arg(
                 clap::Arg::new("line_synchronization")
                     .short('s')
+                    .long("synclines")
                     .help(gettext(
                         "Output line synchronization directives, suitable for cpp",
                     ))
@@ -94,6 +133,7 @@ impl Args {
             .arg(
                 clap::Arg::new("define")
                     .short('D')
+                    .long("define")
                     .value_name(crate::lexer::DEFINE_VALUE_NAME)
                     .help(gettext(
                         "Define the symbol name to have some value (or NULL)",
@@ -105,21 +145,131 @@ impl Args {
             .arg(
                 clap::Arg::new("undefine")
                     .short('U')
+                    .long("undefine")
                     .value_name(crate::lexer::UNDEFINE_VALUE_NAME)
                     .help(gettext("Undefine the symbol name"))
                     .num_args(1)
                     .allow_hyphen_values(true)
                     .action(clap::ArgAction::Append),
             )
+            .arg(
+                clap::Arg::new("include")
+                    .short('I')
+                    .long("include")
+                    .value_name("DIRECTORY")
+                    .help(gettext("Append DIRECTORY to the include path"))
+                    .num_args(1)
+                    .value_parser(clap::value_parser!(PathBuf))
+                    .action(clap::ArgAction::Append),
+            )
+            .arg(
+                clap::Arg::new("prefix_builtins")
+                    .short('P')
+                    .long("prefix-builtins")
+                    .help(gettext("Force a `m4_' prefix to all builtins"))
+                    .action(clap::ArgAction::SetTrue),
+            )
+            .arg(
+                clap::Arg::new("fatal_warnings")
+                    .short('E')
+                    .long("fatal-warnings")
+                    .help(gettext(
+                        "Once: warnings become errors, twice: stop execution at first error",
+                    ))
+                    .action(clap::ArgAction::Count),
+            )
+            .arg(
+                clap::Arg::new("nesting_limit")
+                    .short('L')
+                    .long("nesting-limit")
+                    .value_name("NUMBER")
+                    .help(gettext("Change the nesting limit, 0 for unlimited"))
+                    .num_args(1)
+                    .value_parser(clap::value_parser!(usize)),
+            )
+            .arg(
+                // GNU getopt gives `-d` an argument only when attached
+                // (`-daq`); `parse` spells that `--debug=aq` for clap.
+                clap::Arg::new("debug")
+                    .short('d')
+                    .long("debug")
+                    .value_name("FLAGS")
+                    .help(gettext(
+                        "Set the debug flags (no FLAGS implies `aeq'): a args, c call, \
+                         e expansion, f file, i input, l line, p path, q quote, t trace all, \
+                         x call id, V all",
+                    ))
+                    .num_args(0..=1)
+                    .require_equals(true)
+                    .default_missing_value("")
+                    .value_parser(clap::value_parser!(OsString)),
+            )
+            .arg(
+                clap::Arg::new("debugfile")
+                    .long("debugfile")
+                    .value_name("FILE")
+                    .help(gettext(
+                        "Redirect debug and trace output to FILE (default stderr, \
+                         discard if empty string)",
+                    ))
+                    .num_args(0..=1)
+                    .require_equals(true)
+                    .default_missing_value(DEBUGFILE_STDERR)
+                    .value_parser(clap::value_parser!(OsString)),
+            )
+            .arg(
+                clap::Arg::new("reload_state")
+                    .short('R')
+                    .long("reload-state")
+                    .value_name("FILE")
+                    .help(gettext("Reload a frozen state from FILE at start"))
+                    .num_args(1)
+                    .value_parser(clap::value_parser!(PathBuf)),
+            )
+            .arg(
+                clap::Arg::new("freeze_state")
+                    .short('F')
+                    .long("freeze-state")
+                    .value_name("FILE")
+                    .help(gettext("Produce a frozen state on FILE at end"))
+                    .num_args(1)
+                    .value_parser(clap::value_parser!(PathBuf)),
+            )
+            .arg(
+                clap::Arg::new("trace")
+                    .short('t')
+                    .long("trace")
+                    .value_name("NAME")
+                    .help(gettext("Trace NAME when it is defined"))
+                    .num_args(1)
+                    .allow_hyphen_values(true)
+                    .value_parser(clap::value_parser!(OsString))
+                    .action(clap::ArgAction::Append),
+            )
+            .arg(
+                // autom4te always passes it; the extensions it names are the
+                // only mode there is.
+                clap::Arg::new("gnu")
+                    .short('g')
+                    .long("gnu")
+                    .help(gettext("Enable the GNU extensions (always enabled)"))
+                    .action(clap::ArgAction::SetTrue),
+            )
             .arg(clap::Arg::new("file").action(clap::ArgAction::Append))
     }
 
     pub fn parse() -> Self {
-        let argv = std::env::args_os().collect();
+        let argv = plib::optarg::spell_optional_argument(
+            std::env::args_os().collect(),
+            'd',
+            "debug",
+            &plib::optarg::OptionArguments::of(Self::command()),
+        );
         let matches = plib::optarg::get_matches_from(
             Self::command(),
             plib::optarg::keep_leading_equals_with(argv, Self::command),
         );
+        let bytes = |value: &OsString| value.as_encoded_bytes().to_vec();
 
         let line_synchronization = matches.get_flag("line_synchronization");
 
@@ -151,6 +301,28 @@ impl Args {
         Self {
             line_synchronization,
             items,
+            include_dirs: matches
+                .get_many::<PathBuf>("include")
+                .unwrap_or_default()
+                .cloned()
+                .collect(),
+            prefix_builtins: matches.get_flag("prefix_builtins"),
+            fatal_warnings: matches.get_count("fatal_warnings"),
+            nesting_limit: matches
+                .get_one::<usize>("nesting_limit")
+                .copied()
+                .unwrap_or(0),
+            debug_flags: matches.get_one::<OsString>("debug").map(bytes),
+            debugfile: matches
+                .get_one::<OsString>("debugfile")
+                .map(|name| (name != DEBUGFILE_STDERR).then(|| bytes(name))),
+            reload_state: matches.get_one::<PathBuf>("reload_state").cloned(),
+            freeze_state: matches.get_one::<PathBuf>("freeze_state").cloned(),
+            trace: matches
+                .get_many::<OsString>("trace")
+                .unwrap_or_default()
+                .map(bytes)
+                .collect(),
         }
     }
 }
@@ -202,6 +374,10 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
 ) -> crate::error::Result<()> {
     let stdout = Rc::new(RefCell::new(stdout));
     let mut state = State::try_new(stdout.clone(), Vec::new(), args.line_synchronization)?;
+    state.configure(&args, &mut stderr)?;
+    if let Some(path) = &args.reload_state {
+        reload_state(&mut state, path, &mut stderr)?;
+    }
 
     let has_file = args
         .items
@@ -222,7 +398,7 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
         // Process -D/-U options and file operands in command-line order so a
         // -D/-U takes effect for the operands that follow it. Each file is
         // processed to completion before the next item; m4wrap text and
-        // diversions are flushed once, after all input (see finalize below).
+        // diversions are flushed once, after all input (see run_wrapped below).
         for item in args.items {
             match item {
                 InputItem::Define(_) | InputItem::Undefine(_) => {
@@ -232,17 +408,16 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
                     let reader = if path.as_os_str() == "-" {
                         Ok(InputRead::Stdin(std::io::stdin()))
                     } else {
-                        std::fs::File::open(&path).map(|file| InputRead::File {
-                            file,
-                            path: path.clone(),
-                        })
+                        state
+                            .open_input(&path)
+                            .map(|(file, path)| InputRead::File { file, path })
                     };
                     match reader {
                         Ok(read) => {
                             // Discard the previous (now exhausted) input only once
                             // the next one has opened. Popping before the open
                             // would, on a failed open, leave the input stack empty
-                            // and cause finalize() to be skipped — dropping any
+                            // and cause run_wrapped() to be skipped — dropping any
                             // m4wrap text or diversions queued by earlier files.
                             while state.input.input_len() > 0 {
                                 state.input.input_pop();
@@ -266,10 +441,26 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
     }
 
     let exit_error = state.exit_error;
-    // Flush m4wrap text (rescanned) and any remaining diversions, once, at the
-    // true end of input. Skipped only if no input was ever opened.
+    // Run m4wrap text (rescanned), once, at the true end of input, then flush
+    // the diversions or freeze them. No input ever opened means no m4wrap text.
     if state.input.input_len() > 0 {
-        state = main_loop::finalize(state, &mut stderr)?;
+        state = main_loop::run_wrapped(state, &mut stderr)?;
+    }
+    state.debug.flush()?;
+    match &args.freeze_state {
+        // The diversions go into the frozen file, not to the output.
+        Some(path) => {
+            if let Err(error) = freeze::freeze(&state, path) {
+                writeln!(
+                    stderr,
+                    "m4: cannot write frozen state to `{}': {}",
+                    path.display(),
+                    plib::diag::io_error_text(&error)
+                )?;
+                return Err(Error::new(ErrorKind::Exit(1)));
+            }
+        }
+        None => main_loop::undivert_all(&mut state)?,
     }
 
     // A recoverable error (a diagnostic emitted via State::emit_error, e.g. a
@@ -280,6 +471,33 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
     }
 
     Ok(())
+}
+
+/// Start from the frozen state at `path` (`-R`), in GNU m4's words when it
+/// cannot: exit status 63 for a version this m4 does not read, else 1.
+fn reload_state(state: &mut State, path: &std::path::Path, stderr: &mut dyn Write) -> Result<()> {
+    let file = path.display();
+    let (message, status) = match freeze::reload(state, path, stderr) {
+        Ok(()) => return Ok(()),
+        Err(freeze::ReloadError::Io(error)) => (
+            format!(
+                "m4: cannot open `{file}': {}",
+                plib::diag::io_error_text(&error)
+            ),
+            1,
+        ),
+        Err(freeze::ReloadError::Version(version, line)) => (
+            format!(
+                "m4:{file}:{line}: frozen file version {version} greater than max supported of 1"
+            ),
+            freeze::VERSION_MISMATCH_STATUS,
+        ),
+        Err(freeze::ReloadError::Malformed(line)) => {
+            (format!("m4:{file}:{line}: ill-formed frozen file"), 1)
+        }
+    };
+    writeln!(stderr, "{message}")?;
+    Err(Error::new(ErrorKind::Exit(status)))
 }
 
 /// Apply a `-D`/`-U` directive to the macro table. (File items are handled by

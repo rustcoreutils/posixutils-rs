@@ -31,12 +31,7 @@ use super::MacroImplementation;
 pub struct EvalMacro;
 
 impl MacroImplementation for EvalMacro {
-    fn evaluate(
-        &self,
-        mut state: State,
-        stderr: &mut dyn Write,
-        frame: StackFrame,
-    ) -> Result<State> {
+    fn evaluate(&self, state: &mut State, stderr: &mut dyn Write, frame: StackFrame) -> Result<()> {
         let mut args = frame.args.into_iter();
         let first_arg = args
             .next()
@@ -59,7 +54,7 @@ impl MacroImplementation for EvalMacro {
                     1,
                 );
                 state.emit_error(stderr, format_args!("{msg}"))?;
-                return Ok(state);
+                return Ok(());
             }
         };
 
@@ -76,7 +71,7 @@ impl MacroImplementation for EvalMacro {
                         gettext("radix out of range (2-36) or non-numeric in eval")
                     ),
                 )?;
-                return Ok(state);
+                return Ok(());
             }
         };
         let min_digits = match parse_optional_decimal(width_arg.as_deref()) {
@@ -87,14 +82,14 @@ impl MacroImplementation for EvalMacro {
                     stderr,
                     format_args!("{}", gettext("negative width or non-numeric in eval")),
                 )?;
-                return Ok(state);
+                return Ok(());
             }
         };
 
         state
             .input
             .pushback_string(format_radix(output, radix, min_digits).as_bytes());
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -190,12 +185,51 @@ fn parse_eval_number(input: &[u8]) -> IResult<&[u8], i64> {
     {
         return parse_radix_digits(input, rest, 2, |c| matches!(c, b'0' | b'1'));
     }
+    if let Some(rest) = input
+        .strip_prefix(b"0r")
+        .or_else(|| input.strip_prefix(b"0R"))
+    {
+        return parse_any_radix(input, rest);
+    }
     // A leading 0 followed by an octal digit is an octal constant; a bare 0
     // falls through to the decimal parser (yielding 0).
     if input.first() == Some(&b'0') && input.get(1).is_some_and(|c| (b'0'..=b'7').contains(c)) {
         return parse_radix_digits(input, &input[1..], 8, |c| (b'0'..=b'7').contains(&c));
     }
     parse_positive_integer(input)
+}
+
+/// GNU's `0rRADIX:DIGITS`, radix 1 to 36, with `rest` what follows `0r`:
+/// m4sugar's version comparison writes numbers this way. Radix 1 counts the
+/// `1`s.
+fn parse_any_radix<'a>(orig: &'a [u8], rest: &'a [u8]) -> IResult<&'a [u8], i64> {
+    let fail = || nom::Err::Error(nom::error::Error::new(orig, nom::error::ErrorKind::Fail));
+    let (rest, radix) = parse_positive_integer(rest)?;
+    let radix = u32::try_from(radix)
+        .ok()
+        .filter(|r| (1..=36).contains(r))
+        .ok_or_else(fail)?;
+    let digits = rest.strip_prefix(b":").ok_or_else(fail)?;
+    let digit_value = |c: u8| match radix {
+        1 => (c == b'1').then_some(1),
+        _ => char::from(c).to_digit(radix),
+    };
+    let len = digits
+        .iter()
+        .take_while(|&&c| digit_value(c).is_some())
+        .count();
+    if len == 0 {
+        return Err(fail());
+    }
+    let value = digits[..len].iter().fold(0i64, |n, &c| {
+        let d = i64::from(digit_value(c).expect("counted"));
+        if radix == 1 {
+            n.wrapping_add(d)
+        } else {
+            n.wrapping_mul(i64::from(radix)).wrapping_add(d)
+        }
+    });
+    Ok((&digits[len..], value))
 }
 
 fn parse_radix_digits<'a>(

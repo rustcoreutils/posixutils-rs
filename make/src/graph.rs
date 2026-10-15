@@ -25,7 +25,7 @@
 //! close back on itself.
 
 use crate::error_code::ErrorCode;
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{Map as HashMap, Set as HashSet};
 use std::sync::{Condvar, Mutex};
 
 /// What became of a target.
@@ -76,8 +76,17 @@ pub enum Claim {
 /// Tracks the state of every target across the build, including under `-j`.
 #[derive(Default)]
 pub struct Ledger {
-    entries: Mutex<HashMap<String, Entry>>,
+    state: Mutex<LedgerState>,
     finished: Condvar,
+}
+
+#[derive(Default)]
+struct LedgerState {
+    entries: HashMap<String, Entry>,
+    /// Threads waiting in `claim` for a target another is building. Waking
+    /// them is a system call, which every finished target made before,
+    /// though almost always nobody waits.
+    waiting: usize,
 }
 
 impl Ledger {
@@ -91,15 +100,17 @@ impl Ledger {
     /// guarantees the waited-for target cannot transitively depend on the
     /// waiter, so this cannot deadlock.
     pub fn claim(&self, target: &str) -> Claim {
-        let mut entries = self.entries.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         loop {
-            match entries.get(target) {
+            match state.entries.get(target) {
                 Some(Entry::Finished(outcome)) => return Claim::Done(outcome.clone()),
                 Some(Entry::Running) => {
-                    entries = self.finished.wait(entries).unwrap();
+                    state.waiting += 1;
+                    state = self.finished.wait(state).unwrap();
+                    state.waiting -= 1;
                 }
                 None => {
-                    entries.insert(target.to_string(), Entry::Running);
+                    state.entries.insert(target.to_string(), Entry::Running);
                     return Claim::Build;
                 }
             }
@@ -108,13 +119,18 @@ impl Ledger {
 
     /// Publish a target's outcome and wake anyone waiting on it.
     pub fn finish(&self, target: &str, result: &Result<bool, ErrorCode>) {
-        let mut entries = self.entries.lock().unwrap();
-        entries.insert(
+        let mut state = self.state.lock().unwrap();
+        state.entries.insert(
             target.to_string(),
             Entry::Finished(Outcome::from_result(result)),
         );
-        drop(entries);
-        self.finished.notify_all();
+        // A thread counts itself under this lock before it waits, so none
+        // can be missed.
+        let anyone_waiting = state.waiting > 0;
+        drop(state);
+        if anyone_waiting {
+            self.finished.notify_all();
+        }
     }
 }
 
@@ -131,17 +147,38 @@ pub trait Edges {
 /// and stack sets with the root and never inserted during the walk, so only a
 /// cycle passing back through the root was caught.
 pub fn find_cycle(graph: &impl Edges, root: &str) -> Option<String> {
+    find_cycle_beyond(graph, root, &mut HashSet::default())
+}
+
+/// [`find_cycle`], taking every target in `acyclic` as already known to
+/// reach no cycle, and adding to it every target found so.
+///
+/// make checks before building each target; without the memory each check
+/// walked the target's whole subgraph again, and an automake directory
+/// whose hundred objects each list a hundred headers spent most of a no-op
+/// run re-walking the same headers.
+pub fn find_cycle_beyond(
+    graph: &impl Edges,
+    root: &str,
+    acyclic: &mut HashSet<String>,
+) -> Option<String> {
+    if acyclic.contains(root) {
+        return None;
+    }
     // (target, next prerequisite index)
     let mut stack: Vec<(String, usize)> = vec![(root.to_string(), 0)];
-    let mut on_stack: HashSet<String> = HashSet::from([root.to_string()]);
-    let mut done: HashSet<String> = HashSet::new();
+    let mut on_stack: HashSet<String> = [root.to_string()].into_iter().collect();
+    let done = acyclic;
     let mut children: HashMap<String, Vec<String>> =
-        HashMap::from([(root.to_string(), graph.prerequisites_of(root))]);
+        [(root.to_string(), graph.prerequisites_of(root))]
+            .into_iter()
+            .collect();
 
     while let Some((target, index)) = stack.pop() {
-        let prerequisites = children.get(&target).cloned().unwrap_or_default();
-        if index < prerequisites.len() {
-            let child = prerequisites[index].clone();
+        // Only the one child is copied: cloning the whole list at every
+        // step made a target with n prerequisites cost O(n^2).
+        let next = children.get(&target).and_then(|p| p.get(index)).cloned();
+        if let Some(child) = next {
             stack.push((target, index + 1));
             if on_stack.contains(&child) {
                 return Some(child);
@@ -179,6 +216,23 @@ mod tests {
 
     fn graph(edges: &[(&'static str, Vec<&'static str>)]) -> Fixture {
         Fixture(edges.iter().cloned().collect())
+    }
+
+    // What one walk learns, the next takes as known: a cycle that reaches a
+    // known-acyclic target is still found, through its own back edge.
+    #[test]
+    fn a_remembered_walk_still_finds_a_later_cycle() {
+        let g = graph(&[
+            ("a", vec!["b"]),
+            ("b", vec![]),
+            ("c", vec!["b", "d"]),
+            ("d", vec!["c"]),
+        ]);
+        let mut acyclic = HashSet::default();
+        assert_eq!(find_cycle_beyond(&g, "a", &mut acyclic), None);
+        assert!(acyclic.contains("a") && acyclic.contains("b"));
+        assert!(find_cycle_beyond(&g, "c", &mut acyclic).is_some());
+        assert!(!acyclic.contains("c"));
     }
 
     #[test]

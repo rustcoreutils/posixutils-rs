@@ -14,11 +14,17 @@ use std::{
     rc::Rc,
 };
 
-use crate::EOF;
+use crate::{macros::BuiltinMacro, EOF};
+
+/// An input's name and a line number in it, as diagnostics print them.
+pub type Location = (Rc<[u8]>, usize);
 
 /// Sentinel for [`InputState::output_current_line`] meaning "the input file
 /// changed": the next directive emitted must carry the file name.
 const SYNCLINE_FILE_CHANGED: i64 = -1;
+
+/// What a built-in token reads as. See [`InputState::get_next_character`].
+pub const BUILTIN_TOKEN: u8 = 0x01;
 
 #[derive(Default)]
 pub struct InputState {
@@ -36,6 +42,17 @@ pub struct InputState {
     /// Whether the current literal has already had a directive decision made
     /// for it; further output lines inside it are not eligible.
     literal_line_start_checked: bool,
+    /// The input line of the character read last: its file line, or the
+    /// line of the pushed-back text it came from.
+    last_line: usize,
+    /// The file of the character read last, when it is not the current
+    /// input's own: text `m4wrap` saved in another file.
+    last_file: Option<Rc<[u8]>>,
+    /// While a macro runs, where its call began, which the text it pushes
+    /// back is attributed to.
+    expansion_site: Option<Location>,
+    /// The built-in token the last character read stood for.
+    last_builtin: Option<BuiltinMacro>,
 }
 
 impl InputState {
@@ -47,6 +64,10 @@ impl InputState {
             start_of_output_line: true,
             literal_scan_depth: 0,
             literal_line_start_checked: false,
+            last_line: 0,
+            last_file: None,
+            expansion_site: None,
+            last_builtin: None,
         }
     }
 
@@ -81,10 +102,14 @@ impl InputState {
         // this makes it carry the new file name when it is.
         self.output_current_line = SYNCLINE_FILE_CHANGED;
         self.input.push(input);
+        self.last_line = 1;
+        self.last_file = None;
     }
 
     pub fn input_pop(&mut self) -> Option<Input> {
         let popped = self.input.pop();
+        self.last_line = self.input.last().map_or(0, |i| i.line_number);
+        self.last_file = None;
         // Returning to the enclosing file is a file change too.
         self.output_current_line = SYNCLINE_FILE_CHANGED;
         popped
@@ -156,25 +181,173 @@ impl InputState {
         Ok(n)
     }
 
-    /// Get the next character to be parsed. First it tries to get one from the pushback buffer,
-    /// otherwise it gets one from the input file.
+    /// Get the next character to be parsed: from the text pushed back onto
+    /// the current input, else from the input itself.
+    ///
+    /// A built-in token (see [`InputState::pushback_builtin`]) reads as
+    /// [`BUILTIN_TOKEN`], and [`InputState::take_builtin`] then says which
+    /// built-in it is; a plain byte of that value says none.
     pub fn get_next_character(&mut self) -> crate::error::Result<u8> {
+        self.last_builtin = None;
         let input = self.input.last_mut().unwrap();
-        if let Some(c) = input.pushback_buffer.pop() {
-            return Ok(c);
+        // An exhausted segment is dropped only here, when reading past it,
+        // so that a character read from it and pushed back returns to it.
+        while let Some(segment) = input.pushback.last_mut() {
+            let builtin = segment.builtin.take();
+            let c = match builtin {
+                Some(_) => Some(BUILTIN_TOKEN),
+                None => segment.text.get(segment.pos).copied(),
+            };
+            if let Some(c) = c {
+                if builtin.is_none() {
+                    segment.pos += 1;
+                }
+                self.last_line = segment.line;
+                // Only text from another file (m4wrap's) names one.
+                if segment.file.is_some() || self.last_file.is_some() {
+                    self.last_file.clone_from(&segment.file);
+                }
+                self.last_builtin = builtin;
+                return Ok(c);
+            }
+            input.pushback.pop();
         }
-        Ok(input.get_next_character()?)
+        let c = input.get_next_character()?;
+        self.last_line = input.line_number;
+        self.last_file = None;
+        Ok(c)
     }
 
+    /// Append to `out` the bytes that come next, up to the first for which
+    /// `stop` is true, which is left unread; the run also ends where a piece
+    /// of pushed-back text or a buffer of the input does, so it can be
+    /// short. Returns how many bytes it took.
+    ///
+    /// For runs of plain text, which the main loop would otherwise read and
+    /// write a byte at a time.
+    pub fn take_run(
+        &mut self,
+        stop: impl Fn(u8) -> bool,
+        out: &mut Vec<u8>,
+    ) -> crate::error::Result<usize> {
+        let input = self.input.last_mut().unwrap();
+        while let Some(segment) = input.pushback.last_mut() {
+            if segment.builtin.is_some() {
+                return Ok(0);
+            }
+            let rest = &segment.text[segment.pos..];
+            if rest.is_empty() {
+                input.pushback.pop();
+                continue;
+            }
+            let n = rest.iter().position(|&c| stop(c)).unwrap_or(rest.len());
+            out.extend_from_slice(&rest[..n]);
+            segment.pos += n;
+            if n > 0 {
+                self.last_line = segment.line;
+                if segment.file.is_some() || self.last_file.is_some() {
+                    self.last_file.clone_from(&segment.file);
+                }
+            }
+            return Ok(n);
+        }
+        let n = input.take_run(stop, out)?;
+        if n > 0 {
+            self.last_line = input.line_number;
+            self.last_file = None;
+        }
+        Ok(n)
+    }
+
+    /// The built-in token just read, if the last character read was one.
+    pub fn take_builtin(&mut self) -> Option<BuiltinMacro> {
+        self.last_builtin.take()
+    }
+
+    /// Push back a character just read, to be read again next.
     pub fn pushback_character(&mut self, c: u8) {
-        self.input.last_mut().unwrap().pushback_buffer.push(c);
+        if c == BUILTIN_TOKEN {
+            if let Some(builtin) = self.last_builtin.take() {
+                self.push_segment(Vec::new(), Some(builtin), None);
+                return;
+            }
+        }
+        let input = self.input.last_mut().unwrap();
+        match input.pushback.last_mut() {
+            // Unread it from the text it came from.
+            Some(segment)
+                if segment.builtin.is_none()
+                    && segment.pos > 0
+                    && segment.text[segment.pos - 1] == c =>
+            {
+                segment.pos -= 1
+            }
+            _ => {
+                let site = Some((self.last_file.clone(), self.last_line));
+                self.push_segment(vec![c], None, site);
+            }
+        }
     }
 
+    /// Push back text to be read next: a macro's expansion. As in GNU m4,
+    /// the text keeps the location of the call that produced it (see
+    /// [`InputState::set_expansion_site`]), and macros called from it report
+    /// that location.
     pub fn pushback_string(&mut self, s: &[u8]) {
-        let pushback_buffer = &mut self.input.last_mut().unwrap().pushback_buffer;
-        for c in s.iter().rev() {
-            pushback_buffer.push(*c);
+        if !s.is_empty() {
+            self.push_segment(s.to_vec(), None, None);
         }
+    }
+
+    /// [`InputState::pushback_string`], taking the text.
+    pub fn pushback_vec(&mut self, s: Vec<u8>) {
+        if !s.is_empty() {
+            self.push_segment(s, None, None);
+        }
+    }
+
+    /// Push back a built-in token: what `defn` of a built-in expands to. It
+    /// is not text: as an argument of `define` or `pushdef` it makes that
+    /// built-in, anywhere else it is nothing.
+    pub fn pushback_builtin(&mut self, builtin: BuiltinMacro) {
+        self.push_segment(Vec::new(), Some(builtin), None);
+    }
+
+    /// Push back text attributed to `location`, as `m4wrap` text keeps the
+    /// location of its `m4wrap` call.
+    pub fn pushback_string_at(&mut self, s: &[u8], location: &Location) {
+        if !s.is_empty() {
+            let site = Some((Some(location.0.clone()), location.1));
+            self.push_segment(s.to_vec(), None, site);
+        }
+    }
+
+    /// Push a segment of `text`, or a built-in token, attributed to `site`
+    /// (a file other than the input's own, and a line), else to the call
+    /// being expanded, else to where reading is.
+    fn push_segment(
+        &mut self,
+        text: Vec<u8>,
+        builtin: Option<BuiltinMacro>,
+        site: Option<(Option<Rc<[u8]>>, usize)>,
+    ) {
+        let (file, line) = site
+            .or_else(|| {
+                self.expansion_site
+                    .as_ref()
+                    .map(|(file, line)| (Some(file.clone()), *line))
+            })
+            .unwrap_or_else(|| (self.last_file.clone(), self.last_line));
+        let input = self.input.last_mut().unwrap();
+        // The input's own name is the default; record only another one.
+        let file = file.filter(|f| !Rc::ptr_eq(f, &input.name) && **f != *input.name);
+        input.pushback.push(Segment {
+            text,
+            pos: 0,
+            line,
+            file,
+            builtin,
+        });
     }
 
     /// Fetch new characters attempting to match them all to token. If any character doesn't match
@@ -185,7 +358,8 @@ impl InputState {
     /// * `c` - First character of input which is already available.
     /// * `token` - Token to match against.
     pub fn look_ahead(&mut self, mut c: u8, token: &[u8]) -> crate::error::Result<bool> {
-        if c == EOF || c != token[0] {
+        // An empty token (quoting or comments disabled) matches nothing.
+        if c == EOF || token.first() != Some(&c) {
             return Ok(false);
         }
 
@@ -193,12 +367,13 @@ impl InputState {
         while i < token.len() {
             c = self.get_next_character()?;
             if c == EOF || c != token[i] {
-                loop {
-                    self.pushback_character(token[i]);
-                    if i == 0 {
-                        break;
-                    }
-                    i -= 1;
+                // Unread what matched so far, after the first character,
+                // which the caller still holds, and the one that did not.
+                if c != EOF {
+                    self.pushback_character(c);
+                }
+                for &matched in token[1..i].iter().rev() {
+                    self.pushback_character(matched);
                 }
                 return Ok(false);
             }
@@ -207,6 +382,27 @@ impl InputState {
         }
 
         Ok(true)
+    }
+
+    /// Where the next pushed-back text will go: the depth of the input
+    /// stack and the number of pushed-back segments on its top input.
+    pub fn pushback_position(&self) -> (usize, usize) {
+        let len = self.input.last().map_or(0, |i| i.pushback.len());
+        (self.input.len(), len)
+    }
+
+    /// The text pushed back since [`InputState::pushback_position`] gave
+    /// `(depth, len)`, in reading order; empty if a new input was entered.
+    pub fn pushed_since(&self, depth: usize, len: usize) -> Vec<u8> {
+        match self.input.last() {
+            Some(input) if self.input.len() == depth && input.pushback.len() >= len => input
+                .pushback[len..]
+                .iter()
+                .rev()
+                .flat_map(|segment| segment.text[segment.pos..].iter().copied())
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 
     /// The current line number of the active input, without the allocation
@@ -223,16 +419,13 @@ impl InputState {
     /// The name and current line number of the active input, for diagnostics
     /// (`stdin` when reading standard input). Used to format GNU-style
     /// `m4:<file>:<line>:` messages.
-    pub fn current_location(&self) -> (Vec<u8>, usize) {
+    pub fn current_location(&self) -> Location {
         match self.input.last() {
-            Some(input) => {
-                let name = match &input.input {
-                    InputRead::File { path, .. } => path.as_os_str().as_encoded_bytes().to_vec(),
-                    InputRead::Stdin(_) => b"stdin".to_vec(),
-                };
-                (name, input.line_number)
-            }
-            None => (b"stdin".to_vec(), 0),
+            Some(input) => (
+                self.last_file.clone().unwrap_or_else(|| input.name.clone()),
+                self.last_line,
+            ),
+            None => (b"stdin".as_slice().into(), 0),
         }
     }
 }
@@ -243,13 +436,6 @@ pub struct InputStateRef(Rc<RefCell<InputState>>);
 impl InputStateRef {
     pub fn new(input_state: InputState) -> Self {
         Self(Rc::new(RefCell::new(input_state)))
-    }
-
-    pub fn with<F, T>(&self, f: F) -> T
-    where
-        F: Fn(&InputState) -> T,
-    {
-        f(&self.0.borrow())
     }
 
     pub fn input_pop(&self) -> Option<Input> {
@@ -300,58 +486,178 @@ impl InputStateRef {
         self.0.borrow_mut().leave_literal_scan()
     }
 
-    pub fn current_location(&self) -> (Vec<u8>, usize) {
+    pub fn current_location(&self) -> Location {
         self.0.borrow().current_location()
     }
+
+    pub fn pushback_position(&self) -> (usize, usize) {
+        self.0.borrow().pushback_position()
+    }
+
+    /// Attribute text pushed back from now on to `site`, the location of the
+    /// call being expanded. Returns the previous setting.
+    pub fn set_expansion_site(&self, site: Option<Location>) -> Option<Location> {
+        std::mem::replace(&mut self.0.borrow_mut().expansion_site, site)
+    }
+
+    pub fn pushback_string_at(&self, s: &[u8], location: &Location) {
+        self.0.borrow_mut().pushback_string_at(s, location)
+    }
+
+    pub fn take_run(
+        &self,
+        stop: impl Fn(u8) -> bool,
+        out: &mut Vec<u8>,
+    ) -> crate::error::Result<usize> {
+        self.0.borrow_mut().take_run(stop, out)
+    }
+
+    pub fn pushback_vec(&self, s: Vec<u8>) {
+        self.0.borrow_mut().pushback_vec(s)
+    }
+
+    /// Whether `-s` is on: output must then be written as it is read, a
+    /// byte at a time, for its `#line` directives to be right.
+    pub fn line_synchronization(&self) -> bool {
+        self.0.borrow().line_synchronization
+    }
+
+    pub fn take_builtin(&self) -> Option<BuiltinMacro> {
+        self.0.borrow_mut().take_builtin()
+    }
+
+    pub fn pushback_builtin(&self, builtin: BuiltinMacro) {
+        self.0.borrow_mut().pushback_builtin(builtin)
+    }
+
+    pub fn pushed_since(&self, depth: usize, len: usize) -> Vec<u8> {
+        self.0.borrow().pushed_since(depth, len)
+    }
+}
+
+/// Text pushed back onto an input, read from `pos` on, with the input line
+/// it is attributed to.
+struct Segment {
+    text: Vec<u8>,
+    /// How much of `text` has been read.
+    pos: usize,
+    line: usize,
+    /// The file the text is attributed to, when not the input's own.
+    file: Option<Rc<[u8]>>,
+    /// A built-in token, read before `text`, which is then empty.
+    builtin: Option<BuiltinMacro>,
 }
 
 pub struct Input {
     pub input: InputRead,
-    pub pushback_buffer: Vec<u8>,
+    /// The name diagnostics and `__file__` give this input: its path as
+    /// given, or `stdin`. Shared, because every macro call records it.
+    pub name: Rc<[u8]>,
+    /// Text pushed back onto this input, read before the input itself:
+    /// the top segment first.
+    pushback: Vec<Segment>,
+    /// Bytes read from the input and not yet consumed: from `buffer_pos`.
+    buffer: Vec<u8>,
+    buffer_pos: usize,
     pub line_number: usize,
     /// A `<newline>` has been consumed but not yet accounted for. See
     /// [`Input::get_next_character`].
     pending_newline: bool,
 }
 
+/// How much of an input is read at a time.
+const READ_SIZE: usize = 64 * 1024;
+
 impl Input {
     pub fn new(input: InputRead) -> Self {
+        let name: Rc<[u8]> = match &input {
+            InputRead::File { path, .. } => path.as_os_str().as_encoded_bytes().into(),
+            InputRead::Stdin(_) => b"stdin".as_slice().into(),
+        };
         Self {
             input,
-            pushback_buffer: Vec::new(),
+            name,
+            pushback: Vec::new(),
+            buffer: Vec::new(),
+            buffer_pos: 0,
             line_number: 1,
             pending_newline: false,
         }
     }
 
-    fn get_next_character(&mut self) -> std::io::Result<u8> {
-        let mut buf: [u8; 1] = [0; 1];
-        let n = match &mut self.input {
-            InputRead::File { file, .. } => file.read(&mut buf),
-            InputRead::Stdin(s) => s.read(&mut buf),
-        }?;
-
-        if n == 0 {
-            return Ok(EOF);
+    /// Make sure there is an unconsumed byte in the buffer; `false` at end
+    /// of input. A read takes what is available, so a terminal gives a line
+    /// at a time.
+    fn fill(&mut self) -> std::io::Result<bool> {
+        if self.buffer_pos < self.buffer.len() {
+            return Ok(true);
         }
+        self.buffer.resize(READ_SIZE, 0);
+        self.buffer_pos = 0;
+        let n = loop {
+            let result = match &mut self.input {
+                InputRead::File { file, .. } => file.read(&mut self.buffer),
+                InputRead::Stdin(s) => s.read(&mut self.buffer),
+            };
+            match result {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                other => break other,
+            }
+        };
+        let n = match n {
+            Ok(n) => n,
+            Err(e) => {
+                self.buffer.clear();
+                return Err(e);
+            }
+        };
+        self.buffer.truncate(n);
+        Ok(n > 0)
+    }
 
-        let c = buf[0];
-
-        // `line_number` names the line the character being returned sits on, so
-        // a `<newline>` only advances it once the first character of the next
-        // line is consumed. Advancing eagerly misattributes a diagnostic raised
-        // by a macro call that ends at end-of-line to the following line, since
-        // deciding whether the macro name is followed by `(` already consumes
-        // the `<newline>`.
+    /// Account for consumed bytes `consumed` in `line_number`.
+    ///
+    /// `line_number` names the line the character last returned sits on, so
+    /// a `<newline>` only advances it once the first character of the next
+    /// line is consumed. Advancing eagerly misattributes a diagnostic raised
+    /// by a macro call that ends at end-of-line to the following line, since
+    /// deciding whether the macro name is followed by `(` already consumes
+    /// the `<newline>`.
+    fn count_lines(&mut self, consumed: &[u8]) {
+        let Some((&last, before)) = consumed.split_last() else {
+            return;
+        };
         if self.pending_newline {
             self.line_number += 1;
-            self.pending_newline = false;
         }
-        if c == b'\n' {
-            self.pending_newline = true;
-        }
+        self.line_number += before.iter().filter(|&&c| c == b'\n').count();
+        self.pending_newline = last == b'\n';
+    }
 
+    fn get_next_character(&mut self) -> std::io::Result<u8> {
+        if !self.fill()? {
+            return Ok(EOF);
+        }
+        let c = self.buffer[self.buffer_pos];
+        self.buffer_pos += 1;
+        self.count_lines(&[c]);
         Ok(c)
+    }
+
+    /// See [`InputState::take_run`].
+    fn take_run(&mut self, stop: impl Fn(u8) -> bool, out: &mut Vec<u8>) -> std::io::Result<usize> {
+        if !self.fill()? {
+            return Ok(0);
+        }
+        let start = self.buffer_pos;
+        let rest = &self.buffer[start..];
+        let n = rest.iter().position(|&c| stop(c)).unwrap_or(rest.len());
+        out.extend_from_slice(&rest[..n]);
+        self.buffer_pos += n;
+        let consumed = std::mem::take(&mut self.buffer);
+        self.count_lines(&consumed[start..start + n]);
+        self.buffer = consumed;
+        Ok(n)
     }
 }
 

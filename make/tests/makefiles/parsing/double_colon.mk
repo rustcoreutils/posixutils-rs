@@ -1,5 +1,6 @@
-# GNU's double-colon rule. POSIX has no such construct and we do not implement
-# it; taking the first `:` made the second one a prerequisite named `:`
-# (audit #86).
+# GNU's double-colon rule. Taking the first `:` alone made the second one a
+# prerequisite named `:` (audit #86).
 all:: dc_dep
 	@echo DC
+dc_dep:
+	@echo DEP

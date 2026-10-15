@@ -4,52 +4,39 @@ This document outlines notes about compatibility of this software with other sof
 
 ## [`autoconf`](https://www.gnu.org/software/autoconf/)
 
-[GNU m4](https://www.gnu.org/software/m4/) is probably the most widely used version of m4. The place where it perhaps receives the most use is in [autoconf](https://www.gnu.org/software/autoconf/). `autoconf` is a very popular tool for building software and perhaps the place where m4 is used the most in practice today. As such priority has been placed on establishing what would be needed for this version of m4 to provide compatibility with the [GNU specific m4 features/behaviours](https://www.gnu.org/software/m4/manual/html_node/Extensions.html#Extensions) to allow it to be used as a drop-in replacement to use with autoconf. The first goal was to run autoconf with the GNU [hello project](https://www.gnu.org/software/hello/)
+autoconf, automake and libtoolize drive m4 through GNU extensions, and this
+m4 has the subset they use, listed in the m4 section of `NONPOSIX.md`:
+autom4te's `--gnu --nesting-limit --include --debug=aflq --fatal-warning
+--debugfile --trace --reload-state --undefine` command line and its
+`m4trace:` output, libtoolize's `-daq --prefix --trace`, and the built-ins
+m4sugar is written in.  autom4te's run on a package's `configure.ac`, from
+autoconf's sources or from the frozen files Debian ships, gives the same
+output and traces as GNU m4 1.4.19.
 
-At least the following CLI arguments (at a minimum) still need to be added and supported:
+Where GNU m4 1.4 departs from POSIX in a way autotools output depends on,
+this m4 does as GNU m4 does by default, and as POSIX says when
+`POSIXLY_CORRECT` is set in the environment (to any value):
 
-```rust
- /// Freeze state into a file.
-    #[arg(short = 'F', long)]
-    pub freeze_state: Option<PathBuf>,
-    /// Reload a frozen state from a file.
-    #[arg(short = 'R', long)]
-    pub reload_state: Option<PathBuf>,
-    /// Change nesting limit. 0 for unlimited.
-    #[arg(short = 'L', long)]
-    pub nesting_limit: Option<usize>,
-    /// Override --traditional to re-enable GNU extensions
-    #[arg(short = 'g', long, default_value_t = default_gnu())]
-    pub gnu: bool,
-    /// Suppress all GNU extensions.
-    #[arg(short = 'G', long, default_value_t = default_traditional())]
-    pub traditional: bool,
-    // Append DIRECTORY to include path.
-    #[arg(short = 'I', long)]
-    pub include: Option<PathBuf>,
-    /// Set debug level (no FLAGS implies `aeq')
-    #[arg(short = 'd', long, default_value = "aeq")]
-    pub debug: Option<String>,
-    /// Redirect debug and trace output to FILE
-    /// (default stderr, discard if empty string).
-    #[arg(long)]
-    pub debugfile: Option<PathBuf>,
-    /// once: warnings become errors, twice: stop
-    /// execution at first error.
-    #[arg(short = 'E', long)]
-    pub fatal_warning: bool,
-    /// Trace specified macro name when it is defined.
-    #[arg(short = 't', long)]
-    pub trace: Vec<String>,
-```
+* `len`, `index`, `substr` and `translit` count bytes, as GNU m4 does in
+  every locale; under `POSIXLY_CORRECT` they count the characters of
+  `LC_CTYPE`.  m4sugar measures and cuts text with `m4_len` and
+  `m4_substr`: tar's testsuite, which autotest generates from `.at` files
+  containing UTF-8 text, came out with a test group that no shell could
+  parse when m4 counted characters under `LANG=C.UTF-8`.
+* `m4wrap` text runs last in, first out, as in GNU m4 1.4; under
+  `POSIXLY_CORRECT`, in the order the `m4wrap` calls were made.  GNU
+  autoconf's m4sugar calls `m4wrap` once and orders its own hooks, but
+  autoconf-dickey (the autoconf 2.52 fork ncurses' `configure` is generated
+  with) does not: its `m4_init` wraps a check that every `m4_divert_push`
+  was popped, then pushes `KILL` and wraps the matching pop, which must run
+  first.  It does not pass `--gnu`, so this has to be the default.
 
-GNU m4 specific builtin macros likely to be necessary (there are probably more) were found by grepping the `.m4` files for `m4_*` macros, because all autoconf m4 macros have been renamed as such, which makes them easy to find:
-
-* [copy](https://www.gnu.org/software/m4/manual/m4.html#index-copy)
-* [patsubstr](https://www.gnu.org/software/m4/manual/m4.html#index-patsubst)
-* [fatal_error](https://www.gnu.org/software/m4/manual/m4.html#index-fatal_005ferror)
-* [esyscmd](https://www.gnu.org/software/m4/manual/m4.html#index-esyscmd)
-* [foreach](https://www.gnu.org/software/m4/manual/m4.html#index-foreach)
+`regexp` and `patsubst` take the longest of the matches that start at the
+leftmost position, as GNU regex does (`regexp(abcd, a\|ab, \&)` is `ab`),
+with the groups of the first path to that match.  One difference remains:
+under a multibyte locale GNU regex matches `.` and bracket expressions
+against whole characters, while this m4 matches them against bytes in
+every locale.
 
 ## [`sendmail`](https://www.proofpoint.com/us/products/email-protection/open-source-email-solution)
 
@@ -110,19 +97,21 @@ documentation drifting away from the code, and did not.
 no two runs agree. Only stdout is compared; diagnostic wording is deliberately
 ours.
 
-### Known intentional divergence
+### `m4wrap` order
 
-`m4wrap` is FIFO here and LIFO in GNU m4 1.4.x:
+`m4wrap` is LIFO by default, as in GNU m4 1.4.x, and FIFO under
+`POSIXLY_CORRECT`:
 
 ```
 m4wrap(`W1 ')m4wrap(`W2 ')body
-  ours:  body / W1 W2
-  GNU:   body / W2 W1
+  default, and GNU m4 1.4:  body / W2 W1
+  POSIXLY_CORRECT:          body / W1 W2
 ```
 
 POSIX says the wrapped text is "processed in the order in which the `m4wrap`
-macros were processed", which is FIFO. GNU 2.0 changed to match. This one is
-deliberate and is not a sendmail-compatibility question.
+macros were processed", which is FIFO, but autoconf-dickey depends on GNU's
+order (see the autoconf section above).  Neither is a sendmail-compatibility
+question.
 
 ### Unverified
 

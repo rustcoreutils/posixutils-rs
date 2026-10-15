@@ -9,8 +9,9 @@
 
 use super::directive::{parse_directive, split_condition_args, Directive};
 use super::func;
+use crate::fast_hash::Map as HashMap;
 use crate::Macro;
-use std::collections::HashMap;
+use std::borrow::Cow;
 use std::fmt::{Debug, Display, Formatter};
 use std::fs;
 use std::iter::Peekable;
@@ -27,7 +28,6 @@ pub enum PreprocError {
     BadAssignmentOperator(char),
     CommandFailed,
     UndefinedMacro(String),
-    BadMacroName,
     IncludeFailed {
         path: String,
         reason: String,
@@ -36,8 +36,11 @@ pub enum PreprocError {
     BadConditional(String),
     /// `else`/`endif` without a matching `if`, or an unterminated `if`.
     UnmatchedConditional(String),
-    /// A macro whose expansion re-introduces its own reference.
-    RecursiveMacro,
+    /// A delayed-expansion macro whose value refers to itself, directly or
+    /// through other macros: `A = $(A)x`.
+    SelfReference(String),
+    /// Delayed-expansion macros nested deeper than make allows.
+    NestedTooDeep,
     /// A function reported an error, or does not exist.
     FunctionFailed(String),
     /// `$(eval ...)` re-entered the reader too many times.
@@ -58,12 +61,18 @@ impl Display for PreprocError {
             PreprocError::UnmatchedConditional(word) => {
                 writeln!(f, "unmatched '{word}'")
             }
-            PreprocError::RecursiveMacro => {
-                writeln!(
+            // GNU make's words. `write!` for the reason given below.
+            PreprocError::SelfReference(name) => {
+                write!(
                     f,
-                    "macro expansion does not terminate (recursive definition?)"
+                    "Recursive variable '{name}' references itself (eventually)"
                 )
             }
+            PreprocError::NestedTooDeep => write!(
+                f,
+                "macro references nested more than {} deep",
+                func::MAX_MACRO_NESTING
+            ),
             // `write!`, not `writeln!`: a function error crosses the
             // `Result<String, String>` boundary between `func` and here once
             // per nesting level, and each `to_string()` would otherwise append
@@ -87,6 +96,43 @@ fn ends_with_odd_backslash(s: &str) -> bool {
     s.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1
 }
 
+/// Stands for the newline of an escaped newline in a command line, from the
+/// time the line is folded until the rule stage puts the newline back (see
+/// [`restore_escaped_newlines`]). A private-use character, so it cannot be
+/// confused with anything a makefile means.
+pub(crate) const ESCAPED_NEWLINE: char = '\u{E000}';
+
+/// Put back the newlines [`ESCAPED_NEWLINE`] stands for.
+pub(crate) fn restore_escaped_newlines(text: &str) -> String {
+    text.replace(ESCAPED_NEWLINE, "\n")
+}
+
+/// Inside a macro expansion in a command line, an escaped newline and the
+/// blanks after it are a single space, as anywhere else in the makefile
+/// (POSIX 105556-105559: the newline is kept only "after macro expansion").
+fn join_escaped_newlines(raw: &str) -> Cow<'_, str> {
+    if !raw.contains(ESCAPED_NEWLINE) {
+        return Cow::Borrowed(raw);
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek() == Some(&ESCAPED_NEWLINE) {
+            chars.next();
+            while matches!(chars.peek(), Some(' ' | '\t')) {
+                chars.next();
+            }
+            while out.ends_with([' ', '\t']) {
+                out.pop();
+            }
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+    }
+    Cow::Owned(out)
+}
+
 /// Splice one logical line starting at `lines[i]`, advancing `i` past every
 /// physical line it consumed. Returns the joined text and how many extra
 /// physical lines went into it.
@@ -102,6 +148,12 @@ fn fold_one_line(lines: &[&str], i: &mut usize) -> (String, usize) {
         *i += 1;
         folded += 1;
         if is_recipe {
+            // POSIX 105559-105562: the command executed keeps the backslash,
+            // the newline and the next line, less a leading <tab>. The
+            // newline is held as a marker until the rule stage, because
+            // everything up to there works a line at a time.
+            current.push('\\');
+            current.push(ESCAPED_NEWLINE);
             current.push_str(next.strip_prefix('\t').unwrap_or(next));
         } else {
             // The continuation, the newline, and the next line's leading white
@@ -147,7 +199,7 @@ fn fold_continuations(source: &str) -> String {
 /// Apply a `$(string:subst1=subst2)` substitution to an already-expanded macro
 /// value. Handles both the suffix form (`subst1` is matched as a suffix of each
 /// word) and the pattern form (`[op]%[os]=[np][%][ns]`).
-fn apply_substitution(value: &str, spec: &str) -> String {
+pub(crate) fn apply_substitution(value: &str, spec: &str) -> String {
     let Some((lhs, rhs)) = spec.split_once('=') else {
         return value.to_string();
     };
@@ -166,9 +218,13 @@ fn apply_substitution(value: &str, spec: &str) -> String {
                 } else {
                     word.to_string()
                 }
-            } else if !lhs.is_empty() && word.ends_with(lhs) {
-                // Suffix form.
-                format!("{}{}", &word[..word.len() - lhs.len()], rhs)
+            } else if let Some(base) = word.strip_suffix(lhs) {
+                // Suffix form. An empty `subst1` is a suffix of every word,
+                // so `$(TESTS:=.log)` appends `.log` to each (POSIX
+                // 105806-105807). automake's test harness writes exactly that,
+                // and then runs `rm -f` on the result: returning the words
+                // unchanged deleted gzip's test scripts.
+                format!("{base}{rhs}")
             } else {
                 word.to_string()
             }
@@ -186,8 +242,12 @@ fn skip_blank(letters: &mut Peekable<impl Iterator<Item = char>>) {
     }
 }
 
+/// A character of a macro name. POSIX 105772: portable applications select
+/// macro names from the portable filename character set, which has `-` as
+/// well as letters, digits, `_` and `.`; binutils' top-level Makefile has
+/// `PGO-TRAINING-TARGETS = ...`.
 fn suitable_ident(c: &char) -> bool {
-    c.is_alphanumeric() || matches!(c, '_' | '.')
+    c.is_alphanumeric() || matches!(c, '_' | '.' | '-')
 }
 
 /// Decide whether a whole makefile line is a macro definition, as opposed to a
@@ -226,6 +286,90 @@ pub fn is_macro_definition(line: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| suitable_ident(&c))
 }
 
+/// The byte offsets of the bytes of `line` that are outside every `$(...)`
+/// and `${...}` reference, with the bytes.
+///
+/// An iterator over bytes rather than a vector of characters: every line of
+/// every makefile is scanned this way, most only as far as their first `:`.
+/// Every byte it looks for is ASCII, and in UTF-8 no byte of a multibyte
+/// character is, so an offset found is always a character boundary.
+fn top_level_chars(line: &str) -> impl Iterator<Item = (usize, u8)> + '_ {
+    let mut depth = 0usize;
+    let mut bytes = line.bytes().enumerate();
+    std::iter::from_fn(move || {
+        while let Some((i, c)) = bytes.next() {
+            if depth > 0 {
+                match c {
+                    b'(' | b'{' => depth += 1,
+                    b')' | b'}' => depth -= 1,
+                    _ => {}
+                }
+                continue;
+            }
+            if c != b'$' {
+                return Some((i, c));
+            }
+            // A reference opens, or `$$` / `$x` is one token either way.
+            if let Some((_, next)) = bytes.next() {
+                if matches!(next, b'(' | b'{') {
+                    depth = 1;
+                }
+            }
+        }
+        None
+    })
+}
+
+/// Split a target-specific assignment, `targets: [override] [export] name op
+/// value`, into its targets and its assignment (GNU make).
+///
+/// It is a rule line whose prerequisite side holds an assignment operator
+/// before any `;`, outside every macro reference: `foo: CFLAGS += -g` is
+/// one, `all: $(SRC:.c=.o)` and `x: ; echo a=b` are not. A macro definition
+/// whose value has a `:` in it never gets here; `is_macro_definition`
+/// claims it first.
+fn split_target_var(line: &str) -> Option<(&str, &str)> {
+    if line.starts_with('\t') {
+        return None;
+    }
+    let colon = top_level_chars(line).find(|&(_, c)| c == b':')?.0;
+    let (targets, rest) = (&line[..colon], &line[colon + 1..]);
+    // `targets:: ...` is a double-colon rule, never an assignment.
+    if rest.starts_with([':', '=']) {
+        return None;
+    }
+    for (_, c) in top_level_chars(rest) {
+        match c {
+            b';' => return None,
+            b'=' => return Some((targets, rest)),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Split a rule line before the `;` that begins its inline command (POSIX
+/// 105644), if it has one: the first `;` after the first `:`, outside every
+/// macro reference. The second part keeps the `;`.
+fn split_inline_command(line: &str) -> (&str, &str) {
+    let mut chars = top_level_chars(line);
+    if !chars.any(|(_, c)| c == b':') {
+        return (line, "");
+    }
+    match chars.find(|&(_, c)| c == b';') {
+        Some((at, _)) => line.split_at(at),
+        None => (line, ""),
+    }
+}
+
+/// `text` without a leading `word` and the blanks after it, if it starts
+/// with that word.
+fn strip_word<'a>(text: &'a str, word: &str) -> Option<&'a str> {
+    let rest = text.strip_prefix(word)?;
+    rest.starts_with([' ', '\t'])
+        .then(|| rest.trim_start_matches([' ', '\t']))
+}
+
 fn get_ident(letters: &mut Peekable<impl Iterator<Item = char>>) -> Result<String> {
     let mut ident = String::new();
 
@@ -244,45 +388,44 @@ fn get_ident(letters: &mut Peekable<impl Iterator<Item = char>>) -> Result<Strin
     }
 }
 
-/// Read a `$(...)` name. Function names may contain a hyphen (`filter-out`);
-/// macro names conventionally may not, but accepting one here only makes an
-/// otherwise-malformed reference resolve to the empty string instead of an
-/// error.
-fn get_reference_name(letters: &mut Peekable<impl Iterator<Item = char>>) -> Result<String> {
-    let mut ident = String::new();
-    while let Some(&c) = letters.peek() {
-        if !(suitable_ident(&c) || c == '-') {
-            break;
-        }
-        ident.push(c);
-        letters.next();
-    }
-    if ident.is_empty() {
-        Err(PreprocError::EmptyIdent)
-    } else {
-        Ok(ident)
+/// The function a reference calls, and its argument text, if it is a call.
+/// A function name is followed by at least one blank; `$(shell)` alone is a
+/// macro named `shell`, as in GNU make.
+fn function_call(raw: &str) -> Option<(&str, &str)> {
+    let text = raw.trim_start_matches([' ', '\t']);
+    let end = text.find([' ', '\t'])?;
+    let (name, args) = text.split_at(end);
+    func::is_function(name).then(|| (name, args.trim_start_matches([' ', '\t'])))
+}
+
+/// Split the expanded text of a reference, `name:subst1=subst2`, at its
+/// first `:`, if an `=` follows it; otherwise the whole text is the name
+/// (GNU make).
+fn split_substitution(text: &str) -> (&str, Option<&str>) {
+    match text.split_once(':') {
+        Some((name, spec)) if spec.contains('=') => (name, Some(spec)),
+        _ => (text, None),
     }
 }
 
-/// Consume a function's argument text up to the delimiter that closes it,
-/// honouring nested `$(...)`/`${...}`.
-fn read_balanced(
-    letters: &mut Peekable<impl Iterator<Item = char>>,
-    open: char,
-    close: char,
-) -> Result<String> {
-    let mut raw = String::new();
+/// Consume a reference's text up to the delimiter that closes it, honouring
+/// nested `$(...)`/`${...}`: the text before it, with `text` moved past it.
+///
+/// Both delimiters are ASCII, which no byte of a multibyte character is.
+fn read_balanced<'a>(text: &mut &'a str, open: char, close: char) -> Result<&'a str> {
+    let (open, close) = (open as u8, close as u8);
     let mut depth = 0usize;
-    for c in letters.by_ref() {
-        if c == open {
+    for (i, &b) in text.as_bytes().iter().enumerate() {
+        if b == open {
             depth += 1;
-        } else if c == close {
+        } else if b == close {
             if depth == 0 {
+                let raw = &text[..i];
+                *text = &text[i + 1..];
                 return Ok(raw);
             }
             depth -= 1;
         }
-        raw.push(c);
     }
     Err(PreprocError::UnexpectedEOF)
 }
@@ -303,6 +446,10 @@ fn mentions_automatic(text: &str) -> bool {
             continue;
         }
         match chars.peek() {
+            // `$$` is a literal dollar, so `$$?` hands the shell `$?`.
+            Some('$') => {
+                chars.next();
+            }
             Some(&next) if AUTOMATIC.contains(&next) => return true,
             // `$(@D)`, `${?F}` and friends.
             Some(&('(' | '{')) => {
@@ -318,16 +465,297 @@ fn mentions_automatic(text: &str) -> bool {
     false
 }
 
+/// Write `text` with every `$` doubled: what a function or the shell
+/// returns is data, and expansion writes a literal `$` as `$$` (see
+/// [`expand_into`]).
+pub(crate) fn escape_dollars(text: &str) -> Cow<'_, str> {
+    match text.contains('$') {
+        true => Cow::Owned(text.replace('$', "$$")),
+        false => Cow::Borrowed(text),
+    }
+}
+
+/// Expand every macro reference in `text` onto `out`, once.
+///
+/// POSIX 105776-105784: a delayed-expansion macro's value is expanded where
+/// it is referenced, its result scanned for further macros -- which is what
+/// expanding the value recursively, straight onto `out`, does -- and an
+/// immediate-expansion macro's value, expanded when it was defined, is not
+/// scanned again. Nothing is rescanned: what a function returns, the output
+/// of `$(shell ...)` or a file name `$(wildcard ...)` found, is data.
+///
+/// The output is in "escaped form": a literal `$` is written `$$`, so text
+/// can be expanded in stages and each consumer turns `$$` into `$` once, at
+/// the end ([`unescape_dollars`], and the rule stage for a command line).
+/// `$(MAKE)` is left as written when nothing defines it, for the rule stage
+/// to recognise. While the makefile is read, so is what only a target can
+/// give a value: the automatic macros, and a reference or call that reads
+/// one. An immediate-expansion macro stores its value in this form, so it
+/// expands to itself but for what was left.
+fn expand_into(text: &str, ctx: &func::Ctx, out: &mut String) -> Result<()> {
+    // The text up to each `$` is copied a run at a time.
+    let mut rest = text;
+    while let Some(at) = rest.find('$') {
+        out.push_str(&rest[..at]);
+        let mut after = rest[at + 1..].chars();
+
+        // A `$` with nothing after it is an ordinary character. Rejecting it
+        // failed the whole makefile over a recipe as ordinary as
+        // `@echo end$` (audit #87); the rule stage already emits it literally.
+        let Some(letter) = after.next() else {
+            out.push('$');
+            return Ok(());
+        };
+        rest = after.as_str();
+        expand_dollar(letter, &mut rest, ctx, out)?;
+    }
+    out.push_str(rest);
+    Ok(())
+}
+
+/// Expand what one `$` followed by `letter` begins onto `out`, moving
+/// `rest` past the text of a bracketed reference.
+///
+/// Apart from [`expand_into`] so that its loop, which every level of
+/// nesting passes through, keeps a small stack frame.
+fn expand_dollar(letter: char, rest: &mut &str, ctx: &func::Ctx, out: &mut String) -> Result<()> {
+    match letter {
+        '$' => out.push_str("$$"),
+        c if AUTOMATIC.contains(&c) => match ctx.automatic {
+            Some(automatic) => out.push_str(&escape_dollars(&automatic(c, None))),
+            // Left for the rule stage, which has the target and its
+            // prerequisites.
+            None => {
+                out.push('$');
+                out.push(c);
+            }
+        },
+        open @ ('(' | '{') => {
+            let close = if open == '(' { ')' } else { '}' };
+            // An internal-macro reference such as `$(@)`, `$(@D)`,
+            // `$(@:.html=$(EXT))`, read to its matching close.
+            if rest.starts_with(AUTOMATIC) {
+                let inner = read_balanced(rest, open, close)?;
+                match ctx.automatic {
+                    Some(automatic) => expand_automatic(inner, automatic, ctx, out)?,
+                    None => {
+                        out.push('$');
+                        out.push(open);
+                        out.push_str(inner);
+                        out.push(close);
+                    }
+                }
+                return Ok(());
+            }
+            let raw = join_escaped_newlines(read_balanced(rest, open, close)?);
+            expand_reference(&raw, open, close, ctx, out)?;
+        }
+        // A single character names a macro, as GNU does -- so a stray `$` in
+        // a recipe expands to nothing rather than rejecting the whole
+        // makefile (audit #72).
+        c => {
+            let mut name = [0; 4];
+            expand_macro(c.encode_utf8(&mut name), '(', ')', ctx, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// Expand a bracketed automatic macro, the text between the delimiters of
+/// `$(@)`, `$(@D)` or `$(<F)`, for the target being made.
+///
+/// A name the automatic macros give is a file name, data like a
+/// `$(wildcard)` result: each `$` in it is a `$`.
+fn expand_automatic(
+    inner: &str,
+    automatic: func::Automatic,
+    ctx: &func::Ctx,
+    out: &mut String,
+) -> Result<()> {
+    let inner = join_escaped_newlines(inner);
+    let mut chars = inner.chars();
+    let Some(sigil) = chars.next() else {
+        return Ok(());
+    };
+    let rest = chars.as_str();
+    let modifier = rest.chars().next().filter(|m| matches!(m, 'D' | 'F'));
+    let rest = &rest[modifier.map_or(0, char::len_utf8)..];
+    let value = automatic(sigil, modifier);
+    let value = escape_dollars(&value);
+    match rest.strip_prefix(':') {
+        // `$(@:.html=.htp)`: an internal macro is a macro, and takes a
+        // substitution like any other (POSIX 105804). automake's
+        // `.texi.html` rule writes its output to `$(@:.html=.htp)` and then
+        // moves it.
+        Some(spec) => {
+            let spec = expand_to_string(spec, ctx)?;
+            out.push_str(&apply_substitution(&value, &spec));
+        }
+        None => out.push_str(&value),
+    }
+    Ok(())
+}
+
+/// Expand `text` into a string of its own; see [`expand_into`].
+fn expand_to_string(text: &str, ctx: &func::Ctx) -> Result<String> {
+    let mut out = String::with_capacity(text.len());
+    expand_into(text, ctx, &mut out)?;
+    Ok(out)
+}
+
+/// Expand the text between the delimiters of one `$(...)` or `${...}`
+/// reference that is not an internal macro: a function call, a macro name,
+/// or a substitution `name:subst1=subst2`.
+///
+/// POSIX 105801-105803 and 105830-105832: a reference inside the name or
+/// on the right-hand side of the `:` is expanded first, and the result
+/// examined. That covers a name computed in part, as automake writes it --
+/// `$(am__v_CC_$(V))` -- or wholly, `$($(X))`, and a computed substitution,
+/// `$(SRC:%.c=$(D)/%.o)`, as GNU make expands the whole reference text.
+fn expand_reference(
+    raw: &str,
+    open: char,
+    close: char,
+    ctx: &func::Ctx,
+    out: &mut String,
+) -> Result<()> {
+    if let Some((name, args)) = function_call(raw) {
+        return expand_call(name, args, open, close, ctx, out);
+    }
+    let expanded;
+    let text = match raw.contains('$') {
+        // A reference reading an automatic variable, `$($@)`, `$(TEST_$@)`
+        // or `$(SRC:.c=$@)`, is left for the rule stage, which knows the
+        // target, as a function call reading one is. dpkg's tests of its
+        // own .mk files check every variable with `test '$($@)' =
+        // '$(TEST_$@)'`.
+        true if ctx.automatic.is_none() && mentions_automatic(raw) => {
+            out.push('$');
+            out.push(open);
+            out.push_str(raw);
+            out.push(close);
+            return Ok(());
+        }
+        true => {
+            expanded = expand_to_string(raw, ctx)?;
+            expanded.as_str()
+        }
+        false => raw,
+    };
+    let (name, spec) = split_substitution(text);
+    // POSIX 105833 makes a reference to a macro that does not exist the
+    // empty string, and a name that expands to nothing names none.
+    let name = name.trim();
+    if name.is_empty() {
+        return Ok(());
+    }
+    match spec {
+        None => expand_macro(name, open, close, ctx, out),
+        Some(spec) => {
+            // `$(name:subst1=subst2)` substitutes in the macro's expanded
+            // value: `$(SRC:.c=.o)` has to see the words, not
+            // `$(wildcard *.c)`.
+            let mut body = String::new();
+            expand_macro(name, open, close, ctx, &mut body)?;
+            out.push_str(&apply_substitution(&body, spec));
+            Ok(())
+        }
+    }
+}
+
+/// Expand a reference to the macro `name` onto `out`.
+fn expand_macro(
+    name: &str,
+    open: char,
+    close: char,
+    ctx: &func::Ctx,
+    out: &mut String,
+) -> Result<()> {
+    let Some(found) = ctx.lookup(name) else {
+        // The special `MAKE` macro, when not otherwise defined, is passed
+        // through to the rule stage (it expands to the make program and
+        // marks the command line for recursive execution).
+        if name == "MAKE" {
+            out.push('$');
+            out.push(open);
+            out.push_str(name);
+            out.push(close);
+        }
+        // POSIX 105833: an undefined macro is the empty string, not an error.
+        return Ok(());
+    };
+    let value = found.value;
+    match found.flavour {
+        // A value with no `$` in it is what it expands to.
+        _ if !value.contains('$') => out.push_str(&value),
+        // What expanding the value left for the rule stage is expanded
+        // there; the rest of it expands to itself.
+        Flavour::Simple if ctx.automatic.is_some() => expand_into(&value, ctx, out)?,
+        Flavour::Simple => out.push_str(&value),
+        // A macro met again while its own value is being expanded would be
+        // expanded forever: an error, as in GNU make, when it is used.
+        Flavour::Recursive => {
+            let _expanding = ctx
+                .state
+                .enter_macro(name, found.index)
+                .map_err(|reentry| match reentry {
+                    func::Reentry::SelfReference => PreprocError::SelfReference(name.to_string()),
+                    func::Reentry::TooDeep => PreprocError::NestedTooDeep,
+                })?;
+            expand_into(&value, ctx, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// `$(fn args...)` -- a function call, not a macro reference.
+fn expand_call(
+    name: &str,
+    args: &str,
+    open: char,
+    close: char,
+    ctx: &func::Ctx,
+    out: &mut String,
+) -> Result<()> {
+    // Defer the call if it reads an automatic variable; only the rule
+    // stage can supply one (audit #62).
+    if ctx.automatic.is_none() && mentions_automatic(args) {
+        out.push('$');
+        out.push(open);
+        out.push_str(name);
+        out.push(' ');
+        out.push_str(args);
+        out.push(close);
+        return Ok(());
+    }
+    let result =
+        func::call(name, args, ctx, &expand_for_function).map_err(PreprocError::FunctionFailed)?;
+    out.push_str(&result);
+    Ok(())
+}
+
 /// Expand text on a function's behalf.
 fn expand_for_function(text: &str, ctx: &func::Ctx) -> std::result::Result<String, String> {
-    expand_to_fixpoint(text, ctx.table, ctx.state).map_err(|e| e.to_string())
+    expand_to_string(text, ctx).map_err(|e| e.to_string())
+}
+
+/// Expand `text` against `table`, with nothing bound by a function.
+fn expand_text(text: &str, table: &MacroTable, state: &func::Expansion) -> Result<String> {
+    let ctx = func::Ctx {
+        table,
+        env_wins: ENV_MACROS.load(Acquire),
+        state,
+        locals: None,
+        automatic: None,
+    };
+    expand_to_string(text, &ctx)
 }
 
 fn take_till_eol(letters: &mut Peekable<impl Iterator<Item = char>>) -> String {
     let mut content = String::new();
 
     while let Some(letter) = letters.peek() {
-        if matches!(letter, '\n' | '#') {
+        if *letter == '\n' {
             break;
         };
         content.push(*letter);
@@ -365,10 +793,6 @@ pub enum MacroSource {
     /// it has no source number; it sits above source 1 because that is what
     /// the directive means.
     Override,
-    /// Not a POSIX source: a `foreach` loop variable or a `call` argument,
-    /// in force only while that function's body is expanded. It shadows every
-    /// other source, which is what makes the binding a binding.
-    Local,
 }
 
 impl MacroSource {
@@ -396,15 +820,41 @@ impl MacroSource {
             }
             MacroSource::CommandLine => 3,
             MacroSource::Override => 4,
-            MacroSource::Local => 5,
         }
     }
+}
+
+/// How a macro's value is used when the macro is referenced (POSIX
+/// 105730-105749).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flavour {
+    /// Delayed expansion -- `=`, `?=`, `!=`, `:::=`, `define`, the
+    /// environment and the command line: the value is expanded each time
+    /// the macro is referenced.
+    Recursive,
+    /// Immediate expansion -- `:=` and `::=`: the value was expanded when it
+    /// was assigned, each literal `$` written `$$`, and is not expanded
+    /// again (POSIX 105779-105781).
+    Simple,
 }
 
 #[derive(Debug, Clone)]
 struct MacroEntry {
     value: String,
     source: MacroSource,
+    flavour: Flavour,
+    /// Where the name is in the table's definition order: a number for the
+    /// macro that stays the same when it is defined again.
+    index: usize,
+}
+
+/// What a reference to a macro finds.
+pub(crate) struct Found<'a> {
+    pub value: Cow<'a, str>,
+    pub flavour: Flavour,
+    /// The table entry's number, unless only the environment defines the
+    /// macro or a function binds it.
+    pub index: Option<usize>,
 }
 
 /// A macro table that remembers first-definition order, so the macros handed
@@ -421,7 +871,7 @@ impl MacroTable {
     pub fn from_macros(macros: &[Macro], source: MacroSource) -> Self {
         let mut table = Self::default();
         for (name, body) in macros {
-            table.force(name.clone(), body.clone(), source);
+            table.force(name.clone(), body.clone(), source, Flavour::Recursive);
         }
         table
     }
@@ -431,14 +881,14 @@ impl MacroTable {
     /// Equal ranks assign, which is POSIX 105851: "Macro definitions from a
     /// single source ... shall override previous macro definitions from the
     /// same source."
-    fn set(&mut self, name: String, body: String, source: MacroSource) {
+    fn set(&mut self, name: String, body: String, source: MacroSource, flavour: Flavour) {
         let env_wins = ENV_MACROS.load(Acquire);
         if let Some(existing) = self.values.get(&name) {
             if source.rank(env_wins) < existing.source.rank(env_wins) {
                 return;
             }
         }
-        self.force(name, body, source);
+        self.force(name, body, source, flavour);
     }
 
     /// Assign regardless of precedence, recording `source` as given.
@@ -446,28 +896,29 @@ impl MacroTable {
     /// Used to establish a seed, whose rank is then honoured by every later
     /// assignment, and by `override`, which passes [`MacroSource::Override`]
     /// so that what it establishes outranks a command-line macro.
-    fn force(&mut self, name: String, body: String, source: MacroSource) {
-        if !self.values.contains_key(&name) {
-            self.order.push(name.clone());
-        }
+    fn force(&mut self, name: String, body: String, source: MacroSource, flavour: Flavour) {
+        let index = match self.values.get(&name) {
+            Some(entry) => entry.index,
+            None => {
+                self.order.push(name.clone());
+                self.order.len() - 1
+            }
+        };
         self.values.insert(
             name,
             MacroEntry {
                 value: body,
                 source,
+                flavour,
+                index,
             },
         );
     }
 
-    /// Seed a definition from `source` before the makefile is read.
+    /// Seed a delayed-expansion definition from `source` before the
+    /// makefile is read.
     pub fn seed(&mut self, name: String, body: String, source: MacroSource) {
-        self.force(name, body, source);
-    }
-
-    /// Bind `name` for the duration of a `foreach` or `call` expansion,
-    /// shadowing any definition whatever its source.
-    pub(crate) fn bind_local(&mut self, name: String, value: String) {
-        self.force(name, value, MacroSource::Local);
+        self.force(name, body, source, Flavour::Recursive);
     }
 
     /// What `name` holds, weighing the table against the environment.
@@ -482,17 +933,47 @@ impl MacroTable {
     /// `None` means undefined, which is what `?=` and `ifdef` test; an
     /// explicitly empty value is defined.
     pub(crate) fn resolve(&self, name: &str, env_wins: bool) -> Option<String> {
-        let from_env = std::env::var(name).ok();
-        let Some(entry) = self.values.get(name) else {
-            return from_env;
-        };
-        match from_env {
-            Some(value)
-                if MacroSource::Environment.rank(env_wins) > entry.source.rank(env_wins) =>
-            {
-                Some(value)
+        self.resolve_flavoured(name, env_wins)
+            .map(|(value, _)| value)
+    }
+
+    /// What `name` holds, as [`Self::resolve`] says, and its flavour. A
+    /// value from the environment is a delayed-expansion one.
+    pub(crate) fn resolve_flavoured(
+        &self,
+        name: &str,
+        env_wins: bool,
+    ) -> Option<(String, Flavour)> {
+        self.lookup(name, env_wins)
+            .map(|found| (found.value.into_owned(), found.flavour))
+    }
+
+    /// [`Self::resolve_flavoured`], borrowing the value from the table when
+    /// it comes from there, as it nearly always does: expansion asks this
+    /// for every reference.
+    pub(crate) fn lookup(&self, name: &str, env_wins: bool) -> Option<Found<'_>> {
+        let entry = self.values.get(name);
+        fn from_table(entry: &MacroEntry) -> Found<'_> {
+            Found {
+                value: Cow::Borrowed(entry.value.as_str()),
+                flavour: entry.flavour,
+                index: Some(entry.index),
             }
-            _ => Some(entry.value.clone()),
+        }
+        // The environment is not read for a definition it cannot outrank,
+        // which is nearly every one; `getenv` walks the whole environment.
+        let env_rank = MacroSource::Environment.rank(env_wins);
+        if let Some(entry) = entry.filter(|entry| entry.source.rank(env_wins) >= env_rank) {
+            return Some(from_table(entry));
+        }
+        let from_env = std::env::var(name).ok().map(|value| Found {
+            value: Cow::Owned(value),
+            flavour: Flavour::Recursive,
+            index: entry.map(|entry| entry.index),
+        });
+        match entry {
+            None => from_env,
+            Some(entry) => from_env.or_else(|| Some(from_table(entry))),
         }
     }
 
@@ -501,7 +982,7 @@ impl MacroTable {
     ///
     /// [`Self::resolve`] weighs the environment live, but the environment is
     /// never *stored*, so until this runs the table still has one precedence
-    /// question open and [`Self::into_macros`] would hand on the loser. That is
+    /// question open and [`Self::to_macros`] would hand on the loser. That is
     /// not a question `Make` can answer later: it receives values, not sources.
     ///
     /// Concretely, it is what made everything downstream of the parse disagree
@@ -522,23 +1003,95 @@ impl MacroTable {
             if let Ok(value) = std::env::var(name) {
                 entry.value = value;
                 entry.source = MacroSource::Environment;
+                entry.flavour = Flavour::Recursive;
             }
         }
     }
 
-    pub fn into_macros(self) -> Vec<Macro> {
+    /// Whether `name`'s winning definition is one a target-specific
+    /// assignment not written `override` must yield to: a command-line
+    /// macro, or under `-e` the environment.
+    ///
+    /// A makefile `override` is not one of them: in GNU make
+    /// `sefcontext_compile: LDLIBS += ../src/libselinux.a` adds to
+    /// libselinux's `override LDLIBS += -lselinux`.
+    fn pins(&self, name: &str, env_wins: bool) -> bool {
+        let in_env = env_wins && std::env::var_os(name).is_some();
+        match self.values.get(name) {
+            Some(entry) => match entry.source {
+                MacroSource::CommandLine => true,
+                MacroSource::Override => false,
+                MacroSource::Environment => env_wins,
+                MacroSource::Makefile | MacroSource::BuiltIn => in_env,
+            },
+            None => in_env,
+        }
+    }
+
+    /// Apply a target-specific assignment, for the target being made, to
+    /// this copy of `global`, the makefile's own table.
+    ///
+    /// It replaces whatever the makefile, the environment (without `-e`), a
+    /// makefile `override`, or a target it is made for gave the name. Unless
+    /// it is written `override`, a command-line macro -- or the environment
+    /// under `-e` -- replaces it in turn, `+=` and all, as in GNU make, where
+    /// `make CFLAGS=-O0` holds for `foo: CFLAGS += -g` too.
+    ///
+    /// A `+=` defines a delayed-expansion macro whatever it adds to, as in
+    /// GNU make, where `foo: A += $(X)` reads `X` when the commands are
+    /// expanded even if `A` was defined with `:=`. An immediate macro's
+    /// value expands to itself, so it can begin a delayed one.
+    pub fn apply(&mut self, var: &TargetVar, global: &MacroTable) {
+        let env_wins = ENV_MACROS.load(Acquire);
+        if !var.overriding && global.pins(&var.name, env_wins) {
+            if let Some((value, flavour)) = global.resolve_flavoured(&var.name, env_wins) {
+                self.force(var.name.clone(), value, MacroSource::CommandLine, flavour);
+            }
+            return;
+        }
+        let current = self.resolve(&var.name, env_wins);
+        let (value, flavour) = match (var.op, current) {
+            (TargetAssign::IfUnset, Some(_)) => return,
+            (TargetAssign::Append, Some(current)) if !current.is_empty() => {
+                (format!("{current} {}", var.value), Flavour::Recursive)
+            }
+            _ => (var.value.clone(), var.flavour),
+        };
+        let source = match var.overriding {
+            true => MacroSource::Override,
+            false => MacroSource::Makefile,
+        };
+        self.force(var.name.clone(), value, source, flavour);
+    }
+
+    /// The value the makefile, the command line or the built-ins gave
+    /// `name`, ignoring the environment.
+    pub fn defined(&self, name: &str) -> Option<&str> {
+        self.values.get(name).map(|entry| entry.value.as_str())
+    }
+
+    /// Every definition, in first-definition order.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.order.iter().filter_map(|name| {
+            self.values
+                .get(name)
+                .map(|entry| (name.as_str(), entry.value.as_str()))
+        })
+    }
+
+    pub fn to_macros(&self) -> Vec<Macro> {
         // The source is dropped here, which is why `settle_environment` has to
         // have run: `Make` consumes values, and every precedence decision must
         // already have been made against them.
         self.order
-            .into_iter()
+            .iter()
             .map(|name| {
                 let body = self
                     .values
-                    .get(&name)
+                    .get(name)
                     .map(|e| e.value.clone())
                     .unwrap_or_default();
-                (name, body)
+                (name.clone(), body)
             })
             .collect()
     }
@@ -605,40 +1158,6 @@ fn parse_operator(text: &mut Peekable<impl Iterator<Item = char>>) -> Result<Ope
     }
 }
 
-/// Expand `body` against `table` until it stops changing.
-/// How many expansion rounds before we call a macro self-referential. A value
-/// that re-introduces its own reference (`A = $(A)x`) never converges.
-const MAX_EXPANSION_ROUNDS: usize = 256;
-
-fn expand_to_fixpoint(body: &str, table: &MacroTable, state: &func::Expansion) -> Result<String> {
-    let mut body = body.to_string();
-    for _ in 0..MAX_EXPANSION_ROUNDS {
-        let (result, substitutions) = substitute(&body, table, state)?;
-        if substitutions == 0 {
-            return Ok(body);
-        }
-        body = result;
-    }
-    Err(PreprocError::RecursiveMacro)
-}
-
-/// Expand every macro reference in `source` until it stops changing.
-fn substitute_to_fixpoint(
-    source: &str,
-    table: &MacroTable,
-    state: &func::Expansion,
-) -> Result<String> {
-    let mut source = source.to_string();
-    for _ in 0..MAX_EXPANSION_ROUNDS {
-        let (result, substitutions) = substitute(&source, table, state)?;
-        if substitutions == 0 {
-            return Ok(result);
-        }
-        source = result;
-    }
-    Err(PreprocError::RecursiveMacro)
-}
-
 /// POSIX 105746-105748: strip leading white space, drop a single trailing
 /// <newline>, then turn every remaining <newline> into a <space>.
 fn shell_output_to_macro_value(raw: &str) -> String {
@@ -647,9 +1166,20 @@ fn shell_output_to_macro_value(raw: &str) -> String {
     trimmed.replace('\n', " ")
 }
 
+/// Turn each `$$` of expanded text into the `$` it stands for.
+///
+/// Expansion writes a literal `$` as `$$` (see [`expand_into`]), so that
+/// text can be expanded in stages; what leaves make undoes it once. POSIX
+/// 105799-105800 makes `$$` a single `$`, so
+/// `$(shell test 5 -lt 8; echo $$?)` must run `echo $?`. The rule stage
+/// does the same to a command line itself.
+pub(crate) fn unescape_dollars(text: &str) -> String {
+    text.replace("$$", "$")
+}
+
 /// Run `body` through the shell and convert its stdout to a macro value (`!=`).
 fn shell_assign(body: &str) -> Result<String> {
-    let Ok(result) = std::process::Command::new("sh").args(["-c", body]).output() else {
+    let Ok(result) = func::shell_command(body).output() else {
         return Err(PreprocError::CommandFailed);
     };
     Ok(shell_output_to_macro_value(&String::from_utf8_lossy(
@@ -657,31 +1187,48 @@ fn shell_assign(body: &str) -> Result<String> {
     )))
 }
 
-/// Turn a raw definition body into the value the operator assigns.
+/// Turn a raw definition body into the value the operator assigns, and the
+/// flavour of the macro it defines (POSIX 105730-105764).
 fn apply_operator(
     operator: Operator,
     name: &str,
     body: String,
     table: &MacroTable,
     state: &func::Expansion,
-) -> Result<String> {
+) -> Result<(String, Flavour)> {
+    let recursive = |value| Ok((value, Flavour::Recursive));
     match operator {
-        Operator::Equals => Ok(body),
-        Operator::Colon | Operator::Colon2 => expand_to_fixpoint(&body, table, state),
-        Operator::Colon3 => Ok(substitute(&body, table, state)?.0),
-        Operator::Bang => shell_assign(&substitute(&body, table, state)?.0),
+        Operator::Equals => recursive(body),
+        Operator::Colon | Operator::Colon2 => {
+            Ok((expand_text(&body, table, state)?, Flavour::Simple))
+        }
+        // A delayed-expansion macro whose value is expanded now as well,
+        // with `$$` left as it is (POSIX 105739-105740, 105799-105801).
+        Operator::Colon3 => recursive(expand_text(&body, table, state)?),
+        // A delayed-expansion macro too: the command's output is expanded
+        // when the macro is, unlike what `$(shell ...)` returns.
+        Operator::Bang => {
+            let command = unescape_dollars(&expand_text(&body, table, state)?);
+            recursive(shell_assign(&command)?)
+        }
         // `?=` and `+=` ask what the macro is *now*, and the environment is a
         // macro source (POSIX 105845) -- consulting only the table made
         // `CC ?= gcc` ignore an inherited `CC=clang`, and `CC += -Wall` drop it
         // entirely (audit #73).
-        Operator::QuestionMark => Ok(match existing_value(name, table) {
-            Some(existing) => existing,
-            None => body,
-        }),
-        Operator::Plus => Ok(match existing_value(name, table) {
-            Some(existing) => format!("{existing} {body}"),
-            None => body,
-        }),
+        Operator::QuestionMark => match existing_value(name, table) {
+            Some(existing) => Ok(existing),
+            None => recursive(body),
+        },
+        // POSIX 105759-105764: what is appended to an immediate-expansion
+        // macro is evaluated now, to a delayed-expansion one when used.
+        Operator::Plus => match existing_value(name, table) {
+            Some((existing, Flavour::Simple)) => {
+                let body = expand_text(&body, table, state)?;
+                Ok((format!("{existing} {body}"), Flavour::Simple))
+            }
+            Some((existing, Flavour::Recursive)) => recursive(format!("{existing} {body}")),
+            None => recursive(body),
+        },
     }
 }
 
@@ -699,17 +1246,18 @@ fn parse_macro_name(text: &mut Peekable<impl Iterator<Item = char>>) -> Result<S
 ///
 /// `None` means undefined, which is what `?=` tests; an explicitly empty value
 /// is defined and is left alone.
-fn existing_value(name: &str, table: &MacroTable) -> Option<String> {
-    table.resolve(name, ENV_MACROS.load(Acquire))
+fn existing_value(name: &str, table: &MacroTable) -> Option<(String, Flavour)> {
+    table.resolve_flavoured(name, ENV_MACROS.load(Acquire))
 }
 
-/// Parse one macro-definition line into the name and the value its operator
-/// assigns, resolving against what is already defined.
+/// Parse one macro-definition line into the name, the value its operator
+/// assigns and the flavour that gives the macro, resolving against what is
+/// already defined.
 fn parse_macro_definition(
     line: &str,
     table: &MacroTable,
     state: &func::Expansion,
-) -> Result<(String, String)> {
+) -> Result<(String, String, Flavour)> {
     let mut text = line.chars().peekable();
     // A definition may be indented with spaces, which is common inside a
     // conditional. (A <tab> would make it a command line, handled elsewhere.)
@@ -719,187 +1267,11 @@ fn parse_macro_definition(
     let operator = parse_operator(&mut text)?;
     skip_blank(&mut text);
     let body = take_till_eol(&mut text);
-    let body = apply_operator(operator, &name, body, table, state)?;
-    Ok((name, body))
+    let (body, flavour) = apply_operator(operator, &name, body, table, state)?;
+    Ok((name, body, flavour))
 }
 
 pub static ENV_MACROS: AtomicBool = AtomicBool::new(false);
-
-/// Resolve a macro reference to its value.
-///
-/// POSIX 105845 makes the environment macro source 3, unconditionally -- `-e`
-/// changes which source *wins*, not whether the environment is consulted at
-/// all. POSIX 105833: "if the macro named by string1 does not exist, the final
-/// result shall be an empty string", so an undefined name is not an error.
-fn lookup_macro(name: &str, table: &MacroTable, env_wins: bool) -> String {
-    table.resolve(name, env_wins).unwrap_or_default()
-}
-
-fn substitute(source: &str, table: &MacroTable, state: &func::Expansion) -> Result<(String, u32)> {
-    let env_macros = ENV_MACROS.load(Acquire);
-
-    let mut substitutions = 0;
-    let mut result = String::with_capacity(source.len());
-
-    let mut letters = source.chars().peekable();
-    while let Some(letter) = letters.next() {
-        if letter != '$' {
-            result.push(letter);
-            continue;
-        }
-
-        // A `$` with nothing after it is an ordinary character. Rejecting it
-        // failed the whole makefile over a recipe as ordinary as
-        // `@echo end$` (audit #87); the rule stage already emits it literally.
-        let Some(letter) = letters.next() else {
-            result.push('$');
-            break;
-        };
-
-        match letter {
-            // Internal macros - we leave them "as is"
-            // yet as they will be dealt with in the
-            // parsing stage with more context available
-            c @ ('$' | '@' | '%' | '?' | '<' | '*' | '^' | '+') => {
-                result.push('$');
-                result.push(c);
-                continue;
-            }
-            c if suitable_ident(&c) => {
-                let macro_body = lookup_macro(&c.to_string(), table, env_macros);
-                result.push_str(&macro_body);
-                substitutions += 1;
-                continue;
-            }
-            open @ ('(' | '{') => {
-                let close = if open == '(' { ')' } else { '}' };
-
-                // An internal-macro reference such as `$(@)`, `$(@D)`, `$(?F)`
-                // is left verbatim for the rule stage, which alone has the
-                // target/prerequisite context to expand it.
-                if matches!(
-                    letters.peek(),
-                    Some('@' | '%' | '?' | '<' | '*' | '^' | '+')
-                ) {
-                    result.push('$');
-                    result.push(open);
-                    for c in letters.by_ref() {
-                        result.push(c);
-                        if c == close {
-                            break;
-                        }
-                    }
-                    continue;
-                }
-
-                skip_blank(&mut letters);
-                let macro_name = match get_reference_name(&mut letters) {
-                    Ok(name) => name,
-                    // A computed name -- `$($(X))` names the macro whose name
-                    // `$(X)` spells. Resolve the inner reference and look the
-                    // result up; POSIX 105833 makes an unresolvable reference
-                    // the empty string, so failing the whole makefile was
-                    // never the right outcome (audit #88).
-                    Err(_) if letters.peek() == Some(&'$') => {
-                        let raw = read_balanced(&mut letters, open, close)?;
-                        let name = expand_to_fixpoint(&raw, table, state)?;
-                        substitutions += 1;
-                        let name = name.trim();
-                        if name.is_empty() {
-                            continue;
-                        }
-                        let (text, nested) =
-                            substitute(&format!("${open}{name}{close}"), table, state)?;
-                        result.push_str(&text);
-                        substitutions += nested;
-                        continue;
-                    }
-                    Err(_) => Err(PreprocError::BadMacroName)?,
-                };
-
-                // `$(fn args...)` -- a function call, not a macro reference.
-                if func::is_function(&macro_name) {
-                    skip_blank(&mut letters);
-                    let raw = read_balanced(&mut letters, open, close)?;
-                    // Defer the call if it reads an automatic variable; only
-                    // the rule stage can supply one (audit #62).
-                    if mentions_automatic(&raw) {
-                        result.push('$');
-                        result.push(open);
-                        result.push_str(&macro_name);
-                        result.push(' ');
-                        result.push_str(&raw);
-                        result.push(close);
-                        continue;
-                    }
-                    let ctx = func::Ctx {
-                        table,
-                        env_wins: env_macros,
-                        state,
-                    };
-                    let out = func::call(&macro_name, &raw, &ctx, &expand_for_function)
-                        .map_err(PreprocError::FunctionFailed)?;
-                    result.push_str(&out);
-                    substitutions += 1;
-                    continue;
-                }
-
-                // `$(name:subst1=subst2)` substitution form.
-                if letters.peek() == Some(&':') {
-                    letters.next();
-                    // The replacement may itself contain a reference, as in
-                    // `$(SRC:%.c=$(D)/%.o)`. Stopping at the first `)` cut that
-                    // in half and rejected the makefile (audit #70); the
-                    // balanced reader is the same one the function path uses.
-                    let spec = read_balanced(&mut letters, open, close)?;
-                    // Expand the body before substituting: a delayed macro
-                    // holds unexpanded text, and `$(SRC:.c=.o)` has to see the
-                    // words, not `$(wildcard *.c)`.
-                    let macro_body = lookup_macro(&macro_name, table, env_macros);
-                    let macro_body = expand_to_fixpoint(&macro_body, table, state)?;
-                    result.push_str(&apply_substitution(&macro_body, &spec));
-                    substitutions += 1;
-                    continue;
-                }
-
-                skip_blank(&mut letters);
-                let Some(finilizer) = letters.next() else {
-                    Err(PreprocError::UnexpectedEOF)?
-                };
-                if finilizer != close {
-                    Err(PreprocError::UnexpectedSymbol(finilizer))?
-                }
-
-                // The special `MAKE` macro, when not otherwise defined, is
-                // passed through to the rule stage (it expands to the make
-                // program and marks the recipe for recursive execution).
-                let defined = table.resolve(&macro_name, env_macros).is_some();
-                if !defined && macro_name == "MAKE" {
-                    result.push('$');
-                    result.push(open);
-                    result.push_str("MAKE");
-                    result.push(close);
-                    continue;
-                }
-                let macro_body = lookup_macro(&macro_name, table, env_macros);
-                result.push_str(&macro_body);
-                substitutions += 1;
-
-                continue;
-            }
-            // Any other single character names a macro, as GNU does -- so a
-            // stray `$` in a recipe expands to nothing rather than rejecting
-            // the whole makefile (audit #72).
-            c => {
-                let macro_body = lookup_macro(&c.to_string(), table, env_macros);
-                result.push_str(&macro_body);
-                substitutions += 1;
-            }
-        }
-    }
-
-    Ok((result, substitutions))
-}
 
 /// Recognize an include directive: the word `include`, optionally prefixed with
 /// a `-` (whose missing file is ignored), at the start of a line and followed by
@@ -940,15 +1312,72 @@ pub struct VPathEntry {
     pub dirs: Vec<String>,
 }
 
+/// A file an `include` line named, whether or not it could be read.
+///
+/// Kept so that once the makefiles are read, make can bring each one up to
+/// date and read the makefiles again if any changed (POSIX 105587-105600).
+/// An `include` whose file is still missing then, and that no rule can
+/// make, is an error; a `-include` (`optional`) is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Include {
+    pub path: String,
+    pub optional: bool,
+}
+
+/// How a target-specific assignment combines with the value already in
+/// force for the target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetAssign {
+    /// `=`, `:=`, `::=`, `:::=` and `!=`: the value replaces it.
+    Set,
+    /// `+=`: the value is appended to it.
+    Append,
+    /// `?=`: the value is used only where there is none.
+    IfUnset,
+}
+
+/// A target-specific (or, with a `%` target, pattern-specific) macro
+/// assignment, `targets: [override] [export] name op value` (GNU make).
+///
+/// It is in force while the commands of each target it names are expanded,
+/// and of every target made as a prerequisite of one of them, unless that
+/// target assigns the name itself. sysvinit writes
+/// `init: LDLIBS += $(INITLIBS) $(STATIC)`; libzstd writes
+/// `%-mt : CPPFLAGS_DYNLIB := -DZSTD_MULTITHREAD`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetVar {
+    pub targets: Vec<String>,
+    pub name: String,
+    pub op: TargetAssign,
+    /// For `=`, `+=` and `?=` the text as written, expanded with the
+    /// target's macros when used; for the other operators the value the
+    /// operator gave when the line was read.
+    pub value: String,
+    /// The flavour of the macro it defines: immediate for `:=` and `::=`.
+    pub flavour: Flavour,
+    /// Written `override`: beats a command-line macro.
+    pub overriding: bool,
+    /// Written `export`: the macro goes into the environment of the
+    /// target's commands.
+    pub exported: bool,
+}
+
 /// What the reader produced: the text the rule parser sees, plus the state it
 /// consumed on the way.
 #[derive(Debug, Default)]
 pub struct Preprocessed {
     pub text: String,
     pub macros: Vec<Macro>,
+    /// The same macros with the source of each, which decides whether a
+    /// target-specific assignment may replace one.
+    pub table: MacroTable,
     pub vpaths: Vec<VPathEntry>,
     /// Macros an `export` directive asked to put in the recipe environment.
     pub exports: Vec<String>,
+    /// Every file an `include` line named, in the order read.
+    pub includes: Vec<Include>,
+    /// Target- and pattern-specific macro assignments, in the order read.
+    pub target_vars: Vec<TargetVar>,
 }
 
 /// One level of `if.../else/endif` nesting.
@@ -961,6 +1390,9 @@ struct Branch {
     /// Whether a bare `else` has been seen, so a second one is an error.
     closed: bool,
 }
+
+/// The macro naming the makefiles read so far (GNU make).
+pub const MAKEFILE_LIST: &str = "MAKEFILE_LIST";
 
 /// How deep `include` may nest before we call it a cycle. POSIX 105611 requires
 /// at least 16; the cap exists so a self-including file terminates.
@@ -989,6 +1421,12 @@ struct Reader {
     eval_depth: usize,
     vpaths: Vec<VPathEntry>,
     exports: Vec<String>,
+    includes: Vec<Include>,
+    target_vars: Vec<TargetVar>,
+    /// Whether a rule line was the last line read that was not blank, a
+    /// comment or a conditional: only then is a `<tab>` line a command line
+    /// (POSIX 105643-105646). See `handle_line`.
+    in_rule: bool,
     /// Shared by every expansion this reader performs, so recursion is bounded
     /// and `$(eval ...)` has somewhere to leave text.
     state: func::Expansion,
@@ -1004,6 +1442,9 @@ impl Reader {
             eval_depth: 0,
             vpaths: Vec::new(),
             exports: Vec::new(),
+            includes: Vec::new(),
+            target_vars: Vec::new(),
+            in_rule: false,
             state: func::Expansion::new(),
         }
     }
@@ -1025,16 +1466,28 @@ impl Reader {
             // A command line reaches the shell verbatim, `#` included.
             self.out.push_str(line);
         } else {
-            // Strip the comment *before* expanding, so a reference inside one
-            // is never evaluated -- a commented-out `$(shell rm -rf ...)`
-            // must not run (audit #51).
-            let code = super::scan::strip_comment(line);
-            let expanded = substitute_to_fixpoint(code, &self.table, &self.state)?;
+            // `handle_line` stripped the comment *before* this expansion, so a
+            // reference inside one is never evaluated -- a commented-out
+            // `$(shell rm -rf ...)` must not run (audit #51).
+            let code = line;
+            // A command after the rule line's `;` is a command line, and like
+            // any other is expanded by the rule stage, not here: expanding it
+            // with the rest of the line used macros defined only so far.
+            let (header, command) = split_inline_command(code);
+            let expanded = expand_text(header, &self.table, &self.state)?;
             // Anything `$(eval ...)` queued belongs *before* this line. A rule
             // header emitted by an eval on a rule line would otherwise close
             // the enclosing rule and steal its recipe.
             self.drain_evals()?;
-            self.out.push_str(&expanded);
+            // A `#` here is literal -- it was written `\#`, or came from a
+            // macro -- and the rule parser strips comments again.
+            self.out.push_str(&super::scan::escape_hashes(&expanded));
+            self.out.push_str(&super::scan::escape_hashes(command));
+            // A blank line or a comment leaves a rule open; a line that
+            // expands to nothing closes it, as in GNU make.
+            if !code.trim().is_empty() {
+                self.in_rule = !expanded.trim().is_empty() || !command.is_empty();
+            }
         }
         self.out.push('\n');
         Ok(())
@@ -1048,7 +1501,7 @@ impl Reader {
     /// Expand macro references in a directive's condition, using what is
     /// defined so far.
     fn expand(&self, text: &str) -> Result<String> {
-        expand_to_fixpoint(text, &self.table, &self.state)
+        expand_text(text, &self.table, &self.state)
     }
 
     fn eval_compare(&self, equal: bool, args: &str) -> Result<bool> {
@@ -1200,8 +1653,17 @@ impl Reader {
         Ok(())
     }
 
-    /// Capture a `define ... endef` body, returning the lines consumed.
-    fn capture_define(&mut self, name: &str, lines: &[&str], start: usize) -> usize {
+    /// Capture a `define ... endef` body, returning the index of the last
+    /// line consumed. `op` is the operator written after the name, which
+    /// assigns the body as it would a one-line definition's value:
+    /// `define NAME :=` expands it now.
+    fn capture_define(
+        &mut self,
+        name: &str,
+        op: &str,
+        lines: &[&str],
+        start: usize,
+    ) -> Result<usize> {
         let mut body: Vec<&str> = Vec::new();
         let mut i = start + 1;
         while i < lines.len() {
@@ -1212,41 +1674,82 @@ impl Reader {
             i += 1;
         }
         if self.active() {
+            let operator = match op.is_empty() {
+                true => Operator::Equals,
+                false => parse_operator(&mut op.chars().peekable())?,
+            };
+            let body = body.join("\n");
+            let (value, flavour) = apply_operator(operator, name, body, &self.table, &self.state)?;
             self.table
-                .set(name.to_string(), body.join("\n"), MacroSource::Makefile);
+                .set(name.to_string(), value, MacroSource::Makefile, flavour);
         }
         // Blank out the whole construct, header and terminator included.
         for _ in start..=i.min(lines.len() - 1) {
             self.drop_line();
         }
-        i
+        Ok(i)
     }
 
+    /// Read the files an `include` line names.
+    ///
+    /// POSIX 105572-105577: the expanded remainder of the line is split at
+    /// blanks into one or more pathnames, read in order, so
+    /// `-include $(wildcard *.d)` reads every file the wildcard found.
     fn splice_include(&mut self, line: &str) -> Result<()> {
-        let Some((path_spec, ignore_missing)) = parse_include_directive(line) else {
+        let Some((path_spec, optional)) = parse_include_directive(line) else {
             return Ok(());
         };
-        let path = self.expand(path_spec)?;
-        let path = path.trim();
+        let paths = self.expand(path_spec)?;
         self.drop_line();
+        for path in super::scan::split_words(&paths) {
+            self.include_file(path, optional)?;
+        }
+        Ok(())
+    }
 
+    /// Read one included file, or note that it does not exist yet.
+    ///
+    /// POSIX 105587-105600, the "delayed remaking" method: a file that does
+    /// not exist is read as empty, and once the makefiles have been read, any
+    /// rule for it is used to create it -- automake's
+    /// `include ./$(DEPDIR)/foo.Po` is made by `am--depfiles`. Whether a
+    /// missing file without a rule is an error is decided then, because a
+    /// rule later in the makefile may still supply it; see [`Include`].
+    fn include_file(&mut self, path: String, optional: bool) -> Result<()> {
         if self.depth >= MAX_INCLUDE_DEPTH {
             return Err(PreprocError::IncludeFailed {
-                path: path.to_string(),
+                path,
                 reason: format!("include nested more than {MAX_INCLUDE_DEPTH} deep (cycle?)"),
             });
         }
 
-        let contents = match fs::read_to_string(Path::new(path)) {
+        let read = fs::read_to_string(Path::new(&path));
+        self.includes.push(Include {
+            path: path.clone(),
+            optional,
+        });
+        let contents = match read {
             Ok(contents) => contents,
-            Err(_) if ignore_missing => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) if optional => return Ok(()),
             Err(err) => {
                 return Err(PreprocError::IncludeFailed {
-                    path: path.to_string(),
+                    path,
                     reason: err.to_string(),
                 })
             }
         };
+
+        // GNU make's MAKEFILE_LIST names every makefile read so far, the one
+        // being read last: libzstd.mk finds its own directory with
+        // `$(lastword $(MAKEFILE_LIST))`.
+        let list = match self.table.resolve(MAKEFILE_LIST, ENV_MACROS.load(Acquire)) {
+            Some(list) if !list.is_empty() => format!("{list} {path}"),
+            _ => path.clone(),
+        };
+        let (source, flavour) = (MacroSource::Makefile, Flavour::Recursive);
+        self.table
+            .set(MAKEFILE_LIST.to_string(), list, source, flavour);
 
         self.depth += 1;
         let folded = fold_continuations(&contents);
@@ -1264,9 +1767,11 @@ impl Reader {
     /// which is right: the queue can only be filled while active.
     fn read_isolated(&mut self, text: &str) -> Result<()> {
         let saved = std::mem::take(&mut self.branches);
+        let in_rule = std::mem::replace(&mut self.in_rule, false);
         let result = self.read(text);
         let balanced = self.branches.is_empty();
         self.branches = saved;
+        self.in_rule = in_rule;
         result?;
         if !balanced {
             return Err(PreprocError::UnmatchedConditional("endif".to_string()));
@@ -1327,14 +1832,42 @@ impl Reader {
         // conditional at all -- the comment used to reach `parse_directive`
         // as part of the condition, so the makefile failed outright, and
         // `ifdef X  # why` silently took the `else` arm (audit #81).
-        let line = match lines[i].starts_with('\t') {
-            true => lines[i],
-            false => super::scan::strip_comment(lines[i]),
+        //
+        // A `<tab>` line is a command line only in a rule (POSIX 105643-
+        // 105646: the lines after a target entry's rule line that begin
+        // with a `<tab>`); anything else, a macro definition or a directive
+        // included, ends the rule. Elsewhere POSIX gives a `<tab>` line no
+        // meaning, and GNU make reads it as any other line, so it is read
+        // here without its indentation, its continuations joined as outside
+        // a command line. libselinux indents macro definitions inside
+        // conditionals, `ifeq ($(USE_PCRE2),y)` / `<tab>PCRE_CFLAGS :=
+        // -DUSE_PCRE2 ...`.
+        let detabbed;
+        let raw = match lines[i].starts_with('\t') && !self.in_rule {
+            true => {
+                detabbed = join_escaped_newlines(lines[i].trim_start_matches([' ', '\t']));
+                detabbed.as_ref()
+            }
+            false => lines[i],
+        };
+        let stripped;
+        let line = match raw.starts_with('\t') {
+            true => raw,
+            false => {
+                stripped = super::scan::strip_comment(raw);
+                stripped.as_ref()
+            }
         };
 
         if let Some(directive) = parse_directive(line) {
+            // Only a conditional leaves a rule open, as in GNU make.
+            if self.active() && !directive.is_conditional() {
+                self.in_rule = false;
+            }
             match directive {
-                Directive::Define(name) => return Ok(self.capture_define(&name, lines, i)),
+                Directive::Define { name, op } => {
+                    return self.capture_define(&name, &op, lines, i);
+                }
                 Directive::EndDef => self.drop_line(),
                 Directive::Else(chained) => {
                     self.handle_else(chained.as_deref())?;
@@ -1376,14 +1909,72 @@ impl Reader {
         }
 
         if is_include_directive(line) {
+            self.in_rule = false;
             self.splice_include(line)?;
+            self.in_rule = false;
         } else if is_macro_definition(line) {
+            self.in_rule = false;
             self.define_macro(line)?;
+            self.drop_line();
+        } else if let Some((targets, assignment)) = split_target_var(line) {
+            self.in_rule = false;
+            self.define_target_var(targets, assignment)?;
             self.drop_line();
         } else {
             self.keep(line)?;
         }
         Ok(i)
+    }
+
+    /// Record a target-specific assignment, `targets: [override] [export]
+    /// name op value`.
+    ///
+    /// The targets are expanded now, as a rule's are, and are names from
+    /// then on. The value is kept as written for `=`, `+=` and `?=`, to be
+    /// expanded with the target's macros when its commands are; the other
+    /// operators do their work now, against what is defined at this point,
+    /// as for any macro definition.
+    fn define_target_var(&mut self, targets: &str, assignment: &str) -> Result<()> {
+        // Names, like a rule's targets: `$$` is the `$` it stands for.
+        let targets = super::scan::split_words(&unescape_dollars(&self.expand(targets)?));
+        let mut text = assignment.trim_start();
+        let (mut overriding, mut exported) = (false, false);
+        loop {
+            if let Some(rest) = strip_word(text, "override") {
+                (overriding, text) = (true, rest);
+            } else if let Some(rest) = strip_word(text, "export") {
+                (exported, text) = (true, rest);
+            } else {
+                break;
+            }
+        }
+        let mut letters = text.chars().peekable();
+        let name = get_ident(&mut letters)?;
+        skip_blank(&mut letters);
+        let operator = parse_operator(&mut letters)?;
+        skip_blank(&mut letters);
+        let body: String = letters.collect();
+        let recursive = Flavour::Recursive;
+        let (op, value, flavour) = match operator {
+            Operator::Equals => (TargetAssign::Set, body, recursive),
+            Operator::Plus => (TargetAssign::Append, body, recursive),
+            Operator::QuestionMark => (TargetAssign::IfUnset, body, recursive),
+            other => {
+                let (value, flavour) =
+                    apply_operator(other, &name, body, &self.table, &self.state)?;
+                (TargetAssign::Set, value, flavour)
+            }
+        };
+        self.target_vars.push(TargetVar {
+            targets,
+            name,
+            op,
+            value,
+            flavour,
+            overriding,
+            exported,
+        });
+        Ok(())
     }
 
     fn define_macro(&mut self, line: &str) -> Result<()> {
@@ -1394,10 +1985,10 @@ impl Reader {
             Some(rest) => (rest, true),
             None => (line, false),
         };
-        let (name, body) = parse_macro_definition(line, &self.table, &self.state)?;
+        let (name, body, flavour) = parse_macro_definition(line, &self.table, &self.state)?;
         match overriding {
-            true => self.table.force(name, body, MacroSource::Override),
-            false => self.table.set(name, body, MacroSource::Makefile),
+            true => self.table.force(name, body, MacroSource::Override, flavour),
+            false => self.table.set(name, body, MacroSource::Makefile, flavour),
         }
         Ok(())
     }
@@ -1417,20 +2008,52 @@ impl Reader {
     }
 }
 
-/// Expand the command lines held back during the read, now that every macro is
-/// known.
+/// Expand `text` against `table`, the macros in force for a target, with
+/// no automatic macros: what a macro exported to the target's commands
+/// holds.
 ///
-/// A multi-line value landing in a recipe gets each of its newlines followed by
-/// the recipe's <tab>, so every line stays a command line rather than becoming
-/// a bogus rule.
+/// The automatic macros and any reference or call that reads one are left
+/// as written, and `$$` stands for `$`. `$(eval ...)` is refused: this is
+/// done after the makefile has been read, so text it queued would have no
+/// reader.
+pub fn expand_command(text: &str, table: &MacroTable) -> std::result::Result<String, String> {
+    let state = func::Expansion::without_eval();
+    expand_text(text, table, &state).map_err(|e| e.to_string())
+}
+
+/// Expand one command line for the target being made, against `table`, the
+/// macros in force for it: what the rule stage does to a command line just
+/// before it runs. `automatic` gives the automatic macros.
+///
+/// The result is in the escaped form [`expand_into`] describes: the rule
+/// stage turns `$$` into `$`, and an undefined `$(MAKE)` into the make
+/// program. `$(eval ...)` is refused, as in [`expand_command`].
+pub(crate) fn expand_command_for(
+    text: &str,
+    table: &MacroTable,
+    automatic: func::Automatic,
+) -> std::result::Result<String, String> {
+    let state = func::Expansion::without_eval();
+    let ctx = func::Ctx {
+        table,
+        env_wins: ENV_MACROS.load(Acquire),
+        state: &state,
+        locals: None,
+        automatic: Some(automatic),
+    };
+    expand_to_string(text, &ctx).map_err(|e| e.to_string())
+}
+
+/// Expand every command line of preprocessed text against `table`, as the
+/// rule stage would for a target with no target-specific macros. A
+/// multi-line value gets each of its newlines followed by the <tab> of a
+/// command line.
 fn expand_command_lines(text: &str, table: &MacroTable) -> Result<String> {
-    // A command line is expanded after the reader has finished, so text
-    // queued here would have no consumer: `$(eval ...)` is refused instead.
     let state = func::Expansion::without_eval();
     let mut out = String::with_capacity(text.len());
     for line in text.lines() {
         if line.starts_with('\t') {
-            let expanded = substitute_to_fixpoint(line, table, &state)?;
+            let expanded = expand_text(line, table, &state)?;
             out.push_str(&expanded.replace('\n', "\n\t"));
         } else {
             out.push_str(line);
@@ -1440,25 +2063,30 @@ fn expand_command_lines(text: &str, table: &MacroTable) -> Result<String> {
     Ok(out)
 }
 
-/// Expand a recipe line once the rule stage has substituted its automatic
-/// variables, so a function deferred by `mentions_automatic` finally runs.
-pub fn expand_recipe(text: &str, macros: &[Macro]) -> std::result::Result<String, String> {
-    // These macros are the settled table `Make` was handed: `settle_environment`
-    // has already folded in every environment value that outranked what the
-    // table held, so tagging them all `Makefile` here loses nothing. A name
-    // absent from the table is still resolved against the live environment,
-    // which is what lets a deferred function reach an ordinary environment
-    // variable.
-    let table = MacroTable::from_macros(macros, MacroSource::Makefile);
-    let state = func::Expansion::without_eval();
-    substitute_to_fixpoint(text, &table, &state).map_err(|e| e.to_string())
+/// Preprocess `source`, and expand its command lines too.
+///
+/// [`preprocess_with`] leaves command lines as written, for the rule stage
+/// to expand with each target's macros. This shows what they expand to for
+/// a target that has none of its own.
+pub fn preprocess(source: &str) -> Result<Preprocessed> {
+    let mut scanned = preprocess_with(source, &[], &[])?;
+    scanned.text = expand_command_lines(&scanned.text, &scanned.table)?;
+    Ok(scanned)
 }
 
-/// Resolve directives, includes and macros, returning the text the rule parser
-/// sees and the macro definitions it must not (they are consumed here, but
-/// `Make` needs them for `SHELL` and for the recipe environment).
-pub fn preprocess(source: &str) -> Result<Preprocessed> {
-    preprocess_with(source, &[], &[])
+/// POSIX 105884-105893: `CURDIR` is provided by make, set to the absolute
+/// pathname of the working directory make was executed in.
+///
+/// It ranks as a makefile definition, which places it exactly where the
+/// standard does: the environment's `CURDIR` does not affect it unless `-e`
+/// is given, and a definition in the makefile or on the command line replaces
+/// it. Where the environment does carry a `CURDIR`, the recipe environment
+/// receives the macro's value, as for any inherited name.
+fn seed_curdir(table: &mut MacroTable) {
+    if let Ok(dir) = std::env::current_dir() {
+        let dir = dir.to_string_lossy().into_owned();
+        table.seed("CURDIR".to_string(), dir, MacroSource::Makefile);
+    }
 }
 
 /// Preprocess with the definitions that are in force before the makefile is
@@ -1474,6 +2102,10 @@ pub fn preprocess(source: &str) -> Result<Preprocessed> {
 /// Recorded sources are what keep a later assignment in its place: the
 /// makefile may replace a built-in but not a command-line macro, without
 /// anyone having to track that separately.
+///
+/// Command lines are returned as written. They are expanded by the rule
+/// stage just before they run, against the macros in force for the target
+/// being made, which may include target-specific ones.
 pub fn preprocess_with(
     source: &str,
     cmdline: &[Macro],
@@ -1485,6 +2117,7 @@ pub fn preprocess_with(
             .table
             .seed(name.clone(), value.clone(), MacroSource::BuiltIn);
     }
+    seed_curdir(&mut reader.table);
     for (name, value) in cmdline {
         reader
             .table
@@ -1494,14 +2127,16 @@ pub fn preprocess_with(
     if !reader.branches.is_empty() {
         return Err(PreprocError::UnmatchedConditional("endif".to_string()));
     }
-    let text = expand_command_lines(&reader.out, &reader.table)?;
-    // Settle the one precedence question the table still has open before the
-    // sources are dropped; see `settle_environment`.
+    // Settle the one precedence question the table still has open; see
+    // `settle_environment`.
     reader.table.settle_environment();
     Ok(Preprocessed {
-        text,
-        macros: reader.table.into_macros(),
+        text: reader.out,
+        macros: reader.table.to_macros(),
+        table: reader.table,
         vpaths: reader.vpaths,
         exports: reader.exports,
+        includes: reader.includes,
+        target_vars: reader.target_vars,
     })
 }

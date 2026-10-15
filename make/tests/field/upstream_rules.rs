@@ -115,6 +115,26 @@ fn wildcard_in_a_directory_component() {
         .ok("[lib64/libcrypt.so] [lib/x86/libcrypt.a] [lib64/libcrypt.so]\n");
 }
 
+// libzstd's tests/Makefile: `LIB_SRCDIR` ends in `/`, so
+// `$(wildcard $(LIB_SRCDIR)/decompress/*_amd64.S)` has a `//`, and the names
+// found must keep it, as glob(3) and GNU make keep it, for
+// `$(subst $(LIB_SRCDIR)/decompress/,zstdmt_d_,...)` to turn them into the
+// object names its `zstdmt_d_%.o : $(LIB_SRCDIR)/decompress/%.S` makes.
+#[test]
+fn wildcard_names_are_spelled_as_the_pattern_spells_them() {
+    let dir = Dir::new("up_wildcard_slashes");
+    dir.write("lib/decompress/huf_amd64.S", "");
+    dir.write(
+        "Makefile",
+        "SRC := lib/\nF := $(wildcard $(SRC)/decompress/*_amd64.S)\n\
+         O := $(subst $(SRC)/decompress/,zstdmt_d_,$(F:.S=.o))\n\
+         all:\n\t@echo [$(F)] [$(O)] [$(wildcard ./lib//*/*.S)] [$(wildcard */)]\n",
+    );
+    dir.make(&[])
+        .ok("[lib//decompress/huf_amd64.S] [zstdmt_d_huf_amd64.o] \
+         [./lib//decompress/huf_amd64.S] [lib/]\n");
+}
+
 // A command-line macro's value starts after the blanks that follow `=`, as a
 // makefile's does: libzstd hands a sub-make `LDFLAGS="$(LDFLAGS)"`.
 #[test]

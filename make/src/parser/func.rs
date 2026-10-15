@@ -361,6 +361,12 @@ fn f_wildcard(patterns: &str) -> String {
 /// `$(wildcard $(ROOT)/$(usrdir)/lib*/libcrypt.*)`, a wildcard in a
 /// directory component. As in the shell, a name starting with `.` is
 /// matched only by a component that starts with `.`.
+///
+/// Each name found is spelled as the pattern spells it, `//` included, as
+/// glob(3) gives it: libzstd writes `$(LIB_SRCDIR)/decompress/*.c` with a
+/// `LIB_SRCDIR` that ends in `/`, then turns the names into object names
+/// with `$(subst $(LIB_SRCDIR)/decompress/,zstdd_,...)`, which matches only
+/// if the `//` is still there.
 fn glob(pattern: &str) -> Vec<String> {
     if !pattern.contains(['*', '?']) {
         return match std::path::Path::new(pattern).exists() {
@@ -368,45 +374,57 @@ fn glob(pattern: &str) -> Vec<String> {
             false => Vec::new(),
         };
     }
-    let (mut found, rest) = match pattern.strip_prefix('/') {
-        Some(rest) => (vec!["/".to_string()], rest),
-        None => (vec![String::new()], pattern),
-    };
-    let components: Vec<&str> = rest.split('/').collect();
+    let components: Vec<&str> = pattern.split('/').collect();
+    let mut found = vec![String::new()];
     for (i, component) in components.iter().enumerate() {
-        let last = i + 1 == components.len();
+        let step = Step {
+            first: i == 0,
+            last: i + 1 == components.len(),
+        };
         found = found
             .iter()
-            .flat_map(|prefix| glob_component(prefix, component, last))
+            .flat_map(|prefix| glob_component(prefix, component, step))
             .collect();
     }
     found.sort_unstable();
     found
 }
 
-/// The names `prefix` joined with each match of one pattern component. A
-/// match that is not the last component must be a directory; the last must
-/// exist.
-fn glob_component(prefix: &str, component: &str, last: bool) -> Vec<String> {
+/// Where a pattern component stands in its pattern.
+#[derive(Clone, Copy)]
+struct Step {
+    /// Nothing precedes it: it is matched in the current directory, and no
+    /// `/` joins it to what comes before.
+    first: bool,
+    /// Nothing follows it: what it names must exist, not just be a
+    /// directory.
+    last: bool,
+}
+
+/// The names `prefix` joined with each match of one pattern component, by
+/// a single `/` unless the component is the first. A match that is not the
+/// last component must be a directory; the last must exist.
+fn glob_component(prefix: &str, component: &str, step: Step) -> Vec<String> {
     let join = |name: &str| -> String {
-        match prefix {
-            "" => name.to_string(),
-            p if p.ends_with('/') => format!("{p}{name}"),
-            p => format!("{p}/{name}"),
+        match step.first {
+            true => name.to_string(),
+            false => format!("{prefix}/{name}"),
         }
     };
-    if component.is_empty() {
-        return vec![prefix.to_string()];
-    }
     if !component.contains(['*', '?']) {
         let path = join(component);
-        let keep = match last {
+        let keep = match step.last {
             true => std::path::Path::new(&path).exists(),
             false => true,
         };
         return if keep { vec![path] } else { Vec::new() };
     }
-    let dir = if prefix.is_empty() { "." } else { prefix };
+    let dir = match (step.first, prefix) {
+        (true, _) => ".",
+        // The pattern began with `/`: the root directory.
+        (false, "") => "/",
+        (false, p) => p,
+    };
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -416,7 +434,7 @@ fn glob_component(prefix: &str, component: &str, last: bool) -> Vec<String> {
         .filter(|name| !name.starts_with('.') || component.starts_with('.'))
         .filter(|name| glob_matches(component, name))
         .map(|name| join(&name))
-        .filter(|path| last || std::path::Path::new(path).is_dir())
+        .filter(|path| step.last || std::path::Path::new(path).is_dir())
         .collect()
 }
 

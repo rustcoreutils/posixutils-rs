@@ -18,7 +18,7 @@
 //! they set the corresponding global option, which is what POSIX says they
 //! mean -- "make shall behave as if the -i option had been specified".
 
-use std::collections::HashMap;
+use crate::fast_hash::Map as HashMap;
 
 /// The attributes of one target.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

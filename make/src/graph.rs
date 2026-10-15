@@ -25,7 +25,7 @@
 //! close back on itself.
 
 use crate::error_code::ErrorCode;
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{Map as HashMap, Set as HashSet};
 use std::sync::{Condvar, Mutex};
 
 /// What became of a target.
@@ -131,7 +131,7 @@ pub trait Edges {
 /// and stack sets with the root and never inserted during the walk, so only a
 /// cycle passing back through the root was caught.
 pub fn find_cycle(graph: &impl Edges, root: &str) -> Option<String> {
-    find_cycle_beyond(graph, root, &mut HashSet::new())
+    find_cycle_beyond(graph, root, &mut HashSet::default())
 }
 
 /// [`find_cycle`], taking every target in `acyclic` as already known to
@@ -151,10 +151,12 @@ pub fn find_cycle_beyond(
     }
     // (target, next prerequisite index)
     let mut stack: Vec<(String, usize)> = vec![(root.to_string(), 0)];
-    let mut on_stack: HashSet<String> = HashSet::from([root.to_string()]);
+    let mut on_stack: HashSet<String> = [root.to_string()].into_iter().collect();
     let done = acyclic;
     let mut children: HashMap<String, Vec<String>> =
-        HashMap::from([(root.to_string(), graph.prerequisites_of(root))]);
+        [(root.to_string(), graph.prerequisites_of(root))]
+            .into_iter()
+            .collect();
 
     while let Some((target, index)) = stack.pop() {
         // Only the one child is copied: cloning the whole list at every
@@ -210,7 +212,7 @@ mod tests {
             ("c", vec!["b", "d"]),
             ("d", vec!["c"]),
         ]);
-        let mut acyclic = HashSet::new();
+        let mut acyclic = HashSet::default();
         assert_eq!(find_cycle_beyond(&g, "a", &mut acyclic), None);
         assert!(acyclic.contains("a") && acyclic.contains("b"));
         assert!(find_cycle_beyond(&g, "c", &mut acyclic).is_some());

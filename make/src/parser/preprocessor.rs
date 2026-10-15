@@ -9,9 +9,9 @@
 
 use super::directive::{parse_directive, split_condition_args, Directive};
 use super::func;
+use crate::fast_hash::Map as HashMap;
 use crate::Macro;
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::fs;
 use std::iter::Peekable;

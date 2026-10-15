@@ -10,6 +10,7 @@
 pub mod attributes;
 pub mod config;
 pub mod error_code;
+pub mod fast_hash;
 pub mod graph;
 pub mod parser;
 pub mod rule;
@@ -23,9 +24,9 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use fast_hash::Map as HashMap;
 use parser::preprocessor::{self, MacroSource, MacroTable};
 use parser::{Makefile, TargetVar, VPathEntry};
-use std::collections::HashMap;
 
 /// An owned macro definition `(name, value)`. Owning the data (rather than
 /// holding a rowan AST node) keeps `Make` `Send`/`Sync` for parallel builds.
@@ -102,17 +103,17 @@ pub struct Make {
     pattern_vars: Vec<(String, TargetVar)>,
     /// Every name a target rule has as a target or a prerequisite: what
     /// GNU make says "ought to exist" when it picks a pattern rule.
-    mentioned: std::collections::HashSet<String>,
+    mentioned: fast_hash::Set<String>,
     /// The modification times of targets without commands, as they were
     /// before their prerequisites were made; see `prerequisite_mtime`.
     frozen_mtimes: std::sync::Mutex<HashMap<String, Option<SystemTime>>>,
     /// Targets whose commands ran in this run: known by the name they are
     /// written under from then on, never by one `VPATH` found.
-    remade: std::sync::Mutex<std::collections::HashSet<String>>,
+    remade: std::sync::Mutex<fast_hash::Set<String>>,
     /// `stat` results since the last command ran.
     stats: stat_cache::StatCache,
     /// Targets already known to reach no dependency cycle.
-    acyclic: std::sync::Mutex<std::collections::HashSet<String>>,
+    acyclic: std::sync::Mutex<fast_hash::Set<String>>,
     /// Target rules (non-special, non-inference).
     /// Invariant: inference rules are never stored here, so `first_target()`
     /// always returns a valid default target per POSIX.
@@ -1497,7 +1498,7 @@ impl TryFrom<(Makefile, Config)> for Make {
         let pool = TokenPool::new(config.jobs.saturating_sub(1));
         let mut make = Self {
             rules: vec![],
-            rule_index: HashMap::new(),
+            rule_index: HashMap::default(),
             pattern_rules: Vec::new(),
             inference_rules: vec![],
             macros,
@@ -1610,7 +1611,7 @@ impl TryFrom<(Makefile, Config)> for Make {
 type TargetVarIndex = (HashMap<String, Vec<TargetVar>>, Vec<(String, TargetVar)>);
 
 fn index_target_vars(vars: &[TargetVar]) -> TargetVarIndex {
-    let mut by_target: HashMap<String, Vec<TargetVar>> = HashMap::new();
+    let mut by_target: HashMap<String, Vec<TargetVar>> = HashMap::default();
     let mut by_pattern = Vec::new();
     for var in vars {
         for target in &var.targets {

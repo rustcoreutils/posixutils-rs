@@ -25,7 +25,7 @@
 //! the answer, so a result read from before a command ran can never outlive
 //! it in the cache.
 
-use std::collections::HashMap;
+use crate::fast_hash::Map as HashMap;
 use std::fs;
 use std::sync::Mutex;
 use std::time::SystemTime;

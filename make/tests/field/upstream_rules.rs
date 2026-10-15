@@ -27,6 +27,18 @@ fn compile_c_and_output_option() {
         .ok("cc -O2 -DX -c -o all x.c\ncc -DX -c\nrm -f\n");
 }
 
+// libzstd's tests/Makefile links every test program with `$(LINK.c) $^ -o
+// $@`; without the macro the shell was asked to run `datagen.c`.
+#[test]
+fn link_c() {
+    let dir = Dir::new("up_link_c");
+    dir.write(
+        "Makefile",
+        "CC = cc\nCFLAGS = -O2\nCPPFLAGS = -DX\nLDFLAGS = -s\nall:\n\t@echo $(LINK.c) a.c -o a\n",
+    );
+    dir.make(&[]).ok("cc -O2 -DX -s a.c -o a\n");
+}
+
 // The first pattern rule whose prerequisites exist, here through `vpath`.
 #[test]
 fn a_pattern_rule_is_chosen_by_which_prerequisite_exists() {

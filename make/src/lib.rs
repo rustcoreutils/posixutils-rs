@@ -1331,10 +1331,10 @@ const SCCS_GET_RULE: &str = ".SCCS_GET:\n\tsccs $(SCCSFLAGS) get $(SCCSGETFLAGS)
 /// The macros those rules refer to. A makefile definition overrides them, so
 /// they are seeded first and only kept where the makefile is silent.
 ///
-/// The last four are GNU make's, which libzstd's Makefiles compile and
-/// clean with (`$(COMPILE.c) $(DEPFLAGS) $(OUTPUT_OPTION) $<`, `$(RM)`);
-/// POSIX 106035 allows additional macros.
-const BUILTIN_MACROS: [(&str, &str); 16] = [
+/// The last five are GNU make's, which libzstd's Makefiles compile, link
+/// and clean with (`$(COMPILE.c) $(DEPFLAGS) $(OUTPUT_OPTION) $<`,
+/// `$(LINK.c) $^ -o $@`, `$(RM)`); POSIX 106035 allows additional macros.
+const BUILTIN_MACROS: [(&str, &str); 17] = [
     ("CC", "c17"),
     ("CFLAGS", "-O 1"),
     ("AR", "ar"),
@@ -1351,6 +1351,10 @@ const BUILTIN_MACROS: [(&str, &str); 16] = [
     (
         "COMPILE.S",
         "$(CC) $(ASFLAGS) $(CPPFLAGS) $(TARGET_MACH) -c",
+    ),
+    (
+        "LINK.c",
+        "$(CC) $(CFLAGS) $(CPPFLAGS) $(LDFLAGS) $(TARGET_ARCH)",
     ),
     ("OUTPUT_OPTION", "-o $@"),
     ("RM", "rm -f"),

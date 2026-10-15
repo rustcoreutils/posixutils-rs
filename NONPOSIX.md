@@ -788,8 +788,9 @@ value) m4 does as POSIX says instead:
  * Additional built-in rules and macros, which POSIX allows (106035):
    `.o:` links a program from its objects (`$(CC) $(LDFLAGS) $^ $(LDLIBS)
    -o $@`), and `.c.o` passes `$(CPPFLAGS)`; sysvinit's Makefile builds
-   every program that way.  `COMPILE.c`, `COMPILE.S`, `OUTPUT_OPTION` and
-   `RM` have GNU make's values; libzstd compiles and cleans with them.
+   every program that way.  `COMPILE.c`, `COMPILE.S`, `LINK.c`,
+   `OUTPUT_OPTION` and `RM` have GNU make's values; libzstd compiles,
+   links its test programs and cleans with them.
  * The `realpath` function and the `MAKEFILE_LIST` macro, as in GNU make;
    libzstd.mk finds its own directory with
    `$(dir $(realpath $(lastword $(MAKEFILE_LIST))))`.

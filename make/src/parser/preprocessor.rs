@@ -478,10 +478,11 @@ pub(crate) fn escape_dollars(text: &str) -> Cow<'_, str> {
 /// The output is in "escaped form": a literal `$` is written `$$`, so text
 /// can be expanded in stages and each consumer turns `$$` into `$` once, at
 /// the end ([`unescape_dollars`], and the rule stage for a command line).
-/// What only the rule stage can know is left as written: the automatic
-/// macros, a reference or call that reads one, and `$(MAKE)` when nothing
-/// defines it. An immediate-expansion macro stores its value in this form,
-/// so it can be used as it is.
+/// `$(MAKE)` is left as written when nothing defines it, for the rule stage
+/// to recognise. While the makefile is read, so is what only a target can
+/// give a value: the automatic macros, and a reference or call that reads
+/// one. An immediate-expansion macro stores its value in this form, so it
+/// expands to itself but for what was left.
 fn expand_into(text: &str, ctx: &func::Ctx, out: &mut String) -> Result<()> {
     // The text up to each `$` is copied a run at a time.
     let mut rest = text;
@@ -497,39 +498,92 @@ fn expand_into(text: &str, ctx: &func::Ctx, out: &mut String) -> Result<()> {
             return Ok(());
         };
         rest = after.as_str();
+        expand_dollar(letter, &mut rest, ctx, out)?;
+    }
+    out.push_str(rest);
+    Ok(())
+}
 
-        match letter {
-            '$' => out.push_str("$$"),
-            // Internal macros are left for the rule stage, which has the
-            // target and its prerequisites.
-            c if AUTOMATIC.contains(&c) => {
+/// Expand what one `$` followed by `letter` begins onto `out`, moving
+/// `rest` past the text of a bracketed reference.
+///
+/// Apart from [`expand_into`] so that its loop, which every level of
+/// nesting passes through, keeps a small stack frame.
+fn expand_dollar(letter: char, rest: &mut &str, ctx: &func::Ctx, out: &mut String) -> Result<()> {
+    match letter {
+        '$' => out.push_str("$$"),
+        c if AUTOMATIC.contains(&c) => match ctx.automatic {
+            Some(automatic) => out.push_str(&escape_dollars(&automatic(c, None))),
+            // Left for the rule stage, which has the target and its
+            // prerequisites.
+            None => {
                 out.push('$');
                 out.push(c);
             }
-            open @ ('(' | '{') => {
-                let close = if open == '(' { ')' } else { '}' };
-                // An internal-macro reference such as `$(@)`, `$(@D)`,
-                // `$(@:.html=$(EXT))` is left verbatim, to its matching close.
-                if rest.starts_with(AUTOMATIC) {
-                    out.push('$');
-                    out.push(open);
-                    out.push_str(read_balanced(&mut rest, open, close)?);
-                    out.push(close);
-                    continue;
+        },
+        open @ ('(' | '{') => {
+            let close = if open == '(' { ')' } else { '}' };
+            // An internal-macro reference such as `$(@)`, `$(@D)`,
+            // `$(@:.html=$(EXT))`, read to its matching close.
+            if rest.starts_with(AUTOMATIC) {
+                let inner = read_balanced(rest, open, close)?;
+                match ctx.automatic {
+                    Some(automatic) => expand_automatic(inner, automatic, ctx, out)?,
+                    None => {
+                        out.push('$');
+                        out.push(open);
+                        out.push_str(inner);
+                        out.push(close);
+                    }
                 }
-                let raw = join_escaped_newlines(read_balanced(&mut rest, open, close)?);
-                expand_reference(&raw, open, close, ctx, out)?;
+                return Ok(());
             }
-            // A single character names a macro, as GNU does -- so a stray
-            // `$` in a recipe expands to nothing rather than rejecting the
-            // whole makefile (audit #72).
-            c => {
-                let mut name = [0; 4];
-                expand_macro(c.encode_utf8(&mut name), '(', ')', ctx, out)?;
-            }
+            let raw = join_escaped_newlines(read_balanced(rest, open, close)?);
+            expand_reference(&raw, open, close, ctx, out)?;
+        }
+        // A single character names a macro, as GNU does -- so a stray `$` in
+        // a recipe expands to nothing rather than rejecting the whole
+        // makefile (audit #72).
+        c => {
+            let mut name = [0; 4];
+            expand_macro(c.encode_utf8(&mut name), '(', ')', ctx, out)?;
         }
     }
-    out.push_str(rest);
+    Ok(())
+}
+
+/// Expand a bracketed automatic macro, the text between the delimiters of
+/// `$(@)`, `$(@D)` or `$(<F)`, for the target being made.
+///
+/// A name the automatic macros give is a file name, data like a
+/// `$(wildcard)` result: each `$` in it is a `$`.
+fn expand_automatic(
+    inner: &str,
+    automatic: func::Automatic,
+    ctx: &func::Ctx,
+    out: &mut String,
+) -> Result<()> {
+    let inner = join_escaped_newlines(inner);
+    let mut chars = inner.chars();
+    let Some(sigil) = chars.next() else {
+        return Ok(());
+    };
+    let rest = chars.as_str();
+    let modifier = rest.chars().next().filter(|m| matches!(m, 'D' | 'F'));
+    let rest = &rest[modifier.map_or(0, char::len_utf8)..];
+    let value = automatic(sigil, modifier);
+    let value = escape_dollars(&value);
+    match rest.strip_prefix(':') {
+        // `$(@:.html=.htp)`: an internal macro is a macro, and takes a
+        // substitution like any other (POSIX 105804). automake's
+        // `.texi.html` rule writes its output to `$(@:.html=.htp)` and then
+        // moves it.
+        Some(spec) => {
+            let spec = expand_to_string(spec, ctx)?;
+            out.push_str(&apply_substitution(&value, &spec));
+        }
+        None => out.push_str(&value),
+    }
     Ok(())
 }
 
@@ -566,7 +620,7 @@ fn expand_reference(
         // target, as a function call reading one is. dpkg's tests of its
         // own .mk files check every variable with `test '$($@)' =
         // '$(TEST_$@)'`.
-        true if mentions_automatic(raw) => {
+        true if ctx.automatic.is_none() && mentions_automatic(raw) => {
             out.push('$');
             out.push(open);
             out.push_str(raw);
@@ -609,6 +663,11 @@ fn expand_macro(
     out: &mut String,
 ) -> Result<()> {
     match ctx.lookup(name) {
+        // What expanding the value left for the rule stage is expanded
+        // there; the rest of it expands to itself.
+        Some((value, Flavour::Simple)) if ctx.automatic.is_some() && value.contains('$') => {
+            expand_into(&value, ctx, out)?;
+        }
         Some((value, Flavour::Simple)) => out.push_str(&value),
         Some((value, Flavour::Recursive)) => {
             let _nesting = ctx
@@ -643,7 +702,7 @@ fn expand_call(
 ) -> Result<()> {
     // Defer the call if it reads an automatic variable; only the rule
     // stage can supply one (audit #62).
-    if mentions_automatic(args) {
+    if ctx.automatic.is_none() && mentions_automatic(args) {
         out.push('$');
         out.push(open);
         out.push_str(name);
@@ -670,6 +729,7 @@ fn expand_text(text: &str, table: &MacroTable, state: &func::Expansion) -> Resul
         env_wins: ENV_MACROS.load(Acquire),
         state,
         locals: None,
+        automatic: None,
     };
     expand_to_string(text, &ctx)
 }
@@ -1906,17 +1966,40 @@ impl Reader {
     }
 }
 
-/// Expand one command line's macros against `table`: what the rule stage
-/// does to a command line just before it runs, with the macros in force for
-/// the target being made (target-specific ones included).
+/// Expand `text` against `table`, the macros in force for a target, with
+/// no automatic macros: what a macro exported to the target's commands
+/// holds.
 ///
-/// The automatic macros, `$$`, and any function call that reads an
-/// automatic macro are left for the rule stage, which knows the target.
-/// `$(eval ...)` is refused: a command line is expanded after the makefile
-/// has been read, so text it queued would have no reader.
+/// The automatic macros and any reference or call that reads one are left
+/// as written, and `$$` stands for `$`. `$(eval ...)` is refused: this is
+/// done after the makefile has been read, so text it queued would have no
+/// reader.
 pub fn expand_command(text: &str, table: &MacroTable) -> std::result::Result<String, String> {
     let state = func::Expansion::without_eval();
     expand_text(text, table, &state).map_err(|e| e.to_string())
+}
+
+/// Expand one command line for the target being made, against `table`, the
+/// macros in force for it: what the rule stage does to a command line just
+/// before it runs. `automatic` gives the automatic macros.
+///
+/// The result is in the escaped form [`expand_into`] describes: the rule
+/// stage turns `$$` into `$`, and an undefined `$(MAKE)` into the make
+/// program. `$(eval ...)` is refused, as in [`expand_command`].
+pub(crate) fn expand_command_for(
+    text: &str,
+    table: &MacroTable,
+    automatic: func::Automatic,
+) -> std::result::Result<String, String> {
+    let state = func::Expansion::without_eval();
+    let ctx = func::Ctx {
+        table,
+        env_wins: ENV_MACROS.load(Acquire),
+        state: &state,
+        locals: None,
+        automatic: Some(automatic),
+    };
+    expand_to_string(text, &ctx).map_err(|e| e.to_string())
 }
 
 /// Expand every command line of preprocessed text against `table`, as the

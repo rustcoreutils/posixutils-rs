@@ -34,8 +34,8 @@ const MAX_EXPANSION_DEPTH: usize = 200;
 /// value of another, before we call the expansion non-terminating. POSIX
 /// 105785 asks for at least 100 levels. Each level is a few stack frames,
 /// and a thread Rust starts, a test's among them, has 2 MiB of stack: in a
-/// debug build about 1000 levels fill it.
-const MAX_MACRO_NESTING: usize = 500;
+/// debug build about 550 levels fill it.
+const MAX_MACRO_NESTING: usize = 400;
 
 /// Per-expansion state shared by every nested `Ctx`.
 ///
@@ -151,7 +151,14 @@ pub(crate) struct Ctx<'a> {
     pub state: &'a Expansion,
     /// What the `foreach` loops and `call`s being expanded bind.
     pub locals: Option<&'a Locals<'a>>,
+    /// The automatic macros of the target whose command line this is, or
+    /// `None` while the makefile is read, when there is no target yet.
+    pub automatic: Option<Automatic<'a>>,
 }
+
+/// The value of an automatic macro, `@ % ? < * ^ +`, with the `D` or `F`
+/// modifier of `$(@D)` and `$(@F)` if there is one.
+pub(crate) type Automatic<'a> = &'a dyn Fn(char, Option<char>) -> String;
 
 impl<'a> Ctx<'a> {
     /// What `name` holds here, and its flavour: a `foreach` or `call`
@@ -171,6 +178,7 @@ impl<'a> Ctx<'a> {
             env_wins: self.env_wins,
             state: self.state,
             locals: Some(locals),
+            automatic: self.automatic,
         }
     }
 }
@@ -767,6 +775,15 @@ pub(crate) fn call(name: &str, raw: &str, ctx: &Ctx, expand: Expand) -> Result<S
         .iter()
         .map(|a| expand(a, ctx))
         .collect::<Result<_, _>>()?;
+    call_eager(name, &args)
+}
+
+/// Apply a function that takes its arguments expanded to them.
+///
+/// Apart from [`call`] so that the frame of this match, large in a debug
+/// build, is not on the stack while arguments and lazy functions expand:
+/// a level of nesting passes through `call`.
+fn call_eager(name: &str, args: &[String]) -> Result<String, String> {
     let arg = |i: usize| -> &str { args.get(i).map(String::as_str).unwrap_or("") };
     // Expanded text writes a literal `$` as `$$`. Text leaving make -- a
     // command for the shell, a pattern or a name for the file system, a
@@ -845,6 +862,7 @@ mod tests {
             env_wins: false,
             state: &state,
             locals: None,
+            automatic: None,
         };
         call(name, raw, &ctx, &plain).expect("function should succeed")
     }
@@ -934,6 +952,7 @@ mod tests {
             env_wins: false,
             state: &state,
             locals: None,
+            automatic: None,
         };
         assert!(call("error", "boom", &ctx, &plain).is_err());
     }

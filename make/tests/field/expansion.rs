@@ -69,7 +69,6 @@ fn found_file_names_are_not_expanded() {
 /// The automatic macros name files, and a file name is not makefile text,
 /// inside a function call or a substitution as much as alone.
 #[test]
-#[ignore = "fails until expansion is single-pass"]
 fn automatic_macro_values_are_not_expanded() {
     let dir = Dir::new("expand_automatic_data");
     dir.write("x$(B).c", "").write(
@@ -82,7 +81,6 @@ fn automatic_macro_values_are_not_expanded() {
 /// A function reading an automatic macro through another macro sees the
 /// macro's value.
 #[test]
-#[ignore = "fails until expansion is single-pass"]
 fn a_function_sees_an_automatic_macro_through_a_macro() {
     let dir = Dir::new("expand_automatic_indirect");
     dir.write(

@@ -444,7 +444,7 @@ impl Rule {
                 flags: attributes.of(target.as_ref()),
             };
             for recipe in self.recipes() {
-                for command in self.expand_macros(env, recipe)? {
+                for command in self.expand_macros(env, &step, recipe)? {
                     self.run_command(env, &step, recipe, &command)?;
                 }
             }
@@ -480,12 +480,26 @@ impl Rule {
 
     /// Expand the macros of one command line against the target's macros,
     /// just before it runs, giving the command lines it becomes.
-    fn expand_macros(&self, env: &Env<'_>, recipe: &Recipe) -> Result<Vec<Recipe>, ErrorCode> {
-        let text = preprocessor::expand_command(recipe.inner(), env.table).map_err(|message| {
-            ParserError {
+    ///
+    /// One pass, the automatic macros `$@ $< $* $^ $+ $? $%` included, so a
+    /// function reading one sees its value -- however the reference reaches
+    /// it -- and what they give is a file name, never scanned again.
+    ///
+    /// Fails rather than pass the line on: `$(error bad $@)` reports its
+    /// error here, where it used to reach the shell as a command (audit #90).
+    fn expand_macros(
+        &self,
+        env: &Env<'_>,
+        step: &Step<'_>,
+        recipe: &Recipe,
+    ) -> Result<Vec<Recipe>, ErrorCode> {
+        let automatic = |sigil: char, modifier: Option<char>| {
+            self.expand_internal_macro(env, sigil, modifier, step.target, step.files, step.newer)
+        };
+        let text = preprocessor::expand_command_for(recipe.inner(), env.table, &automatic)
+            .map_err(|message| ParserError {
                 constraint: crate::parser::ParseError(vec![message]),
-            }
-        })?;
+            })?;
         Ok(recipe.expanded(&text))
     }
 
@@ -512,12 +526,7 @@ impl Rule {
         let is_recursive = mentions_make(written.inner()) || mentions_make(command.inner());
         let always_run = command.config.force_run || is_recursive;
 
-        // Expand `$@`, `$<`, `$*`, `$^`, `$+` and `$?` before the recipe is
-        // either shown or run, so the line printed under -n (or when not
-        // silent) is the line that executes.
-        let expanded =
-            self.substitute_internal_macros(env, target, command, step.files, step.newer)?;
-        let expanded = preprocessor::restore_escaped_newlines(expanded.inner());
+        let expanded = preprocessor::restore_escaped_newlines(&finish_command(command.inner()));
 
         // A command line that expanded to nothing is neither shown nor run,
         // as in GNU make: automake's `$(AM_V_at)` alone on a line.
@@ -620,13 +629,15 @@ impl Rule {
         newer: &[String],
     ) -> String {
         // `$@` is the target name; for an `archive(member)` target `$%` is the
-        // member and `$@` is the archive name.
+        // member and `$@` is the archive name. A name has that form,
+        // `lib(member.o)` (POSIX 105946-105947), only when it ends with the
+        // `)`, as GNU make reads it: `x$(B).o` is a file name.
         let target_name = target.as_ref();
-        let archive_name = target_name.split('(').next().unwrap_or(target_name);
-        let member = target_name
-            .split_once('(')
-            .map(|(_, m)| m.strip_suffix(')').unwrap_or(m))
-            .unwrap_or("");
+        let (archive_name, member) = target_name
+            .strip_suffix(')')
+            .and_then(|name| name.split_once('('))
+            .filter(|(archive, member)| !archive.is_empty() && !member.is_empty())
+            .unwrap_or((target_name, ""));
 
         // Every prerequisite name is resolved through `VPATH`, exactly as `$<`
         // is. A recipe reads the file make found, so `$^` and `$?` have to
@@ -667,126 +678,6 @@ impl Rule {
             _ => base,
         };
         parts.join(" ")
-    }
-
-    /// Expand `$@`, `$<`, `$*`, `$^`, `$+` and `$?` in a recipe line, and
-    /// evaluate the deferred function calls that read them.
-    ///
-    /// Fails rather than pass the line on: a call reaching this stage can still
-    /// report an error — `$(error bad $@)` mentions an automatic variable, so
-    /// it is deferred to here — and re-emitting the unevaluated call handed
-    /// `error` to the shell as a command instead (audit #90).
-    fn substitute_internal_macros(
-        &self,
-        env: &Env<'_>,
-        target: &Target,
-        recipe: &Recipe,
-        files: &(PathBuf, PathBuf),
-        newer: &[String],
-    ) -> Result<Recipe, ErrorCode> {
-        const SIGILS: [char; 7] = ['@', '%', '?', '<', '*', '^', '+'];
-
-        let recipe = recipe.inner();
-        let mut stream = recipe.chars().peekable();
-        let mut result = String::new();
-
-        while let Some(ch) = stream.next() {
-            if ch != '$' {
-                result.push(ch);
-                continue;
-            }
-
-            match stream.peek().copied() {
-                Some('$') => {
-                    stream.next();
-                    result.push('$');
-                }
-                // Two-character form, e.g. `$@`, `$^`, `$?`.
-                Some(c) if SIGILS.contains(&c) => {
-                    stream.next();
-                    result
-                        .push_str(&self.expand_internal_macro(env, c, None, target, files, newer));
-                }
-                // Bracketed form, e.g. `$(@)`, `$(@D)`, `$(?F)`.
-                Some(open @ ('(' | '{')) => {
-                    let close = if open == '(' { ')' } else { '}' };
-                    stream.next();
-                    // Read to the *matching* close, not the first one. A
-                    // deferred call nests -- `$(addprefix o/,$(notdir $^))` --
-                    // and stopping at the inner `)` both evaluated a truncated
-                    // call and left the real `)` in the command (audit #79).
-                    let mut inner = String::new();
-                    let mut depth = 0usize;
-                    for c in stream.by_ref() {
-                        if c == open {
-                            depth += 1;
-                        } else if c == close {
-                            if depth == 0 {
-                                break;
-                            }
-                            depth -= 1;
-                        }
-                        inner.push(c);
-                    }
-                    let inner = preprocessor::join_escaped_newlines(&inner);
-                    let mut chars = inner.chars();
-                    match chars.next() {
-                        Some(sigil) if SIGILS.contains(&sigil) => {
-                            let rest = chars.as_str();
-                            let modifier = rest.chars().next().filter(|m| matches!(m, 'D' | 'F'));
-                            let rest = &rest[modifier.map_or(0, char::len_utf8)..];
-                            let value = self
-                                .expand_internal_macro(env, sigil, modifier, target, files, newer);
-                            // `$(@:.html=.htp)`: an internal macro is a macro,
-                            // and takes a substitution like any other (POSIX
-                            // 105804). automake's `.texi.html` rule writes
-                            // its output to `$(@:.html=.htp)` and then moves it.
-                            match rest.strip_prefix(':') {
-                                Some(spec) => {
-                                    let spec = preprocessor::expand_command(spec, env.table)
-                                        .map_err(|message| ParserError {
-                                            constraint: crate::parser::ParseError(vec![message]),
-                                        })?;
-                                    result
-                                        .push_str(&preprocessor::apply_substitution(&value, &spec));
-                                }
-                                None => result.push_str(&value),
-                            }
-                        }
-                        // The special `MAKE` macro expands to the make program.
-                        _ if inner == "MAKE" => result.push_str(&make_program()),
-                        // Not an internal macro -- a deferred function call
-                        // such as `$(notdir $^)`. Re-emit it, but substitute
-                        // inside first: the automatic variables it reads are
-                        // exactly what this pass exists to supply, and leaving
-                        // them raw is what made `$(notdir $^)` operate on the
-                        // two characters `$^` (audit #62).
-                        _ => {
-                            let inner = self.substitute_internal_macros(
-                                env,
-                                target,
-                                &Recipe::new(inner),
-                                files,
-                                newer,
-                            )?;
-                            let call = format!("${open}{}{close}", inner.inner());
-                            // Evaluate just this call, not the whole line: a
-                            // line-wide pass would also eat a shell `$VAR`.
-                            let text = preprocessor::expand_command(&call, env.table).map_err(
-                                |message| ParserError {
-                                    constraint: crate::parser::ParseError(vec![message]),
-                                },
-                            )?;
-                            result.push_str(&text);
-                        }
-                    }
-                }
-                // A stray `$` (or `$` at end of line): emit it literally.
-                _ => result.push('$'),
-            }
-        }
-
-        Ok(Recipe::new(result))
     }
 }
 
@@ -924,6 +815,33 @@ pub(crate) fn pattern_expand(text: &str, stem: &str) -> String {
         Some((prefix, suffix)) => format!("{prefix}{stem}{suffix}"),
         None => text.to_string(),
     }
+}
+
+/// Turn a command line expanded for its target into the text the shell
+/// runs: `$$` is a `$`, and `$(MAKE)` or `${MAKE}`, which expansion leaves
+/// as written when nothing defines `MAKE`, is the make program. Any other
+/// `$` -- one at the end of the line -- is itself.
+fn finish_command(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('$') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at + 1..];
+        if let Some(after) = rest.strip_prefix('$') {
+            out.push('$');
+            rest = after;
+        } else if let Some(after) = rest
+            .strip_prefix("(MAKE)")
+            .or_else(|| rest.strip_prefix("{MAKE}"))
+        {
+            out.push_str(&make_program());
+            rest = after;
+        } else {
+            out.push('$');
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The make program to substitute for the `$(MAKE)` macro: this executable's

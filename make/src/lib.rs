@@ -20,6 +20,7 @@ mod stat_cache;
 
 use std::borrow::Cow;
 use std::os::unix::fs::PermissionsExt;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::{
     fs::{self},
     time::{Duration, SystemTime},
@@ -136,6 +137,18 @@ impl TokenPool {
     fn release(&self) {
         *self.available.lock().unwrap() += 1;
     }
+}
+
+/// One run of independent prerequisites being made under `-j`: a queue
+/// that the thread owning it and the workers it starts all take from.
+struct Segment<'a> {
+    names: &'a [&'a str],
+    /// The position of the next prerequisite nobody has taken.
+    next: AtomicUsize,
+    /// Set once a failure means no more are to be started.
+    stop: AtomicBool,
+    updated: AtomicBool,
+    errors: std::sync::Mutex<Vec<ErrorCode>>,
 }
 
 /// Represents the make utility with its data and configuration.
@@ -1179,58 +1192,97 @@ impl Make {
             };
         }
 
-        let updated = std::sync::atomic::AtomicBool::new(false);
-        let errors: std::sync::Mutex<Vec<ErrorCode>> = std::sync::Mutex::new(Vec::new());
-        std::thread::scope(|threads| {
-            let mut handles = Vec::new();
-            let mut inline: Vec<&str> = Vec::new();
-            // Spawn a worker for each prerequisite that can obtain a token; the
-            // rest are built inline in this thread. Spawning first (before any
-            // inline build) is what lets the work actually overlap.
-            for &name in names {
-                if !self.pool.try_acquire() {
-                    inline.push(name);
-                    continue;
-                }
-                let errors = &errors;
-                let updated = &updated;
-                let spawned = std::thread::Builder::new()
-                    .stack_size(BUILD_STACK_SIZE)
-                    .spawn_scoped(threads, move || {
-                        WalkLevel::on_build_stack();
-                        let result = self.build_target_in(name, scope);
-                        self.pool.release();
-                        match result {
-                            Ok(true) => updated.store(true, std::sync::atomic::Ordering::Relaxed),
-                            Ok(false) => {}
-                            Err(err) => errors.lock().unwrap().push(err),
-                        }
-                    });
-                match spawned {
-                    Ok(handle) => handles.push(handle),
-                    // No thread to be had: the target is built here instead.
-                    Err(_) => {
-                        self.pool.release();
-                        inline.push(name);
-                    }
-                }
-            }
-            for name in inline {
-                match self.build_target_in(name, scope) {
-                    Ok(true) => updated.store(true, std::sync::atomic::Ordering::Relaxed),
-                    Ok(false) => {}
-                    Err(err) => errors.lock().unwrap().push(err),
-                }
-            }
-            for handle in handles {
-                let _ = handle.join();
-            }
-        });
+        let segment = Segment {
+            names,
+            next: AtomicUsize::new(0),
+            stop: AtomicBool::new(false),
+            updated: AtomicBool::new(false),
+            errors: std::sync::Mutex::new(Vec::new()),
+        };
+        std::thread::scope(|threads| self.work_on(&segment, scope, threads));
 
         // Report the first error (if any).
-        match errors.into_inner().unwrap().into_iter().next() {
+        match segment.errors.into_inner().unwrap().into_iter().next() {
             Some(err) => Err(err),
-            None => Ok(updated.into_inner()),
+            None => Ok(segment.updated.into_inner()),
+        }
+    }
+
+    /// Make prerequisites of `segment` until none is left, first starting a
+    /// worker for each further one a token can be had for.
+    ///
+    /// Every thread working on the segment does this, the one that owns it
+    /// as well as its workers, so a token given back anywhere is put to use
+    /// as soon as any of them finishes a prerequisite. Workers used to be
+    /// started once, for the first prerequisites, and the owning thread made
+    /// all the rest one after another: automake's `check-TESTS`, one target
+    /// with hundreds of `.log` prerequisites, ran its tests one at a time
+    /// after the first few, whatever `-j` said.
+    fn work_on<'scope, 'env>(
+        &'env self,
+        segment: &'env Segment<'env>,
+        scope: &'env [TargetVar],
+        threads: &'scope std::thread::Scope<'scope, 'env>,
+    ) {
+        loop {
+            self.start_workers(segment, scope, threads);
+            if segment.stop.load(Relaxed) {
+                return;
+            }
+            let Some(&name) = segment.names.get(segment.next.fetch_add(1, Relaxed)) else {
+                return;
+            };
+            self.make_one(segment, name, scope);
+        }
+    }
+
+    /// Start a worker for each prerequisite of `segment` after the next one
+    /// that a token can be had for. A worker makes its prerequisite, works on
+    /// the segment as its starter does, and gives its token back.
+    fn start_workers<'scope, 'env>(
+        &'env self,
+        segment: &'env Segment<'env>,
+        scope: &'env [TargetVar],
+        threads: &'scope std::thread::Scope<'scope, 'env>,
+    ) {
+        // The next prerequisite is the calling thread's own.
+        while segment.names.len() > segment.next.load(Relaxed) + 1
+            && !segment.stop.load(Relaxed)
+            && self.pool.try_acquire()
+        {
+            let Some(&name) = segment.names.get(segment.next.fetch_add(1, Relaxed)) else {
+                self.pool.release();
+                return;
+            };
+            let spawned = std::thread::Builder::new()
+                .stack_size(BUILD_STACK_SIZE)
+                .spawn_scoped(threads, move || {
+                    WalkLevel::on_build_stack();
+                    self.make_one(segment, name, scope);
+                    self.work_on(segment, scope, threads);
+                    self.pool.release();
+                });
+            if spawned.is_err() {
+                // No thread to be had: the target is made here instead.
+                self.pool.release();
+                self.make_one(segment, name, scope);
+            }
+        }
+    }
+
+    /// Make one prerequisite of `segment` and record the outcome. Without
+    /// `-k` a failure stops the segment starting any more, as when it is made
+    /// serially.
+    fn make_one(&self, segment: &Segment<'_>, name: &str, scope: &[TargetVar]) {
+        match self.build_target_in(name, scope) {
+            Ok(true) => segment.updated.store(true, Relaxed),
+            Ok(false) => {}
+            Err(err) => {
+                if !self.config.keep_going || self.config.terminate {
+                    segment.stop.store(true, Relaxed);
+                }
+                segment.errors.lock().unwrap().push(err);
+            }
         }
     }
 

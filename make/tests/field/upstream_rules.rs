@@ -95,7 +95,28 @@ fn a_program_is_linked_from_its_objects() {
     dir.make(&["-n"]).ok("cc -O2 -DWITH_SELINUX -c init.c\n\
          cc -O2  -c util.c\n\
          cc  init.o util.o -lcrypt -o init\n\
-         cc -O2  -o killall5 killall5.c\n");
+         cc -O2   killall5.c  -o killall5\n");
+}
+
+// The built-in `.c:` links every prerequisite with `$(CPPFLAGS)` and
+// `$(LDLIBS)`, as GNU make's `%: %.c` does (GNU orders `$^` with the source
+// first). libselinux links its utils with `override LDLIBS += -lselinux`;
+// libzstd's `fuzzer` has no commands, only objects and sources.
+#[test]
+fn a_program_is_linked_from_its_sources_with_ldlibs() {
+    let dir = Dir::new("up_link_c_rule");
+    dir.write(
+        "Makefile",
+        "CC = cc\nCFLAGS = -O2\noverride LDFLAGS += -L../src\n\
+         override LDLIBS += -lselinux\nall: avcstat fuzzer\n\
+         fuzzer : CPPFLAGS += -DMT\nfuzzer : a.o\nfuzzer : util.c fuzzer.c\n",
+    );
+    for f in ["avcstat.c", "fuzzer.c", "util.c", "a.o"] {
+        dir.write(f, "");
+    }
+    dir.make(&["-n"])
+        .ok("cc -O2  -L../src avcstat.c -lselinux -o avcstat\n\
+         cc -O2 -DMT -L../src a.o util.c fuzzer.c -lselinux -o fuzzer\n");
 }
 
 // sysvinit: `$(wildcard $(ROOT)/$(usrdir)/lib*/libcrypt.*)`, a wildcard in a

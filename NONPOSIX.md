@@ -788,7 +788,11 @@ value) m4 does as POSIX says instead:
  * Additional built-in rules and macros, which POSIX allows (106035):
    `.o:` links a program from its objects (`$(CC) $(LDFLAGS) $^ $(LDLIBS)
    -o $@`), and `.c.o` passes `$(CPPFLAGS)`; sysvinit's Makefile builds
-   every program that way.  `COMPILE.c`, `COMPILE.S`, `LINK.c`,
+   every program that way.  `.c:` links every prerequisite, as GNU make's
+   `%: %.c` does (`$(CC) $(CFLAGS) $(CPPFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o
+   $@`): libselinux links its utils with `override LDLIBS += -lselinux`,
+   and libzstd's test program `fuzzer` has no commands, only the objects
+   and sources it is linked from.  `COMPILE.c`, `COMPILE.S`, `LINK.c`,
    `OUTPUT_OPTION` and `RM` have GNU make's values; libzstd compiles,
    links its test programs and cleans with them.
  * The `realpath` function and the `MAKEFILE_LIST` macro, as in GNU make;

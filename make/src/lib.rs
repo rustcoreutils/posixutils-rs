@@ -1272,11 +1272,17 @@ fn search_dirs(dirs: &[&str], name: &str) -> Option<String> {
 /// passes `$(CPPFLAGS)`, which sysvinit sets per object
 /// (`init.o: CPPFLAGS += $(SELINUX_DEF)`). With `CPPFLAGS` empty, `.c.o`
 /// gives what POSIX's gives.
+///
+/// `.c:` links, as GNU make's `%: %.c` does, every prerequisite (`$^`)
+/// with `$(CPPFLAGS)` and `$(LDLIBS)`: libselinux links each of its utils
+/// from its source with `override LDLIBS += -lselinux`, and libzstd's
+/// `fuzzer:` has no commands, only its objects and sources. With one
+/// prerequisite and both macros empty it runs what POSIX's runs.
 const BUILTIN_RULES: &str = r#"
 .o:
 	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
 .c:
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
 .sh:
 	cp $< $@
 	chmod a+x $@

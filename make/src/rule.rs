@@ -110,6 +110,8 @@ pub struct Rule {
     prerequisites: Vec<Prerequisite>,
     /// The recipe of the rule
     recipes: Vec<Recipe>,
+    /// Written `target::`: one of several independent rules for its target.
+    double_colon: bool,
 }
 
 impl Rule {
@@ -123,6 +125,12 @@ impl Rule {
 
     pub fn recipes(&self) -> impl Iterator<Item = &Recipe> {
         self.recipes.iter()
+    }
+
+    /// Whether the rule was written `target::` (GNU make's double-colon
+    /// rule).
+    pub fn is_double_colon(&self) -> bool {
+        self.double_colon
     }
 
     /// True if this rule's target is a `%` pattern.
@@ -147,6 +155,7 @@ impl Rule {
                 .map(|p| Prerequisite::new(pattern_expand(p.as_ref(), stem)))
                 .collect(),
             recipes: self.recipes.clone(),
+            double_colon: false,
         })
     }
 
@@ -173,6 +182,7 @@ impl Rule {
                 targets: vec![target.clone()],
                 prerequisites: self.prerequisites.clone(),
                 recipes: self.recipes.clone(),
+                double_colon: self.double_colon,
             })
             .collect()
     }
@@ -721,6 +731,7 @@ impl From<ParsedRule> for Rule {
             targets: parsed.targets().map(Target::new).collect(),
             prerequisites: parsed.prerequisites().map(Prerequisite::new).collect(),
             recipes: parsed.recipes().map(Recipe::new).collect(),
+            double_colon: parsed.is_double_colon(),
         }
     }
 }

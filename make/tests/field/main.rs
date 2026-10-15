@@ -18,6 +18,7 @@ mod common;
 mod cancel_rules;
 mod computed_names;
 mod curdir;
+mod double_colon;
 mod empty_targets;
 mod include_remaking;
 mod makeflags;

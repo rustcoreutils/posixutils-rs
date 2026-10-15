@@ -48,6 +48,10 @@ pub enum ErrorCode {
         target: String,
         constraint: Error,
     },
+    /// A target with both `:` and `::` rules, which GNU make refuses too.
+    MixedColons {
+        target: String,
+    },
 }
 
 impl From<ErrorCode> for i32 {
@@ -66,6 +70,7 @@ impl From<&ErrorCode> for i32 {
             ExecutionError { .. } => 2,
             IoError(_) => 3,
             ParserError { .. } => 4,
+            MixedColons { .. } => 4,
             NoMakefile => 5,
             NoTarget { .. } => 6,
             NoRule { .. } => 7,
@@ -107,6 +112,13 @@ impl fmt::Display for ErrorCode {
                 None => write!(f, "{}", gettext("no targets to execute")),
             },
             NoRule { rule } => write!(f, "{} '{}'", gettext("no rule"), rule),
+            MixedColons { target } => write!(
+                f,
+                "{} '{}' {}",
+                gettext("target"),
+                target,
+                gettext("has both : and :: rules")
+            ),
             RecursivePrerequisite { origin } => {
                 write!(
                     f,

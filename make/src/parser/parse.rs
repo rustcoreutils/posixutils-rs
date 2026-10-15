@@ -221,9 +221,9 @@ impl Builder {
         if rule.targets.is_empty() || (pattern && rule.recipes.is_empty()) {
             return;
         }
-        if rule.double_colon {
+        if rule.double_colon && pattern {
             self.errors.push(format!(
-                "{}: double-colon rules are not supported",
+                "{}: double-colon pattern rules are not supported",
                 rule.line
             ));
             return;

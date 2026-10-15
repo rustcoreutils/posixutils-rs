@@ -119,6 +119,13 @@ impl graph::Edges for Make {
     /// are the edges that will actually be walked.
     fn prerequisites_of(&self, target: &str) -> Vec<String> {
         let named = self.rule_by_target_name(target);
+        if named.is_some_and(Rule::is_double_colon) {
+            return self
+                .double_colon_rules(target)
+                .into_iter()
+                .flat_map(|rule| edge_names(rule.prerequisites()))
+                .collect();
+        }
         let mut edges = match named {
             Some(rule) => edge_names(rule.prerequisites()),
             None => match self.find_pattern_rule(target) {
@@ -461,6 +468,9 @@ impl Make {
         };
         let target = Target::new(name.as_ref());
 
+        if rule.is_double_colon() {
+            return self.run_double_colon_rules(&target);
+        }
         self.run_rule_with_prerequisites(rule, &target, Dispatch::Explicit)
     }
 
@@ -540,7 +550,7 @@ impl Make {
         // `.c.o:` idiom never saw `foo.c` at all, and a changed source never
         // recompiled (audit #83).
         let inferred = match rule.recipes().count() {
-            0 => self.find_inference_rule(target.as_ref()),
+            0 if !rule.is_double_colon() => self.find_inference_rule(target.as_ref()),
             _ => None,
         };
         if let Some(source) = inferred.and_then(|rule| inference_source(rule, target)) {
@@ -559,7 +569,9 @@ impl Make {
         let newer = self.newer_prerequisites(target.as_ref(), &prerequisites);
         let exists = get_modified_time(self.resolve_vpath(target.as_ref())).is_some();
         let phony = self.attributes.is_phony(target.as_ref());
-        let up_to_date = !rebuilt && newer.is_empty() && exists && !phony;
+        // A double-colon rule with no prerequisites always runs (GNU make).
+        let always = rule.is_double_colon() && prerequisites.is_empty();
+        let up_to_date = !rebuilt && newer.is_empty() && exists && !phony && !always;
 
         if up_to_date {
             return Ok(false);
@@ -756,6 +768,57 @@ impl Make {
             Some(err) => Err(err),
             None => Ok(updated.into_inner()),
         }
+    }
+
+    /// File a single-target rule.
+    ///
+    /// A second ordinary rule for a target is folded into the first
+    /// (POSIX 105653). A double-colon rule never is: each is independent,
+    /// with its own prerequisites and commands, and they run in the order
+    /// written. GNU make refuses a target that has both kinds, as here.
+    fn add_target_rule(&mut self, rule: Rule) -> Result<(), ErrorCode> {
+        let Some(name) = rule.targets().next().map(|t| t.to_string()) else {
+            return Ok(());
+        };
+        let existing = self
+            .rules
+            .iter_mut()
+            .find(|existing| existing.targets().any(|t| t.as_ref() == name));
+        match existing {
+            Some(existing) if existing.is_double_colon() != rule.is_double_colon() => {
+                Err(MixedColons { target: name })
+            }
+            Some(existing) if !rule.is_double_colon() => {
+                existing.absorb(rule);
+                Ok(())
+            }
+            _ => {
+                self.rules.push(rule);
+                Ok(())
+            }
+        }
+    }
+
+    /// Every `::` rule for `name`, in the order written.
+    fn double_colon_rules(&self, name: &str) -> Vec<&Rule> {
+        self.rules
+            .iter()
+            .filter(|rule| rule.is_double_colon())
+            .filter(|rule| rule.targets().any(|t| t.as_ref() == name))
+            .collect()
+    }
+
+    /// Run each double-colon rule for `target` in turn.
+    ///
+    /// Each brings its own prerequisites up to date and runs its commands
+    /// when one of them is newer than the target, or always when it has none
+    /// (GNU make). Reports whether any rule ran.
+    fn run_double_colon_rules(&self, target: &Target) -> Result<bool, ErrorCode> {
+        let mut ran = false;
+        for rule in self.double_colon_rules(target.as_ref()) {
+            ran |= self.run_rule_with_prerequisites(rule, target, Dispatch::Explicit)?;
+        }
+        Ok(ran)
     }
 
     /// Whether some rule can make `name`: a target rule, a pattern rule or an
@@ -1077,17 +1140,7 @@ impl TryFrom<(Makefile, Config)> for Make {
                 // `extra` to `b` as well -- the same leak `.IGNORE: a` had
                 // before attributes were keyed by target (audit #84).
                 for rule in rule.split_targets() {
-                    let Some(name) = rule.targets().next().map(|t| t.to_string()) else {
-                        continue;
-                    };
-                    match make
-                        .rules
-                        .iter_mut()
-                        .find(|existing| existing.targets().any(|t| t.as_ref() == name))
-                    {
-                        Some(existing) => existing.absorb(rule),
-                        None => make.rules.push(rule),
-                    }
+                    make.add_target_rule(rule)?;
                 }
             }
         }

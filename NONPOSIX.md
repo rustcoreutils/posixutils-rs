@@ -736,6 +736,12 @@ The GNU m4 extensions autoconf, automake and libtoolize cannot run without:
    the option letters, then `--` and the command-line macros.
  * `--no-print-directory` — accepted and ignored; this make never announces
    directory changes.  libzstd's `lib/Makefile` passes it to `$(MAKE)`.
+ * Double-colon rules, `target:: prerequisites`, as GNU make has them: each
+   is independent, with its own prerequisites and commands, run in order,
+   each when one of its own prerequisites is newer than the target, or
+   always when it has none.  A target may not have both kinds.  perl's
+   ExtUtils::MakeMaker output (`pure_all ::`, `config ::`) and ncurses'
+   Makefiles (`clean :: mostlyclean`) are written in them.
  * A `%` pattern rule without commands is not used: in GNU make it cancels
    a built-in pattern rule.  automake ends every Makefile with
    `%:: %,v`, `%:: SCCS/s.%` and three more of them.

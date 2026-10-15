@@ -595,7 +595,7 @@ impl Make {
         let Some(_level) = WalkLevel::enter() else {
             return self.build_target_on_new_stack(name, inherited);
         };
-        let name = &rule::prerequisite::without_dot_slash(name.to_string());
+        let name = rule::prerequisite::dot_slash_stripped(name);
         match self.ledger.claim(name) {
             graph::Claim::Done(outcome) => return outcome.into_result(),
             graph::Claim::Build => {}

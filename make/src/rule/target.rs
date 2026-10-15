@@ -39,6 +39,12 @@ impl Target {
     pub fn new(name: impl Into<String>) -> Self {
         let name = super::prerequisite::without_dot_slash(name.into());
 
+        // Special targets and suffix rules all begin with a dot, and most
+        // targets do not.
+        if !name.starts_with('.') {
+            return Target::Simple { name };
+        }
+
         if let Some(t) = Self::try_parse_special(&name) {
             return t;
         }

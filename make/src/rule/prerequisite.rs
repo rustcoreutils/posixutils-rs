@@ -29,14 +29,23 @@ impl Prerequisite {
 /// targets `$(srcdir)/file`, which is `./file` when building in the source
 /// tree, and depends on them as `file`.
 pub fn without_dot_slash(name: String) -> String {
-    let mut rest = name.as_str();
+    let rest = dot_slash_stripped(&name);
+    match rest.len() == name.len() {
+        true => name,
+        false => rest.to_string(),
+    }
+}
+
+/// [`without_dot_slash`], borrowing: the part of `name` after its leading
+/// `./` components.
+pub fn dot_slash_stripped(name: &str) -> &str {
+    let mut rest = name;
     while let Some(stripped) = rest.strip_prefix("./") {
         rest = stripped.trim_start_matches('/');
     }
-    match rest.len() == name.len() {
-        true => name,
-        false if rest.is_empty() => ".".to_string(),
-        false => rest.to_string(),
+    match rest.is_empty() && !name.is_empty() {
+        true => ".",
+        false => rest,
     }
 }
 

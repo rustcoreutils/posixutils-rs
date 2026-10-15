@@ -30,10 +30,34 @@ fn run(makeflags: &str, args: &[&str]) -> crate::common::Run {
     dir.make_env(args, &[("MAKEFLAGS", makeflags)])
 }
 
+// A parent's token pool whose descriptors this make was not given leaves it
+// serial, with GNU make's warning; one of a kind it does not take part in,
+// GNU make 4.4's named pipe, leaves it serial too. Either way it passes no
+// `-j` on.
 #[test]
-fn a_gnu_jobserver_is_passed_over() {
-    run(" -j4 --jobserver-auth=3,4", &[]).ok("[] []\n");
+fn a_gnu_jobserver_that_cannot_be_had_leaves_make_serial() {
+    let out = run(" -j4 --jobserver-auth=3,4", &[]);
+    out.ok("[] []\n");
+    assert_eq!(
+        out.stderr,
+        "make: warning: jobserver unavailable: using -j1.  Add '+' to parent make rule.\n"
+    );
+    let out = run(" -j4 --jobserver-auth=fifo:/tmp/GMfifo123", &[]);
+    out.ok("[] []\n");
+    assert_eq!(out.stderr, "");
     run(" --jobserver-auth=fifo:/tmp/GMfifo123", &[]).ok("[] []\n");
+}
+
+// A `-j` in MAKEFLAGS with no pool, as a parent other than GNU make or
+// this one may write it, gives a pool of the make's own.
+#[test]
+fn an_inherited_j_without_a_pool_makes_one() {
+    let out = run(" -j3", &[]);
+    assert_eq!(out.code, Some(0), "{out:?}");
+    assert!(
+        out.stdout.starts_with("[] [-j3 --jobserver-auth="),
+        "{out:?}"
+    );
 }
 
 #[test]

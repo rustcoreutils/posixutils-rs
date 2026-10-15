@@ -12,6 +12,7 @@ pub mod config;
 pub mod error_code;
 pub mod fast_hash;
 pub mod graph;
+pub mod jobserver;
 pub mod parser;
 pub mod rule;
 pub mod signal_handler;
@@ -109,36 +110,6 @@ impl Drop for WalkLevel {
     }
 }
 
-/// A pool of build tokens bounding how many targets are updated concurrently
-/// under `-j`. Acquisition is non-blocking: a caller that cannot get a token
-/// builds the target inline instead, which keeps the recursive build
-/// deadlock-free (the inline path always makes progress).
-struct TokenPool {
-    available: std::sync::Mutex<usize>,
-}
-
-impl TokenPool {
-    fn new(tokens: usize) -> Self {
-        TokenPool {
-            available: std::sync::Mutex::new(tokens),
-        }
-    }
-
-    fn try_acquire(&self) -> bool {
-        let mut available = self.available.lock().unwrap();
-        if *available > 0 {
-            *available -= 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn release(&self) {
-        *self.available.lock().unwrap() += 1;
-    }
-}
-
 /// One run of independent prerequisites being made under `-j`: a queue
 /// that the thread owning it and the workers it starts all take from.
 struct Segment<'a> {
@@ -194,8 +165,8 @@ pub struct Make {
     /// makefile supplies its own `.SCCS_GET`.
     sccs_get: Option<Rule>,
     /// Token pool bounding concurrent target updates under `-j` (maxjobs - 1
-    /// tokens; the inline build needs no token).
-    pool: TokenPool,
+    /// tokens; the inline build needs no token), shared with sub-makes.
+    pool: std::sync::Arc<jobserver::Pool>,
     /// Which targets are built, building, or failed. Gives single-build under
     /// `-j` and memoization across repeated visits.
     ledger: graph::Ledger,
@@ -1663,7 +1634,7 @@ impl TryFrom<(Makefile, Config)> for Make {
 
         // Build the Make struct early so we can process .SUFFIXES via the
         // normal special_target::process path (which writes to make.config).
-        let pool = TokenPool::new(config.jobs.saturating_sub(1));
+        let pool = jobserver::pool_for(config.jobs);
         let mut make = Self {
             rules: vec![],
             rule_index: HashMap::default(),

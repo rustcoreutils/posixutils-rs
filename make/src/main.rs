@@ -19,6 +19,7 @@ use gettextrs::gettext;
 use posixutils_make::{
     config::Config,
     error_code::ErrorCode::{self, *},
+    jobserver::{self, Jobs},
     parser::{
         preprocessor::{ENV_MACROS, MAKEFILE_LIST},
         Makefile,
@@ -179,9 +180,10 @@ fn target_not_remade(target: &str) -> String {
 
 /// The single-letter options a parent make may pass down in `MAKEFLAGS`.
 ///
-/// `-f` and `-p` are left out by POSIX 105856 itself, `-C` and `-j` belong to
-/// the invocation, and a letter this make does not implement -- GNU's `w`,
-/// `B`, `R` and the rest -- is passed over when it arrives.
+/// `-f` and `-p` are left out by POSIX 105856 itself, `-C` belongs to the
+/// invocation, `-j` is passed with the token pool (`makeflags_jobs`), and a
+/// letter this make does not implement -- GNU's `w`, `B`, `R` and the rest
+/// -- is passed over when it arrives.
 const INHERITED_LETTERS: &str = "inqksSetr";
 
 /// Build the `MAKEFLAGS` value a sub-make should inherit.
@@ -191,8 +193,10 @@ const INHERITED_LETTERS: &str = "inqksSetr";
 /// MAKEFLAGS is read by another instance of the make command, the original
 /// macro's value is recovered". The form is GNU make's, so that either make
 /// reads the other's: the option letters, then `--`, then the macros, with a
-/// blank or a backslash in a value escaped by a backslash.
-fn makeflags_for_children(config: &Config, macros: &[String]) -> String {
+/// blank or a backslash in a value escaped by a backslash. `jobs` is the
+/// `-j` and token pool words from `jobserver::setup`, which go between the
+/// two (POSIX 105378-105384).
+fn makeflags_for_children(config: &Config, jobs: &str, macros: &[String]) -> String {
     let mut out = String::new();
     for (flag, ch) in [
         (config.ignore, 'i'),
@@ -208,6 +212,12 @@ fn makeflags_for_children(config: &Config, macros: &[String]) -> String {
         if flag {
             out.push(ch);
         }
+    }
+    if !jobs.is_empty() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(jobs);
     }
     // The last definition of a name is the one in force; it alone is passed.
     let name_of = |m: &str| -> String {
@@ -307,6 +317,29 @@ fn makeflags_args(flags: &str) -> Vec<OsString> {
         }
     }
     args
+}
+
+/// The `-j` count and the token pool a `MAKEFLAGS` value passes down, as
+/// this make and GNU make write them: `-j4 --jobserver-auth=3,4` (an older
+/// GNU make writes `--jobserver-fds=3,4`). `makeflags_args` leaves both out,
+/// so that the `-j` clap sees is the command line's alone: a sub-make given
+/// a `-j` of its own makes a pool of its own.
+fn makeflags_jobs(flags: &str) -> (Option<usize>, Option<String>) {
+    let mut jobs = None;
+    let mut auth = None;
+    for word in makeflags_words(flags) {
+        if word == "--" {
+            break;
+        } else if let Some(value) = word
+            .strip_prefix("--jobserver-auth=")
+            .or_else(|| word.strip_prefix("--jobserver-fds="))
+        {
+            auth = Some(value.to_string());
+        } else if let Some(count) = word.strip_prefix("-j") {
+            jobs = count.parse::<usize>().ok().or(jobs);
+        }
+    }
+    (jobs, auth)
 }
 
 /// Build the effective argument vector, seeding options and macros from the
@@ -481,9 +514,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut status_code = 0;
 
-    // -j maxjobs: a non-positive value is unspecified; treat it (and absence)
-    // as 1 (no parallelism).
-    let jobs = jobs.filter(|&j| j >= 1).unwrap_or(1);
+    // -j maxjobs: a non-positive value is unspecified; treat it as 1 (no
+    // parallelism). With none on the command line, a parent's comes from
+    // MAKEFLAGS, with its token pool (POSIX 105378-105384).
+    let (inherited_jobs, inherited_pool) = env::var("MAKEFLAGS")
+        .map(|flags| makeflags_jobs(&flags))
+        .unwrap_or_default();
+    let (jobs, job_flags) = jobserver::setup(match (jobs, inherited_jobs) {
+        (Some(jobs), _) => Jobs::CommandLine(jobs.max(1)),
+        (None, Some(jobs)) => Jobs::Inherited(jobs, inherited_pool.as_deref()),
+        (None, None) => Jobs::None,
+    });
 
     // -C flag
     if let Some(dir) = directory {
@@ -528,10 +569,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // POSIX 105856: make passes its options and command-line macros to
     // sub-makes through MAKEFLAGS. -f, -C and the target operands belong to
     // this invocation (audit #40). The value replaces whatever was
-    // inherited, a GNU parent's jobserver included.
+    // inherited; `-j` and the token pool are this make's own.
     env::set_var(
         "MAKEFLAGS",
-        makeflags_for_children(&config, &cmdline_macros),
+        makeflags_for_children(&config, &job_flags, &cmdline_macros),
     );
 
     // POSIX 105866: "all of the make utility command line macro definitions

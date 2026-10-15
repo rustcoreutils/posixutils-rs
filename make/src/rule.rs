@@ -586,6 +586,26 @@ impl Rule {
             return Ok(());
         }
         let mut command = Command::new(shell);
+        // POSIX 105378-105384: a sub-make started through `$(MAKE)` or a `+`
+        // line uses this make's token pool, so it is given the pool's
+        // descriptors; every other command line runs without them.
+        if always_run {
+            if let Some(fds) = crate::jobserver::shared_descriptors() {
+                use std::os::unix::process::CommandExt;
+                // SAFETY: the closure runs in the child between fork and exec
+                // and calls only fcntl(2), which is async-signal-safe.
+                unsafe {
+                    command.pre_exec(move || {
+                        for fd in fds {
+                            if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                        }
+                        Ok(())
+                    });
+                }
+            }
+        }
         command.envs(exported_macros(config.env_macros, env.table, env.exports));
         // POSIX: when errors are not being ignored, the shell -e option shall
         // also be in effect, so the recipe aborts on the first failing

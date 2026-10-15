@@ -18,14 +18,41 @@ use std::{
 
 use crate::{
     input::{Input, InputState, InputStateRef, Location},
-    lexer::{is_alphnumeric, MacroName, ParseConfig},
+    lexer::{is_name_byte, MacroName, ParseConfig},
     macros::{trace::Trace, BuiltinMacro, MacroDefinition},
     output::{Output, OutputState},
     EOF,
 };
 
+/// FNV-1a, for the macro table: it is searched for every name read, the
+/// keys are short, and nothing about them is adversarial, so the default
+/// SipHash's resistance to collision attacks only costs time.
+#[derive(Default)]
+pub struct FnvHasher(u64);
+
+impl std::hash::Hasher for FnvHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut hash = if self.0 == 0 {
+            0xcbf2_9ce4_8422_2325
+        } else {
+            self.0
+        };
+        for &b in bytes {
+            hash ^= u64::from(b);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        self.0 = hash;
+    }
+}
+
+pub type FastHash = std::hash::BuildHasherDefault<FnvHasher>;
+
 pub struct State {
-    pub macro_definitions: HashMap<MacroName, Vec<Rc<MacroDefinition>>>,
+    pub macro_definitions: HashMap<MacroName, Vec<Rc<MacroDefinition>>, FastHash>,
     pub parse_config: ParseConfig,
     /// Whether the process should exit with an error once processing has completed.
     pub exit_error: bool,
@@ -82,8 +109,14 @@ impl State {
         token.push(c);
 
         loop {
+            // The rest of the name in runs; a byte at a time only where a run
+            // ends, at the end of a piece of pushed-back text, since a name
+            // continues across it.
+            if self.input.take_run(|c| !is_name_byte(c), token)? > 0 {
+                continue;
+            }
             c = self.input.get_next_character()?;
-            if !(is_alphnumeric(c) || c == b'_') {
+            if !is_name_byte(c) {
                 break;
             }
             token.push(c)

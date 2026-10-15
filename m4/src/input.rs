@@ -196,9 +196,12 @@ impl InputState {
             let builtin = segment.builtin.take();
             let c = match builtin {
                 Some(_) => Some(BUILTIN_TOKEN),
-                None => segment.text.pop(),
+                None => segment.text.get(segment.pos).copied(),
             };
             if let Some(c) = c {
+                if builtin.is_none() {
+                    segment.pos += 1;
+                }
                 self.last_line = segment.line;
                 // Only text from another file (m4wrap's) names one.
                 if segment.file.is_some() || self.last_file.is_some() {
@@ -213,6 +216,47 @@ impl InputState {
         self.last_line = input.line_number;
         self.last_file = None;
         Ok(c)
+    }
+
+    /// Append to `out` the bytes that come next, up to the first for which
+    /// `stop` is true, which is left unread; the run also ends where a piece
+    /// of pushed-back text or a buffer of the input does, so it can be
+    /// short. Returns how many bytes it took.
+    ///
+    /// For runs of plain text, which the main loop would otherwise read and
+    /// write a byte at a time.
+    pub fn take_run(
+        &mut self,
+        stop: impl Fn(u8) -> bool,
+        out: &mut Vec<u8>,
+    ) -> crate::error::Result<usize> {
+        let input = self.input.last_mut().unwrap();
+        while let Some(segment) = input.pushback.last_mut() {
+            if segment.builtin.is_some() {
+                return Ok(0);
+            }
+            let rest = &segment.text[segment.pos..];
+            if rest.is_empty() {
+                input.pushback.pop();
+                continue;
+            }
+            let n = rest.iter().position(|&c| stop(c)).unwrap_or(rest.len());
+            out.extend_from_slice(&rest[..n]);
+            segment.pos += n;
+            if n > 0 {
+                self.last_line = segment.line;
+                if segment.file.is_some() || self.last_file.is_some() {
+                    self.last_file.clone_from(&segment.file);
+                }
+            }
+            return Ok(n);
+        }
+        let n = input.take_run(stop, out)?;
+        if n > 0 {
+            self.last_line = input.line_number;
+            self.last_file = None;
+        }
+        Ok(n)
     }
 
     /// The built-in token just read, if the last character read was one.
@@ -230,7 +274,14 @@ impl InputState {
         }
         let input = self.input.last_mut().unwrap();
         match input.pushback.last_mut() {
-            Some(segment) if segment.builtin.is_none() => segment.text.push(c),
+            // Unread it from the text it came from.
+            Some(segment)
+                if segment.builtin.is_none()
+                    && segment.pos > 0
+                    && segment.text[segment.pos - 1] == c =>
+            {
+                segment.pos -= 1
+            }
             _ => {
                 let site = Some((self.last_file.clone(), self.last_line));
                 self.push_segment(vec![c], None, site);
@@ -244,7 +295,14 @@ impl InputState {
     /// that location.
     pub fn pushback_string(&mut self, s: &[u8]) {
         if !s.is_empty() {
-            self.push_segment(s.iter().rev().copied().collect(), None, None);
+            self.push_segment(s.to_vec(), None, None);
+        }
+    }
+
+    /// [`InputState::pushback_string`], taking the text.
+    pub fn pushback_vec(&mut self, s: Vec<u8>) {
+        if !s.is_empty() {
+            self.push_segment(s, None, None);
         }
     }
 
@@ -260,13 +318,13 @@ impl InputState {
     pub fn pushback_string_at(&mut self, s: &[u8], location: &Location) {
         if !s.is_empty() {
             let site = Some((Some(location.0.clone()), location.1));
-            self.push_segment(s.iter().rev().copied().collect(), None, site);
+            self.push_segment(s.to_vec(), None, site);
         }
     }
 
-    /// Push a segment of reversed `text`, or a built-in token, attributed to
-    /// `site` (a file other than the input's own, and a line), else to the
-    /// call being expanded, else to where reading is.
+    /// Push a segment of `text`, or a built-in token, attributed to `site`
+    /// (a file other than the input's own, and a line), else to the call
+    /// being expanded, else to where reading is.
     fn push_segment(
         &mut self,
         text: Vec<u8>,
@@ -285,6 +343,7 @@ impl InputState {
         let file = file.filter(|f| !Rc::ptr_eq(f, &input.name) && **f != *input.name);
         input.pushback.push(Segment {
             text,
+            pos: 0,
             line,
             file,
             builtin,
@@ -340,7 +399,7 @@ impl InputState {
                 .pushback[len..]
                 .iter()
                 .rev()
-                .flat_map(|segment| segment.text.iter().rev().copied())
+                .flat_map(|segment| segment.text[segment.pos..].iter().copied())
                 .collect(),
             _ => Vec::new(),
         }
@@ -445,6 +504,24 @@ impl InputStateRef {
         self.0.borrow_mut().pushback_string_at(s, location)
     }
 
+    pub fn take_run(
+        &self,
+        stop: impl Fn(u8) -> bool,
+        out: &mut Vec<u8>,
+    ) -> crate::error::Result<usize> {
+        self.0.borrow_mut().take_run(stop, out)
+    }
+
+    pub fn pushback_vec(&self, s: Vec<u8>) {
+        self.0.borrow_mut().pushback_vec(s)
+    }
+
+    /// Whether `-s` is on: output must then be written as it is read, a
+    /// byte at a time, for its `#line` directives to be right.
+    pub fn line_synchronization(&self) -> bool {
+        self.0.borrow().line_synchronization
+    }
+
     pub fn take_builtin(&self) -> Option<BuiltinMacro> {
         self.0.borrow_mut().take_builtin()
     }
@@ -458,10 +535,12 @@ impl InputStateRef {
     }
 }
 
-/// Text pushed back onto an input, stored reversed so that reading it is a
-/// `pop`, with the input line it is attributed to.
+/// Text pushed back onto an input, read from `pos` on, with the input line
+/// it is attributed to.
 struct Segment {
     text: Vec<u8>,
+    /// How much of `text` has been read.
+    pos: usize,
     line: usize,
     /// The file the text is attributed to, when not the input's own.
     file: Option<Rc<[u8]>>,
@@ -475,13 +554,19 @@ pub struct Input {
     /// given, or `stdin`. Shared, because every macro call records it.
     pub name: Rc<[u8]>,
     /// Text pushed back onto this input, read before the input itself:
-    /// the top segment first, each from its end.
+    /// the top segment first.
     pushback: Vec<Segment>,
+    /// Bytes read from the input and not yet consumed: from `buffer_pos`.
+    buffer: Vec<u8>,
+    buffer_pos: usize,
     pub line_number: usize,
     /// A `<newline>` has been consumed but not yet accounted for. See
     /// [`Input::get_next_character`].
     pending_newline: bool,
 }
+
+/// How much of an input is read at a time.
+const READ_SIZE: usize = 64 * 1024;
 
 impl Input {
     pub fn new(input: InputRead) -> Self {
@@ -493,39 +578,86 @@ impl Input {
             input,
             name,
             pushback: Vec::new(),
+            buffer: Vec::new(),
+            buffer_pos: 0,
             line_number: 1,
             pending_newline: false,
         }
     }
 
-    fn get_next_character(&mut self) -> std::io::Result<u8> {
-        let mut buf: [u8; 1] = [0; 1];
-        let n = match &mut self.input {
-            InputRead::File { file, .. } => file.read(&mut buf),
-            InputRead::Stdin(s) => s.read(&mut buf),
-        }?;
-
-        if n == 0 {
-            return Ok(EOF);
+    /// Make sure there is an unconsumed byte in the buffer; `false` at end
+    /// of input. A read takes what is available, so a terminal gives a line
+    /// at a time.
+    fn fill(&mut self) -> std::io::Result<bool> {
+        if self.buffer_pos < self.buffer.len() {
+            return Ok(true);
         }
+        self.buffer.resize(READ_SIZE, 0);
+        self.buffer_pos = 0;
+        let n = loop {
+            let result = match &mut self.input {
+                InputRead::File { file, .. } => file.read(&mut self.buffer),
+                InputRead::Stdin(s) => s.read(&mut self.buffer),
+            };
+            match result {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                other => break other,
+            }
+        };
+        let n = match n {
+            Ok(n) => n,
+            Err(e) => {
+                self.buffer.clear();
+                return Err(e);
+            }
+        };
+        self.buffer.truncate(n);
+        Ok(n > 0)
+    }
 
-        let c = buf[0];
-
-        // `line_number` names the line the character being returned sits on, so
-        // a `<newline>` only advances it once the first character of the next
-        // line is consumed. Advancing eagerly misattributes a diagnostic raised
-        // by a macro call that ends at end-of-line to the following line, since
-        // deciding whether the macro name is followed by `(` already consumes
-        // the `<newline>`.
+    /// Account for consumed bytes `consumed` in `line_number`.
+    ///
+    /// `line_number` names the line the character last returned sits on, so
+    /// a `<newline>` only advances it once the first character of the next
+    /// line is consumed. Advancing eagerly misattributes a diagnostic raised
+    /// by a macro call that ends at end-of-line to the following line, since
+    /// deciding whether the macro name is followed by `(` already consumes
+    /// the `<newline>`.
+    fn count_lines(&mut self, consumed: &[u8]) {
+        let Some((&last, before)) = consumed.split_last() else {
+            return;
+        };
         if self.pending_newline {
             self.line_number += 1;
-            self.pending_newline = false;
         }
-        if c == b'\n' {
-            self.pending_newline = true;
-        }
+        self.line_number += before.iter().filter(|&&c| c == b'\n').count();
+        self.pending_newline = last == b'\n';
+    }
 
+    fn get_next_character(&mut self) -> std::io::Result<u8> {
+        if !self.fill()? {
+            return Ok(EOF);
+        }
+        let c = self.buffer[self.buffer_pos];
+        self.buffer_pos += 1;
+        self.count_lines(&[c]);
         Ok(c)
+    }
+
+    /// See [`InputState::take_run`].
+    fn take_run(&mut self, stop: impl Fn(u8) -> bool, out: &mut Vec<u8>) -> std::io::Result<usize> {
+        if !self.fill()? {
+            return Ok(0);
+        }
+        let start = self.buffer_pos;
+        let rest = &self.buffer[start..];
+        let n = rest.iter().position(|&c| stop(c)).unwrap_or(rest.len());
+        out.extend_from_slice(&rest[..n]);
+        self.buffer_pos += n;
+        let consumed = std::mem::take(&mut self.buffer);
+        self.count_lines(&consumed[start..start + n]);
+        self.buffer = consumed;
+        Ok(n)
     }
 }
 

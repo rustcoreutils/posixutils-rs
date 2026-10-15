@@ -31,12 +31,7 @@ use super::MacroImplementation;
 pub struct EvalMacro;
 
 impl MacroImplementation for EvalMacro {
-    fn evaluate(
-        &self,
-        mut state: State,
-        stderr: &mut dyn Write,
-        frame: StackFrame,
-    ) -> Result<State> {
+    fn evaluate(&self, state: &mut State, stderr: &mut dyn Write, frame: StackFrame) -> Result<()> {
         let mut args = frame.args.into_iter();
         let first_arg = args
             .next()
@@ -59,7 +54,7 @@ impl MacroImplementation for EvalMacro {
                     1,
                 );
                 state.emit_error(stderr, format_args!("{msg}"))?;
-                return Ok(state);
+                return Ok(());
             }
         };
 
@@ -76,7 +71,7 @@ impl MacroImplementation for EvalMacro {
                         gettext("radix out of range (2-36) or non-numeric in eval")
                     ),
                 )?;
-                return Ok(state);
+                return Ok(());
             }
         };
         let min_digits = match parse_optional_decimal(width_arg.as_deref()) {
@@ -87,14 +82,14 @@ impl MacroImplementation for EvalMacro {
                     stderr,
                     format_args!("{}", gettext("negative width or non-numeric in eval")),
                 )?;
-                return Ok(state);
+                return Ok(());
             }
         };
 
         state
             .input
             .pushback_string(format_radix(output, radix, min_digits).as_bytes());
-        Ok(state)
+        Ok(())
     }
 }
 

@@ -205,10 +205,34 @@ pub(crate) fn is_space(c: u8) -> bool {
     unsafe { libc::isspace(c.into()) != 0 }
 }
 
-pub(crate) fn is_alphnumeric(c: u8) -> bool {
-    unsafe { libc::isalnum(c.into()) != 0 }
+/// Which bytes start and continue a name token, looked up once: the main
+/// loop asks for every byte it reads, and the locale is fixed by then.
+struct NameBytes {
+    start: [bool; 256],
+    rest: [bool; 256],
 }
 
-pub(crate) fn is_alpha(c: u8) -> bool {
-    unsafe { libc::isalpha(c.into()) != 0 }
+fn name_bytes() -> &'static NameBytes {
+    static TABLE: std::sync::OnceLock<NameBytes> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = NameBytes {
+            start: [false; 256],
+            rest: [false; 256],
+        };
+        for c in 0..=255u8 {
+            table.start[usize::from(c)] = is_word_char_start(c);
+            table.rest[usize::from(c)] = is_word_char_end(c);
+        }
+        table
+    })
+}
+
+/// Whether `c` can start a name token: a letter or `_`.
+pub(crate) fn is_name_start(c: u8) -> bool {
+    name_bytes().start[usize::from(c)]
+}
+
+/// Whether `c` can continue a name token: a letter, digit or `_`.
+pub(crate) fn is_name_byte(c: u8) -> bool {
+    name_bytes().rest[usize::from(c)]
 }

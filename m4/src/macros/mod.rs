@@ -47,20 +47,20 @@ macro_rules! macro_enums {
         impl MacroImplementation for MacroDefinitionImplementation {
             fn evaluate(
                 &self,
-                mut state: State,
+                state: &mut State,
                 stderr: &mut dyn Write,
                 f: StackFrame,
-            ) -> Result<State> {
+            ) -> Result<()> {
                 let pending = if state.is_traced(&f) {
                     state.trace_call(stderr, &f)?
                 } else {
                     None
                 };
-                let mut state = self.call(state, stderr, f)?;
+                self.call(state, stderr, f)?;
                 if let Some(pending) = pending {
                     state.trace_expansion(stderr, pending)?;
                 }
-                Ok(state)
+                Ok(())
             }
         }
 
@@ -70,31 +70,29 @@ macro_rules! macro_enums {
             /// macro named in the input.
             pub fn call(
                 &self,
-                mut state: State,
+                state: &mut State,
                 stderr: &mut dyn Write,
                 f: StackFrame,
-            ) -> Result<State> {
+            ) -> Result<()> {
                 let outer_expansion_site = state.input.set_expansion_site(Some(f.location.clone()));
                 let builtin = match self {
                     Self::UserDefined(d) => {
-                        let state = d.evaluate(state, stderr, f)?;
+                        d.evaluate(state, stderr, f)?;
                         state.input.set_expansion_site(outer_expansion_site);
-                        return Ok(state);
+                        return Ok(());
                     }
                     _ => self.builtin().expect("not user-defined"),
                 };
                 let outer_call_site = state.call_site.replace(f.location.clone());
-                let mut state = if check_arity(&mut state, stderr, builtin, &f)? {
+                if check_arity(state, stderr, builtin, &f)? {
                     match self {
                         $(Self::$variant_name(d) => d.evaluate(state, stderr, f)),*,
                         Self::UserDefined(_) => unreachable!("handled above"),
                     }?
-                } else {
-                    state
-                };
+                }
                 state.call_site = outer_call_site;
                 state.input.set_expansion_site(outer_expansion_site);
-                Ok(state)
+                Ok(())
             }
         }
 
@@ -413,5 +411,5 @@ fn check_arity(
 }
 
 pub trait MacroImplementation {
-    fn evaluate(&self, state: State, stderr: &mut dyn Write, frame: StackFrame) -> Result<State>;
+    fn evaluate(&self, state: &mut State, stderr: &mut dyn Write, frame: StackFrame) -> Result<()>;
 }

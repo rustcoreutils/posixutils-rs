@@ -28,10 +28,10 @@ pub struct TraceoffMacro;
 impl MacroImplementation for TraceoffMacro {
     fn evaluate(
         &self,
-        mut state: State,
+        state: &mut State,
         _stderr: &mut dyn Write,
         frame: StackFrame,
-    ) -> Result<State> {
+    ) -> Result<()> {
         if frame.args.is_empty() {
             state.trace.traced.clear();
         } else {
@@ -39,7 +39,7 @@ impl MacroImplementation for TraceoffMacro {
                 state.trace.traced.remove(&arg);
             }
         }
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -50,10 +50,10 @@ pub struct TraceonMacro;
 impl MacroImplementation for TraceonMacro {
     fn evaluate(
         &self,
-        mut state: State,
+        state: &mut State,
         _stderr: &mut dyn Write,
         frame: StackFrame,
-    ) -> Result<State> {
+    ) -> Result<()> {
         if frame.args.is_empty() {
             let names: Vec<Vec<u8>> = state
                 .macro_definitions
@@ -64,7 +64,7 @@ impl MacroImplementation for TraceonMacro {
         } else {
             state.trace.traced.extend(frame.args);
         }
-        Ok(state)
+        Ok(())
     }
 }
 

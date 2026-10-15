@@ -29,7 +29,12 @@ pub struct UserDefinedMacro {
 }
 
 impl MacroImplementation for UserDefinedMacro {
-    fn evaluate(&self, state: State, _stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
+    fn evaluate(
+        &self,
+        state: &mut State,
+        _stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<()> {
         let definition = &self.definition;
         let args = &frame.args;
         let mut expansion = Vec::with_capacity(definition.len());
@@ -96,7 +101,7 @@ impl MacroImplementation for UserDefinedMacro {
             }
             i += 2;
         }
-        state.input.pushback_string(&expansion);
-        Ok(state)
+        state.input.pushback_vec(expansion);
+        Ok(())
     }
 }

@@ -30,6 +30,17 @@ use crate::state::{StackFrame, State};
 use crate::EOF;
 use plib::locale::mb_char_slices;
 
+/// The characters of `bytes` under the current `LC_CTYPE`. ASCII text, which
+/// is nearly all m4 sees, is a character per byte in every locale m4 runs
+/// in, so it skips the decoding.
+fn char_slices(bytes: &[u8]) -> Vec<&[u8]> {
+    if bytes.is_ascii() {
+        bytes.chunks(1).collect()
+    } else {
+        mb_char_slices(bytes)
+    }
+}
+
 /// Convert a byte offset within `bytes` to the index of the character that
 /// begins at (or after) that offset, counting multibyte characters under the
 /// current `LC_CTYPE`. Used by `index` to report a character (not byte)
@@ -37,7 +48,7 @@ use plib::locale::mb_char_slices;
 fn byte_offset_to_char_index(bytes: &[u8], byte_offset: usize) -> usize {
     let mut consumed = 0;
     let mut index = 0;
-    for ch in mb_char_slices(bytes) {
+    for ch in char_slices(bytes) {
         if consumed >= byte_offset {
             break;
         }
@@ -55,7 +66,7 @@ const AT_LEAST_ONE_MACRO_DEFINITION_EXPECT: &str =
 pub struct DnlMacro;
 
 impl MacroImplementation for DnlMacro {
-    fn evaluate(&self, state: State, _stderr: &mut dyn Write, _f: StackFrame) -> Result<State> {
+    fn evaluate(&self, state: &mut State, _stderr: &mut dyn Write, _f: StackFrame) -> Result<()> {
         let mut c: u8;
         loop {
             c = state.input.get_next_character()?;
@@ -63,7 +74,7 @@ impl MacroImplementation for DnlMacro {
                 break;
             }
         }
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -99,10 +110,10 @@ impl DefineMacro {
 impl MacroImplementation for DefineMacro {
     fn evaluate(
         &self,
-        mut state: State,
+        state: &mut State,
         _stderr: &mut dyn Write,
         frame: StackFrame,
-    ) -> Result<State> {
+    ) -> Result<()> {
         let definition = Rc::new(DefineMacro::define(frame));
         let name = definition.parse_config.name.clone();
         match state.macro_definitions.get_mut(&name) {
@@ -115,7 +126,7 @@ impl MacroImplementation for DefineMacro {
                 state.macro_definitions.insert(name, vec![definition]);
             }
         }
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -127,10 +138,10 @@ pub struct PushdefMacro;
 impl MacroImplementation for PushdefMacro {
     fn evaluate(
         &self,
-        mut state: State,
+        state: &mut State,
         _stderr: &mut dyn Write,
         frame: StackFrame,
-    ) -> Result<State> {
+    ) -> Result<()> {
         let definition = Rc::new(DefineMacro::define(frame));
         let name = definition.parse_config.name.clone();
         state
@@ -138,7 +149,7 @@ impl MacroImplementation for PushdefMacro {
             .entry(name)
             .or_default()
             .push(definition);
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -150,10 +161,10 @@ pub struct PopdefMacro;
 impl MacroImplementation for PopdefMacro {
     fn evaluate(
         &self,
-        mut state: State,
+        state: &mut State,
         _stderr: &mut dyn Write,
         frame: StackFrame,
-    ) -> Result<State> {
+    ) -> Result<()> {
         for arg in frame.args {
             let name = MacroName(arg);
             if let Some(stack) = state.macro_definitions.get_mut(&name) {
@@ -164,7 +175,7 @@ impl MacroImplementation for PopdefMacro {
                 }
             }
         }
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -176,14 +187,14 @@ pub struct UndefineMacro;
 impl MacroImplementation for UndefineMacro {
     fn evaluate(
         &self,
-        mut state: State,
+        state: &mut State,
         _stderr: &mut dyn Write,
         frame: StackFrame,
-    ) -> Result<State> {
+    ) -> Result<()> {
         for arg in frame.args {
             state.macro_definitions.remove(&MacroName(arg));
         }
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -193,12 +204,7 @@ impl MacroImplementation for UndefineMacro {
 pub struct DefnMacro;
 
 impl MacroImplementation for DefnMacro {
-    fn evaluate(
-        &self,
-        mut state: State,
-        stderr: &mut dyn Write,
-        frame: StackFrame,
-    ) -> Result<State> {
+    fn evaluate(&self, state: &mut State, stderr: &mut dyn Write, frame: StackFrame) -> Result<()> {
         // The quoted definitions of every named macro, in order; an undefined
         // name contributes nothing. A built-in has no text, so it can only be
         // the whole result: with one argument it becomes the marker that
@@ -236,14 +242,19 @@ impl MacroImplementation for DefnMacro {
             }
         }
         state.input.pushback_string(&text);
-        Ok(state)
+        Ok(())
     }
 }
 
 pub struct ErrprintMacro;
 
 impl MacroImplementation for ErrprintMacro {
-    fn evaluate(&self, state: State, stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
+    fn evaluate(
+        &self,
+        _state: &mut State,
+        stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<()> {
         let args_len = frame.args.len();
         for (i, arg) in frame.args.into_iter().enumerate() {
             stderr.write_all(&arg)?;
@@ -251,7 +262,7 @@ impl MacroImplementation for ErrprintMacro {
                 stderr.write_all(b" ")?;
             }
         }
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -284,22 +295,17 @@ impl IncludeMacro {
 }
 
 impl MacroImplementation for IncludeMacro {
-    fn evaluate(
-        &self,
-        mut state: State,
-        stderr: &mut dyn Write,
-        frame: StackFrame,
-    ) -> Result<State> {
+    fn evaluate(&self, state: &mut State, stderr: &mut dyn Write, frame: StackFrame) -> Result<()> {
         // POSIX: "It shall be an error if the file cannot be read." GNU m4
         // diagnoses and continues with a non-zero exit status rather than
         // aborting.
-        if let Err((path, error)) = Self::include(&state, frame) {
+        if let Err((path, error)) = Self::include(state, frame) {
             let msg = gettext("cannot open `{}': {}")
                 .replacen("{}", &path.display().to_string(), 1)
                 .replacen("{}", &plib::diag::io_error_text(&error), 1);
             state.emit_error(stderr, format_args!("{msg}"))?;
         }
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -309,9 +315,14 @@ impl MacroImplementation for IncludeMacro {
 pub struct SincludeMacro;
 
 impl MacroImplementation for SincludeMacro {
-    fn evaluate(&self, state: State, _stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
-        let _ = IncludeMacro::include(&state, frame);
-        Ok(state)
+    fn evaluate(
+        &self,
+        state: &mut State,
+        _stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<()> {
+        let _ = IncludeMacro::include(state, frame);
+        Ok(())
     }
 }
 
@@ -320,17 +331,17 @@ pub struct ChangecomMacro;
 impl MacroImplementation for ChangecomMacro {
     fn evaluate(
         &self,
-        mut state: State,
+        state: &mut State,
         _stderr: &mut dyn Write,
         frame: StackFrame,
-    ) -> Result<State> {
+    ) -> Result<()> {
         // GNU m4: an empty or missing start string disables comments, and a
         // missing end string is the <newline> (POSIX), not the previous one.
         let mut args = frame.args.into_iter();
         let open_tag = args.next().unwrap_or_default();
         if open_tag.is_empty() {
             state.parse_config.comment_enabled = false;
-            return Ok(state);
+            return Ok(());
         }
         state.parse_config.comment_enabled = true;
         state.parse_config.comment_open_tag = open_tag;
@@ -338,7 +349,7 @@ impl MacroImplementation for ChangecomMacro {
             Some(close_tag) if !close_tag.is_empty() => close_tag,
             _ => DEFAULT_COMMENT_CLOSE_TAG.to_vec(),
         };
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -347,10 +358,10 @@ pub struct ChangequoteMacro;
 impl MacroImplementation for ChangequoteMacro {
     fn evaluate(
         &self,
-        mut state: State,
+        state: &mut State,
         _stderr: &mut dyn Write,
         frame: StackFrame,
-    ) -> Result<State> {
+    ) -> Result<()> {
         // As GNU m4: no arguments restore the defaults; an empty start string
         // disables quoting; a non-empty one with no, or an empty, end string
         // gets the default end string.
@@ -369,7 +380,7 @@ impl MacroImplementation for ChangequoteMacro {
         };
         state.parse_config.quote_open_tag = open_tag;
         state.parse_config.quote_close_tag = close_tag;
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -379,12 +390,7 @@ impl MacroImplementation for ChangequoteMacro {
 pub struct IncrMacro;
 
 impl MacroImplementation for IncrMacro {
-    fn evaluate(
-        &self,
-        mut state: State,
-        stderr: &mut dyn Write,
-        frame: StackFrame,
-    ) -> Result<State> {
+    fn evaluate(&self, state: &mut State, stderr: &mut dyn Write, frame: StackFrame) -> Result<()> {
         if let Some(first) = frame.args.into_iter().next() {
             match super::eval::padded(super::eval::parse_integer)(&first) {
                 Ok((b"", number)) => state
@@ -398,7 +404,7 @@ impl MacroImplementation for IncrMacro {
                 )?,
             }
         }
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -408,12 +414,7 @@ impl MacroImplementation for IncrMacro {
 pub struct DecrMacro;
 
 impl MacroImplementation for DecrMacro {
-    fn evaluate(
-        &self,
-        mut state: State,
-        stderr: &mut dyn Write,
-        frame: StackFrame,
-    ) -> Result<State> {
+    fn evaluate(&self, state: &mut State, stderr: &mut dyn Write, frame: StackFrame) -> Result<()> {
         if let Some(first) = frame.args.into_iter().next() {
             match super::eval::padded(super::eval::parse_integer)(&first) {
                 Ok((b"", number)) => state
@@ -425,7 +426,7 @@ impl MacroImplementation for DecrMacro {
                 )?,
             }
         }
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -444,12 +445,7 @@ impl MacroImplementation for DecrMacro {
 pub struct IfelseMacro;
 
 impl MacroImplementation for IfelseMacro {
-    fn evaluate(
-        &self,
-        mut state: State,
-        stderr: &mut dyn Write,
-        frame: StackFrame,
-    ) -> Result<State> {
+    fn evaluate(&self, state: &mut State, stderr: &mut dyn Write, frame: StackFrame) -> Result<()> {
         let mut args_len = frame.args.len();
         if args_len < 3 {
             // POSIX 103940 says ifelse "takes three or more arguments" and
@@ -464,7 +460,7 @@ impl MacroImplementation for IfelseMacro {
                     format_args!("{}", gettext("too few arguments to builtin `ifelse'")),
                 )?;
             }
-            return Ok(state);
+            return Ok(());
         }
 
         let mut args = frame.args.into_iter();
@@ -483,11 +479,11 @@ impl MacroImplementation for IfelseMacro {
                 log::debug!("IfelseMacro::evaluate() evaluating argument {}", i * 3 + 2);
                 let arg = args.next().expect("at least 3 args");
                 state.input.pushback_string(&arg);
-                return Ok(state);
+                return Ok(());
             } else {
                 match args_len {
                     0..=2 => panic!("at least 3 args"),
-                    3 => return Ok(state),
+                    3 => return Ok(()),
                     4 | 5 => {
                         args.next();
                         log::debug!("IfelseMacro::evaluate() evaluating argument {}", i * 3 + 3);
@@ -502,7 +498,7 @@ impl MacroImplementation for IfelseMacro {
                                 ),
                             )?;
                         }
-                        return Ok(state);
+                        return Ok(());
                     }
                     6.. => {
                         // the first three arguments shall be discarded and processing shall
@@ -524,7 +520,12 @@ impl MacroImplementation for IfelseMacro {
 pub struct IfdefMacro;
 
 impl MacroImplementation for IfdefMacro {
-    fn evaluate(&self, state: State, _stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
+    fn evaluate(
+        &self,
+        state: &mut State,
+        _stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<()> {
         let mut args = frame.args.into_iter();
         let first_arg = args
             .next()
@@ -538,7 +539,7 @@ impl MacroImplementation for IfdefMacro {
             state.input.pushback_string(&third_arg);
         }
         log::debug!("IfdefMacro::evaluate() finished");
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -548,7 +549,12 @@ impl MacroImplementation for IfdefMacro {
 pub struct ShiftMacro;
 
 impl MacroImplementation for ShiftMacro {
-    fn evaluate(&self, state: State, _stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
+    fn evaluate(
+        &self,
+        state: &mut State,
+        _stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<()> {
         // Every argument but the first, each quoted, as POSIX says: an empty
         // one stays an argument, and none is expanded again.
         let mut text = Vec::new();
@@ -561,7 +567,7 @@ impl MacroImplementation for ShiftMacro {
             text.extend_from_slice(&state.parse_config.quote_close_tag);
         }
         state.input.pushback_string(&text);
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -570,16 +576,21 @@ impl MacroImplementation for ShiftMacro {
 pub struct LenMacro;
 
 impl MacroImplementation for LenMacro {
-    fn evaluate(&self, state: State, _stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
+    fn evaluate(
+        &self,
+        state: &mut State,
+        _stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<()> {
         let first_arg = frame
             .args
             .into_iter()
             .next()
             .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
         // POSIX: the length is in characters, not bytes (LC_CTYPE).
-        let len = mb_char_slices(&first_arg).len();
+        let len = char_slices(&first_arg).len();
         state.input.pushback_string(len.to_string().as_bytes());
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -590,7 +601,12 @@ impl MacroImplementation for LenMacro {
 pub struct IndexMacro;
 
 impl MacroImplementation for IndexMacro {
-    fn evaluate(&self, state: State, _stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
+    fn evaluate(
+        &self,
+        state: &mut State,
+        _stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<()> {
         let mut args = frame.args.into_iter();
         let first_arg = args
             .next()
@@ -600,7 +616,7 @@ impl MacroImplementation for IndexMacro {
             // Already diagnosed: `index(abc)` is 0.
             None => {
                 state.input.pushback_character(b'0');
-                return Ok(state);
+                return Ok(());
             }
         };
 
@@ -608,7 +624,7 @@ impl MacroImplementation for IndexMacro {
         // would otherwise panic.
         if second_arg.is_empty() {
             state.input.pushback_character(b'0');
-            return Ok(state);
+            return Ok(());
         }
 
         let byte_offset = first_arg
@@ -627,7 +643,7 @@ impl MacroImplementation for IndexMacro {
                 state.input.pushback_string(b"-1");
             }
         }
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -688,7 +704,12 @@ fn push_range(out: &mut Vec<Vec<u8>>, from: u8, to: u8) {
 }
 
 impl MacroImplementation for TranslitMacro {
-    fn evaluate(&self, state: State, _stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
+    fn evaluate(
+        &self,
+        state: &mut State,
+        _stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<()> {
         let mut args = frame.args.into_iter();
         let first_arg = args
             .next()
@@ -700,7 +721,7 @@ impl MacroImplementation for TranslitMacro {
             // result is the first argument unchanged (GNU m4).
             None => {
                 state.input.pushback_string(&first_arg);
-                return Ok(state);
+                return Ok(());
             }
         };
 
@@ -709,10 +730,10 @@ impl MacroImplementation for TranslitMacro {
         // Transliterate by character, not byte (LC_CTYPE): each source character
         // maps to the target character at the same position, or is deleted when
         // the target list is shorter.
-        let from = expand_ranges(mb_char_slices(&second_arg));
-        let to = expand_ranges(mb_char_slices(&third_arg));
+        let from = expand_ranges(char_slices(&second_arg));
+        let to = expand_ranges(char_slices(&third_arg));
         let mut output_buffer: Vec<u8> = Vec::with_capacity(first_arg.len());
-        for ch in mb_char_slices(&first_arg) {
+        for ch in char_slices(&first_arg) {
             match from.iter().position(|source| source.as_slice() == ch) {
                 Some(pos) => {
                     if let Some(replacement) = to.get(pos) {
@@ -724,7 +745,7 @@ impl MacroImplementation for TranslitMacro {
         }
 
         state.input.pushback_string(&output_buffer);
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -739,21 +760,16 @@ impl MacroImplementation for TranslitMacro {
 pub struct SubstrMacro;
 
 impl MacroImplementation for SubstrMacro {
-    fn evaluate(
-        &self,
-        mut state: State,
-        stderr: &mut dyn Write,
-        frame: StackFrame,
-    ) -> Result<State> {
+    fn evaluate(&self, state: &mut State, stderr: &mut dyn Write, frame: StackFrame) -> Result<()> {
         let mut args = frame.args.into_iter();
         let first_arg = args
             .next()
             .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
 
         // Indices and lengths are in characters, not bytes (LC_CTYPE).
-        let chars = mb_char_slices(&first_arg);
+        let chars = char_slices(&first_arg);
         if chars.is_empty() {
-            return Ok(state);
+            return Ok(());
         }
 
         let start_index = match args.next() {
@@ -764,7 +780,7 @@ impl MacroImplementation for SubstrMacro {
                         stderr,
                         format_args!("{}", gettext("non-numeric argument to builtin `substr'")),
                     )?;
-                    return Ok(state);
+                    return Ok(());
                 }
             },
             None => 0,
@@ -772,7 +788,7 @@ impl MacroImplementation for SubstrMacro {
 
         // A starting point beyond the end is not an error; the result is null.
         if start_index >= chars.len() {
-            return Ok(state);
+            return Ok(());
         }
 
         let selected: &[&[u8]] = match args.next() {
@@ -782,7 +798,7 @@ impl MacroImplementation for SubstrMacro {
                         let end_index = usize::min(start_index + number_of_chars, chars.len());
                         &chars[start_index..end_index]
                     } else {
-                        return Ok(state);
+                        return Ok(());
                     }
                 }
                 Err(_) => {
@@ -790,14 +806,14 @@ impl MacroImplementation for SubstrMacro {
                         stderr,
                         format_args!("{}", gettext("non-numeric argument to builtin `substr'")),
                     )?;
-                    return Ok(state);
+                    return Ok(());
                 }
             },
             None => &chars[start_index..],
         };
 
         state.input.pushback_string(&selected.concat());
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -806,12 +822,7 @@ impl MacroImplementation for SubstrMacro {
 pub struct DumpdefMacro;
 
 impl MacroImplementation for DumpdefMacro {
-    fn evaluate(
-        &self,
-        mut state: State,
-        stderr: &mut dyn Write,
-        frame: StackFrame,
-    ) -> Result<State> {
+    fn evaluate(&self, state: &mut State, stderr: &mut dyn Write, frame: StackFrame) -> Result<()> {
         // Collect first, then print sorted by name -- with no arguments every
         // macro, otherwise the named ones -- as GNU m4 does; autom4te reads
         // the list of built-ins out of a bare `dumpdef`.
@@ -876,7 +887,7 @@ impl MacroImplementation for DumpdefMacro {
         }
         state.debug.write(stderr, &text)?;
 
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -940,12 +951,7 @@ fn mkstemp(mut template: Vec<u8>) -> Result<Vec<u8>> {
 }
 
 impl MacroImplementation for MkstempMacro {
-    fn evaluate(
-        &self,
-        mut state: State,
-        stderr: &mut dyn Write,
-        frame: StackFrame,
-    ) -> Result<State> {
+    fn evaluate(&self, state: &mut State, stderr: &mut dyn Write, frame: StackFrame) -> Result<()> {
         let first_arg = frame
             .args
             .into_iter()
@@ -963,7 +969,7 @@ impl MacroImplementation for MkstempMacro {
                 state.exit_error = true;
             }
         }
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -975,12 +981,7 @@ impl MacroImplementation for MkstempMacro {
 pub struct M4exitMacro;
 
 impl MacroImplementation for M4exitMacro {
-    fn evaluate(
-        &self,
-        mut state: State,
-        stderr: &mut dyn Write,
-        frame: StackFrame,
-    ) -> Result<State> {
+    fn evaluate(&self, state: &mut State, stderr: &mut dyn Write, frame: StackFrame) -> Result<()> {
         if let Some(first_arg) = frame.args.into_iter().next() {
             let exit_code: i32 = match nom::combinator::all_consuming(parse_index)(&first_arg) {
                 Ok((_, code)) => i32::try_from(code).unwrap_or(1),
@@ -1018,10 +1019,10 @@ pub struct M4wrapMacro;
 impl MacroImplementation for M4wrapMacro {
     fn evaluate(
         &self,
-        mut state: State,
+        state: &mut State,
         _stderr: &mut dyn Write,
         frame: StackFrame,
-    ) -> Result<State> {
+    ) -> Result<()> {
         let first_arg = frame
             .args
             .into_iter()
@@ -1029,7 +1030,7 @@ impl MacroImplementation for M4wrapMacro {
             .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
         let location = state.location();
         state.m4wrap.push((first_arg, location));
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -1053,12 +1054,7 @@ fn system(command: &[u8]) -> Result<ExitStatus> {
 }
 
 impl MacroImplementation for SyscmdMacro {
-    fn evaluate(
-        &self,
-        mut state: State,
-        stderr: &mut dyn Write,
-        frame: StackFrame,
-    ) -> Result<State> {
+    fn evaluate(&self, state: &mut State, stderr: &mut dyn Write, frame: StackFrame) -> Result<()> {
         let first_arg = frame
             .args
             .into_iter()
@@ -1072,7 +1068,7 @@ impl MacroImplementation for SyscmdMacro {
         stderr.flush()?;
         let status = system(&first_arg)?;
         state.last_syscmd_status = Some(status);
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -1081,7 +1077,12 @@ impl MacroImplementation for SyscmdMacro {
 pub struct SysvalMacro;
 
 impl MacroImplementation for SysvalMacro {
-    fn evaluate(&self, state: State, stderr: &mut dyn Write, _frame: StackFrame) -> Result<State> {
+    fn evaluate(
+        &self,
+        state: &mut State,
+        stderr: &mut dyn Write,
+        _frame: StackFrame,
+    ) -> Result<()> {
         if let Some(status) = state.last_syscmd_status {
             match status.code() {
                 Some(code) => state.input.pushback_string(code.to_string().as_bytes()),
@@ -1092,7 +1093,7 @@ impl MacroImplementation for SysvalMacro {
                 )?,
             }
         }
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -1106,12 +1107,7 @@ impl MacroImplementation for SysvalMacro {
 pub struct DivertMacro;
 
 impl MacroImplementation for DivertMacro {
-    fn evaluate(
-        &self,
-        mut state: State,
-        stderr: &mut dyn Write,
-        frame: StackFrame,
-    ) -> Result<State> {
+    fn evaluate(&self, state: &mut State, stderr: &mut dyn Write, frame: StackFrame) -> Result<()> {
         let divert_number = match frame.args.into_iter().next() {
             Some(first_arg) if !first_arg.is_empty() => {
                 match nom::combinator::all_consuming(parse_integer)(&first_arg) {
@@ -1123,7 +1119,7 @@ impl MacroImplementation for DivertMacro {
                             stderr,
                             format_args!("{}", gettext("non-numeric argument to builtin `divert'")),
                         )?;
-                        return Ok(state);
+                        return Ok(());
                     }
                 }
             }
@@ -1140,7 +1136,7 @@ impl MacroImplementation for DivertMacro {
             None => 0,
         };
         state.output.output.divert(divert_number)?;
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -1148,11 +1144,16 @@ impl MacroImplementation for DivertMacro {
 pub struct DivnumMacro;
 
 impl MacroImplementation for DivnumMacro {
-    fn evaluate(&self, state: State, _stderr: &mut dyn Write, _frame: StackFrame) -> Result<State> {
+    fn evaluate(
+        &self,
+        state: &mut State,
+        _stderr: &mut dyn Write,
+        _frame: StackFrame,
+    ) -> Result<()> {
         state
             .input
             .pushback_string(state.output.output.divert_number().to_string().as_bytes());
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -1181,16 +1182,11 @@ fn parse_index(input: &[u8]) -> IResult<&[u8], usize> {
 }
 
 impl MacroImplementation for UndivertMacro {
-    fn evaluate(
-        &self,
-        mut state: State,
-        stderr: &mut dyn Write,
-        frame: StackFrame,
-    ) -> Result<State> {
+    fn evaluate(&self, state: &mut State, stderr: &mut dyn Write, frame: StackFrame) -> Result<()> {
         // No arguments: flush every diversion buffer in numerical order.
         if frame.args.is_empty() {
             state.output.output.undivert_all()?;
-            return Ok(state);
+            return Ok(());
         }
 
         for arg in frame.args.into_iter() {
@@ -1210,7 +1206,7 @@ impl MacroImplementation for UndivertMacro {
                 )?,
             }
         }
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -1218,7 +1214,12 @@ impl MacroImplementation for UndivertMacro {
 pub struct FileMacro;
 
 impl MacroImplementation for FileMacro {
-    fn evaluate(&self, state: State, _stderr: &mut dyn Write, _frame: StackFrame) -> Result<State> {
+    fn evaluate(
+        &self,
+        state: &mut State,
+        _stderr: &mut dyn Write,
+        _frame: StackFrame,
+    ) -> Result<()> {
         let (name, _) = state.location();
         state
             .input
@@ -1227,7 +1228,7 @@ impl MacroImplementation for FileMacro {
         state
             .input
             .pushback_string(&state.parse_config.quote_open_tag);
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -1235,10 +1236,15 @@ impl MacroImplementation for FileMacro {
 pub struct LineMacro;
 
 impl MacroImplementation for LineMacro {
-    fn evaluate(&self, state: State, _stderr: &mut dyn Write, _frame: StackFrame) -> Result<State> {
+    fn evaluate(
+        &self,
+        state: &mut State,
+        _stderr: &mut dyn Write,
+        _frame: StackFrame,
+    ) -> Result<()> {
         let (_, line) = state.location();
         state.input.pushback_string(line.to_string().as_bytes());
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -1247,12 +1253,17 @@ impl MacroImplementation for LineMacro {
 pub struct ProgramMacro;
 
 impl MacroImplementation for ProgramMacro {
-    fn evaluate(&self, state: State, _stderr: &mut dyn Write, _frame: StackFrame) -> Result<State> {
+    fn evaluate(
+        &self,
+        state: &mut State,
+        _stderr: &mut dyn Write,
+        _frame: StackFrame,
+    ) -> Result<()> {
         let program = std::env::args_os().next().unwrap_or_else(|| "m4".into());
         let mut text = state.parse_config.quote_open_tag.clone();
         text.extend_from_slice(program.as_bytes());
         text.extend_from_slice(&state.parse_config.quote_close_tag);
         state.input.pushback_string(&text);
-        Ok(state)
+        Ok(())
     }
 }

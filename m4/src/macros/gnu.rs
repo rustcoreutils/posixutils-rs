@@ -40,17 +40,12 @@ fn inner_frame(frame: StackFrame, definition: Rc<MacroDefinition>) -> StackFrame
 pub struct BuiltinMacroCall;
 
 impl MacroImplementation for BuiltinMacroCall {
-    fn evaluate(
-        &self,
-        mut state: State,
-        stderr: &mut dyn Write,
-        frame: StackFrame,
-    ) -> Result<State> {
+    fn evaluate(&self, state: &mut State, stderr: &mut dyn Write, frame: StackFrame) -> Result<()> {
         let name = frame.args[0].clone();
         let Some(builtin) = BuiltinMacro::from_name(&name) else {
             let name = String::from_utf8_lossy(&name);
             state.emit_message(stderr, format_args!("undefined builtin `{name}'"))?;
-            return Ok(state);
+            return Ok(());
         };
         let definition = Rc::new(MacroDefinition::new_builtin(MacroName(name), builtin));
         let frame = inner_frame(frame, definition.clone());
@@ -63,12 +58,7 @@ impl MacroImplementation for BuiltinMacroCall {
 pub struct IndirMacro;
 
 impl MacroImplementation for IndirMacro {
-    fn evaluate(
-        &self,
-        mut state: State,
-        stderr: &mut dyn Write,
-        frame: StackFrame,
-    ) -> Result<State> {
+    fn evaluate(&self, state: &mut State, stderr: &mut dyn Write, frame: StackFrame) -> Result<()> {
         let name = frame.args[0].as_slice();
         let Some(definition) = state
             .macro_definitions
@@ -78,7 +68,7 @@ impl MacroImplementation for IndirMacro {
         else {
             let name = String::from_utf8_lossy(name).into_owned();
             state.emit_message(stderr, format_args!("undefined macro `{name}'"))?;
-            return Ok(state);
+            return Ok(());
         };
         let frame = inner_frame(frame, definition.clone());
         definition.implementation.call(state, stderr, frame)
@@ -151,21 +141,16 @@ fn substitute(
 pub struct RegexpMacro;
 
 impl MacroImplementation for RegexpMacro {
-    fn evaluate(
-        &self,
-        mut state: State,
-        stderr: &mut dyn Write,
-        frame: StackFrame,
-    ) -> Result<State> {
+    fn evaluate(&self, state: &mut State, stderr: &mut dyn Write, frame: StackFrame) -> Result<()> {
         let mut args = frame.args.into_iter();
         let victim = args.next().unwrap_or_default();
         let pattern = args.next().unwrap_or_default();
         let replacement = args.next();
-        let re = match compile(&mut state, &pattern) {
+        let re = match compile(state, &pattern) {
             Ok(re) => re,
             Err(message) => {
                 state.emit_message(stderr, format_args!("{message}"))?;
-                return Ok(state);
+                return Ok(());
             }
         };
         let mut out = Vec::new();
@@ -176,12 +161,12 @@ impl MacroImplementation for RegexpMacro {
             },
             Some(replacement) => {
                 if let Some(captures) = re.captures(&victim) {
-                    substitute(&mut state, stderr, &mut out, &replacement, &captures)?;
+                    substitute(state, stderr, &mut out, &replacement, &captures)?;
                 }
             }
         }
         state.input.pushback_string(&out);
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -189,12 +174,7 @@ impl MacroImplementation for RegexpMacro {
 pub struct PatsubstMacro;
 
 impl MacroImplementation for PatsubstMacro {
-    fn evaluate(
-        &self,
-        mut state: State,
-        stderr: &mut dyn Write,
-        frame: StackFrame,
-    ) -> Result<State> {
+    fn evaluate(&self, state: &mut State, stderr: &mut dyn Write, frame: StackFrame) -> Result<()> {
         let mut args = frame.args.into_iter();
         let victim = args.next().unwrap_or_default();
         let pattern = args.next().unwrap_or_default();
@@ -203,13 +183,13 @@ impl MacroImplementation for PatsubstMacro {
         // the string is unchanged.
         if pattern.is_empty() && replacement.is_empty() {
             state.input.pushback_string(&victim);
-            return Ok(state);
+            return Ok(());
         }
-        let re = match compile(&mut state, &pattern) {
+        let re = match compile(state, &pattern) {
             Ok(re) => re,
             Err(message) => {
                 state.emit_message(stderr, format_args!("{message}"))?;
-                return Ok(state);
+                return Ok(());
             }
         };
         // As GNU m4 does: search from just past each match, keeping the
@@ -224,7 +204,7 @@ impl MacroImplementation for PatsubstMacro {
             };
             let whole = captures.get(0).expect("group 0 is the match");
             out.extend_from_slice(&victim[offset..whole.start()]);
-            substitute(&mut state, stderr, &mut out, &replacement, &captures)?;
+            substitute(state, stderr, &mut out, &replacement, &captures)?;
             offset = whole.end();
             if whole.start() == whole.end() {
                 if let Some(&c) = victim.get(offset) {
@@ -234,7 +214,7 @@ impl MacroImplementation for PatsubstMacro {
             }
         }
         state.input.pushback_string(&out);
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -242,12 +222,7 @@ impl MacroImplementation for PatsubstMacro {
 pub struct EsyscmdMacro;
 
 impl MacroImplementation for EsyscmdMacro {
-    fn evaluate(
-        &self,
-        mut state: State,
-        stderr: &mut dyn Write,
-        frame: StackFrame,
-    ) -> Result<State> {
+    fn evaluate(&self, state: &mut State, stderr: &mut dyn Write, frame: StackFrame) -> Result<()> {
         // The child writes to our standard error, and may read the files our
         // output and debug streams are going to.
         state.output.output.stdout().borrow_mut().flush()?;
@@ -267,7 +242,7 @@ impl MacroImplementation for EsyscmdMacro {
             .read_to_end(&mut output)?;
         state.last_syscmd_status = Some(child.wait()?);
         state.input.pushback_string(&output);
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -276,15 +251,10 @@ impl MacroImplementation for EsyscmdMacro {
 pub struct DebugmodeMacro;
 
 impl MacroImplementation for DebugmodeMacro {
-    fn evaluate(
-        &self,
-        mut state: State,
-        stderr: &mut dyn Write,
-        frame: StackFrame,
-    ) -> Result<State> {
+    fn evaluate(&self, state: &mut State, stderr: &mut dyn Write, frame: StackFrame) -> Result<()> {
         let Some(arg) = frame.args.first() else {
             state.debug.flags = 0;
-            return Ok(state);
+            return Ok(());
         };
         let (change, flags) = match arg.split_first() {
             Some((&c @ (b'+' | b'-'), rest)) => (Some(c), rest),
@@ -301,7 +271,7 @@ impl MacroImplementation for DebugmodeMacro {
                 state.emit_message(stderr, format_args!("Debugmode: bad debug flags: `{arg}'"))?;
             }
         }
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -310,12 +280,7 @@ impl MacroImplementation for DebugmodeMacro {
 pub struct DebugfileMacro;
 
 impl MacroImplementation for DebugfileMacro {
-    fn evaluate(
-        &self,
-        mut state: State,
-        stderr: &mut dyn Write,
-        frame: StackFrame,
-    ) -> Result<State> {
+    fn evaluate(&self, state: &mut State, stderr: &mut dyn Write, frame: StackFrame) -> Result<()> {
         let sink = match frame.args.first() {
             None => Ok(debug::Sink::Stderr),
             Some(name) => debug::Sink::open(name),
@@ -334,7 +299,7 @@ impl MacroImplementation for DebugfileMacro {
                 )?;
             }
         }
-        Ok(state)
+        Ok(())
     }
 }
 
@@ -342,12 +307,7 @@ impl MacroImplementation for DebugfileMacro {
 pub struct FormatMacro;
 
 impl MacroImplementation for FormatMacro {
-    fn evaluate(
-        &self,
-        mut state: State,
-        stderr: &mut dyn Write,
-        frame: StackFrame,
-    ) -> Result<State> {
+    fn evaluate(&self, state: &mut State, stderr: &mut dyn Write, frame: StackFrame) -> Result<()> {
         let mut args = frame.args.into_iter();
         let format = args.next().unwrap_or_default();
         let args: Vec<Vec<u8>> = args.collect();
@@ -359,6 +319,6 @@ impl MacroImplementation for FormatMacro {
             }
         };
         state.input.pushback_string(&out);
-        Ok(state)
+        Ok(())
     }
 }

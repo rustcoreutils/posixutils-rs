@@ -10,7 +10,7 @@
 use std::io::Write;
 
 use crate::input::{Location, BUILTIN_TOKEN};
-use crate::lexer::{is_alpha, is_space};
+use crate::lexer::{is_name_start, is_space};
 use crate::macros::MacroImplementation;
 use crate::state::{StackFrame, State};
 use crate::EOF;
@@ -27,6 +27,10 @@ pub(crate) fn process(mut state: State, stderr: &mut dyn Write) -> crate::error:
     // TODO(style): rename these to something sensible.
     let mut l: u8 = 0;
     let mut t: u8;
+    // Plain text is copied in runs rather than a byte at a time, except
+    // under `-s`, whose `#line` directives follow the input byte by byte.
+    let bulk = !state.input.line_synchronization();
+    let mut run: Vec<u8> = Vec::new();
 
     'main_loop: loop {
         t = state.input.get_next_character()?;
@@ -46,6 +50,20 @@ pub(crate) fn process(mut state: State, stderr: &mut dyn Write) -> crate::error:
             state.input.enter_literal_scan();
 
             'inside_quote: loop {
+                // Copy the text up to the next quote character at once.
+                if let (true, &[open], &[close]) = (
+                    bulk,
+                    state.parse_config.quote_open_tag.as_slice(),
+                    state.parse_config.quote_close_tag.as_slice(),
+                ) {
+                    run.clear();
+                    state
+                        .input
+                        .take_run(|c| c == open || c == close || c == EOF, &mut run)?;
+                    if !run.is_empty() {
+                        state.output.write_all(&run)?;
+                    }
+                }
                 l = state.input.get_next_character()?;
                 if state
                     .input
@@ -107,7 +125,7 @@ pub(crate) fn process(mut state: State, stderr: &mut dyn Write) -> crate::error:
                 state.output.write_all(&[t])?;
             }
             state.input.leave_literal_scan();
-        } else if t == b'_' || is_alpha(t) {
+        } else if is_name_start(t) {
             // Possibly a macro to be evaluated. A call is reported at the line
             // of its name, before reading past the name moves on.
             let location = state.input.current_location();
@@ -135,7 +153,9 @@ pub(crate) fn process(mut state: State, stderr: &mut dyn Write) -> crate::error:
                         frame.args.push(Vec::new());
                         state.output.stack.push(frame);
                     } else {
-                        state = definition.implementation.evaluate(state, stderr, frame)?;
+                        definition
+                            .implementation
+                            .evaluate(&mut state, stderr, frame)?;
                     }
                 }
             } else {
@@ -154,7 +174,7 @@ pub(crate) fn process(mut state: State, stderr: &mut dyn Write) -> crate::error:
             continue 'main_loop;
         } else if state.output.stack.is_empty() {
             // not in a macro
-            state.output.write_all(&[t])?;
+            write_plain(&mut state, t, bulk, &mut run)?;
         } else {
             match t {
                 b'(' => {
@@ -181,11 +201,11 @@ pub(crate) fn process(mut state: State, stderr: &mut dyn Write) -> crate::error:
                     } else {
                         // end of argument list
                         let frame = state.output.stack.pop().unwrap();
-                        state = frame
+                        frame
                             .definition
                             .clone()
                             .implementation
-                            .evaluate(state, stderr, frame)?;
+                            .evaluate(&mut state, stderr, frame)?;
                     }
                 }
                 b',' => {
@@ -237,7 +257,7 @@ pub(crate) fn process(mut state: State, stderr: &mut dyn Write) -> crate::error:
                         }
                         state.input.leave_literal_scan();
                     } else {
-                        state.output.write_all(&[t])?;
+                        write_plain(&mut state, t, bulk, &mut run)?;
                     }
                 }
             }
@@ -245,6 +265,36 @@ pub(crate) fn process(mut state: State, stderr: &mut dyn Write) -> crate::error:
     }
 
     Ok(state)
+}
+
+/// Write the plain byte `t`, and with `bulk` the run of plain text after it:
+/// up to anything the main loop must look at itself, which is a quote or
+/// comment start, a name, end of input, a built-in token, and inside an
+/// argument list a parenthesis or comma.
+fn write_plain(state: &mut State, t: u8, bulk: bool, run: &mut Vec<u8>) -> crate::Result<()> {
+    run.clear();
+    run.push(t);
+    if bulk {
+        let quote = state.parse_config.quote_open_tag.first().copied();
+        let comment = if state.parse_config.comment_enabled {
+            state.parse_config.comment_open_tag.first().copied()
+        } else {
+            None
+        };
+        let in_args = !state.output.stack.is_empty();
+        state.input.take_run(
+            |c| {
+                Some(c) == quote
+                    || Some(c) == comment
+                    || is_name_start(c)
+                    || c == EOF
+                    || c == BUILTIN_TOKEN
+                    || (in_args && matches!(c, b'(' | b')' | b','))
+            },
+            run,
+        )?;
+    }
+    state.output.write_all(run)
 }
 
 /// Run queued m4wrap text at the true end of all input, rescanned, in the

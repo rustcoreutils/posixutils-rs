@@ -21,7 +21,6 @@ use crate::common::Dir;
 
 /// `$(shell ...)` output is not scanned for macros.
 #[test]
-#[ignore = "fails until expansion is single-pass"]
 fn shell_output_is_not_expanded_again() {
     let dir = Dir::new("expand_shell_data");
     dir.write(
@@ -35,7 +34,6 @@ fn shell_output_is_not_expanded_again() {
 /// A function body's `$$$$` reaches the shell as `$$`, and the `$$` the
 /// shell writes back is two dollars.
 #[test]
-#[ignore = "fails until expansion is single-pass"]
 fn shell_output_from_a_call_keeps_its_dollars() {
     let dir = Dir::new("expand_shell_call");
     dir.write(
@@ -59,7 +57,6 @@ fn bang_output_is_expanded_when_used() {
 
 /// A file name `$(wildcard ...)` or `$(realpath ...)` finds is a name.
 #[test]
-#[ignore = "fails until expansion is single-pass"]
 fn found_file_names_are_not_expanded() {
     let dir = Dir::new("expand_file_data");
     dir.write("x$(B)y", "").write("r$(B)", "").write(
@@ -181,7 +178,6 @@ fn a_substitution_expands_its_replacement() {
 
 /// ... including the `=` and the `%` of the substitution.
 #[test]
-#[ignore = "fails until expansion is single-pass"]
 fn a_substitution_can_be_computed() {
     let dir = Dir::new("expand_subst_computed");
     dir.write(
@@ -194,7 +190,6 @@ fn a_substitution_can_be_computed() {
 /// POSIX 105785 asks for at least 100 levels of indirection; GNU make has
 /// no limit.
 #[test]
-#[ignore = "fails until expansion is single-pass"]
 fn a_long_chain_of_macros_expands() {
     let dir = Dir::new("expand_deep_chain");
     let mut makefile = String::new();
@@ -240,7 +235,6 @@ fn an_unused_self_referencing_macro_is_harmless() {
 
 /// What `$(warning ...)` writes is expanded text, with `$$` a `$`.
 #[test]
-#[ignore = "fails until expansion is single-pass"]
 fn a_warning_shows_a_dollar() {
     let dir = Dir::new("expand_warning_dollar");
     dir.write("Makefile", "$(warning w$$x)\nall:\n\t@:\n");

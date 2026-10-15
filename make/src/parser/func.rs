@@ -18,16 +18,24 @@
 //! three that need their arguments *unexpanded* (`if`, `foreach`, `call`) are
 //! handled separately, before argument expansion.
 
-use crate::parser::preprocessor::MacroTable;
+use crate::parser::preprocessor::{escape_dollars, unescape_dollars, Flavour, MacroTable};
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 
-/// How deep the expansion cycle may recurse before we call it non-terminating.
+/// How deep function calls may nest before we call the expansion
+/// non-terminating.
 ///
-/// `substitute` -> `func::call` -> `expand` -> `substitute` is a real recursion,
-/// and `MAX_EXPANSION_ROUNDS` bounds only the rounds *within* one frame. A
-/// self-referential `$(call ...)` therefore used to exhaust the stack and abort
-/// the process rather than report anything.
+/// Expansion -> `func::call` -> expansion is a real recursion, and a
+/// self-referential `$(call ...)` used to exhaust the stack and abort the
+/// process rather than report anything.
 const MAX_EXPANSION_DEPTH: usize = 200;
+
+/// How deep delayed-expansion macros may nest, one expanded inside the
+/// value of another, before we call the expansion non-terminating. POSIX
+/// 105785 asks for at least 100 levels. Each level is a few stack frames,
+/// and a thread Rust starts, a test's among them, has 2 MiB of stack: in a
+/// debug build about 1000 levels fill it.
+const MAX_MACRO_NESTING: usize = 500;
 
 /// Per-expansion state shared by every nested `Ctx`.
 ///
@@ -41,6 +49,7 @@ const MAX_EXPANSION_DEPTH: usize = 200;
 #[derive(Default)]
 pub(crate) struct Expansion {
     depth: Cell<usize>,
+    macro_depth: Cell<usize>,
     pending: Option<RefCell<Vec<String>>>,
 }
 
@@ -48,17 +57,14 @@ impl Expansion {
     /// State for a context that can accept `$(eval ...)`.
     pub(crate) fn new() -> Self {
         Expansion {
-            depth: Cell::new(0),
             pending: Some(RefCell::new(Vec::new())),
+            ..Expansion::default()
         }
     }
 
     /// State for a context that cannot -- a command line.
     pub(crate) fn without_eval() -> Self {
-        Expansion {
-            depth: Cell::new(0),
-            pending: None,
-        }
+        Expansion::default()
     }
 
     /// Queue text for the reader. Whitespace-only text is dropped: an eval that
@@ -96,16 +102,44 @@ impl Expansion {
             ));
         }
         self.depth.set(depth + 1);
-        Ok(DepthGuard(self))
+        Ok(DepthGuard(&self.depth))
+    }
+
+    /// Enter the value of one more delayed-expansion macro, or `None` if
+    /// they are nested too deep.
+    pub(crate) fn enter_macro(&self) -> Option<DepthGuard<'_>> {
+        let depth = self.macro_depth.get();
+        if depth >= MAX_MACRO_NESTING {
+            return None;
+        }
+        self.macro_depth.set(depth + 1);
+        Some(DepthGuard(&self.macro_depth))
     }
 }
 
-/// Restores the expansion depth when dropped.
-struct DepthGuard<'a>(&'a Expansion);
+/// Restores an expansion depth when dropped.
+pub(crate) struct DepthGuard<'a>(&'a Cell<usize>);
 
 impl Drop for DepthGuard<'_> {
     fn drop(&mut self) {
-        self.0.depth.set(self.0.depth.get() - 1);
+        self.0.set(self.0.get() - 1);
+    }
+}
+
+/// The macros a `foreach` loop or a `call` binds while its body is
+/// expanded, in front of those bound by the functions it is inside.
+pub(crate) struct Locals<'a> {
+    bindings: Vec<(String, String)>,
+    outer: Option<&'a Locals<'a>>,
+}
+
+impl Locals<'_> {
+    /// The innermost binding of `name`.
+    fn get(&self, name: &str) -> Option<&str> {
+        match self.bindings.iter().find(|(bound, _)| bound == name) {
+            Some((_, value)) => Some(value),
+            None => self.outer?.get(name),
+        }
     }
 }
 
@@ -115,6 +149,30 @@ pub(crate) struct Ctx<'a> {
     pub env_wins: bool,
     /// Shared across every nested `Ctx`, so recursion is bounded end to end.
     pub state: &'a Expansion,
+    /// What the `foreach` loops and `call`s being expanded bind.
+    pub locals: Option<&'a Locals<'a>>,
+}
+
+impl<'a> Ctx<'a> {
+    /// What `name` holds here, and its flavour: a `foreach` or `call`
+    /// binding shadows every definition, and its value is already
+    /// expanded, as GNU make binds it.
+    pub(crate) fn lookup(&self, name: &str) -> Option<(Cow<'a, str>, Flavour)> {
+        if let Some(value) = self.locals.and_then(|locals| locals.get(name)) {
+            return Some((Cow::Borrowed(value), Flavour::Simple));
+        }
+        self.table.lookup(name, self.env_wins)
+    }
+
+    /// This context with `locals` bound in front of what it binds already.
+    fn with<'b>(&'b self, locals: &'b Locals<'b>) -> Ctx<'b> {
+        Ctx {
+            table: self.table,
+            env_wins: self.env_wins,
+            state: self.state,
+            locals: Some(locals),
+        }
+    }
 }
 
 type Expand<'a> = &'a dyn Fn(&str, &Ctx) -> Result<String, String>;
@@ -605,8 +663,8 @@ fn call_lazy(name: &str, raw: &str, ctx: &Ctx, expand: Expand) -> Option<Result<
 /// driven its paren depth to the floor.
 ///
 /// One `$` level is consumed, matching GNU: a template writes `$$(CC)` so that
-/// the recipe it generates still says `$(CC)`. Our `substitute` passes `$$`
-/// through untouched, so without this the generated recipe would keep both
+/// the recipe it generates still says `$(CC)`. Expansion writes a literal `$`
+/// as `$$`, so without this the generated recipe would keep both
 /// dollars and reach the shell as a command substitution.
 fn f_eval(raw: &str, ctx: &Ctx, expand: Expand) -> Result<String, String> {
     // `R = $(eval $(R))` recurses through `expand` without ever reaching
@@ -661,14 +719,11 @@ fn f_foreach(raw: &str, ctx: &Ctx, expand: Expand) -> Result<String, String> {
     let list = expand(&args[1], ctx)?;
     let mut results = Vec::new();
     for word in words(&list) {
-        let mut table = ctx.table.clone();
-        table.bind_local(var.clone(), word.to_string());
-        let inner = Ctx {
-            table: &table,
-            env_wins: ctx.env_wins,
-            state: ctx.state,
+        let locals = Locals {
+            bindings: vec![(var.clone(), word.to_string())],
+            outer: ctx.locals,
         };
-        results.push(expand(&args[2], &inner)?);
+        results.push(expand(&args[2], &ctx.with(&locals))?);
     }
     Ok(join(results))
 }
@@ -681,22 +736,25 @@ fn f_call(raw: &str, ctx: &Ctx, expand: Expand) -> Result<String, String> {
     };
     let _guard = ctx.state.enter()?;
     let name = expand(name, ctx)?.trim().to_string();
-    // Resolved, not read straight out of the table: a function defined only in
-    // the environment is as callable as any other, and `$(F)` already finds it.
-    let Some(body) = ctx.table.resolve(&name, ctx.env_wins) else {
+    // Looked up as a reference would be: a function defined only in the
+    // environment is as callable as any other, and `$(F)` already finds it.
+    let Some((body, flavour)) = ctx.lookup(&name) else {
         return Ok(String::new());
     };
-    let mut table = ctx.table.clone();
-    table.bind_local("0".to_string(), name);
-    for (i, arg) in args.iter().skip(1).enumerate() {
-        table.bind_local((i + 1).to_string(), expand(arg, ctx)?);
+    // An immediate-expansion macro was expanded when it was defined; there
+    // is nothing in it for the arguments to fill in.
+    if flavour == Flavour::Simple {
+        return Ok(body.into_owned());
     }
-    let inner = Ctx {
-        table: &table,
-        env_wins: ctx.env_wins,
-        state: ctx.state,
+    let mut bindings = vec![("0".to_string(), name)];
+    for (i, arg) in args.iter().skip(1).enumerate() {
+        bindings.push(((i + 1).to_string(), expand(arg, ctx)?));
+    }
+    let locals = Locals {
+        bindings,
+        outer: ctx.locals,
     };
-    expand(&body, &inner)
+    expand(&body, &ctx.with(&locals))
 }
 
 /// Invoke a function. `raw` is the unexpanded argument text.
@@ -710,7 +768,12 @@ pub(crate) fn call(name: &str, raw: &str, ctx: &Ctx, expand: Expand) -> Result<S
         .map(|a| expand(a, ctx))
         .collect::<Result<_, _>>()?;
     let arg = |i: usize| -> &str { args.get(i).map(String::as_str).unwrap_or("") };
-    let all = args.join(",");
+    // Expanded text writes a literal `$` as `$$`. Text leaving make -- a
+    // command for the shell, a pattern or a name for the file system, a
+    // message -- has the `$` itself, and what the shell or the file system
+    // gives back is data, each `$` in it a `$`.
+    let all = || unescape_dollars(&args.join(","));
+    let data = |text: String| escape_dollars(&text).into_owned();
 
     let out = match name {
         "subst" => arg(2).replace(arg(0), arg(1)),
@@ -749,12 +812,12 @@ pub(crate) fn call(name: &str, raw: &str, ctx: &Ctx, expand: Expand) -> Result<S
             .last()
             .map(|s| s.to_string())
             .unwrap_or_default(),
-        "wildcard" => f_wildcard(arg(0)),
-        "realpath" => f_realpath(arg(0)),
-        "shell" => f_shell(&crate::parser::preprocessor::unescape_dollars(&all))?,
-        "error" => return Err(all),
+        "wildcard" => data(f_wildcard(&unescape_dollars(arg(0)))),
+        "realpath" => data(f_realpath(&unescape_dollars(arg(0)))),
+        "shell" => data(f_shell(&all())?),
+        "error" => return Err(all()),
         "warning" | "info" => {
-            eprintln!("{all}");
+            eprintln!("{}", all());
             String::new()
         }
         other => return Err(format!("unknown function '{other}'")),
@@ -781,6 +844,7 @@ mod tests {
             table: &table,
             env_wins: false,
             state: &state,
+            locals: None,
         };
         call(name, raw, &ctx, &plain).expect("function should succeed")
     }
@@ -869,6 +933,7 @@ mod tests {
             table: &table,
             env_wins: false,
             state: &state,
+            locals: None,
         };
         assert!(call("error", "boom", &ctx, &plain).is_err());
     }

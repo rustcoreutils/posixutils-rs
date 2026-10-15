@@ -43,6 +43,10 @@ pub struct State {
     pub fatal_warnings: u8,
     /// `-I` directories, then `M4PATH`. See [`State::open_input`].
     pub include_dirs: Vec<PathBuf>,
+    /// GNU m4 debug flags and stream.
+    pub debug: crate::debug::Debug,
+    /// Compiled `regexp`/`patsubst` patterns: m4sugar uses a few, often.
+    pub regex_cache: HashMap<Vec<u8>, Rc<regex::bytes::Regex>>,
     /// `-L`. See [`State::check_nesting`].
     pub nesting_limit: usize,
 }
@@ -275,6 +279,8 @@ impl Default for State {
             fatal_warnings: 0,
             include_dirs: Vec::new(),
             nesting_limit: 0,
+            debug: crate::debug::Debug::default(),
+            regex_cache: HashMap::new(),
         }
     }
 }

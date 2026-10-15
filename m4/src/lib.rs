@@ -15,7 +15,10 @@ use macros::MacroDefinition;
 use state::State;
 use std::{cell::RefCell, ffi::OsStr, io::Write, path::PathBuf, rc::Rc};
 
+mod debug;
+mod emacs_regex;
 pub mod error;
+mod format;
 mod input;
 mod lexer;
 mod macros;

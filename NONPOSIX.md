@@ -695,6 +695,13 @@ The GNU m4 extensions autoconf, automake and libtoolize cannot run without:
      twice, the first one stops m4.
    * `-L N` / `--nesting-limit=N` — a call nested more than `N` deep is fatal
      (0, the default, is no limit; autom4te passes 1024).
+ * Built-ins `builtin`, `indir`, `regexp`, `patsubst`, `format`, `esyscmd`,
+   `debugmode` and `debugfile`.  `regexp` and `patsubst` take GNU Emacs
+   syntax (`\(` `\)` `\|`, `\w` `\b` `\<` `\>`), with `\N` and `\&` in the
+   replacement; where several matches start at the leftmost position, the
+   first alternative wins rather than the longest, and back-references in a
+   pattern are not supported.  `format` takes C `printf` conversions, once,
+   without backslash escapes.  `dumpdef` writes to the debug stream.
 
 ### make
 

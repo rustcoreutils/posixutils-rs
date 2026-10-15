@@ -9,6 +9,7 @@
 
 mod builtin;
 mod eval;
+mod gnu;
 pub mod trace;
 mod user_defined;
 
@@ -16,6 +17,7 @@ use std::io::Write;
 
 use builtin::*;
 use eval::EvalMacro;
+use gnu::*;
 use trace::{TraceoffMacro, TraceonMacro};
 use user_defined::UserDefinedMacro;
 
@@ -45,25 +47,39 @@ macro_rules! macro_enums {
         impl MacroImplementation for MacroDefinitionImplementation {
             fn evaluate(
                 &self,
-                mut state: State,
+                state: State,
                 stderr: &mut dyn Write,
                 f: StackFrame,
             ) -> Result<State> {
                 state.trace.trace(&state.output.stack, &f, stderr)?;
+                self.call(state, stderr, f)
+            }
+        }
+
+        impl MacroDefinitionImplementation {
+            /// Run the macro on the arguments in `f`, untraced: `indir` and
+            /// `builtin` call macros this way, and GNU m4 traces only the
+            /// macro named in the input.
+            pub fn call(
+                &self,
+                mut state: State,
+                stderr: &mut dyn Write,
+                f: StackFrame,
+            ) -> Result<State> {
                 let builtin = match self {
                     Self::UserDefined(d) => return d.evaluate(state, stderr, f),
                     _ => self.builtin().expect("not user-defined"),
                 };
-                state.call_site = Some(f.location.clone());
-                if !check_arity(&mut state, stderr, builtin, &f)? {
-                    state.call_site = None;
-                    return Ok(state);
-                }
-                let mut state = match self {
-                    $(Self::$variant_name(d) => d.evaluate(state, stderr, f)),*,
-                    Self::UserDefined(_) => unreachable!("handled above"),
-                }?;
-                state.call_site = None;
+                let outer_call_site = state.call_site.replace(f.location.clone());
+                let mut state = if check_arity(&mut state, stderr, builtin, &f)? {
+                    match self {
+                        $(Self::$variant_name(d) => d.evaluate(state, stderr, f)),*,
+                        Self::UserDefined(_) => unreachable!("handled above"),
+                    }?
+                } else {
+                    state
+                };
+                state.call_site = outer_call_site;
                 Ok(state)
             }
         }
@@ -98,6 +114,7 @@ macro_rules! macro_enums {
 macro_enums!(
     #[derive(Clone, Copy)]
     pub enum BuiltinMacroDefinition {
+        Builtin(BuiltinMacroCall),
         Changecom(ChangecomMacro),
         Changequote(ChangequoteMacro),
         Decr(DecrMacro),
@@ -107,13 +124,17 @@ macro_enums!(
         Divnum(DivnumMacro),
         Dnl(DnlMacro),
         Dumpdef(DumpdefMacro),
+        Debugfile(DebugfileMacro),
+        Debugmode(DebugmodeMacro),
         Errprint(ErrprintMacro),
         Eval(EvalMacro),
         File(FileMacro),
+        Esyscmd(EsyscmdMacro),
         Ifdef(IfdefMacro),
         Ifelse(IfelseMacro),
         Include(IncludeMacro),
         Incr(IncrMacro),
+        Format(FormatMacro),
         Index(IndexMacro),
         Len(LenMacro),
         Line(LineMacro),
@@ -122,7 +143,10 @@ macro_enums!(
         Maketemp(MkstempMacro),
         Mkstemp(MkstempMacro),
         Popdef(PopdefMacro),
+        Indir(IndirMacro),
+        Patsubst(PatsubstMacro),
         Pushdef(PushdefMacro),
+        Regexp(RegexpMacro),
         Shift(ShiftMacro),
         Sinclude(SincludeMacro),
         Substr(SubstrMacro),
@@ -140,7 +164,15 @@ impl AsRef<[u8]> for BuiltinMacro {
     fn as_ref(&self) -> &'static [u8] {
         use BuiltinMacro::*;
         match self {
+            Builtin => b"builtin",
             Changecom => b"changecom",
+            Debugfile => b"debugfile",
+            Debugmode => b"debugmode",
+            Esyscmd => b"esyscmd",
+            Format => b"format",
+            Indir => b"indir",
+            Patsubst => b"patsubst",
+            Regexp => b"regexp",
             Changequote => b"changequote",
             Decr => b"decr",
             Define => b"define",
@@ -197,7 +229,15 @@ impl BuiltinMacro {
     pub fn min_args(&self) -> usize {
         use BuiltinMacro::*;
         match self {
+            Builtin => 1,
             Changecom => 0,
+            Debugfile => 0,
+            Debugmode => 0,
+            Esyscmd => 1,
+            Format => 1,
+            Indir => 1,
+            Patsubst => 1,
+            Regexp => 1,
             Changequote => 0,
             Decr => 1,
             Define => 1,
@@ -243,6 +283,10 @@ impl BuiltinMacro {
         match self {
             Divnum | Dnl | File | Line | Sysval => (0, Some(0)),
             Changecom | Changequote => (0, Some(2)),
+            Debugfile | Debugmode => (0, Some(1)),
+            Esyscmd => (1, Some(1)),
+            Builtin | Format | Indir => (1, None),
+            Patsubst | Regexp => (2, Some(3)),
             Divert | M4exit => (0, Some(1)),
             Dumpdef | Traceoff | Traceon | Undivert => (0, None),
             // Handles its own short argument lists.
@@ -263,7 +307,11 @@ impl BuiltinMacro {
     fn runs_when_short(&self) -> bool {
         matches!(
             self,
-            BuiltinMacro::Index | BuiltinMacro::Substr | BuiltinMacro::Translit
+            BuiltinMacro::Index
+                | BuiltinMacro::Patsubst
+                | BuiltinMacro::Regexp
+                | BuiltinMacro::Substr
+                | BuiltinMacro::Translit
         )
     }
 

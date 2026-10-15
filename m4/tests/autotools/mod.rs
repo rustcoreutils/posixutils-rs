@@ -315,3 +315,134 @@ fn long_option_spellings_of_define_and_undefine() {
         0,
     );
 }
+
+// ---------------------------------------------------------------------------
+// GNU built-ins m4sugar is written in
+// ---------------------------------------------------------------------------
+
+#[test]
+fn builtin_and_indir_call_by_name() {
+    m4(
+        &[],
+        "changequote([,])dnl
+1 builtin([len],[abcd]) builtin([nosuch]) indir([len],[ab]) indir([nosuch],x)
+define([a-b],[<$1|$0>])2 indir([a-b],[X])
+3 builtin([define],[q],[Q])q builtin([dnl]) gone
+",
+        "1 4  2 \n2 <X|a-b>\n3 Q ",
+        "m4:stdin:2: undefined builtin `nosuch'\nm4:stdin:2: undefined macro `nosuch'\n",
+        0,
+    );
+}
+
+// libtoolize defines `dnl` as `m4_builtin([dnl])` under --prefix-builtins:
+// builtin takes the unprefixed names.
+#[test]
+fn builtin_takes_original_names_under_prefix_builtins() {
+    m4(
+        &["-P"],
+        "m4_builtin(`dnl')gone\nm4_builtin(`len',`abc')\n",
+        "3\n",
+        "",
+        0,
+    );
+}
+
+// A built-in reached through indir can still be copied with defn.
+#[test]
+fn indir_passes_a_builtin_token_through() {
+    m4(
+        &[],
+        "indir(`define',`mylen',defn(`len'))mylen(`abcd')\n",
+        "4\n",
+        "",
+        0,
+    );
+}
+
+#[test]
+fn regexp_in_emacs_syntax() {
+    m4(
+        &[],
+        "changequote([,])dnl
+1 regexp([GNUs not Unix], [\\<[a-z]\\w+]) regexp([GNUs not Unix], [\\<Q\\w*])
+2 regexp([GNUs not Unix], [\\w\\(\\w+\\)$], [*** \\& *** \\1 ***])
+3 regexp([abc],[\\(x\\)\\|b],[\\1-\\&]) regexp([abc])
+",
+        "1 5 -1\n2 *** Unix *** nix ***\n3 -b 0\n",
+        "m4:stdin:4: Warning: too few arguments to builtin `regexp'\n",
+        0,
+    );
+}
+
+#[test]
+fn patsubst_in_emacs_syntax() {
+    m4(
+        &[],
+        "changequote([,])dnl
+1 patsubst([GNUs not Unix], [\\w+], [(\\&)]) patsubst([abc], [], [-])
+2 patsubst([GNUs not Unix], [^], [OBS: ]) patsubst([a
+b], [^], [> ])
+3 patsubst([m4_define], [^m4_\\(.*\\)], [[\\1]]) patsubst([a.b.c],[\\.],[,])
+4 patsubst([a(b)c], [(\\(b\\))], [[\\1]]) patsubst([aaa], [a*], [x]) patsubst([abc], [x*], [-])
+5 patsubst([foo bar], [\\(o\\)\\|\\(a\\)], [\\2\\1]) patsubst([abc])
+",
+        "1 (GNUs) (not) (Unix) -a-b-c-\n2 OBS: GNUs not Unix > a\n> b\n3 define a,b,c\n4 abc xx -a-b-c-\n5 foo bar abc\n",
+        "m4:stdin:7: Warning: too few arguments to builtin `patsubst'\n",
+        0,
+    );
+}
+
+#[test]
+fn regular_expression_diagnostics() {
+    m4(
+        &[],
+        "changequote([,])regexp([abc],[\\(]) regexp([x], [x], [\\3])\n",
+        " \n",
+        "m4:stdin:1: bad regular expression: `\\(': Unmatched ( or \\(\n\
+         m4:stdin:1: Warning: sub-expression 3 not present\n",
+        0,
+    );
+}
+
+#[test]
+fn format_conversions() {
+    m4(
+        &[],
+        "changequote([,])dnl
+1 format([%s-%d-%5s|%-5s|%.2s], [x], [42], [ab], [cd], [efgh])
+2 format([%*s|%.*s|%c], [4], [x], [2], [abcdef], [65])
+",
+        "1 x-42-   ab|cd   |ef\n2    x|ab|A\n",
+        "",
+        0,
+    );
+}
+
+#[test]
+fn esyscmd_expands_to_the_command_output() {
+    m4(&[], "esyscmd(`echo hi; exit 3')sysval\n", "hi\n3\n", "", 0);
+}
+
+#[test]
+fn debugmode_q_quotes_dumpdef_and_bad_flags_are_reported() {
+    m4(
+        &[],
+        "define(`a',`A')debugmode(`aq')dumpdef(`a')debugmode debugmode(`zz')\n",
+        " \n",
+        "a:\t`A'\nm4:stdin:1: Debugmode: bad debug flags: `zz'\n",
+        0,
+    );
+}
+
+#[test]
+fn debugfile_receives_dumpdef() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let file = dir.path().join("debug.out");
+    let input = format!(
+        "define(`a',`A')debugfile(`{}')dumpdef(`a')debugfile()dumpdef(`a')debugfile\n",
+        file.display()
+    );
+    m4(&[], &input, "\n", "", 0);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "a:\tA\n");
+}

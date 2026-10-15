@@ -816,24 +816,34 @@ impl MacroImplementation for DumpdefMacro {
         }
         found.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
 
+        // To the debug stream, as GNU m4 writes it; `-dq` quotes the text.
+        let quote = state.debug.has(crate::debug::QUOTE);
+        let mut text = Vec::new();
         for (name, definition) in found {
-            stderr.write_all(&name.0)?;
-            stderr.write_all(b":\t")?;
+            text.extend_from_slice(&name.0);
+            text.extend_from_slice(b":\t");
             match &definition.implementation {
                 MacroDefinitionImplementation::UserDefined(user_defined) => {
-                    stderr.write_all(&user_defined.definition)?;
+                    if quote {
+                        text.extend_from_slice(&state.parse_config.quote_open_tag);
+                    }
+                    text.extend_from_slice(&user_defined.definition);
+                    if quote {
+                        text.extend_from_slice(&state.parse_config.quote_close_tag);
+                    }
                 }
                 implementation => {
                     let builtin = implementation
                         .builtin()
                         .expect("a definition that is not user-defined is a built-in");
-                    stderr.write_all(b"<")?;
-                    stderr.write_all(builtin.as_ref())?;
-                    stderr.write_all(b">")?;
+                    text.push(b'<');
+                    text.extend_from_slice(builtin.as_ref());
+                    text.push(b'>');
                 }
             }
-            stderr.write_all(b"\n")?;
+            text.push(b'\n');
         }
+        state.debug.write(stderr, &text)?;
 
         Ok(state)
     }

@@ -24,3 +24,23 @@ fn an_empty_suffix_appends() {
     );
     dir.make(&[]).ok("gzip-env.log keep.log\n");
 }
+
+// An internal macro takes a substitution like any other (POSIX 105804).
+// automake's `.texi.html` rule writes `$(@:.html=.htp)` and moves it to
+// `$@`; the substitution was dropped, so libffi's `make html` moved
+// libffi.html onto itself after deleting it.
+#[test]
+fn an_internal_macro_takes_a_substitution() {
+    let dir = Dir::new("subst_internal");
+    dir.write("a.texi", "");
+    dir.write("b.c", "");
+    dir.write(
+        "Makefile",
+        "EXT = .x\n.SUFFIXES: .texi .html\nall: a.html d/q.o\n\
+         .texi.html:\n\t@echo [$(@:.html=.htp)] [${@:.html=$(EXT)}] [$(<:.texi=.y)] \
+         [$(*:a=b)] [$(@F:%.html=%.z)]\n\
+         d/q.o: b.c\n\t@echo [$(@D:d=e)] [$(^:.c=.h)]\n",
+    );
+    dir.make(&[])
+        .ok("[a.htp] [a.x] [a.y] [b] [a.z]\n[e] [b.h]\n");
+}

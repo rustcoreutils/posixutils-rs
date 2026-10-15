@@ -725,12 +725,26 @@ impl Rule {
                     let mut chars = inner.chars();
                     match chars.next() {
                         Some(sigil) if SIGILS.contains(&sigil) => {
-                            let modifier = chars.next().filter(|m| matches!(m, 'D' | 'F'));
-                            result.push_str(
-                                &self.expand_internal_macro(
-                                    env, sigil, modifier, target, files, newer,
-                                ),
-                            );
+                            let rest = chars.as_str();
+                            let modifier = rest.chars().next().filter(|m| matches!(m, 'D' | 'F'));
+                            let rest = &rest[modifier.map_or(0, char::len_utf8)..];
+                            let value = self
+                                .expand_internal_macro(env, sigil, modifier, target, files, newer);
+                            // `$(@:.html=.htp)`: an internal macro is a macro,
+                            // and takes a substitution like any other (POSIX
+                            // 105804). automake's `.texi.html` rule writes
+                            // its output to `$(@:.html=.htp)` and then moves it.
+                            match rest.strip_prefix(':') {
+                                Some(spec) => {
+                                    let spec = preprocessor::expand_command(spec, env.table)
+                                        .map_err(|message| ParserError {
+                                            constraint: crate::parser::ParseError(vec![message]),
+                                        })?;
+                                    result
+                                        .push_str(&preprocessor::apply_substitution(&value, &spec));
+                                }
+                                None => result.push_str(&value),
+                            }
                         }
                         // The special `MAKE` macro expands to the make program.
                         _ if inner == "MAKE" => result.push_str(&make_program()),

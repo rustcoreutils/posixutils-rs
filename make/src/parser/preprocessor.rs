@@ -189,7 +189,7 @@ fn fold_continuations(source: &str) -> String {
 /// Apply a `$(string:subst1=subst2)` substitution to an already-expanded macro
 /// value. Handles both the suffix form (`subst1` is matched as a suffix of each
 /// word) and the pattern form (`[op]%[os]=[np][%][ns]`).
-fn apply_substitution(value: &str, spec: &str) -> String {
+pub(crate) fn apply_substitution(value: &str, spec: &str) -> String {
     let Some((lhs, rhs)) = spec.split_once('=') else {
         return value.to_string();
     };
@@ -1088,14 +1088,12 @@ fn substitute(source: &str, table: &MacroTable, state: &func::Expansion) -> Resu
                     letters.peek(),
                     Some('@' | '%' | '?' | '<' | '*' | '^' | '+')
                 ) {
+                    // To the matching close: a substitution may nest a
+                    // reference, `$(@:.html=$(EXT))`.
                     result.push('$');
                     result.push(open);
-                    for c in letters.by_ref() {
-                        result.push(c);
-                        if c == close {
-                            break;
-                        }
-                    }
+                    result.push_str(&read_balanced(&mut letters, open, close)?);
+                    result.push(close);
                     continue;
                 }
 

@@ -1546,13 +1546,13 @@ pub fn builtin_macros() -> Vec<Macro> {
 impl TryFrom<(Makefile, Config)> for Make {
     type Error = ErrorCode;
 
-    fn try_from((makefile, config): (Makefile, Config)) -> Result<Self, Self::Error> {
+    fn try_from((mut makefile, config): (Makefile, Config)) -> Result<Self, Self::Error> {
         // Two-pass classification: .SUFFIXES must be processed before inference
         // rule classification so that user-defined suffixes (especially with -r)
         // are available when determining whether a rule like `.txt.out:` is an
         // inference rule.
 
-        let table = makefile.table().clone();
+        let table = makefile.take_table();
         let (target_vars, pattern_vars) = index_target_vars(makefile.target_vars());
         let (parsed_rules, macros, vpaths, exports) = makefile.into_parts();
 

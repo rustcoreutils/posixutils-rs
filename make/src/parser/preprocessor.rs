@@ -759,7 +759,7 @@ impl MacroTable {
     ///
     /// [`Self::resolve`] weighs the environment live, but the environment is
     /// never *stored*, so until this runs the table still has one precedence
-    /// question open and [`Self::into_macros`] would hand on the loser. That is
+    /// question open and [`Self::to_macros`] would hand on the loser. That is
     /// not a question `Make` can answer later: it receives values, not sources.
     ///
     /// Concretely, it is what made everything downstream of the parse disagree
@@ -850,19 +850,19 @@ impl MacroTable {
         })
     }
 
-    pub fn into_macros(self) -> Vec<Macro> {
+    pub fn to_macros(&self) -> Vec<Macro> {
         // The source is dropped here, which is why `settle_environment` has to
         // have run: `Make` consumes values, and every precedence decision must
         // already have been made against them.
         self.order
-            .into_iter()
+            .iter()
             .map(|name| {
                 let body = self
                     .values
-                    .get(&name)
+                    .get(name)
                     .map(|e| e.value.clone())
                     .unwrap_or_default();
-                (name, body)
+                (name.clone(), body)
             })
             .collect()
     }
@@ -1956,7 +1956,7 @@ pub fn preprocess_with(
     reader.table.settle_environment();
     Ok(Preprocessed {
         text: reader.out,
-        macros: reader.table.clone().into_macros(),
+        macros: reader.table.to_macros(),
         table: reader.table,
         vpaths: reader.vpaths,
         exports: reader.exports,

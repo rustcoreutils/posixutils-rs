@@ -172,6 +172,11 @@ impl Makefile {
         &self.table
     }
 
+    /// Take the macro table out, leaving an empty one.
+    pub fn take_table(&mut self) -> MacroTable {
+        std::mem::take(&mut self.table)
+    }
+
     pub fn target_vars(&self) -> &[TargetVar] {
         &self.target_vars
     }

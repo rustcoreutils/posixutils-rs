@@ -763,6 +763,21 @@ The GNU m4 extensions autoconf, automake and libtoolize cannot run without:
  * `\#` outside a command line is a literal `#`, not the start of a
    comment, as in GNU make.  libzstd writes `NUM_SYMBOL := \#`, and
    build-essential's debian/rules `$(shell grep -v '^\#' ...)`.
+ * Pattern rules are searched as GNU make searches them: a rule applies when
+   each of its prerequisites exists (`VPATH` searched) or ought to exist,
+   being named by some target rule, or can be made by another pattern or
+   inference rule; and a target rule without commands takes them from a
+   pattern rule (not for a `.PHONY` target).  libzstd picks `%.o : %.c` or
+   `%.o : %.S` by which source there is, and builds its default target
+   `lib-release:` from `%-release : %`.
+ * Additional built-in rules and macros, which POSIX allows (106035):
+   `.o:` links a program from its objects (`$(CC) $(LDFLAGS) $^ $(LDLIBS)
+   -o $@`), and `.c.o` passes `$(CPPFLAGS)`; sysvinit's Makefile builds
+   every program that way.  `COMPILE.c`, `COMPILE.S`, `OUTPUT_OPTION` and
+   `RM` have GNU make's values; libzstd compiles and cleans with them.
+ * The `realpath` function and the `MAKEFILE_LIST` macro, as in GNU make;
+   libzstd.mk finds its own directory with
+   `$(dir $(realpath $(lastword $(MAKEFILE_LIST))))`.
  * A `%` pattern rule without commands is not used: in GNU make it cancels
    a built-in pattern rule.  automake ends every Makefile with
    `%:: %,v`, `%:: SCCS/s.%` and three more of them.

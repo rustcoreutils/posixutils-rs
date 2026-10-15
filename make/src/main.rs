@@ -19,7 +19,10 @@ use gettextrs::gettext;
 use posixutils_make::{
     config::Config,
     error_code::ErrorCode::{self, *},
-    parser::{preprocessor::ENV_MACROS, Makefile},
+    parser::{
+        preprocessor::{ENV_MACROS, MAKEFILE_LIST},
+        Makefile,
+    },
     Make,
 };
 
@@ -348,6 +351,7 @@ fn parse_makefile(
     builtins: &[(String, String)],
 ) -> Result<Makefile, ErrorCode> {
     let mut contents = String::new();
+    let mut names: Vec<String> = Vec::new();
 
     if paths.is_empty() {
         let default = MAKEFILE_PATH
@@ -356,11 +360,22 @@ fn parse_makefile(
             .find(|p| p.exists())
             .ok_or(NoMakefile)?;
         append_part(&mut contents, &read_makefile(default)?);
+        names.push(
+            default
+                .to_string_lossy()
+                .trim_start_matches("./")
+                .to_string(),
+        );
     } else {
         for path in paths {
             append_part(&mut contents, &read_makefile(path)?);
+            names.push(path.to_string_lossy().into_owned());
         }
     }
+    // GNU make's MAKEFILE_LIST starts with the makefiles named here; each
+    // include adds its file.
+    let mut builtins = builtins.to_vec();
+    builtins.push((MAKEFILE_LIST.to_string(), names.join(" ")));
 
     // Command-line macros are *seeded*, not appended: a rule header is expanded
     // where it appears, so appending left `all: $(OBJ)` already expanded by the
@@ -370,15 +385,23 @@ fn parse_makefile(
         .filter_map(|def| def.split_once('='))
         .map(|(name, value)| {
             let name = name.trim_end_matches([':', '?', '+', '!']).trim();
-            (name.to_string(), value.to_string())
+            (name.to_string(), cmdline_value(value).to_string())
         })
         .filter(|(name, _)| !name.is_empty())
         .collect();
 
-    match Makefile::parse_with_macros(&contents, &seeded, builtins) {
+    match Makefile::parse_with_macros(&contents, &seeded, &builtins) {
         Ok(makefile) => Ok(makefile),
         Err(err) => Err(ErrorCode::ParserError { constraint: err }),
     }
+}
+
+/// The value of a command-line `macro=value` operand: as for a definition
+/// in a makefile, the blanks after the `=` are not part of it (GNU make
+/// reads it the same way). libzstd passes `LDFLAGS="$(LDFLAGS)"` to a
+/// sub-make with a value that starts with a blank.
+fn cmdline_value(value: &str) -> &str {
+    value.trim_start_matches([' ', '\t'])
 }
 
 /// Reads the makefile from `stdin` until EOF (Ctrl + D)
@@ -479,7 +502,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if name.is_empty() || name == "MAKEFLAGS" || name == "SHELL" {
             continue;
         }
-        env::set_var(name, value);
+        env::set_var(name, cmdline_value(value));
     }
 
     // POSIX source 4: the macros the built-in inference rules refer to. They

@@ -143,6 +143,7 @@ pub(crate) fn is_function(name: &str) -> bool {
             | "firstword"
             | "lastword"
             | "wildcard"
+            | "realpath"
             | "shell"
             | "if"
             | "or"
@@ -335,6 +336,18 @@ fn f_shell(command: &str) -> Result<String, String> {
     Ok(text.replace('\n', " "))
 }
 
+/// `$(realpath names...)`: the canonical absolute name of each that exists
+/// (GNU make). libzstd.mk finds its own directory with
+/// `$(dir $(realpath $(lastword $(MAKEFILE_LIST))))`.
+fn f_realpath(names: &str) -> String {
+    join(
+        words(names)
+            .into_iter()
+            .filter_map(|name| std::fs::canonicalize(name).ok())
+            .map(|path| path.to_string_lossy().into_owned()),
+    )
+}
+
 fn f_wildcard(patterns: &str) -> String {
     let mut hits: Vec<String> = Vec::new();
     for pattern in words(patterns) {
@@ -343,37 +356,68 @@ fn f_wildcard(patterns: &str) -> String {
     join(hits)
 }
 
-/// Minimal filename globbing: `*` and `?` within a single directory, which is
-/// what `$(wildcard ...)` is used for in practice.
+/// Filename globbing for `$(wildcard ...)`: `*` and `?` in any component of
+/// the pattern, as glob(3) does. sysvinit looks for libcrypt with
+/// `$(wildcard $(ROOT)/$(usrdir)/lib*/libcrypt.*)`, a wildcard in a
+/// directory component. As in the shell, a name starting with `.` is
+/// matched only by a component that starts with `.`.
 fn glob(pattern: &str) -> Vec<String> {
     if !pattern.contains(['*', '?']) {
-        return if std::path::Path::new(pattern).exists() {
-            vec![pattern.to_string()]
-        } else {
-            Vec::new()
+        return match std::path::Path::new(pattern).exists() {
+            true => vec![pattern.to_string()],
+            false => Vec::new(),
         };
     }
-    let (dir, name) = match pattern.rfind('/') {
-        Some(i) => (&pattern[..i], &pattern[i + 1..]),
-        None => (".", pattern),
+    let (mut found, rest) = match pattern.strip_prefix('/') {
+        Some(rest) => (vec!["/".to_string()], rest),
+        None => (vec![String::new()], pattern),
     };
-    let Ok(entries) = std::fs::read_dir(if dir.is_empty() { "/" } else { dir }) else {
+    let components: Vec<&str> = rest.split('/').collect();
+    for (i, component) in components.iter().enumerate() {
+        let last = i + 1 == components.len();
+        found = found
+            .iter()
+            .flat_map(|prefix| glob_component(prefix, component, last))
+            .collect();
+    }
+    found.sort_unstable();
+    found
+}
+
+/// The names `prefix` joined with each match of one pattern component. A
+/// match that is not the last component must be a directory; the last must
+/// exist.
+fn glob_component(prefix: &str, component: &str, last: bool) -> Vec<String> {
+    let join = |name: &str| -> String {
+        match prefix {
+            "" => name.to_string(),
+            p if p.ends_with('/') => format!("{p}{name}"),
+            p => format!("{p}/{name}"),
+        }
+    };
+    if component.is_empty() {
+        return vec![prefix.to_string()];
+    }
+    if !component.contains(['*', '?']) {
+        let path = join(component);
+        let keep = match last {
+            true => std::path::Path::new(&path).exists(),
+            false => true,
+        };
+        return if keep { vec![path] } else { Vec::new() };
+    }
+    let dir = if prefix.is_empty() { "." } else { prefix };
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut hits: Vec<String> = entries
+    entries
         .flatten()
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|f| glob_matches(name, f))
-        .map(|f| {
-            if pattern.contains('/') {
-                format!("{dir}/{f}")
-            } else {
-                f
-            }
-        })
-        .collect();
-    hits.sort_unstable();
-    hits
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| !name.starts_with('.') || component.starts_with('.'))
+        .filter(|name| glob_matches(component, name))
+        .map(|name| join(&name))
+        .filter(|path| last || std::path::Path::new(path).is_dir())
+        .collect()
 }
 
 /// Shell-style `*`/`?` match over a single name component.
@@ -567,6 +611,7 @@ pub(crate) fn call(name: &str, raw: &str, ctx: &Ctx, expand: Expand) -> Result<S
             .map(|s| s.to_string())
             .unwrap_or_default(),
         "wildcard" => f_wildcard(arg(0)),
+        "realpath" => f_realpath(arg(0)),
         "shell" => f_shell(&crate::parser::preprocessor::unescape_dollars(&all))?,
         "error" => return Err(all),
         "warning" | "info" => {

@@ -45,6 +45,10 @@ const DEFAULT_SHELL: &str = "/bin/sh";
 /// The `.WAIT` special target, used as a prerequisite-list barrier.
 const WAIT_TARGET: &str = ".WAIT";
 
+/// How many pattern rules may be chained to make a prerequisite of a
+/// pattern rule (GNU make chains them; POSIX allows it as an extension).
+const MAX_PATTERN_CHAIN: usize = 2;
+
 /// A pool of build tokens bounding how many targets are updated concurrently
 /// under `-j`. Acquisition is non-blocking: a caller that cannot get a token
 /// builds the target inline instead, which keeps the recursive build
@@ -87,6 +91,9 @@ pub struct Make {
     target_vars: HashMap<String, Vec<TargetVar>>,
     /// Pattern-specific ones (a `%` target), with the pattern, in order.
     pattern_vars: Vec<(String, TargetVar)>,
+    /// Every name a target rule has as a target or a prerequisite: what
+    /// GNU make says "ought to exist" when it picks a pattern rule.
+    mentioned: std::collections::HashSet<String>,
     /// Target rules (non-special, non-inference).
     /// Invariant: inference rules are never stored here, so `first_target()`
     /// always returns a valid default target per POSIX.
@@ -134,6 +141,12 @@ impl graph::Edges for Make {
                 .into_iter()
                 .flat_map(|rule| edge_names(rule.prerequisites().chain(rule.order_only())))
                 .collect();
+        }
+        if let Some(rule) = named {
+            if let Some(pattern) = self.pattern_rule_for_commandless(rule, target) {
+                let merged = pattern.with_prerequisites_of(rule);
+                return edge_names(merged.prerequisites().chain(merged.order_only()));
+            }
         }
         let mut edges = match named {
             Some(rule) => edge_names(rule.prerequisites().chain(rule.order_only())),
@@ -301,15 +314,57 @@ impl Make {
     }
 
     /// Find a `%` pattern rule matching `name` and instantiate it for that
-    /// target. The first matching pattern in file order wins, as GNU does.
+    /// target.
     ///
     /// Pattern rules are not POSIX -- the standard has only suffix inference
-    /// rules -- but they are how real makefiles express the same thing.
+    /// rules -- but they are how real makefiles express the same thing. As in
+    /// GNU make, a rule applies only if each of its prerequisites exists
+    /// (`VPATH` searched) or ought to exist, being named by some rule; the
+    /// first such rule in file order wins. Failing that, the first whose
+    /// missing prerequisites another pattern or inference rule can make.
+    /// libzstd has `$(D)/%.o : %.c` and `$(D)/%.o : %.S`, and which one
+    /// builds an object depends on which source there is.
     fn find_pattern_rule(&self, name: &str) -> Option<Rule> {
-        self.rules
+        self.find_pattern_rule_within(name, MAX_PATTERN_CHAIN)
+    }
+
+    fn find_pattern_rule_within(&self, name: &str, depth: usize) -> Option<Rule> {
+        let candidates: Vec<Rule> = self
+            .rules
             .iter()
             .filter(|rule| rule.is_pattern())
-            .find_map(|rule| rule.instantiate_pattern(name))
+            .filter_map(|rule| rule.instantiate_pattern(name))
+            .collect();
+        let needs = |rule: &Rule| -> Vec<String> {
+            rule.prerequisites()
+                .chain(rule.order_only())
+                .map(|p| p.as_ref().to_string())
+                .filter(|p| p != WAIT_TARGET)
+                .collect()
+        };
+        if let Some(found) = candidates
+            .iter()
+            .find(|rule| needs(rule).iter().all(|p| self.exists_or_ought_to(p)))
+        {
+            return Some(found.clone());
+        }
+        if depth == 0 {
+            return None;
+        }
+        candidates.into_iter().find(|rule| {
+            needs(rule).iter().all(|p| {
+                self.exists_or_ought_to(p)
+                    || self.find_inference_rule(p).is_some()
+                    || self.find_pattern_rule_within(p, depth - 1).is_some()
+            })
+        })
+    }
+
+    /// Whether `name` exists, here or through `VPATH`, or ought to exist:
+    /// some target rule names it as its target or as a prerequisite (GNU
+    /// make's term).
+    fn exists_or_ought_to(&self, name: &str) -> bool {
+        self.mentioned.contains(name) || std::path::Path::new(&self.resolve_vpath(name)).exists()
     }
 
     pub fn first_target(&self) -> Result<&Target, ErrorCode> {
@@ -363,7 +418,7 @@ impl Make {
                 });
                 if let Some(rule) = hit {
                     let prereq_path = self.resolve_vpath(&suffix_source_name(stem, source_suffix));
-                    if std::path::Path::new(&prereq_path).exists() {
+                    if self.exists_or_ought_to(&prereq_path) {
                         return Some(rule);
                     }
                 }
@@ -381,7 +436,7 @@ impl Make {
             });
             if let Some(rule) = hit {
                 let prereq_path = self.resolve_vpath(&suffix_source_name(name, source_suffix));
-                if std::path::Path::new(&prereq_path).exists() {
+                if self.exists_or_ought_to(&prereq_path) {
                     return Some(rule);
                 }
             }
@@ -496,7 +551,28 @@ impl Make {
         if rule.is_double_colon() {
             return self.run_double_colon_rules(&target, inherited);
         }
+        if let Some(pattern) = self.pattern_rule_for_commandless(rule, name.as_ref()) {
+            let merged = pattern.with_prerequisites_of(rule);
+            return self.run_rule_with_prerequisites(
+                &merged,
+                &target,
+                Dispatch::Explicit,
+                inherited,
+            );
+        }
         self.run_rule_with_prerequisites(rule, &target, Dispatch::Explicit, inherited)
+    }
+
+    /// The pattern rule that supplies the commands of `rule`, a target rule
+    /// for `name` that has none (GNU make). libzstd's default target is
+    /// `lib-release:`, made by `%-release : %`. A phony target is not
+    /// searched for, as in GNU make.
+    fn pattern_rule_for_commandless(&self, rule: &Rule, name: &str) -> Option<Rule> {
+        let named = self.rule_by_target_name(name).is_some();
+        if !named || rule.recipes().count() > 0 || self.attributes.is_phony(name) {
+            return None;
+        }
+        self.find_pattern_rule(name)
     }
 
     /// The prerequisites that decide whether `target` is out of date.
@@ -615,14 +691,16 @@ impl Make {
         }
 
         if let Some(inference_rule) = inferred {
-            return self.run_inference(inference_rule, target, up_to_date, &newer, &scope);
+            let inference_rule = inference_rule.with_prerequisites(&prerequisites);
+            return self.run_inference(&inference_rule, target, up_to_date, &newer, &scope);
         }
 
         // An inference rule derives `$<` from its suffixes rather than from a
         // prerequisite list, so it must go through `run_for_target`; handing it
         // to `run` would leave `$<` empty.
         if dispatch == Dispatch::Inference {
-            return self.run_inference(rule, target, up_to_date, &newer, &scope);
+            let rule = rule.with_prerequisites(&prerequisites);
+            return self.run_inference(&rule, target, up_to_date, &newer, &scope);
         }
 
         self.with_env(&scope, |env| rule.run(env, target, up_to_date, &newer))?;
@@ -862,6 +940,22 @@ impl Make {
         let Some(name) = rule.targets().next().map(|t| t.to_string()) else {
             return Ok(());
         };
+        // Pattern rules with one target pattern are alternatives, not one
+        // rule: libzstd has `$(D)/%.o : %.c` and `$(D)/%.o : %.S`, and the
+        // one used is the one whose prerequisites exist. One with the same
+        // prerequisites as an earlier one replaces it, as in GNU make.
+        if rule.is_pattern() {
+            let same = |r: &&mut Rule| {
+                r.is_pattern()
+                    && r.targets().eq(rule.targets())
+                    && r.prerequisites().eq(rule.prerequisites())
+            };
+            match self.rules.iter_mut().find(same) {
+                Some(existing) => *existing = rule,
+                None => self.rules.push(rule),
+            }
+            return Ok(());
+        }
         let existing = self
             .rules
             .iter_mut()
@@ -1045,14 +1139,24 @@ fn search_dirs(dirs: &[&str], name: &str) -> Option<String> {
 ///
 /// Written as makefile text so it goes through the same reader as anything
 /// else. `-r` (`config.clear`) suppresses it, as POSIX requires.
+///
+/// POSIX 106035 lets an implementation "provide additional macros and
+/// rules", and two of GNU make's are here because sysvinit's Makefile
+/// cannot build without them: `.o:` links a program from its objects
+/// (`init: init.o init_utmp.o runlevellog.o` has no commands), and `.c.o`
+/// passes `$(CPPFLAGS)`, which sysvinit sets per object
+/// (`init.o: CPPFLAGS += $(SELINUX_DEF)`). With `CPPFLAGS` empty, `.c.o`
+/// gives what POSIX's gives.
 const BUILTIN_RULES: &str = r#"
+.o:
+	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
 .c:
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 .sh:
 	cp $< $@
 	chmod a+x $@
 .c.o:
-	$(CC) $(CFLAGS) -c $<
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $<
 .y.o:
 	$(YACC) $(YFLAGS) $<
 	$(CC) $(CFLAGS) -c y.tab.c
@@ -1112,7 +1216,11 @@ const SCCS_GET_RULE: &str = ".SCCS_GET:\n\tsccs $(SCCSFLAGS) get $(SCCSGETFLAGS)
 
 /// The macros those rules refer to. A makefile definition overrides them, so
 /// they are seeded first and only kept where the makefile is silent.
-const BUILTIN_MACROS: [(&str, &str); 12] = [
+///
+/// The last four are GNU make's, which libzstd's Makefiles compile and
+/// clean with (`$(COMPILE.c) $(DEPFLAGS) $(OUTPUT_OPTION) $<`, `$(RM)`);
+/// POSIX 106035 allows additional macros.
+const BUILTIN_MACROS: [(&str, &str); 16] = [
     ("CC", "c17"),
     ("CFLAGS", "-O 1"),
     ("AR", "ar"),
@@ -1125,6 +1233,13 @@ const BUILTIN_MACROS: [(&str, &str); 12] = [
     ("GFLAGS", ""),
     ("SCCSFLAGS", ""),
     ("SCCSGETFLAGS", "-s"),
+    ("COMPILE.c", "$(CC) $(CFLAGS) $(CPPFLAGS) $(TARGET_ARCH) -c"),
+    (
+        "COMPILE.S",
+        "$(CC) $(ASFLAGS) $(CPPFLAGS) $(TARGET_MACH) -c",
+    ),
+    ("OUTPUT_OPTION", "-o $@"),
+    ("RM", "rm -f"),
 ];
 
 /// The macros POSIX's built-in inference rules refer to (source 4).
@@ -1178,6 +1293,7 @@ impl TryFrom<(Makefile, Config)> for Make {
             table,
             target_vars,
             pattern_vars,
+            mentioned: Default::default(),
             default_rule: None,
             sccs_get: None,
             pool,
@@ -1241,6 +1357,20 @@ impl TryFrom<(Makefile, Config)> for Make {
         for rule in special_rules {
             special_target::process(rule, &mut make)?;
         }
+
+        make.mentioned = make
+            .rules
+            .iter()
+            .filter(|rule| !rule.is_pattern())
+            .flat_map(|rule| {
+                let targets = rule.targets().map(|t| t.as_ref().to_string());
+                let prerequisites = rule
+                    .prerequisites()
+                    .chain(rule.order_only())
+                    .map(|p| p.as_ref().to_string());
+                targets.chain(prerequisites).collect::<Vec<_>>()
+            })
+            .collect();
 
         // Built-in inference rules come last, so a rule of the same name in
         // the makefile is found first.

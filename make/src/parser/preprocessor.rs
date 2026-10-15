@@ -1218,6 +1218,9 @@ struct Branch {
     closed: bool,
 }
 
+/// The macro naming the makefiles read so far (GNU make).
+pub const MAKEFILE_LIST: &str = "MAKEFILE_LIST";
+
 /// How deep `include` may nest before we call it a cycle. POSIX 105611 requires
 /// at least 16; the cap exists so a self-including file terminates.
 const MAX_INCLUDE_DEPTH: usize = 64;
@@ -1538,6 +1541,16 @@ impl Reader {
                 })
             }
         };
+
+        // GNU make's MAKEFILE_LIST names every makefile read so far, the one
+        // being read last: libzstd.mk finds its own directory with
+        // `$(lastword $(MAKEFILE_LIST))`.
+        let list = match self.table.resolve(MAKEFILE_LIST, ENV_MACROS.load(Acquire)) {
+            Some(list) if !list.is_empty() => format!("{list} {path}"),
+            _ => path.clone(),
+        };
+        self.table
+            .set(MAKEFILE_LIST.to_string(), list, MacroSource::Makefile);
 
         self.depth += 1;
         let folded = fold_continuations(&contents);

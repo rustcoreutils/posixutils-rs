@@ -175,6 +175,31 @@ impl Rule {
         })
     }
 
+    /// This rule -- an instantiated pattern or inference rule -- with the
+    /// prerequisites of `explicit`, a target rule without commands for the
+    /// same target, added after its own: the rule GNU make runs for such a
+    /// target. Its own prerequisites come first, so `$<` is the one the
+    /// pattern or suffixes name.
+    pub fn with_prerequisites_of(&self, explicit: &Rule) -> Rule {
+        let mut merged = self.clone();
+        for p in explicit.prerequisites() {
+            if !merged.prerequisites.contains(p) {
+                merged.prerequisites.push(p.clone());
+            }
+        }
+        merged.order_only.extend(explicit.order_only().cloned());
+        merged
+    }
+
+    /// This rule with `names` as its prerequisites: an inference rule run
+    /// for a target rule without commands, so that `$^`, `$+` and `$?` see
+    /// the source and the target rule's prerequisites.
+    pub fn with_prerequisites(&self, names: &[String]) -> Rule {
+        let mut rule = self.clone();
+        rule.prerequisites = names.iter().map(Prerequisite::new).collect();
+        rule
+    }
+
     /// One rule per target.
     ///
     /// POSIX 105643 makes the target side a `<blank>`-separated list of

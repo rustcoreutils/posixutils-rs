@@ -28,3 +28,4 @@ mod recipe_continuation;
 mod shell_status;
 mod static_pattern;
 mod target_vars;
+mod upstream_rules;

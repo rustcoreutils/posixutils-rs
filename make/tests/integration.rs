@@ -2498,6 +2498,18 @@ mod tilde_suffix_rules {
             "#!/bin/sh\nprintf 'int tilde_probe(void){return 0;}\\n'\n",
         );
         let _ = fs::set_permissions(&stub, fs::Permissions::from_mode(0o755));
+        // `execve` refuses a file any process holds open for writing, and
+        // every other test here forks: a `fork` during the write leaves the
+        // descriptor open in the child until that child's `exec`. Wait out
+        // `ETXTBSY` here rather than have make report it.
+        for attempt in 0..10 {
+            match Command::new(&stub).output() {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10 << attempt.min(4)));
+                }
+                _ => break,
+            }
+        }
     }
 
     // The `$<` a `~` rule sees is the SCCS history file, and `$*` is the stem

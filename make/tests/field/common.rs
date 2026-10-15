@@ -54,6 +54,31 @@ impl Dir {
         self
     }
 
+    /// Write an executable script `name` inside the directory, and wait
+    /// until it can be run.
+    ///
+    /// `execve` refuses a file any process holds open for writing, and the
+    /// other tests in this binary fork all the time: a `fork` while the
+    /// script is being written copies its descriptor into the child, where
+    /// `O_CLOEXEC` closes it only at that child's `exec`. Until then running
+    /// the script fails with `ETXTBSY`, and make reports the failure.
+    pub fn write_executable(&self, name: &str, contents: &str) -> &Self {
+        use std::os::unix::fs::PermissionsExt;
+        self.write(name, contents);
+        let path = self.path(name);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .expect("make the script executable");
+        for attempt in 0..10 {
+            match Command::new(&path).output() {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10 << attempt.min(4)));
+                }
+                _ => break,
+            }
+        }
+        self
+    }
+
     /// The path of `name` inside the directory.
     pub fn path(&self, name: &str) -> PathBuf {
         self.0.join(name)

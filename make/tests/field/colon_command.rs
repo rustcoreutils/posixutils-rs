@@ -13,7 +13,6 @@
 //! is its own business, and it is run.
 
 use crate::common::Dir;
-use std::os::unix::fs::PermissionsExt;
 
 #[test]
 fn a_colon_command_is_shown_and_succeeds() {
@@ -25,11 +24,7 @@ fn a_colon_command_is_shown_and_succeeds() {
 #[test]
 fn a_makefile_shell_is_run_for_a_colon_command() {
     let dir = Dir::new("colon_custom_shell");
-    dir.write("trace.sh", "#!/bin/sh\necho \"shell $*\"\n");
-    let script = dir.path("trace.sh");
-    let mut mode = std::fs::metadata(&script).unwrap().permissions();
-    mode.set_mode(0o755);
-    std::fs::set_permissions(&script, mode).unwrap();
+    dir.write_executable("trace.sh", "#!/bin/sh\necho \"shell $*\"\n");
     dir.write("Makefile", "SHELL = ./trace.sh\nall:\n\t@:\n");
     dir.make(&[]).ok("shell -e -c :\n");
 }

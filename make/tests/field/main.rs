@@ -20,6 +20,7 @@ mod automake;
 mod cancel_rules;
 mod computed_names;
 mod curdir;
+mod deep_chain;
 mod dotted_suffixes;
 mod double_colon;
 mod empty_targets;

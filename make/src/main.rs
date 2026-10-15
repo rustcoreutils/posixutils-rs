@@ -456,7 +456,26 @@ fn read_stdin() -> Result<String, ErrorCode> {
     Ok(buffer)
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// Run make on a thread with room for a deep dependency graph; see
+/// `BUILD_STACK_SIZE`.
+fn main() {
+    let worker = std::thread::Builder::new()
+        .name("main".to_string())
+        .stack_size(posixutils_make::BUILD_STACK_SIZE)
+        .spawn(|| run().map_err(|err| format!("{err:?}")));
+    let result = match worker {
+        Ok(handle) => handle.join().unwrap_or_else(|_| process::exit(101)),
+        // No such thread to be had: the main thread's stack will have to do.
+        Err(_) => run().map_err(|err| format!("{err:?}")),
+    };
+    // As `main` returning the error would report it.
+    if let Err(err) = result {
+        eprintln!("Error: {err}");
+        process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("make");
 
     let Args {

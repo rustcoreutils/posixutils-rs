@@ -50,6 +50,14 @@ const WAIT_TARGET: &str = ".WAIT";
 /// pattern rule (GNU make chains them; POSIX allows it as an extension).
 const MAX_PATTERN_CHAIN: usize = 2;
 
+/// The stack a thread that walks the dependency graph is given.
+///
+/// The walk recurses once for each link of a prerequisite chain, and the
+/// default stacks (8 MiB for the main thread, 2 MiB for others) overflowed
+/// on a chain of a few thousand, where GNU make goes on. The memory is only
+/// reserved; pages are used as the walk reaches them.
+pub const BUILD_STACK_SIZE: usize = 512 << 20;
+
 /// A pool of build tokens bounding how many targets are updated concurrently
 /// under `-j`. Acquisition is non-blocking: a caller that cannot get a token
 /// builds the target inline instead, which keeps the recursive build
@@ -1064,10 +1072,15 @@ impl Make {
             // rest are built inline in this thread. Spawning first (before any
             // inline build) is what lets the work actually overlap.
             for &name in names {
-                if self.pool.try_acquire() {
-                    let errors = &errors;
-                    let updated = &updated;
-                    handles.push(threads.spawn(move || {
+                if !self.pool.try_acquire() {
+                    inline.push(name);
+                    continue;
+                }
+                let errors = &errors;
+                let updated = &updated;
+                let spawned = std::thread::Builder::new()
+                    .stack_size(BUILD_STACK_SIZE)
+                    .spawn_scoped(threads, move || {
                         let result = self.build_target_in(name, scope);
                         self.pool.release();
                         match result {
@@ -1075,9 +1088,14 @@ impl Make {
                             Ok(false) => {}
                             Err(err) => errors.lock().unwrap().push(err),
                         }
-                    }));
-                } else {
-                    inline.push(name);
+                    });
+                match spawned {
+                    Ok(handle) => handles.push(handle),
+                    // No thread to be had: the target is built here instead.
+                    Err(_) => {
+                        self.pool.release();
+                        inline.push(name);
+                    }
                 }
             }
             for name in inline {

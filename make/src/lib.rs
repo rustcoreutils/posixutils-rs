@@ -51,13 +51,61 @@ const WAIT_TARGET: &str = ".WAIT";
 /// pattern rule (GNU make chains them; POSIX allows it as an extension).
 const MAX_PATTERN_CHAIN: usize = 2;
 
-/// The stack a thread that walks the dependency graph is given.
+/// The stack of a thread make starts to walk the dependency graph on.
 ///
 /// The walk recurses once for each link of a prerequisite chain, and the
 /// default stacks (8 MiB for the main thread, 2 MiB for others) overflowed
 /// on a chain of a few thousand, where GNU make goes on. The memory is only
 /// reserved; pages are used as the walk reaches them.
-pub const BUILD_STACK_SIZE: usize = 512 << 20;
+const BUILD_STACK_SIZE: usize = 512 << 20;
+
+/// How deep the walk goes on a thread before it continues on a new one
+/// with a stack of `BUILD_STACK_SIZE`: on the main thread, whose stack
+/// may be as small as the system's limit, and on such a thread itself.
+///
+/// A link costs a few KiB of stack (several times that in a debug build).
+/// Moving to a new thread only when a chain is this deep keeps the cost of
+/// starting one -- about a quarter of a millisecond, as much as the rest of
+/// make's start-up -- off every ordinary run.
+const DEPTH_ON_MAIN_STACK: usize = 200;
+const DEPTH_ON_BUILD_STACK: usize = 16_000;
+
+std::thread_local! {
+    /// How deep the walk is on this thread, and how deep it may go.
+    static WALK_DEPTH: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, DEPTH_ON_MAIN_STACK)) };
+}
+
+/// Holds one level of the walk on this thread for as long as it lives.
+struct WalkLevel;
+
+impl WalkLevel {
+    /// Enter a level, unless this thread is as deep as it may go.
+    fn enter() -> Option<WalkLevel> {
+        WALK_DEPTH.with(|cell| {
+            let (depth, limit) = cell.get();
+            (depth < limit).then(|| {
+                cell.set((depth + 1, limit));
+                WalkLevel
+            })
+        })
+    }
+
+    /// Mark this thread, just started with `BUILD_STACK_SIZE`, as having
+    /// room for `DEPTH_ON_BUILD_STACK` levels.
+    fn on_build_stack() {
+        WALK_DEPTH.with(|cell| cell.set((0, DEPTH_ON_BUILD_STACK)));
+    }
+}
+
+impl Drop for WalkLevel {
+    fn drop(&mut self) {
+        WALK_DEPTH.with(|cell| {
+            let (depth, limit) = cell.get();
+            cell.set((depth - 1, limit));
+        });
+    }
+}
 
 /// A pool of build tokens bounding how many targets are updated concurrently
 /// under `-j`. Acquisition is non-blocking: a caller that cannot get a token
@@ -544,6 +592,9 @@ impl Make {
     /// A target reached by several paths is built once, in the context of
     /// the first, as in GNU make.
     fn build_target_in(&self, name: &str, inherited: &[TargetVar]) -> Result<bool, ErrorCode> {
+        let Some(_level) = WalkLevel::enter() else {
+            return self.build_target_on_new_stack(name, inherited);
+        };
         let name = &rule::prerequisite::without_dot_slash(name.to_string());
         match self.ledger.claim(name) {
             graph::Claim::Done(outcome) => return outcome.into_result(),
@@ -552,6 +603,26 @@ impl Make {
         let result = self.build_target_uncached(name, inherited);
         self.ledger.finish(name, &result);
         result
+    }
+
+    /// Continue the walk at `name` on a new thread with a stack of
+    /// `BUILD_STACK_SIZE`, this one waiting for it; see `WalkLevel`.
+    fn build_target_on_new_stack(
+        &self,
+        name: &str,
+        inherited: &[TargetVar],
+    ) -> Result<bool, ErrorCode> {
+        std::thread::scope(|scope| {
+            let walk = std::thread::Builder::new()
+                .stack_size(BUILD_STACK_SIZE)
+                .spawn_scoped(scope, || {
+                    WalkLevel::on_build_stack();
+                    self.build_target_in(name, inherited)
+                })
+                .expect("cannot start a thread to continue a deep build");
+            walk.join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })
     }
 
     fn build_target_uncached(
@@ -1082,6 +1153,7 @@ impl Make {
                 let spawned = std::thread::Builder::new()
                     .stack_size(BUILD_STACK_SIZE)
                     .spawn_scoped(threads, move || {
+                        WalkLevel::on_build_stack();
                         let result = self.build_target_in(name, scope);
                         self.pool.release();
                         match result {

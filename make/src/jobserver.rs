@@ -148,7 +148,26 @@ fn join([read, write]: [RawFd; 2]) -> Option<Pool> {
     };
     let (r, w) = (stat(read)?, stat(write)?);
     let is_fifo = |st: &libc::stat| st.st_mode & libc::S_IFMT == libc::S_IFIFO;
-    if !is_fifo(&r) || !is_fifo(&w) || r.st_ino != w.st_ino || r.st_dev != w.st_dev {
+    if !is_fifo(&r) || !is_fifo(&w) {
+        return None;
+    }
+    // The read end must be open for reading and the write end for writing.
+    let mode = |fd: RawFd| {
+        // SAFETY: fcntl(2) F_GETFL on a descriptor number.
+        unsafe { libc::fcntl(fd, libc::F_GETFL) }
+    };
+    let (rm, wm) = (mode(read), mode(write));
+    if rm < 0
+        || wm < 0
+        || rm & libc::O_ACCMODE != libc::O_RDONLY
+        || wm & libc::O_ACCMODE != libc::O_WRONLY
+    {
+        return None;
+    }
+    // On Linux both ends of one pipe report the same inode; on macOS each end
+    // has an inode of its own, so the check cannot be made there.
+    #[cfg(target_os = "linux")]
+    if r.st_ino != w.st_ino || r.st_dev != w.st_dev {
         return None;
     }
     if !own(read) || !own(write) {

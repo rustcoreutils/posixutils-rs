@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-mailx"
-version = "0.9.0"
+version = "0.9.1"
 authors = ["Jeff Garzik"]
 repository.workspace = true
 license.workspace = true

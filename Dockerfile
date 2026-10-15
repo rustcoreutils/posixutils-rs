@@ -73,7 +73,7 @@ FROM debian:bookworm-slim AS runtime
 # Populated by CI (docker/metadata-action). Declared here so an unlabelled
 # local build does not inherit the base image's own version label -- the
 # ubuntu-based image used to advertise itself as version "24.04".
-ARG VERSION=0.9.0
+ARG VERSION=0.9.1
 ARG REVISION=
 ARG CREATED=
 

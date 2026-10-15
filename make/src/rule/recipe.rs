@@ -68,6 +68,25 @@ impl Recipe {
         }
     }
 
+    /// The command lines this one becomes once its macros are expanded to
+    /// `text`.
+    ///
+    /// A multi-line value -- a `define` body -- makes one command line of
+    /// each of its lines. Each takes the prefixes it has after expansion
+    /// (`$(AM_V_at)` expanding to `@`) and this line's own, which in GNU make
+    /// apply to every line of a canned sequence.
+    pub fn expanded(&self, text: &str) -> Vec<Recipe> {
+        text.split('\n')
+            .map(|line| {
+                let mut recipe = Recipe::new(line);
+                recipe.config.ignore |= self.config.ignore;
+                recipe.config.silent |= self.config.silent;
+                recipe.config.force_run |= self.config.force_run;
+                recipe
+            })
+            .collect()
+    }
+
     /// Retrieves the inner recipe.
     pub fn inner(&self) -> &str {
         &self.inner

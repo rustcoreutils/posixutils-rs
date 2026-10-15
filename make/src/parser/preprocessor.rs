@@ -268,6 +268,88 @@ pub fn is_macro_definition(line: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| suitable_ident(&c))
 }
 
+/// The byte offsets of the characters of `line` that are outside every
+/// `$(...)` and `${...}` reference, with the characters.
+fn top_level_chars(line: &str) -> Vec<(usize, char)> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut chars = line.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if depth > 0 {
+            match c {
+                '(' | '{' => depth += 1,
+                ')' | '}' => depth -= 1,
+                _ => {}
+            }
+            continue;
+        }
+        if c != '$' {
+            out.push((i, c));
+            continue;
+        }
+        // A reference opens, or `$$` / `$x` is one token either way.
+        if let Some((_, next)) = chars.next() {
+            if matches!(next, '(' | '{') {
+                depth = 1;
+            }
+        }
+    }
+    out
+}
+
+/// Split a target-specific assignment, `targets: [override] [export] name op
+/// value`, into its targets and its assignment (GNU make).
+///
+/// It is a rule line whose prerequisite side holds an assignment operator
+/// before any `;`, outside every macro reference: `foo: CFLAGS += -g` is
+/// one, `all: $(SRC:.c=.o)` and `x: ; echo a=b` are not. A macro definition
+/// whose value has a `:` in it never gets here; `is_macro_definition`
+/// claims it first.
+fn split_target_var(line: &str) -> Option<(&str, &str)> {
+    if line.starts_with('\t') {
+        return None;
+    }
+    let colon = top_level_chars(line)
+        .into_iter()
+        .find(|&(_, c)| c == ':')?
+        .0;
+    let (targets, rest) = (&line[..colon], &line[colon + 1..]);
+    // `targets:: ...` is a double-colon rule, never an assignment.
+    if rest.starts_with([':', '=']) {
+        return None;
+    }
+    for (_, c) in top_level_chars(rest) {
+        match c {
+            ';' => return None,
+            '=' => return Some((targets, rest)),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Split a rule line before the `;` that begins its inline command (POSIX
+/// 105644), if it has one: the first `;` after the first `:`, outside every
+/// macro reference. The second part keeps the `;`.
+fn split_inline_command(line: &str) -> (&str, &str) {
+    let chars = top_level_chars(line);
+    let Some(colon) = chars.iter().position(|&(_, c)| c == ':') else {
+        return (line, "");
+    };
+    match chars[colon..].iter().find(|&&(_, c)| c == ';') {
+        Some(&(at, _)) => line.split_at(at),
+        None => (line, ""),
+    }
+}
+
+/// `text` without a leading `word` and the blanks after it, if it starts
+/// with that word.
+fn strip_word<'a>(text: &'a str, word: &str) -> Option<&'a str> {
+    let rest = text.strip_prefix(word)?;
+    rest.starts_with([' ', '\t'])
+        .then(|| rest.trim_start_matches([' ', '\t']))
+}
+
 fn get_ident(letters: &mut Peekable<impl Iterator<Item = char>>) -> Result<String> {
     let mut ident = String::new();
 
@@ -681,6 +763,44 @@ impl MacroTable {
         }
     }
 
+    /// Apply a target-specific assignment, for the target being made.
+    ///
+    /// It ranks as a makefile definition made after every other, so it
+    /// replaces any from the makefile and the environment (but, without
+    /// `-e`, not over the environment's rank), and not a command-line macro
+    /// unless written `override` -- as in GNU make, where
+    /// `make CFLAGS=-O0` holds for `foo: CFLAGS += -g` too.
+    pub fn apply(&mut self, var: &TargetVar) {
+        let env_wins = ENV_MACROS.load(Acquire);
+        let current = self.resolve(&var.name, env_wins);
+        let value = match (var.op, current) {
+            (TargetAssign::IfUnset, Some(_)) => return,
+            (TargetAssign::Append, Some(current)) if !current.is_empty() => {
+                format!("{current} {}", var.value)
+            }
+            _ => var.value.clone(),
+        };
+        match var.overriding {
+            true => self.force(var.name.clone(), value, MacroSource::Override),
+            false => self.set(var.name.clone(), value, MacroSource::Makefile),
+        }
+    }
+
+    /// The value the makefile, the command line or the built-ins gave
+    /// `name`, ignoring the environment.
+    pub fn defined(&self, name: &str) -> Option<&str> {
+        self.values.get(name).map(|entry| entry.value.as_str())
+    }
+
+    /// Every definition, in first-definition order.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.order.iter().filter_map(|name| {
+            self.values
+                .get(name)
+                .map(|entry| (name.as_str(), entry.value.as_str()))
+        })
+    }
+
     pub fn into_macros(self) -> Vec<Macro> {
         // The source is dropped here, which is why `settle_environment` has to
         // have run: `Make` consumes values, and every precedence decision must
@@ -1033,17 +1153,58 @@ pub struct Include {
     pub optional: bool,
 }
 
+/// How a target-specific assignment combines with the value already in
+/// force for the target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetAssign {
+    /// `=`, `:=`, `::=`, `:::=` and `!=`: the value replaces it.
+    Set,
+    /// `+=`: the value is appended to it.
+    Append,
+    /// `?=`: the value is used only where there is none.
+    IfUnset,
+}
+
+/// A target-specific (or, with a `%` target, pattern-specific) macro
+/// assignment, `targets: [override] [export] name op value` (GNU make).
+///
+/// It is in force while the commands of each target it names are expanded,
+/// and of every target made as a prerequisite of one of them, unless that
+/// target assigns the name itself. sysvinit writes
+/// `init: LDLIBS += $(INITLIBS) $(STATIC)`; libzstd writes
+/// `%-mt : CPPFLAGS_DYNLIB := -DZSTD_MULTITHREAD`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetVar {
+    pub targets: Vec<String>,
+    pub name: String,
+    pub op: TargetAssign,
+    /// For `=`, `+=` and `?=` the text as written, expanded with the
+    /// target's macros when used; for the other operators the value the
+    /// operator gave when the line was read.
+    pub value: String,
+    /// Written `override`: beats a command-line macro.
+    pub overriding: bool,
+    /// Written `export`: the macro goes into the environment of the
+    /// target's commands.
+    pub exported: bool,
+}
+
 /// What the reader produced: the text the rule parser sees, plus the state it
 /// consumed on the way.
 #[derive(Debug, Default)]
 pub struct Preprocessed {
     pub text: String,
     pub macros: Vec<Macro>,
+    /// The same macros with the source of each, which decides whether a
+    /// target-specific assignment may replace one.
+    pub table: MacroTable,
     pub vpaths: Vec<VPathEntry>,
     /// Macros an `export` directive asked to put in the recipe environment.
     pub exports: Vec<String>,
     /// Every file an `include` line named, in the order read.
     pub includes: Vec<Include>,
+    /// Target- and pattern-specific macro assignments, in the order read.
+    pub target_vars: Vec<TargetVar>,
 }
 
 /// One level of `if.../else/endif` nesting.
@@ -1085,6 +1246,7 @@ struct Reader {
     vpaths: Vec<VPathEntry>,
     exports: Vec<String>,
     includes: Vec<Include>,
+    target_vars: Vec<TargetVar>,
     /// Shared by every expansion this reader performs, so recursion is bounded
     /// and `$(eval ...)` has somewhere to leave text.
     state: func::Expansion,
@@ -1101,6 +1263,7 @@ impl Reader {
             vpaths: Vec::new(),
             exports: Vec::new(),
             includes: Vec::new(),
+            target_vars: Vec::new(),
             state: func::Expansion::new(),
         }
     }
@@ -1126,12 +1289,17 @@ impl Reader {
             // is never evaluated -- a commented-out `$(shell rm -rf ...)`
             // must not run (audit #51).
             let code = super::scan::strip_comment(line);
-            let expanded = substitute_to_fixpoint(code, &self.table, &self.state)?;
+            // A command after the rule line's `;` is a command line, and like
+            // any other is expanded by the rule stage, not here: expanding it
+            // with the rest of the line used macros defined only so far.
+            let (header, command) = split_inline_command(code);
+            let expanded = substitute_to_fixpoint(header, &self.table, &self.state)?;
             // Anything `$(eval ...)` queued belongs *before* this line. A rule
             // header emitted by an eval on a rule line would otherwise close
             // the enclosing rule and steal its recipe.
             self.drain_evals()?;
             self.out.push_str(&expanded);
+            self.out.push_str(command);
         }
         self.out.push('\n');
         Ok(())
@@ -1501,10 +1669,59 @@ impl Reader {
         } else if is_macro_definition(line) {
             self.define_macro(line)?;
             self.drop_line();
+        } else if let Some((targets, assignment)) = split_target_var(line) {
+            self.define_target_var(targets, assignment)?;
+            self.drop_line();
         } else {
             self.keep(line)?;
         }
         Ok(i)
+    }
+
+    /// Record a target-specific assignment, `targets: [override] [export]
+    /// name op value`.
+    ///
+    /// The targets are expanded now, as a rule's are. The value is kept as
+    /// written for `=`, `+=` and `?=`, to be expanded with the target's
+    /// macros when its commands are; the other operators do their work now,
+    /// against what is defined at this point, as for any macro definition.
+    fn define_target_var(&mut self, targets: &str, assignment: &str) -> Result<()> {
+        let targets = super::scan::split_words(&self.expand(targets)?);
+        let mut text = assignment.trim_start();
+        let (mut overriding, mut exported) = (false, false);
+        loop {
+            if let Some(rest) = strip_word(text, "override") {
+                (overriding, text) = (true, rest);
+            } else if let Some(rest) = strip_word(text, "export") {
+                (exported, text) = (true, rest);
+            } else {
+                break;
+            }
+        }
+        let mut letters = text.chars().peekable();
+        let name = get_ident(&mut letters)?;
+        skip_blank(&mut letters);
+        let operator = parse_operator(&mut letters)?;
+        skip_blank(&mut letters);
+        let body: String = letters.collect();
+        let (op, value) = match operator {
+            Operator::Equals => (TargetAssign::Set, body),
+            Operator::Plus => (TargetAssign::Append, body),
+            Operator::QuestionMark => (TargetAssign::IfUnset, body),
+            other => (
+                TargetAssign::Set,
+                apply_operator(other, &name, body, &self.table, &self.state)?,
+            ),
+        };
+        self.target_vars.push(TargetVar {
+            targets,
+            name,
+            op,
+            value,
+            overriding,
+            exported,
+        });
+        Ok(())
     }
 
     fn define_macro(&mut self, line: &str) -> Result<()> {
@@ -1538,15 +1755,24 @@ impl Reader {
     }
 }
 
-/// Expand the command lines held back during the read, now that every macro is
-/// known.
+/// Expand one command line's macros against `table`: what the rule stage
+/// does to a command line just before it runs, with the macros in force for
+/// the target being made (target-specific ones included).
 ///
-/// A multi-line value landing in a recipe gets each of its newlines followed by
-/// the recipe's <tab>, so every line stays a command line rather than becoming
-/// a bogus rule.
+/// The automatic macros, `$$`, and any function call that reads an
+/// automatic macro are left for the rule stage, which knows the target.
+/// `$(eval ...)` is refused: a command line is expanded after the makefile
+/// has been read, so text it queued would have no reader.
+pub fn expand_command(text: &str, table: &MacroTable) -> std::result::Result<String, String> {
+    let state = func::Expansion::without_eval();
+    substitute_to_fixpoint(text, table, &state).map_err(|e| e.to_string())
+}
+
+/// Expand every command line of preprocessed text against `table`, as the
+/// rule stage would for a target with no target-specific macros. A
+/// multi-line value gets each of its newlines followed by the <tab> of a
+/// command line.
 fn expand_command_lines(text: &str, table: &MacroTable) -> Result<String> {
-    // A command line is expanded after the reader has finished, so text
-    // queued here would have no consumer: `$(eval ...)` is refused instead.
     let state = func::Expansion::without_eval();
     let mut out = String::with_capacity(text.len());
     for line in text.lines() {
@@ -1561,25 +1787,15 @@ fn expand_command_lines(text: &str, table: &MacroTable) -> Result<String> {
     Ok(out)
 }
 
-/// Expand a recipe line once the rule stage has substituted its automatic
-/// variables, so a function deferred by `mentions_automatic` finally runs.
-pub fn expand_recipe(text: &str, macros: &[Macro]) -> std::result::Result<String, String> {
-    // These macros are the settled table `Make` was handed: `settle_environment`
-    // has already folded in every environment value that outranked what the
-    // table held, so tagging them all `Makefile` here loses nothing. A name
-    // absent from the table is still resolved against the live environment,
-    // which is what lets a deferred function reach an ordinary environment
-    // variable.
-    let table = MacroTable::from_macros(macros, MacroSource::Makefile);
-    let state = func::Expansion::without_eval();
-    substitute_to_fixpoint(text, &table, &state).map_err(|e| e.to_string())
-}
-
-/// Resolve directives, includes and macros, returning the text the rule parser
-/// sees and the macro definitions it must not (they are consumed here, but
-/// `Make` needs them for `SHELL` and for the recipe environment).
+/// Preprocess `source`, and expand its command lines too.
+///
+/// [`preprocess_with`] leaves command lines as written, for the rule stage
+/// to expand with each target's macros. This shows what they expand to for
+/// a target that has none of its own.
 pub fn preprocess(source: &str) -> Result<Preprocessed> {
-    preprocess_with(source, &[], &[])
+    let mut scanned = preprocess_with(source, &[], &[])?;
+    scanned.text = expand_command_lines(&scanned.text, &scanned.table)?;
+    Ok(scanned)
 }
 
 /// POSIX 105884-105893: `CURDIR` is provided by make, set to the absolute
@@ -1610,6 +1826,10 @@ fn seed_curdir(table: &mut MacroTable) {
 /// Recorded sources are what keep a later assignment in its place: the
 /// makefile may replace a built-in but not a command-line macro, without
 /// anyone having to track that separately.
+///
+/// Command lines are returned as written. They are expanded by the rule
+/// stage just before they run, against the macros in force for the target
+/// being made, which may include target-specific ones.
 pub fn preprocess_with(
     source: &str,
     cmdline: &[Macro],
@@ -1631,15 +1851,16 @@ pub fn preprocess_with(
     if !reader.branches.is_empty() {
         return Err(PreprocError::UnmatchedConditional("endif".to_string()));
     }
-    let text = expand_command_lines(&reader.out, &reader.table)?;
-    // Settle the one precedence question the table still has open before the
-    // sources are dropped; see `settle_environment`.
+    // Settle the one precedence question the table still has open; see
+    // `settle_environment`.
     reader.table.settle_environment();
     Ok(Preprocessed {
-        text,
-        macros: reader.table.into_macros(),
+        text: reader.out,
+        macros: reader.table.clone().into_macros(),
+        table: reader.table,
         vpaths: reader.vpaths,
         exports: reader.exports,
         includes: reader.includes,
+        target_vars: reader.target_vars,
     })
 }

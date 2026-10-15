@@ -750,6 +750,16 @@ The GNU m4 extensions autoconf, automake and libtoolize cannot run without:
    brought up to date before the target, but never a reason to remake it,
    and not among `$^`, `$+`, `$?` or `$<`.  libzstd creates its build
    directories this way (`$(ZSTD_DYNLIB_DIR)/%.o : %.c | $(ZSTD_DYNLIB_DIR)`).
+ * Target-specific and pattern-specific macros, `targets: [override]
+   [export] name op value` with any of the assignment operators, as in GNU
+   make: in force while the commands of each target named (or matching the
+   `%` pattern) are expanded, and of every target made as one of its
+   prerequisites unless that target assigns the name itself.  Without
+   `override` one does not replace a command-line macro.  sysvinit links
+   each program with `init: LDLIBS += $(INITLIBS) $(STATIC)`; libzstd sets
+   flags per library and per pattern (`%-mt : CPPFLAGS_DYNLIB := ...`).
+   Command lines are therefore expanded just before they run, with the
+   target's macros, as GNU make does.
  * A `%` pattern rule without commands is not used: in GNU make it cancels
    a built-in pattern rule.  automake ends every Makefile with
    `%:: %,v`, `%:: SCCS/s.%` and three more of them.

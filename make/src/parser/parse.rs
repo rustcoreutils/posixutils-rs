@@ -14,7 +14,8 @@
 //! time.
 
 use super::preprocessor::{
-    is_include_line, is_macro_definition, preprocess_with, Include, VPathEntry,
+    is_include_line, is_macro_definition, preprocess_with, Include, MacroTable, TargetVar,
+    VPathEntry,
 };
 use super::scan::{self, RuleLine};
 use crate::Macro;
@@ -105,7 +106,7 @@ impl Display for Rule {
 }
 
 /// A parsed makefile: its rules, and the macros the preprocessor consumed.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct Makefile {
     rules: Vec<Rule>,
     macros: Vec<Macro>,
@@ -115,6 +116,10 @@ pub struct Makefile {
     exports: Vec<String>,
     /// Every file an `include` line named; see [`Include`].
     includes: Vec<Include>,
+    /// The macros again, with the source of each.
+    table: MacroTable,
+    /// Target- and pattern-specific macro assignments, in the order read.
+    target_vars: Vec<TargetVar>,
 }
 
 impl Makefile {
@@ -136,6 +141,16 @@ impl Makefile {
 
     pub fn includes(&self) -> &[Include] {
         &self.includes
+    }
+
+    /// The macros with the source of each, which decides whether a
+    /// target-specific assignment may replace one.
+    pub fn table(&self) -> &MacroTable {
+        &self.table
+    }
+
+    pub fn target_vars(&self) -> &[TargetVar] {
+        &self.target_vars
     }
 
     /// Consume the makefile, yielding its rules, macros, search paths and
@@ -336,7 +351,7 @@ impl Builder {
                 macros,
                 vpaths,
                 exports,
-                includes: Vec::new(),
+                ..Makefile::default()
             })
         } else {
             Err(ParseError(self.errors))
@@ -395,6 +410,8 @@ impl Makefile {
             scanned.exports,
         )?;
         makefile.includes = scanned.includes;
+        makefile.table = scanned.table;
+        makefile.target_vars = scanned.target_vars;
         Ok(makefile)
     }
 }

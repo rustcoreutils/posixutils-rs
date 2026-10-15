@@ -22,7 +22,9 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use parser::{preprocessor, Makefile, VPathEntry};
+use parser::preprocessor::{self, MacroSource, MacroTable};
+use parser::{Makefile, TargetVar, VPathEntry};
+use std::collections::HashMap;
 
 /// An owned macro definition `(name, value)`. Owning the data (rather than
 /// holding a rowan AST node) keeps `Make` `Send`/`Sync` for parallel builds.
@@ -78,6 +80,13 @@ impl TokenPool {
 /// The only way to create a Make is from a Makefile and a Config.
 pub struct Make {
     macros: Vec<Macro>,
+    /// The same macros with the source of each: what command lines are
+    /// expanded against, and what target-specific assignments are applied to.
+    table: MacroTable,
+    /// Target-specific macro assignments, by target, in the order read.
+    target_vars: HashMap<String, Vec<TargetVar>>,
+    /// Pattern-specific ones (a `%` target), with the pattern, in order.
+    pattern_vars: Vec<(String, TargetVar)>,
     /// Target rules (non-special, non-inference).
     /// Invariant: inference rules are never stored here, so `first_target()`
     /// always returns a valid default target per POSIX.
@@ -392,16 +401,30 @@ impl Make {
     /// - Ok(false) if the target was already up to date.
     /// - Err(_) if any errors occur.
     pub fn build_target(&self, name: impl AsRef<str>) -> Result<bool, ErrorCode> {
-        match self.ledger.claim(name.as_ref()) {
+        self.build_target_in(name.as_ref(), &[])
+    }
+
+    /// Build `name` as a prerequisite of a target whose target-specific
+    /// assignments are `inherited` (GNU make): they are in force for this
+    /// target's commands too, under its own.
+    ///
+    /// A target reached by several paths is built once, in the context of
+    /// the first, as in GNU make.
+    fn build_target_in(&self, name: &str, inherited: &[TargetVar]) -> Result<bool, ErrorCode> {
+        match self.ledger.claim(name) {
             graph::Claim::Done(outcome) => return outcome.into_result(),
             graph::Claim::Build => {}
         }
-        let result = self.build_target_uncached(name.as_ref());
-        self.ledger.finish(name.as_ref(), &result);
+        let result = self.build_target_uncached(name, inherited);
+        self.ledger.finish(name, &result);
         result
     }
 
-    fn build_target_uncached(&self, name: impl AsRef<str>) -> Result<bool, ErrorCode> {
+    fn build_target_uncached(
+        &self,
+        name: impl AsRef<str>,
+        inherited: &[TargetVar],
+    ) -> Result<bool, ErrorCode> {
         // Search both regular rules and inference rules
         let rule = match self.rule_by_target_name(&name) {
             Some(rule) => rule,
@@ -429,6 +452,7 @@ impl Make {
                             &rule,
                             &target,
                             Dispatch::Explicit,
+                            inherited,
                         );
                     }
                     // No target rule named `name`: try to infer one (single- or
@@ -439,6 +463,7 @@ impl Make {
                             inference_rule,
                             &target,
                             Dispatch::Inference,
+                            inherited,
                         );
                     }
                     // XSI: a source file with an SCCS history is retrieved
@@ -469,9 +494,9 @@ impl Make {
         let target = Target::new(name.as_ref());
 
         if rule.is_double_colon() {
-            return self.run_double_colon_rules(&target);
+            return self.run_double_colon_rules(&target, inherited);
         }
-        self.run_rule_with_prerequisites(rule, &target, Dispatch::Explicit)
+        self.run_rule_with_prerequisites(rule, &target, Dispatch::Explicit, inherited)
     }
 
     /// The prerequisites that decide whether `target` is out of date.
@@ -535,10 +560,12 @@ impl Make {
         rule: &Rule,
         target: &Target,
         dispatch: Dispatch,
+        inherited: &[TargetVar],
     ) -> Result<bool, ErrorCode> {
         if let Some(origin) = graph::find_cycle(self, target.as_ref()) {
             return Err(RecursivePrerequisite { origin });
         }
+        let scope = self.scope_for(target.as_ref(), inherited);
 
         let mut prerequisites = self.effective_prerequisites(rule, target, dispatch);
 
@@ -563,7 +590,7 @@ impl Make {
         // was actually rebuilt makes this target stale whatever the timestamps
         // say, and one that is merely older must still be visited -- it may be
         // phony, or stale against its own sources.
-        let rebuilt = self.build_prerequisites(&prerequisites)?;
+        let rebuilt = self.build_prerequisites(&prerequisites, &scope)?;
 
         // Order-only prerequisites (GNU make) are brought up to date too, but
         // whether they were remade, or are newer, says nothing about this
@@ -573,7 +600,7 @@ impl Make {
             .map(|p| p.as_ref().to_string())
             .filter(|name| !prerequisites.contains(name))
             .collect();
-        self.build_prerequisites(&order_only)?;
+        self.build_prerequisites(&order_only, &scope)?;
 
         // `$?` is the prerequisites newer than the target.
         let newer = self.newer_prerequisites(target.as_ref(), &prerequisites);
@@ -588,25 +615,25 @@ impl Make {
         }
 
         if let Some(inference_rule) = inferred {
-            return self.run_inference(inference_rule, target, up_to_date, &newer);
+            return self.run_inference(inference_rule, target, up_to_date, &newer, &scope);
         }
 
         // An inference rule derives `$<` from its suffixes rather than from a
         // prerequisite list, so it must go through `run_for_target`; handing it
         // to `run` would leave `$<` empty.
         if dispatch == Dispatch::Inference {
-            return self.run_inference(rule, target, up_to_date, &newer);
+            return self.run_inference(rule, target, up_to_date, &newer, &scope);
         }
 
-        self.with_env(|env| rule.run(env, target, up_to_date, &newer))?;
+        self.with_env(&scope, |env| rule.run(env, target, up_to_date, &newer))?;
         Ok(true)
     }
 
-    /// Register the built-in inference rules, expanded against the macros in
-    /// force, skipping any the makefile already defines.
+    /// Register the built-in inference rules, skipping any the makefile already
+    /// defines. Their commands are expanded when they run, like any others.
     fn seed_builtin_rules(&mut self) -> Result<(), ErrorCode> {
-        let text = expand_rules(BUILTIN_RULES, &self.macros)?;
-        let parsed = parser::parse(&text).map_err(|constraint| ParserError { constraint })?;
+        let text = BUILTIN_RULES;
+        let parsed = parser::parse(text).map_err(|constraint| ParserError { constraint })?;
         for parsed_rule in parsed.rules() {
             let rule = Rule::from(parsed_rule.clone());
             let Some(name) = rule.targets().next().map(Target::to_string) else {
@@ -639,7 +666,7 @@ impl Make {
             return Ok(false);
         }
         let target = Target::new(name);
-        self.with_env(|env| rule.run(env, &target, false, &[]))?;
+        self.with_env(&[], |env| rule.run(env, &target, false, &[]))?;
         Ok(true)
     }
 
@@ -648,8 +675,8 @@ impl Make {
         if self.sccs_get.is_some() {
             return Ok(());
         }
-        let text = expand_rules(SCCS_GET_RULE, &self.macros)?;
-        let parsed = parser::parse(&text).map_err(|constraint| ParserError { constraint })?;
+        let text = SCCS_GET_RULE;
+        let parsed = parser::parse(text).map_err(|constraint| ParserError { constraint })?;
         self.sccs_get = parsed.rules().next().map(|r| Rule::from(r.clone()));
         Ok(())
     }
@@ -659,15 +686,48 @@ impl Make {
     /// The `VPATH` resolver borrows `self`, so it cannot outlive the call; a
     /// callback keeps that borrow local instead of asking every caller to
     /// spell the closure out.
-    fn with_env<R>(&self, f: impl FnOnce(&rule::Env<'_>) -> R) -> R {
+    ///
+    /// The macros are the makefile's with `scope` -- the target-specific
+    /// assignments in force for the target -- applied in order. Without any,
+    /// the makefile's own table is used as it is.
+    fn with_env<R>(&self, scope: &[TargetVar], f: impl FnOnce(&rule::Env<'_>) -> R) -> R {
         let resolve = |name: &str| self.resolve_vpath(name);
+        let table = match scope.is_empty() {
+            true => std::borrow::Cow::Borrowed(&self.table),
+            false => {
+                let mut table = self.table.clone();
+                for var in scope {
+                    table.apply(var);
+                }
+                std::borrow::Cow::Owned(table)
+            }
+        };
+        let mut exports = self.exports.clone();
+        exports.extend(scope.iter().filter(|v| v.exported).map(|v| v.name.clone()));
         f(&rule::Env {
             config: &self.config,
-            macros: &self.macros,
-            exports: &self.exports,
+            table: &table,
+            exports: &exports,
             resolve: &resolve,
             attributes: &self.attributes,
         })
+    }
+
+    /// The target-specific assignments in force for `target`: those it
+    /// inherits from the target it is made for, then those of each `%`
+    /// pattern it matches, then its own -- each overriding the ones before,
+    /// as in GNU make.
+    fn scope_for(&self, target: &str, inherited: &[TargetVar]) -> Vec<TargetVar> {
+        let mut scope = inherited.to_vec();
+        for (pattern, var) in &self.pattern_vars {
+            if rule::pattern_stem(pattern, target).is_some() {
+                scope.push(var.clone());
+            }
+        }
+        if let Some(own) = self.target_vars.get(target) {
+            scope.extend(own.iter().cloned());
+        }
+        scope
     }
 
     fn run_inference(
@@ -676,8 +736,11 @@ impl Make {
         target: &Target,
         up_to_date: bool,
         newer: &[String],
+        scope: &[TargetVar],
     ) -> Result<bool, ErrorCode> {
-        self.with_env(|env| rule.run_for_target(env, target, up_to_date, newer))?;
+        self.with_env(scope, |env| {
+            rule.run_for_target(env, target, up_to_date, newer)
+        })?;
         Ok(true)
     }
 
@@ -687,7 +750,11 @@ impl Make {
     /// `.WAIT` prerequisites split the list into segments that must be built in
     /// order: every prerequisite to the left of a `.WAIT` is brought up to date
     /// before any to its right. Within a segment, prerequisites are independent.
-    fn build_prerequisites(&self, prerequisites: &[String]) -> Result<bool, ErrorCode> {
+    fn build_prerequisites(
+        &self,
+        prerequisites: &[String],
+        scope: &[TargetVar],
+    ) -> Result<bool, ErrorCode> {
         let parallel = self.config.jobs > 1
             && !self.config.not_parallel
             && !self.config.dry_run
@@ -700,27 +767,32 @@ impl Make {
             let name = prerequisite.as_str();
             if name == WAIT_TARGET {
                 // Barrier: finish the current segment before continuing.
-                updated |= self.build_segment(&segment, parallel)?;
+                updated |= self.build_segment(&segment, parallel, scope)?;
                 segment.clear();
             } else {
                 segment.push(name);
             }
         }
-        updated |= self.build_segment(&segment, parallel)?;
+        updated |= self.build_segment(&segment, parallel, scope)?;
         Ok(updated)
     }
 
     /// Builds one segment of independent prerequisites, in parallel when `-j`
     /// allows it. Parallelism is bounded by the token pool; a prerequisite that
     /// cannot obtain a token is built inline so the build always progresses.
-    fn build_segment(&self, names: &[&str], parallel: bool) -> Result<bool, ErrorCode> {
+    fn build_segment(
+        &self,
+        names: &[&str],
+        parallel: bool,
+        scope: &[TargetVar],
+    ) -> Result<bool, ErrorCode> {
         if !parallel || names.len() <= 1 {
             // Under -k a failed prerequisite must not stop its *siblings*; the
             // first error is still returned, so the dependent target is skipped.
             let mut first_error = None;
             let mut updated = false;
             for name in names {
-                match self.build_target(name) {
+                match self.build_target_in(name, scope) {
                     Ok(built) => updated |= built,
                     Err(err) => {
                         if !self.config.keep_going || self.config.terminate {
@@ -738,7 +810,7 @@ impl Make {
 
         let updated = std::sync::atomic::AtomicBool::new(false);
         let errors: std::sync::Mutex<Vec<ErrorCode>> = std::sync::Mutex::new(Vec::new());
-        std::thread::scope(|scope| {
+        std::thread::scope(|threads| {
             let mut handles = Vec::new();
             let mut inline: Vec<&str> = Vec::new();
             // Spawn a worker for each prerequisite that can obtain a token; the
@@ -748,8 +820,8 @@ impl Make {
                 if self.pool.try_acquire() {
                     let errors = &errors;
                     let updated = &updated;
-                    handles.push(scope.spawn(move || {
-                        let result = self.build_target(name);
+                    handles.push(threads.spawn(move || {
+                        let result = self.build_target_in(name, scope);
                         self.pool.release();
                         match result {
                             Ok(true) => updated.store(true, std::sync::atomic::Ordering::Relaxed),
@@ -762,7 +834,7 @@ impl Make {
                 }
             }
             for name in inline {
-                match self.build_target(name) {
+                match self.build_target_in(name, scope) {
                     Ok(true) => updated.store(true, std::sync::atomic::Ordering::Relaxed),
                     Ok(false) => {}
                     Err(err) => errors.lock().unwrap().push(err),
@@ -823,10 +895,14 @@ impl Make {
     /// Each brings its own prerequisites up to date and runs its commands
     /// when one of them is newer than the target, or always when it has none
     /// (GNU make). Reports whether any rule ran.
-    fn run_double_colon_rules(&self, target: &Target) -> Result<bool, ErrorCode> {
+    fn run_double_colon_rules(
+        &self,
+        target: &Target,
+        inherited: &[TargetVar],
+    ) -> Result<bool, ErrorCode> {
         let mut ran = false;
         for rule in self.double_colon_rules(target.as_ref()) {
-            ran |= self.run_rule_with_prerequisites(rule, target, Dispatch::Explicit)?;
+            ran |= self.run_rule_with_prerequisites(rule, target, Dispatch::Explicit, inherited)?;
         }
         Ok(ran)
     }
@@ -1071,6 +1147,8 @@ impl TryFrom<(Makefile, Config)> for Make {
         // are available when determining whether a rule like `.txt.out:` is an
         // inference rule.
 
+        let table = makefile.table().clone();
+        let (target_vars, pattern_vars) = index_target_vars(makefile.target_vars());
         let (parsed_rules, macros, vpaths, exports) = makefile.into_parts();
 
         let mut suffixes_rules = vec![];
@@ -1097,6 +1175,9 @@ impl TryFrom<(Makefile, Config)> for Make {
             rules: vec![],
             inference_rules: vec![],
             macros,
+            table,
+            target_vars,
+            pattern_vars,
             default_rule: None,
             sccs_get: None,
             pool,
@@ -1116,6 +1197,8 @@ impl TryFrom<(Makefile, Config)> for Make {
             for (name, value) in BUILTIN_MACROS {
                 if !make.macros.iter().any(|(n, _)| n == name) {
                     make.macros.push((name.to_string(), value.to_string()));
+                    make.table
+                        .seed(name.to_string(), value.to_string(), MacroSource::BuiltIn);
                 }
             }
         }
@@ -1170,35 +1253,26 @@ impl TryFrom<(Makefile, Config)> for Make {
     }
 }
 
-/// Expand the built-in recipes against the macros actually in force.
-///
-/// The rule text is a constant, so it always parses; only the recipe lines
-/// need the makefile's macros. The previous arrangement pasted every macro
-/// back into that text as `NAME ::= value` and re-parsed the lot, so any value
-/// containing a newline -- every `define` body -- made the whole thing fail to
-/// parse, and an `if let Ok` swallowed the error. Every built-in rule
-/// disappeared without a word (audit #67).
-fn expand_rules(text: &str, macros: &[Macro]) -> Result<String, ErrorCode> {
-    let mut out = String::with_capacity(text.len());
-    for line in text.lines() {
-        match line.strip_prefix('\t') {
-            Some(body) => {
-                out.push('\t');
-                out.push_str(&expand_builtin_recipe(body, macros)?);
-            }
-            None => out.push_str(line),
-        }
-        out.push('\n');
-    }
-    Ok(out)
-}
+/// Target-specific macro assignments indexed by target, and the
+/// pattern-specific ones (a `%` target) with their patterns, each in the
+/// order read.
+type TargetVarIndex = (HashMap<String, Vec<TargetVar>>, Vec<(String, TargetVar)>);
 
-/// Expand one built-in recipe line. `$@`, `$<` and `$*` are left for the rule
-/// stage, which is the only place that knows the target.
-fn expand_builtin_recipe(line: &str, macros: &[Macro]) -> Result<String, ErrorCode> {
-    preprocessor::expand_recipe(line, macros).map_err(|message| ParserError {
-        constraint: parser::ParseError(vec![message]),
-    })
+fn index_target_vars(vars: &[TargetVar]) -> TargetVarIndex {
+    let mut by_target: HashMap<String, Vec<TargetVar>> = HashMap::new();
+    let mut by_pattern = Vec::new();
+    for var in vars {
+        for target in &var.targets {
+            match target.contains('%') {
+                true => by_pattern.push((target.clone(), var.clone())),
+                false => by_target
+                    .entry(target.clone())
+                    .or_default()
+                    .push(var.clone()),
+            }
+        }
+    }
+    (by_target, by_pattern)
 }
 
 /// The SCCS history file for `name`, if there is one.

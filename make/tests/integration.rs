@@ -2444,7 +2444,8 @@ mod sccs {
 
         let (with, _) = run(&["-C", dir, "-p", "all"]);
         assert!(with.contains(".SCCS_GET:"), "stdout: {with}");
-        assert!(with.contains("get -s $@"), "stdout: {with}");
+        // Shown as written: command lines are expanded when they run.
+        assert!(with.contains("get $(SCCSGETFLAGS) $@"), "stdout: {with}");
 
         let (without, _) = run(&["-C", dir, "-rp", "all"]);
         assert!(!without.contains(".SCCS_GET:"), "stdout: {without}");

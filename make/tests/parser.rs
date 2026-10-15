@@ -297,7 +297,9 @@ mod parse {
         let (targets, prerequisites, recipes) = only_rule(SIMPLE);
         assert_eq!(targets, vec!["rule"]);
         assert_eq!(prerequisites, vec!["dependency"]);
-        assert_eq!(recipes, vec!["command", "command2"]);
+        // Command lines are kept as written; the rule stage expands them
+        // with the macros in force for the target being made.
+        assert_eq!(recipes, vec!["command", "${VARIABLE}"]);
     }
 
     #[test]

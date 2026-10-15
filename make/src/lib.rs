@@ -18,6 +18,7 @@ pub mod signal_handler;
 pub mod special_target;
 mod stat_cache;
 
+use std::borrow::Cow;
 use std::os::unix::fs::PermissionsExt;
 use std::{
     fs::{self},
@@ -402,20 +403,25 @@ impl Make {
     ///
     /// A target whose commands ran is the file they made here, as in GNU
     /// make: `$<` then names `parse.c`, not the stale `$(srcdir)/parse.c`.
-    pub fn resolve_vpath(&self, name: &str) -> String {
+    ///
+    /// The name is borrowed back when it is the answer, which it nearly
+    /// always is: every name the walk looks at comes through here.
+    pub fn resolve_vpath<'a>(&self, name: &'a str) -> Cow<'a, str> {
         if name.starts_with('/')
             || self.stats.exists(name)
             || self.remade.lock().unwrap().contains(name)
         {
-            return name.to_string();
+            return Cow::Borrowed(name);
         }
         // A `vpath` pattern is more specific than the blanket `VPATH` macro, so
         // it is consulted first; the first matching pattern wins, as GNU does.
         if let Some(found) = self.search_vpath_patterns(name) {
-            return found;
+            return Cow::Owned(found);
         }
-        self.search_dirs(&self.vpath_dirs, name)
-            .unwrap_or_else(|| name.to_string())
+        match self.search_dirs(&self.vpath_dirs, name) {
+            Some(found) => Cow::Owned(found),
+            None => Cow::Borrowed(name),
+        }
     }
 
     /// Look `name` up in the directories of the first `vpath` pattern it
@@ -543,7 +549,8 @@ impl Make {
                                 && from == from_name)
                 });
                 if let Some(rule) = hit {
-                    let prereq_path = self.resolve_vpath(&suffix_source_name(stem, source_suffix));
+                    let source = suffix_source_name(stem, source_suffix);
+                    let prereq_path = self.resolve_vpath(&source);
                     if self.exists_or_ought_to(&prereq_path) {
                         return Some(rule);
                     }
@@ -561,7 +568,8 @@ impl Make {
                         if to.is_empty() && from == from_name)
             });
             if let Some(rule) = hit {
-                let prereq_path = self.resolve_vpath(&suffix_source_name(name, source_suffix));
+                let source = suffix_source_name(name, source_suffix);
+                let prereq_path = self.resolve_vpath(&source);
                 if self.exists_or_ought_to(&prereq_path) {
                     return Some(rule);
                 }
@@ -648,7 +656,7 @@ impl Make {
                     // `$(srcdir)/doc`, is not one of them: matched by the
                     // name it is written under, the rule "remade" it.
                     let found = self.resolve_vpath(name.as_ref());
-                    if found != name.as_ref()
+                    if found.as_ref() != name.as_ref()
                         && self.find_pattern_rule(&found).is_none()
                         && self.find_inference_rule(&found).is_none()
                     {
@@ -1016,7 +1024,7 @@ impl Make {
     /// assignments in force for the target -- applied in order. Without any,
     /// the makefile's own table is used as it is.
     fn with_env<R>(&self, scope: &[TargetVar], f: impl FnOnce(&rule::Env<'_>) -> R) -> R {
-        let resolve = |name: &str| self.resolve_vpath(name);
+        let resolve = |name: &str| self.resolve_vpath(name).into_owned();
         let table = match scope.is_empty() {
             true => std::borrow::Cow::Borrowed(&self.table),
             false => {

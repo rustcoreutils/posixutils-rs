@@ -698,9 +698,9 @@ The GNU m4 extensions autoconf, automake and libtoolize cannot run without:
  * Built-ins `builtin`, `indir`, `regexp`, `patsubst`, `format`, `esyscmd`,
    `debugmode` and `debugfile`.  `regexp` and `patsubst` take GNU Emacs
    syntax (`\(` `\)` `\|`, `\w` `\b` `\<` `\>`), with `\N` and `\&` in the
-   replacement; where several matches start at the leftmost position, the
-   first alternative wins rather than the longest, and back-references in a
-   pattern are not supported.  `format` takes C `printf` conversions, once,
+   replacement; of the matches that start at the leftmost position the
+   longest wins, as in GNU regex, and back-references in a pattern are not
+   supported.  `format` takes C `printf` conversions, once,
    without backslash escapes.  `dumpdef` writes to the debug stream.
  * Tracing: `-t NAME` / `--trace=NAME` (by name, so it holds before the macro
    is defined and across redefinition), `-d[FLAGS]` / `--debug[=FLAGS]`

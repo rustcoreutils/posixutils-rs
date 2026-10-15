@@ -31,8 +31,12 @@ this m4 does as GNU m4 does by default, and as POSIX says when
   was popped, then pushes `KILL` and wraps the matching pop, which must run
   first.  It does not pass `--gnu`, so this has to be the default.
 
-One difference remains: `regexp` and `patsubst` take the first alternative
-that matches where GNU regex takes the longest.
+`regexp` and `patsubst` take the longest of the matches that start at the
+leftmost position, as GNU regex does (`regexp(abcd, a\|ab, \&)` is `ab`),
+with the groups of the first path to that match.  One difference remains:
+under a multibyte locale GNU regex matches `.` and bracket expressions
+against whole characters, while this m4 matches them against bytes in
+every locale.
 
 ## [`sendmail`](https://www.proofpoint.com/us/products/email-protection/open-source-email-solution)
 

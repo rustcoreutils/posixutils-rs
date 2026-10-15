@@ -393,6 +393,24 @@ b], [^], [> ])
     );
 }
 
+// GNU regex takes the longest of the matches that start leftmost, and the
+// groups of the first path to that match.
+#[test]
+fn regexp_and_patsubst_take_the_longest_leftmost_match() {
+    m4(
+        &[],
+        "changequote([,])dnl
+1 regexp([abcd], [a\\|ab]) regexp([abcd], [a\\|ab], [\\&]) patsubst([abcd], [a\\|ab], [X])
+2 patsubst([xabcabc], [abc\\|ab\\|abcabc], [<\\&>]) regexp([abc], [\\(ab\\)*\\(abc\\)*], [<\\1|\\2>])
+3 regexp([abb], [\\(a\\|ab\\)\\(b*\\)], [\\1-\\2]) regexp([abcd], [\\(a\\|ab\\)\\(c\\|bcd\\)], [\\1-\\2])
+4 patsubst([foo bar], [\\(o\\|oo\\)\\b], [<\\&>]) regexp([ab], [a\\|ab\\b], [\\&]) regexp([abc], [a\\|ab\\b], [\\&])
+",
+        "1 0 ab Xcd\n2 x<abcabc> <|abc>\n3 a-bb a-bcd\n4 f<oo> bar ab a\n",
+        "",
+        0,
+    );
+}
+
 #[test]
 fn regular_expression_diagnostics() {
     m4(

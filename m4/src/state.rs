@@ -73,7 +73,7 @@ pub struct State {
     /// GNU m4 debug flags and stream.
     pub debug: crate::debug::Debug,
     /// Compiled `regexp`/`patsubst` patterns: m4sugar uses a few, often.
-    pub regex_cache: HashMap<Vec<u8>, Rc<regex::bytes::Regex>>,
+    pub regex_cache: HashMap<Vec<u8>, Rc<crate::emacs_regex::Regex>>,
     /// `-L`. See [`State::check_nesting`].
     pub nesting_limit: usize,
     /// `POSIXLY_CORRECT` is set in the environment: where GNU m4 1.4, the

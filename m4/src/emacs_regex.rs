@@ -20,13 +20,92 @@
 //! stands for itself.
 //!
 //! [`translate`] rewrites such a pattern into the syntax of the `regex`
-//! crate, matching bytes.  One difference remains: GNU regex picks the
-//! longest of the matches starting at the leftmost position, `regex` the
-//! first alternative that matches, so `\(a\|ab\)` matches `a`, not `ab`, in
-//! `ab`.  Back-references (`\1` in a pattern) are not supported; autoconf
-//! uses neither.
+//! crate, matching bytes, and [`Regex`] matches it as GNU regex does: of
+//! the matches that start at the leftmost position it takes the longest
+//! (`\(a\|ab\)` matches `ab` in `abc`), where the `regex` crate takes the
+//! first alternative that matches.  Back-references (`\1` in a pattern) are
+//! not supported; autoconf uses none.
 
+use std::cell::RefCell;
 use std::fmt::Write;
+use std::ops::Range;
+
+use regex_automata::nfa::thompson::{self, pikevm, pikevm::PikeVM};
+use regex_automata::util::{captures::Captures, syntax};
+use regex_automata::{Anchored, Input, MatchKind};
+
+/// A compiled `regexp`/`patsubst` pattern.
+///
+/// A match is found in two steps.  The `regex` crate finds where the
+/// leftmost match starts, which does not depend on which of the matches
+/// there is taken.  Then a PikeVM anchored at that start, visiting every
+/// match state rather than stopping at the first, runs on until no thread
+/// is left and reports the last, longest, end.  Its groups are those of the
+/// highest-priority path that reaches that end, as backtracking would give
+/// with the overall match fixed: `regexp(abb, \(a\|ab\)\(b*\), \1-\2)` is
+/// `a-bb`, as in GNU m4 1.4.19.
+pub struct Regex {
+    leftmost: regex::bytes::Regex,
+    longest: PikeVM,
+    cache: RefCell<(pikevm::Cache, Captures)>,
+}
+
+impl Regex {
+    /// Compile the GNU Emacs-syntax `pattern`, or say why it does not.
+    pub fn new(pattern: &[u8]) -> Result<Regex, String> {
+        let translated = translate(pattern)?;
+        let leftmost = regex::bytes::Regex::new(&translated).map_err(|e| e.to_string())?;
+        let longest = PikeVM::builder()
+            .syntax(syntax::Config::new().utf8(false))
+            .thompson(thompson::Config::new().utf8(false))
+            .configure(PikeVM::config().match_kind(MatchKind::All))
+            .build(&translated)
+            .map_err(|e| e.to_string())?;
+        let cache = RefCell::new((longest.create_cache(), longest.create_captures()));
+        Ok(Regex {
+            leftmost,
+            longest,
+            cache,
+        })
+    }
+
+    /// The first match in `haystack` at or after `start`, with the whole of
+    /// `haystack` as context for anchors and word boundaries.
+    pub fn captures_at(&self, haystack: &[u8], start: usize) -> Option<Groups> {
+        let begin = self.leftmost.find_at(haystack, start)?.start();
+        let mut cache = self.cache.borrow_mut();
+        let (cache, captures) = &mut *cache;
+        let input = Input::new(haystack).range(begin..).anchored(Anchored::Yes);
+        self.longest.search(cache, &input, captures);
+        let spans = (0..captures.group_len())
+            .map(|group| captures.get_group(group).map(|span| span.range()))
+            .collect::<Vec<_>>();
+        // A match starts here, so the anchored search finds one.
+        spans.first()?.as_ref()?;
+        Some(Groups(spans))
+    }
+}
+
+/// Where each group of a match is in the haystack, group 0 being the whole
+/// match; `None` for a group that took no part in it.
+pub struct Groups(Vec<Option<Range<usize>>>);
+
+impl Groups {
+    /// The number of groups, the whole match included.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Where group `group` matched, if it did.
+    pub fn get(&self, group: usize) -> Option<Range<usize>> {
+        self.0.get(group).cloned().flatten()
+    }
+
+    /// Where the whole match is.
+    pub fn whole(&self) -> Range<usize> {
+        self.get(0).expect("group 0 is the match")
+    }
+}
 
 /// Translate the GNU Emacs-syntax `pattern` into a `regex` crate pattern
 /// over bytes, or say why it cannot be.
@@ -237,11 +316,47 @@ fn bracket(pattern: &[u8], mut i: usize, out: &mut String) -> Result<usize, Stri
 
 #[cfg(test)]
 mod tests {
-    use super::translate;
+    use super::{translate, Regex};
 
     fn find(pattern: &str, text: &str) -> Option<(usize, usize)> {
-        let re = regex::bytes::Regex::new(&translate(pattern.as_bytes()).unwrap()).unwrap();
-        re.find(text.as_bytes()).map(|m| (m.start(), m.end()))
+        let re = Regex::new(pattern.as_bytes()).unwrap();
+        re.captures_at(text.as_bytes(), 0)
+            .map(|m| (m.whole().start, m.whole().end))
+    }
+
+    /// The text of each group of the first match, `-` for one that took no
+    /// part.
+    fn groups(pattern: &str, text: &str) -> Vec<String> {
+        let re = Regex::new(pattern.as_bytes()).unwrap();
+        let m = re.captures_at(text.as_bytes(), 0).unwrap();
+        (0..m.len())
+            .map(|g| m.get(g).map_or(String::from("-"), |r| text[r].to_string()))
+            .collect()
+    }
+
+    // GNU regex takes the longest of the matches at the leftmost start.
+    #[test]
+    fn leftmost_longest() {
+        assert_eq!(find(r"a\|ab", "abcd"), Some((0, 2)));
+        assert_eq!(find(r"abc\|ab\|abcabc", "xabcabc"), Some((1, 7)));
+        assert_eq!(find(r"\(ab\)*\(abc\)*", "abc"), Some((0, 3)));
+        // Leftmost first: a later, longer match does not win.
+        assert_eq!(find(r"a\|bcd", "abcd"), Some((0, 1)));
+        // Anchors and word boundaries see the text beyond the match.
+        assert_eq!(find(r"a\|ab\b", "ab"), Some((0, 2)));
+        assert_eq!(find(r"a\|ab\b", "abc"), Some((0, 1)));
+        assert_eq!(find(r"a\|ab\B", "abc"), Some((0, 2)));
+    }
+
+    // With the overall match fixed, groups are those of the first path to
+    // it, as GNU m4 1.4.19 gives them.
+    #[test]
+    fn groups_of_the_longest_match() {
+        assert_eq!(groups(r"\(a\|ab\)\(c\|bcd\)", "abcd"), ["abcd", "a", "bcd"]);
+        assert_eq!(groups(r"\(a\|ab\)\(b*\)", "abb"), ["abb", "a", "bb"]);
+        assert_eq!(groups(r"\(a*\)\(a*\)", "aa"), ["aa", "aa", ""]);
+        assert_eq!(groups(r"\(ab\|a\)*", "abab"), ["abab", "ab"]);
+        assert_eq!(groups(r"\(x\)\|y", "y"), ["y", "-"]);
     }
 
     #[test]

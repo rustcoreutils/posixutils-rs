@@ -17,6 +17,7 @@ use std::rc::Rc;
 
 use super::{BuiltinMacro, MacroDefinition, MacroImplementation};
 use crate::debug;
+use crate::emacs_regex::{Groups, Regex};
 use crate::lexer::MacroName;
 use crate::state::{StackFrame, State};
 use crate::Result;
@@ -77,35 +78,30 @@ impl MacroImplementation for IndirMacro {
 
 /// The compiled form of `pattern`, from the cache, or the diagnostic GNU m4
 /// gives for a pattern that does not compile.
-fn compile(
-    state: &mut State,
-    pattern: &[u8],
-) -> std::result::Result<Rc<regex::bytes::Regex>, String> {
+fn compile(state: &mut State, pattern: &[u8]) -> std::result::Result<Rc<Regex>, String> {
     if let Some(re) = state.regex_cache.get(pattern) {
         return Ok(re.clone());
     }
-    let compiled = crate::emacs_regex::translate(pattern)
-        .and_then(|translated| regex::bytes::Regex::new(&translated).map_err(|e| e.to_string()))
-        .map(Rc::new)
-        .map_err(|why| {
-            format!(
-                "bad regular expression: `{}': {why}",
-                String::from_utf8_lossy(pattern)
-            )
-        })?;
+    let compiled = Regex::new(pattern).map(Rc::new).map_err(|why| {
+        format!(
+            "bad regular expression: `{}': {why}",
+            String::from_utf8_lossy(pattern)
+        )
+    })?;
     state.regex_cache.insert(pattern.to_vec(), compiled.clone());
     Ok(compiled)
 }
 
-/// Expand `replacement` for the match `captures`: `\N` is group N, `\&` and
-/// `\0` the whole match, `\\` a backslash, and any other escaped character
-/// itself.
+/// Expand `replacement` for the match `captures` in `victim`: `\N` is group
+/// N, `\&` and `\0` the whole match, `\\` a backslash, and any other escaped
+/// character itself.
 fn substitute(
     state: &mut State,
     stderr: &mut dyn Write,
     out: &mut Vec<u8>,
     replacement: &[u8],
-    captures: &regex::bytes::Captures,
+    victim: &[u8],
+    captures: &Groups,
 ) -> Result<()> {
     let mut i = 0;
     while i < replacement.len() {
@@ -124,11 +120,11 @@ fn substitute(
                 if group >= captures.len() {
                     state
                         .emit_warning(stderr, format_args!("sub-expression {group} not present"))?;
-                } else if let Some(m) = captures.get(group) {
-                    out.extend_from_slice(m.as_bytes());
+                } else if let Some(span) = captures.get(group) {
+                    out.extend_from_slice(&victim[span]);
                 }
             }
-            Some(b'&') => out.extend_from_slice(&captures[0]),
+            Some(b'&') => out.extend_from_slice(&victim[captures.whole()]),
             Some(&other) => out.push(other),
         }
         i += 1;
@@ -154,16 +150,16 @@ impl MacroImplementation for RegexpMacro {
             }
         };
         let mut out = Vec::new();
-        match replacement {
-            None => match re.find(&victim) {
-                Some(m) => out.extend_from_slice(m.start().to_string().as_bytes()),
-                None => out.extend_from_slice(b"-1"),
-            },
-            Some(replacement) => {
-                if let Some(captures) = re.captures(&victim) {
-                    substitute(state, stderr, &mut out, &replacement, &captures)?;
-                }
+        let captures = re.captures_at(&victim, 0);
+        match (replacement, captures) {
+            (None, Some(captures)) => {
+                out.extend_from_slice(captures.whole().start.to_string().as_bytes())
             }
+            (None, None) => out.extend_from_slice(b"-1"),
+            (Some(replacement), Some(captures)) => {
+                substitute(state, stderr, &mut out, &replacement, &victim, &captures)?;
+            }
+            (Some(_), None) => {}
         }
         state.input.pushback_string(&out);
         Ok(())
@@ -202,11 +198,11 @@ impl MacroImplementation for PatsubstMacro {
                 out.extend_from_slice(&victim[offset..]);
                 break;
             };
-            let whole = captures.get(0).expect("group 0 is the match");
-            out.extend_from_slice(&victim[offset..whole.start()]);
-            substitute(state, stderr, &mut out, &replacement, &captures)?;
-            offset = whole.end();
-            if whole.start() == whole.end() {
+            let whole = captures.whole();
+            out.extend_from_slice(&victim[offset..whole.start]);
+            substitute(state, stderr, &mut out, &replacement, &victim, &captures)?;
+            offset = whole.end;
+            if whole.is_empty() {
                 if let Some(&c) = victim.get(offset) {
                     out.push(c);
                 }

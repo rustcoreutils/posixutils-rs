@@ -26,6 +26,7 @@ mod dotted_suffixes;
 mod double_colon;
 mod empty_targets;
 mod escaped_hash;
+mod expansion;
 mod files_commands_make;
 mod include_remaking;
 mod makeflags;

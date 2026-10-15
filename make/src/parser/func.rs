@@ -175,7 +175,7 @@ impl Drop for MacroGuard<'_> {
 }
 
 /// Restores an expansion depth when dropped.
-pub(crate) struct DepthGuard<'a>(&'a Cell<usize>);
+struct DepthGuard<'a>(&'a Cell<usize>);
 
 impl Drop for DepthGuard<'_> {
     fn drop(&mut self) {

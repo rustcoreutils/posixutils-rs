@@ -110,7 +110,7 @@ pub(crate) fn restore_escaped_newlines(text: &str) -> String {
 /// Inside a macro expansion in a command line, an escaped newline and the
 /// blanks after it are a single space, as anywhere else in the makefile
 /// (POSIX 105556-105559: the newline is kept only "after macro expansion").
-pub(crate) fn join_escaped_newlines(raw: &str) -> Cow<'_, str> {
+fn join_escaped_newlines(raw: &str) -> Cow<'_, str> {
     if !raw.contains(ESCAPED_NEWLINE) {
         return Cow::Borrowed(raw);
     }
@@ -1166,13 +1166,13 @@ fn shell_output_to_macro_value(raw: &str) -> String {
     trimmed.replace('\n', " ")
 }
 
-/// Turn each `$$` of fully expanded text into the `$` it stands for.
+/// Turn each `$$` of expanded text into the `$` it stands for.
 ///
-/// Expansion here leaves `$$` in place, because most text is expanded again
-/// later -- a command line by the rule stage, which does this itself. Text
-/// handed to the shell while the makefile is read is not: POSIX 105799-105800
-/// makes `$$` a single `$`, so `$(shell test 5 -lt 8; echo $$?)` must run
-/// `echo $?`.
+/// Expansion writes a literal `$` as `$$` (see [`expand_into`]), so that
+/// text can be expanded in stages; what leaves make undoes it once. POSIX
+/// 105799-105800 makes `$$` a single `$`, so
+/// `$(shell test 5 -lt 8; echo $$?)` must run `echo $?`. The rule stage
+/// does the same to a command line itself.
 pub(crate) fn unescape_dollars(text: &str) -> String {
     text.replace("$$", "$")
 }

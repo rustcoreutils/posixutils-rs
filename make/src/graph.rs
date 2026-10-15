@@ -157,9 +157,10 @@ pub fn find_cycle_beyond(
         HashMap::from([(root.to_string(), graph.prerequisites_of(root))]);
 
     while let Some((target, index)) = stack.pop() {
-        let prerequisites = children.get(&target).cloned().unwrap_or_default();
-        if index < prerequisites.len() {
-            let child = prerequisites[index].clone();
+        // Only the one child is copied: cloning the whole list at every
+        // step made a target with n prerequisites cost O(n^2).
+        let next = children.get(&target).and_then(|p| p.get(index)).cloned();
+        if let Some(child) = next {
             stack.push((target, index + 1));
             if on_stack.contains(&child) {
                 return Some(child);

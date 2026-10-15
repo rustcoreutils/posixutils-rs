@@ -79,3 +79,19 @@ fn no_print_directory_is_accepted() {
     dir.write("Makefile", SHOW);
     dir.make(&["--no-print-directory"]).ok("[] []\n");
 }
+
+// `-j` with no number, as GNU make takes it: libzstd's `make test` runs
+// `$(MAKE) -j -C programs allVariants`, and `-C` was read as the job count.
+#[test]
+fn a_bare_j_takes_no_operand() {
+    let dir = Dir::new("bare_j");
+    dir.write("sub/Makefile", "all: a b\na b:\n\t@echo $@ >$@.out\n");
+    let run = dir.make(&["-j", "-C", "sub", "all"]);
+    assert_eq!(run.code, Some(0), "{run:?}");
+    assert!(dir.path("sub/a.out").exists() && dir.path("sub/b.out").exists());
+    // A number after it is still its operand, and a target after it is not.
+    dir.write("Makefile", "t:\n\t@echo t\n");
+    dir.make(&["-j", "2", "t"]).ok("t\n");
+    dir.make(&["-j", "t"]).ok("t\n");
+    dir.make(&["t", "-j"]).ok("t\n");
+}

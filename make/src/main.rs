@@ -323,6 +323,50 @@ fn args_with_makeflags() -> Vec<OsString> {
     args
 }
 
+/// `-j` with no number after it, as GNU make takes it: as many jobs as it
+/// likes. POSIX gives `-j` a required `maxjobs`, but libzstd's `make test`
+/// runs `$(MAKE) -j -C programs allVariants`, which read `-C` as the job
+/// count and failed. Such a `-j` becomes `-jN`, N the processors there are:
+/// a bound, unlike GNU make's, but the same build.
+///
+/// It is bare when nothing follows, or what follows is an operand or one of
+/// this make's own options. Any other word beginning with `-` is still its
+/// option-argument (XBD 12.2, Guideline 7), and refused as a count.
+fn bare_jobs(args: Vec<OsString>) -> Vec<OsString> {
+    let letters: Vec<char> = <Args as clap::CommandFactory>::command()
+        .get_arguments()
+        .filter_map(|arg| arg.get_short())
+        .collect();
+    let is_option_or_operand = |word: &str| match word.strip_prefix('-') {
+        Some(rest) => rest.starts_with(|c: char| letters.contains(&c)),
+        None => true,
+    };
+    let mut out = Vec::with_capacity(args.len());
+    let mut iter = args.into_iter().peekable();
+    if let Some(program) = iter.next() {
+        out.push(program);
+    }
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            out.push(arg);
+            out.extend(iter);
+            break;
+        }
+        let bare = match iter.peek().map(|next| next.to_str()) {
+            None => true,
+            Some(Some(next)) => next.parse::<usize>().is_err() && is_option_or_operand(next),
+            Some(None) => false,
+        };
+        if arg == "-j" && bare {
+            let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+            out.push(OsString::from(format!("-j{cpus}")));
+        } else {
+            out.push(arg);
+        }
+    }
+    out
+}
+
 /// Read one makefile operand into a string, honoring `-` as standard input.
 fn read_makefile(path: &Path) -> Result<String, ErrorCode> {
     if path == Path::new("-") {
@@ -431,9 +475,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         jobs,
         no_print_directory: _,
         mut targets,
-    } = plib::optarg::parse_from::<Args>(plib::optarg::keep_leading_equals::<Args>(
+    } = plib::optarg::parse_from::<Args>(plib::optarg::keep_leading_equals::<Args>(bare_jobs(
         args_with_makeflags(),
-    ));
+    )));
 
     let mut status_code = 0;
 

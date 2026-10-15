@@ -746,6 +746,9 @@ value) m4 does as POSIX says instead:
    over, and the macro definitions after `--` are read, a blank escaped by
    a backslash.  This make writes its own `MAKEFLAGS` in that form too:
    the option letters, then `--` and the command-line macros.
+ * `-j` with no number after it (nothing, an operand, or another of this
+   make's options follows), as in GNU make: as many jobs as there are
+   processors.  libzstd's `make test` runs `$(MAKE) -j -C programs`.
  * `--no-print-directory` — accepted and ignored; this make never announces
    directory changes.  libzstd's `lib/Makefile` passes it to `$(MAKE)`.
  * Double-colon rules, `target:: prerequisites`, as GNU make has them: each

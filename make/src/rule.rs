@@ -52,6 +52,27 @@ pub struct InterruptInfo {
 /// counted as remade without commands.
 pub static COMMANDS_SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// A count of the command lines shown or run for one goal, when goals are
+/// made in parallel and `COMMANDS_SEEN` cannot tell them apart.
+pub type GoalCommands = Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>;
+
+std::thread_local! {
+    /// The count of the goal this thread is working for. A thread started
+    /// to work below it carries the count on.
+    static GOAL_COMMANDS: std::cell::RefCell<GoalCommands> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The count of the goal this thread is working for.
+pub fn goal_commands() -> GoalCommands {
+    GOAL_COMMANDS.with(|goal| goal.borrow().clone())
+}
+
+/// Make `goal` the count this thread's command lines go to.
+pub fn set_goal_commands(goal: GoalCommands) {
+    GOAL_COMMANDS.with(|current| *current.borrow_mut() = goal);
+}
+
 /// Every target whose recipe is running right now.
 ///
 /// A list, not a single slot: under `-j` several recipes are in flight at once
@@ -534,6 +555,11 @@ impl Rule {
             return Ok(());
         }
         COMMANDS_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        GOAL_COMMANDS.with(|goal| {
+            if let Some(goal) = goal.borrow().as_ref() {
+                goal.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
 
         if !always_run {
             // -n flag

@@ -120,6 +120,22 @@ struct Segment<'a> {
     stop: AtomicBool,
     updated: AtomicBool,
     errors: std::sync::Mutex<Vec<ErrorCode>>,
+    /// For goals named on the command line, the count of command lines
+    /// shown or run for each, by position.
+    goals: Option<&'a [std::sync::Arc<AtomicUsize>]>,
+}
+
+impl<'a> Segment<'a> {
+    fn new(names: &'a [&'a str], goals: Option<&'a [std::sync::Arc<AtomicUsize>]>) -> Self {
+        Segment {
+            names,
+            next: AtomicUsize::new(0),
+            stop: AtomicBool::new(false),
+            updated: AtomicBool::new(false),
+            errors: std::sync::Mutex::new(Vec::new()),
+            goals,
+        }
+    }
 }
 
 /// Represents the make utility with its data and configuration.
@@ -640,11 +656,13 @@ impl Make {
         name: &str,
         inherited: &[TargetVar],
     ) -> Result<bool, ErrorCode> {
+        let goal = rule::goal_commands();
         std::thread::scope(|scope| {
             let walk = std::thread::Builder::new()
                 .stack_size(BUILD_STACK_SIZE)
                 .spawn_scoped(scope, || {
                     WalkLevel::on_build_stack();
+                    rule::set_goal_commands(goal);
                     self.build_target_in(name, inherited)
                 })
                 .expect("cannot start a thread to continue a deep build");
@@ -1110,11 +1128,7 @@ impl Make {
         prerequisites: &[String],
         scope: &[TargetVar],
     ) -> Result<bool, ErrorCode> {
-        let parallel = self.config.jobs > 1
-            && !self.config.not_parallel
-            && !self.config.dry_run
-            && !self.config.quit
-            && !self.config.touch;
+        let parallel = self.parallel();
 
         let mut updated = false;
         let mut segment: Vec<&str> = Vec::new();
@@ -1163,13 +1177,7 @@ impl Make {
             };
         }
 
-        let segment = Segment {
-            names,
-            next: AtomicUsize::new(0),
-            stop: AtomicBool::new(false),
-            updated: AtomicBool::new(false),
-            errors: std::sync::Mutex::new(Vec::new()),
-        };
+        let segment = Segment::new(names, None);
         std::thread::scope(|threads| self.work_on(&segment, scope, threads));
 
         // Report the first error (if any).
@@ -1177,6 +1185,36 @@ impl Make {
             Some(err) => Err(err),
             None => Ok(segment.updated.into_inner()),
         }
+    }
+
+    /// Whether independent targets are made in parallel: `-j` above 1, and
+    /// no option or `.NOTPARALLEL` that keeps the run serial.
+    fn parallel(&self) -> bool {
+        self.config.jobs > 1
+            && !self.config.not_parallel
+            && !self.config.dry_run
+            && !self.config.quit
+            && !self.config.touch
+    }
+
+    /// Make the goals named on the command line in parallel, as `-j` allows
+    /// and as GNU make does, before the caller asks for each in turn;
+    /// `build_target` then answers from what was made. automake's check-am
+    /// names hundreds of test programs to one `$(MAKE)`.
+    ///
+    /// Returns how many command lines were shown or run for each goal --
+    /// what decides whether it gets a "nothing to be done" message -- or
+    /// `None` when the goals are not made in parallel. Without `-k` a
+    /// failure stops more goals being started, as a serial run stops.
+    pub fn make_goals_in_parallel(&self, goals: &[&str]) -> Option<Vec<usize>> {
+        if !self.parallel() || goals.len() <= 1 {
+            return None;
+        }
+        let counts: Vec<std::sync::Arc<AtomicUsize>> =
+            goals.iter().map(|_| Default::default()).collect();
+        let segment = Segment::new(goals, Some(&counts));
+        std::thread::scope(|threads| self.work_on(&segment, &[], threads));
+        Some(counts.iter().map(|count| count.load(Relaxed)).collect())
     }
 
     /// Make prerequisites of `segment` until none is left, first starting a
@@ -1200,10 +1238,11 @@ impl Make {
             if segment.stop.load(Relaxed) {
                 return;
             }
-            let Some(&name) = segment.names.get(segment.next.fetch_add(1, Relaxed)) else {
+            let next = segment.next.fetch_add(1, Relaxed);
+            if next >= segment.names.len() {
                 return;
-            };
-            self.make_one(segment, name, scope);
+            }
+            self.make_one(segment, next, scope);
         }
     }
 
@@ -1221,31 +1260,45 @@ impl Make {
             && !segment.stop.load(Relaxed)
             && self.pool.try_acquire()
         {
-            let Some(&name) = segment.names.get(segment.next.fetch_add(1, Relaxed)) else {
+            let next = segment.next.fetch_add(1, Relaxed);
+            if next >= segment.names.len() {
                 self.pool.release();
                 return;
-            };
+            }
+            let goal = rule::goal_commands();
             let spawned = std::thread::Builder::new()
                 .stack_size(BUILD_STACK_SIZE)
                 .spawn_scoped(threads, move || {
                     WalkLevel::on_build_stack();
-                    self.make_one(segment, name, scope);
+                    rule::set_goal_commands(goal);
+                    self.make_one(segment, next, scope);
                     self.work_on(segment, scope, threads);
                     self.pool.release();
                 });
             if spawned.is_err() {
                 // No thread to be had: the target is made here instead.
                 self.pool.release();
-                self.make_one(segment, name, scope);
+                self.make_one(segment, next, scope);
             }
         }
     }
 
-    /// Make one prerequisite of `segment` and record the outcome. Without
+    /// Make prerequisite `index` of `segment` and record the outcome. Without
     /// `-k` a failure stops the segment starting any more, as when it is made
     /// serially.
-    fn make_one(&self, segment: &Segment<'_>, name: &str, scope: &[TargetVar]) {
-        match self.build_target_in(name, scope) {
+    fn make_one(&self, segment: &Segment<'_>, index: usize, scope: &[TargetVar]) {
+        let name = segment.names[index];
+        // A goal's command lines are counted as its own.
+        let outer = segment.goals.map(|goals| {
+            let outer = rule::goal_commands();
+            rule::set_goal_commands(Some(std::sync::Arc::clone(&goals[index])));
+            outer
+        });
+        let result = self.build_target_in(name, scope);
+        if let Some(outer) = outer {
+            rule::set_goal_commands(outer);
+        }
+        match result {
             Ok(true) => segment.updated.store(true, Relaxed),
             Ok(false) => {}
             Err(err) => {

@@ -199,3 +199,40 @@ fn a_make_not_run_as_a_sub_make_runs_serially() {
     let (max, made) = concurrency(&dir, 4);
     assert_eq!((max, made), (1, 4));
 }
+
+// The targets named on the command line are made in parallel too, as GNU
+// make makes them: automake's check-am runs `$(MAKE) $(check_PROGRAMS)`,
+// hundreds of test programs as operands. 24 half-second goals at -j8 take
+// 1.5 s; made one after another they took 12 s.
+#[test]
+fn command_line_targets_share_the_job_slots() {
+    let dir = Dir::new("parallel_goals");
+    dir.write("Makefile", &wide_makefile(24, "0.5"));
+    std::fs::create_dir(dir.path("running")).unwrap();
+    let goals: Vec<String> = (0..24).map(|i| format!("t{i}")).collect();
+    let mut args = vec!["-j8"];
+    args.extend(goals.iter().map(String::as_str));
+    let (code, took) = make_within(&dir, &args, Duration::from_secs(60));
+    assert_eq!(code, Some(0));
+    let (max, made) = concurrency(&dir, 24);
+    assert_eq!(made, 24, "every target is made");
+    assert!(max <= 8, "{max} jobs ran at once under -j8");
+    assert!(
+        took < Duration::from_secs(6),
+        "24 half-second goals took {took:?} under -j8"
+    );
+}
+
+// Made in parallel, each goal still gets its own message when it needed
+// nothing done, as from GNU make.
+#[test]
+fn messages_for_goals_made_in_parallel() {
+    let dir = Dir::new("parallel_goal_messages");
+    dir.write("Makefile", "a:\n\ttouch a\nb:\n\ttouch b\nc:\n");
+    dir.write("b", "");
+    dir.make(&["-j3", "a", "b", "c"])
+        .ok("touch a\nmake: 'b' is up to date.\nmake: Nothing to be done for 'c'.\n");
+    dir.make(&["-j3", "a", "b", "c"]).ok(
+        "make: 'a' is up to date.\nmake: 'b' is up to date.\nmake: Nothing to be done for 'c'.\n",
+    );
+}

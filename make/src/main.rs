@@ -663,13 +663,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         targets.push(target);
     }
 
+    let targets: Vec<Result<String, OsString>> =
+        targets.into_iter().map(OsString::into_string).collect();
+    // Under -j the goals are made together first, each then answered below
+    // from what was made, in order.
+    let goals: Vec<&str> = targets.iter().flatten().map(String::as_str).collect();
+    let mut goal_commands = make.make_goals_in_parallel(&goals).map(Vec::into_iter);
+
     let mut had_error = false;
     for target in targets {
         // A target is a filename, so it need not be valid UTF-8. Diagnose it
         // rather than panicking (audit #39); the rest of the crate is
         // String-based, so a non-UTF-8 operand cannot be built, but it can at
         // least be reported.
-        let target = match target.into_string() {
+        let target = match target {
             Ok(target) => target,
             Err(raw) => {
                 eprintln!(
@@ -682,6 +689,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         let seen = COMMANDS_SEEN.load(Relaxed);
+        let made_in_parallel = goal_commands.as_mut().and_then(Iterator::next);
         match make.build_target(&target) {
             // -q asks a question and prints nothing: the answer is the exit
             // status. The build reports "not up to date" rather than calling
@@ -698,7 +706,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // with no prerequisites, and worded by whether the goal has
             // commands of its own.
             Ok(_) => {
-                if !make.config.silent && COMMANDS_SEEN.load(Relaxed) == seen {
+                let none_seen = match made_in_parallel {
+                    Some(commands) => commands == 0,
+                    None => COMMANDS_SEEN.load(Relaxed) == seen,
+                };
+                if !make.config.silent && none_seen {
                     let message = match make.goal_has_commands(&target) {
                         true => gettext("'%s' is up to date."),
                         false => gettext("Nothing to be done for '%s'."),

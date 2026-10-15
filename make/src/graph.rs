@@ -76,8 +76,17 @@ pub enum Claim {
 /// Tracks the state of every target across the build, including under `-j`.
 #[derive(Default)]
 pub struct Ledger {
-    entries: Mutex<HashMap<String, Entry>>,
+    state: Mutex<LedgerState>,
     finished: Condvar,
+}
+
+#[derive(Default)]
+struct LedgerState {
+    entries: HashMap<String, Entry>,
+    /// Threads waiting in `claim` for a target another is building. Waking
+    /// them is a system call, which every finished target made before,
+    /// though almost always nobody waits.
+    waiting: usize,
 }
 
 impl Ledger {
@@ -91,15 +100,17 @@ impl Ledger {
     /// guarantees the waited-for target cannot transitively depend on the
     /// waiter, so this cannot deadlock.
     pub fn claim(&self, target: &str) -> Claim {
-        let mut entries = self.entries.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         loop {
-            match entries.get(target) {
+            match state.entries.get(target) {
                 Some(Entry::Finished(outcome)) => return Claim::Done(outcome.clone()),
                 Some(Entry::Running) => {
-                    entries = self.finished.wait(entries).unwrap();
+                    state.waiting += 1;
+                    state = self.finished.wait(state).unwrap();
+                    state.waiting -= 1;
                 }
                 None => {
-                    entries.insert(target.to_string(), Entry::Running);
+                    state.entries.insert(target.to_string(), Entry::Running);
                     return Claim::Build;
                 }
             }
@@ -108,13 +119,18 @@ impl Ledger {
 
     /// Publish a target's outcome and wake anyone waiting on it.
     pub fn finish(&self, target: &str, result: &Result<bool, ErrorCode>) {
-        let mut entries = self.entries.lock().unwrap();
-        entries.insert(
+        let mut state = self.state.lock().unwrap();
+        state.entries.insert(
             target.to_string(),
             Entry::Finished(Outcome::from_result(result)),
         );
-        drop(entries);
-        self.finished.notify_all();
+        // A thread counts itself under this lock before it waits, so none
+        // can be missed.
+        let anyone_waiting = state.waiting > 0;
+        drop(state);
+        if anyone_waiting {
+            self.finished.notify_all();
+        }
     }
 }
 

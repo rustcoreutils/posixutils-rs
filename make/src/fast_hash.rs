@@ -68,8 +68,13 @@ impl Hasher for FxHasher {
         self.add(i as u64);
     }
 
+    /// The low bits of the last product depend only on the low bits of the
+    /// words mixed in, and the table picks a bucket by its low bits: `t1230`
+    /// to `t1239` differ only in their fifth byte and all landed in one
+    /// bucket. The rotation brings the well-mixed high bits down, as
+    /// rustc-hash 2 does.
     fn finish(&self) -> u64 {
-        self.hash
+        self.hash.rotate_left(26)
     }
 }
 
@@ -86,5 +91,17 @@ mod tests {
         assert!(set.contains("abcdefgh2"));
         assert!(!set.contains("abcdefgh3"));
         assert_eq!(set.len(), 5);
+    }
+
+    /// Names that differ only past their fourth byte must not share the
+    /// low bits a table picks its bucket by.
+    #[test]
+    fn names_differing_in_a_high_byte_spread_over_buckets() {
+        use std::hash::BuildHasher;
+        let build = BuildHasherDefault::<FxHasher>::default();
+        let buckets: Set<u64> = (0..10)
+            .map(|i| build.hash_one(format!("t123{i}")) & 0xff)
+            .collect();
+        assert!(buckets.len() > 5, "{buckets:?}");
     }
 }

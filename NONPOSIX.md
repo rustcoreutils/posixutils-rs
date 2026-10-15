@@ -799,7 +799,10 @@ value) m4 does as POSIX says instead:
    and `$?` give.  A relative name with a directory part is searched for
    too, an absolute one never.  automake's out-of-tree builds depend on
    it; dpkg, gmp, libffi and xz-utils compile `sub/file.o` from
-   `$(srcdir)/sub/file.c` this way.
+   `$(srcdir)/sub/file.c` this way.  A file found elsewhere with no target
+   rule of its own is matched against implicit rules by the name it was
+   found under; binutils' `doc/%.texi: doc/%.stamp` must not apply to the
+   source `$(srcdir)/doc/bfd.texi`.
  * `.NOTPARALLEL` with prerequisites is accepted, and the whole run is
    serial.  POSIX says an application shall not give it any; bash's
    debian/rules, run by this make, has `.NOTPARALLEL: build`.

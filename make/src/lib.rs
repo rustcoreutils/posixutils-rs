@@ -500,6 +500,20 @@ impl Make {
             {
                 Some(rule) => rule,
                 None => {
+                    // A file `VPATH` finds elsewhere is known by the name it
+                    // was found under, and that is the name an implicit rule
+                    // must match, as in GNU make. binutils' bfd has
+                    // `doc/%.texi: doc/%.stamp` for the texinfo files it
+                    // generates, and `doc/bfd.texi`, a source in
+                    // `$(srcdir)/doc`, is not one of them: matched by the
+                    // name it is written under, the rule "remade" it.
+                    let found = self.resolve_vpath(name.as_ref());
+                    if found != name.as_ref()
+                        && self.find_pattern_rule(&found).is_none()
+                        && self.find_inference_rule(&found).is_none()
+                    {
+                        return Ok(false);
+                    }
                     // A `%.o: %.c` pattern rule, instantiated for this target.
                     // Pattern rules are tried before suffix inference: a
                     // makefile that writes `%.o: %.c` means it, and must not

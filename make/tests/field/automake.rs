@@ -118,3 +118,44 @@ fn vpath_does_not_search_for_an_absolute_name() {
     assert_eq!(run.code, Some(2), "{run:?}");
     assert!(run.stderr.contains("'/nosuch/file.c'"), "{run:?}");
 }
+
+// A file VPATH finds is matched against implicit rules by the name it was
+// found under, as in GNU make. binutils' bfd/Makefile generates texinfo
+// files by `doc/%.texi: doc/%.stamp`, and `doc/bfd.texi`, a source found in
+// `$(srcdir)/doc`, must not be "remade" by it: its stamp's commands touch a
+// file in a directory that does not exist yet.
+#[test]
+fn an_implicit_rule_matches_the_name_vpath_found() {
+    let dir = Dir::new("am_vpath_implicit");
+    dir.write("src/doc/bfd.texi", "");
+    dir.write(
+        "b/Makefile",
+        "VPATH = ../src\nsrcdir = ../src\nall: doc/bfd.info\n\
+         doc/bfd.info: doc/bfd.texi\n\t@echo info from $<\n\
+         doc/%.texi: doc/%.stamp ; @true\n\
+         doc/%.stamp: $(srcdir)/%.c\n\t@echo stamp $@\n\
+         doc/bfd.stamp: $(srcdir)/doc/bfd.texi ; touch $@\n",
+    );
+    dir.make(&["-C", "b"]).ok("info from ../src/doc/bfd.texi\n");
+}
+
+// One the found name does match is still remade by it when it is stale.
+#[test]
+fn an_implicit_rule_for_the_found_name_still_applies() {
+    let dir = Dir::new("am_vpath_implicit_stale");
+    dir.write("src/parse.c", "");
+    dir.write("src/parse.y", "");
+    std::fs::File::options()
+        .write(true)
+        .open(dir.path("src/parse.c"))
+        .unwrap()
+        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000))
+        .unwrap();
+    dir.write(
+        "b/Makefile",
+        "VPATH = ../src\nall: parse.o\nparse.o: parse.c\n\t@echo cc\n\
+         %.c: %.y\n\t@echo yacc $< to $@\n",
+    );
+    dir.make(&["-C", "b"])
+        .ok("yacc ../src/parse.y to parse.c\ncc\n");
+}

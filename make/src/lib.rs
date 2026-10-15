@@ -130,6 +130,8 @@ pub struct Make {
     ledger: graph::Ledger,
     /// `vpath` search paths, in declaration order.
     vpaths: Vec<VPathEntry>,
+    /// The directories of the `VPATH` macro, in search order.
+    vpath_dirs: Vec<String>,
     /// Macros an `export` directive put in the recipe environment.
     exports: Vec<String>,
     /// What the attribute special targets say about each target.
@@ -315,14 +317,18 @@ impl Make {
     /// POSIX has no `VPATH`, but it is the conventional way to keep sources in
     /// one tree and build in another. Both the `:`-separated and
     /// blank-separated spellings are accepted, as GNU does.
-    fn vpath_dirs(&self) -> Vec<&str> {
-        self.macros
+    ///
+    /// Read once, when the makefile has been: every name not found as
+    /// written is looked for here.
+    fn vpath_dirs(macros: &[Macro]) -> Vec<String> {
+        macros
             .iter()
             .find(|(name, _)| name == "VPATH")
             .map(|(_, value)| {
                 value
                     .split([':', ' ', '\t'])
                     .filter(|d| !d.is_empty())
+                    .map(String::from)
                     .collect()
             })
             .unwrap_or_default()
@@ -351,7 +357,7 @@ impl Make {
         if let Some(found) = self.search_vpath_patterns(name) {
             return found;
         }
-        self.search_dirs(&self.vpath_dirs(), name)
+        self.search_dirs(&self.vpath_dirs, name)
             .unwrap_or_else(|| name.to_string())
     }
 
@@ -362,12 +368,18 @@ impl Make {
             if rule::pattern_stem(&entry.pattern, name).is_none() {
                 continue;
             }
-            let dirs: Vec<&str> = entry.dirs.iter().map(String::as_str).collect();
-            if let Some(found) = self.search_dirs(&dirs, name) {
+            if let Some(found) = self.search_dirs(&entry.dirs, name) {
                 return Some(found);
             }
         }
         None
+    }
+
+    /// Return `name` found under one of `dirs`, if any.
+    fn search_dirs(&self, dirs: &[String], name: &str) -> Option<String> {
+        dirs.iter()
+            .map(|dir| format!("{dir}/{name}"))
+            .find(|candidate| self.stats.exists(candidate))
     }
 
     /// Find a `%` pattern rule matching `name` and instantiate it for that
@@ -458,6 +470,8 @@ impl Make {
             .max_by_key(|s| s.len())
         {
             let stem = &name[..name.len() - target_suffix.len()];
+            // The rule's `to`, as its target spells it, without the dot.
+            let to_name = target_suffix.strip_prefix('.');
             // POSIX 105920/105930: "The order in which the suffixes are
             // specified defines the order in which the inference rules ... are
             // used", so the search iterates `.SUFFIXES`, not the order the
@@ -468,7 +482,7 @@ impl Make {
                     matches!(rule.targets().next(),
                         Some(Target::Inference { from, to, .. })
                             if !to.is_empty()
-                                && format!(".{to}") == *target_suffix
+                                && to_name == Some(to.as_str())
                                 && from == from_name)
                 });
                 if let Some(rule) = hit {
@@ -1298,15 +1312,6 @@ fn inference_source(rule: &Rule, target: &Target) -> Option<String> {
     Some(suffix_source_name(stem, &format!(".{from}")))
 }
 
-/// Return `name` found under one of `dirs`, if any.
-impl Make {
-    fn search_dirs(&self, dirs: &[&str], name: &str) -> Option<String> {
-        dirs.iter()
-            .map(|dir| format!("{dir}/{name}"))
-            .find(|candidate| self.stats.exists(candidate))
-    }
-}
-
 /// The default macros and inference rules POSIX requires make to start with.
 ///
 /// These existed only as display strings in the `-p` dump table, so `make f.o`
@@ -1491,6 +1496,7 @@ impl TryFrom<(Makefile, Config)> for Make {
             pool,
             ledger: graph::Ledger::new(),
             vpaths,
+            vpath_dirs: Vec::new(),
             exports,
             attributes: attributes::Attributes::default(),
             config,
@@ -1510,6 +1516,8 @@ impl TryFrom<(Makefile, Config)> for Make {
                 }
             }
         }
+
+        make.vpath_dirs = Self::vpath_dirs(&make.macros);
 
         for rule in suffixes_rules {
             special_target::process(rule, &mut make)?;

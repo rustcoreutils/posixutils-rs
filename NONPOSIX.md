@@ -742,6 +742,10 @@ The GNU m4 extensions autoconf, automake and libtoolize cannot run without:
    always when it has none.  A target may not have both kinds.  perl's
    ExtUtils::MakeMaker output (`pure_all ::`, `config ::`) and ncurses'
    Makefiles (`clean :: mostlyclean`) are written in them.
+ * Static pattern rules, `targets: target-pattern: prereq-patterns`, as in
+   GNU make: each target matching the target pattern gets the prerequisites
+   the patterns name for its stem, the commands, and the stem as `$*`.
+   bzip2's Makefile builds its objects with `$(OBJS): %.o: %.c`.
  * A `%` pattern rule without commands is not used: in GNU make it cancels
    a built-in pattern rule.  automake ends every Makefile with
    `%:: %,v`, `%:: SCCS/s.%` and three more of them.

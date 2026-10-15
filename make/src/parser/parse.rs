@@ -45,6 +45,11 @@ pub struct Rule {
     recipes: Vec<String>,
     /// Written `target::`, the GNU double-colon form.
     double_colon: bool,
+    /// The target pattern of a static pattern rule, until `Builder::close`
+    /// makes one rule per target out of it.
+    target_pattern: Option<String>,
+    /// The stem a static pattern rule matched, which `$*` names.
+    stem: Option<String>,
     /// 1-based line in the preprocessed text, for diagnostics.
     line: usize,
 }
@@ -60,6 +65,11 @@ impl Rule {
 
     pub fn recipes(&self) -> impl Iterator<Item = &str> {
         self.recipes.iter().map(String::as_str)
+    }
+
+    /// The stem, for a rule made from a static pattern rule.
+    pub fn stem(&self) -> Option<&str> {
+        self.stem.as_deref()
     }
 
     /// Whether the rule was written `target::`.
@@ -179,14 +189,52 @@ fn rule_from(header: RuleLine, line: usize) -> Rule {
         prerequisites,
         inline,
         double_colon,
+        target_pattern,
     } = header;
     Rule {
         targets,
         prerequisites,
         recipes: inline.into_iter().collect(),
         double_colon,
+        target_pattern,
+        stem: None,
         line,
     }
+}
+
+/// Make one ordinary target rule per target of a static pattern rule.
+///
+/// GNU make: `targets: target-pattern: prereq-patterns` gives each target
+/// that matches the target pattern the prerequisites the patterns name for
+/// its stem, the commands, and the stem as `$*`. bzip2 builds every object
+/// this way. A target that does not match is warned about and gets no
+/// prerequisites, as in GNU make.
+fn expand_static_pattern(rule: Rule) -> Vec<Rule> {
+    let pattern = rule.target_pattern.clone().unwrap_or_default();
+    rule.targets
+        .iter()
+        .map(|target| {
+            let stem = crate::rule::pattern_stem(&pattern, target).map(String::from);
+            let prerequisites = match &stem {
+                Some(stem) => rule
+                    .prerequisites
+                    .iter()
+                    .map(|p| crate::rule::pattern_expand(p, stem))
+                    .collect(),
+                None => {
+                    eprintln!("make: target '{target}' doesn't match the target pattern");
+                    Vec::new()
+                }
+            };
+            Rule {
+                targets: vec![target.clone()],
+                prerequisites,
+                target_pattern: None,
+                stem,
+                ..rule.clone()
+            }
+        })
+        .collect()
 }
 
 /// Accumulates rules while walking the file.
@@ -217,6 +265,10 @@ impl Builder {
         let Some(rule) = self.current.take() else {
             return;
         };
+        if rule.target_pattern.is_some() {
+            self.rules.extend(expand_static_pattern(rule));
+            return;
+        }
         let pattern = rule.targets.iter().any(|t| t.contains('%'));
         if rule.targets.is_empty() || (pattern && rule.recipes.is_empty()) {
             return;

@@ -23,3 +23,4 @@ mod empty_targets;
 mod include_remaking;
 mod makeflags;
 mod shell_status;
+mod static_pattern;

@@ -21,6 +21,9 @@ pub(crate) struct RuleLine {
     pub inline: Option<String>,
     /// Written `target::`, the GNU double-colon form.
     pub double_colon: bool,
+    /// The target pattern of a GNU static pattern rule,
+    /// `targets: target-pattern: prereq-patterns`.
+    pub target_pattern: Option<String>,
 }
 
 /// Drop a trailing comment. POSIX 105551: a `#` and everything after it, up to
@@ -54,6 +57,22 @@ fn split_inline_command(rhs: &str) -> (&str, Option<String>) {
     }
 }
 
+/// Split off the target pattern of a GNU static pattern rule.
+///
+/// `$(OBJS): %.o: %.c` (bzip2) has a second `:` on the prerequisite side,
+/// and the single word before it is a `%` pattern. Anything else -- a `:` in
+/// an ordinary prerequisite, `all: a:b` -- is left alone.
+fn split_static_pattern(text: &str) -> (Option<String>, &str) {
+    let Some(colon) = text.find(':') else {
+        return (None, text);
+    };
+    let words = split_words(&text[..colon]);
+    match words.as_slice() {
+        [pattern] if pattern.contains('%') => (Some(pattern.clone()), &text[colon + 1..]),
+        _ => (None, text),
+    }
+}
+
 /// Parse `target [target...]: [prerequisite...][; command]` (POSIX 105639).
 ///
 /// Every character that is not a `<blank>`, `:`, `;` or `#` is an ordinary name
@@ -83,11 +102,13 @@ pub(crate) fn split_rule_line(line: &str) -> Result<RuleLine, String> {
     let targets = split_words(lhs);
 
     let (prereq_text, inline) = split_inline_command(rhs);
+    let (target_pattern, prereq_text) = split_static_pattern(prereq_text);
     Ok(RuleLine {
         targets,
         prerequisites: split_words(prereq_text),
         inline,
         double_colon,
+        target_pattern,
     })
 }
 
@@ -170,6 +191,18 @@ mod tests {
         let r = rule("rule: ;");
         assert!(r.prerequisites.is_empty());
         assert_eq!(r.inline.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn recognizes_a_static_pattern_rule() {
+        let r = rule("a.o b.o: %.o: %.c common.h");
+        assert_eq!(r.targets, vec!["a.o", "b.o"]);
+        assert_eq!(r.target_pattern.as_deref(), Some("%.o"));
+        assert_eq!(r.prerequisites, vec!["%.c", "common.h"]);
+        // Without a `%` before the second colon it is not one.
+        let r = rule("all: a:b");
+        assert_eq!(r.target_pattern, None);
+        assert_eq!(r.prerequisites, vec!["a:b"]);
     }
 
     #[test]

@@ -112,6 +112,8 @@ pub struct Rule {
     recipes: Vec<Recipe>,
     /// Written `target::`: one of several independent rules for its target.
     double_colon: bool,
+    /// The stem a pattern or static pattern rule matched, which `$*` names.
+    stem: Option<String>,
 }
 
 impl Rule {
@@ -156,6 +158,7 @@ impl Rule {
                 .collect(),
             recipes: self.recipes.clone(),
             double_colon: false,
+            stem: Some(stem.to_string()),
         })
     }
 
@@ -183,6 +186,7 @@ impl Rule {
                 prerequisites: self.prerequisites.clone(),
                 recipes: self.recipes.clone(),
                 double_colon: self.double_colon,
+                stem: self.stem.clone(),
             })
             .collect()
     }
@@ -537,8 +541,13 @@ impl Rule {
             '+' => all_prereqs,
             '<' => vec![files.0.to_string_lossy().into_owned()],
             // POSIX: `$*` is the target with the suffix deleted, i.e. the
-            // stem -- not the whole target name.
-            '*' => vec![stem_of(&files.1.to_string_lossy())],
+            // stem -- not the whole target name. A rule made from a `%`
+            // pattern knows its stem exactly: `lib/%.o` matching `lib/a.o`
+            // has the stem `a`.
+            '*' => match &self.stem {
+                Some(stem) => vec![stem.clone()],
+                None => vec![stem_of(&files.1.to_string_lossy())],
+            },
             _ => return String::new(),
         };
 
@@ -732,6 +741,7 @@ impl From<ParsedRule> for Rule {
             prerequisites: parsed.prerequisites().map(Prerequisite::new).collect(),
             recipes: parsed.recipes().map(Recipe::new).collect(),
             double_colon: parsed.is_double_colon(),
+            stem: parsed.stem().map(String::from),
         }
     }
 }
@@ -758,7 +768,7 @@ pub fn pattern_stem<'a>(pattern: &str, target: &'a str) -> Option<&'a str> {
 }
 
 /// Replace `%` in `text` with `stem`, or return it unchanged when it has none.
-fn pattern_expand(text: &str, stem: &str) -> String {
+pub(crate) fn pattern_expand(text: &str, stem: &str) -> String {
     match text.split_once('%') {
         Some((prefix, suffix)) => format!("{prefix}{stem}{suffix}"),
         None => text.to_string(),

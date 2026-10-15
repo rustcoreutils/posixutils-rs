@@ -125,6 +125,9 @@ pub struct Rule {
     double_colon: bool,
     /// The stem a pattern or static pattern rule matched, which `$*` names.
     stem: Option<String>,
+    /// The first prerequisite of the rule that gave the commands, when other
+    /// rules for the target listed theirs before it: `$<` names it.
+    input: Option<Prerequisite>,
 }
 
 impl Rule {
@@ -177,6 +180,7 @@ impl Rule {
             recipes: self.recipes.clone(),
             double_colon: false,
             stem: Some(stem.to_string()),
+            input: None,
         })
     }
 
@@ -244,6 +248,7 @@ impl Rule {
                 recipes: self.recipes.clone(),
                 double_colon: self.double_colon,
                 stem: self.stem.clone(),
+                input: self.input.clone(),
             })
             .collect()
     }
@@ -259,7 +264,22 @@ impl Rule {
     /// The clause carries no "shall be an error", so a second commanded rule is
     /// undefined rather than invalid: warn and let the later one win, as GNU
     /// does, rather than refusing a makefile that other makes accept.
+    ///
+    /// `$<` and `$*` come from the rule with the commands, as in GNU make.
+    /// POSIX leaves `$<` unspecified outside inference rules, and keeps `$^`
+    /// and `$+` in the order written. dash has `mksyntax: token.h` before
+    /// `$(HELPERS): %: %.c` with `$(CC) -o $@ $<`, which must compile
+    /// mksyntax.c, not token.h.
     pub fn absorb(&mut self, other: Rule) {
+        if !other.recipes.is_empty() {
+            self.input = other
+                .input
+                .clone()
+                .or_else(|| other.prerequisites.first().cloned());
+            if other.stem.is_some() {
+                self.stem = other.stem.clone();
+            }
+        }
         self.prerequisites.extend(other.prerequisites);
         self.order_only.extend(other.order_only);
         if !other.recipes.is_empty() {
@@ -347,8 +367,9 @@ impl Rule {
         // meant a dot-target that merely *looked* like an inference rule
         // (`.config:`) found no files and silently ran no recipe (audit #38, #46).
         let input = self
-            .prerequisites()
-            .next()
+            .input
+            .as_ref()
+            .or_else(|| self.prerequisites().next())
             .map(|p| PathBuf::from((env.resolve)(p.as_ref())))
             .unwrap_or_default();
         let files = vec![(input, PathBuf::from(target.as_ref()))];
@@ -841,6 +862,7 @@ impl From<ParsedRule> for Rule {
             recipes: parsed.recipes().map(Recipe::new).collect(),
             double_colon: parsed.is_double_colon(),
             stem: parsed.stem().map(String::from),
+            input: None,
         }
     }
 }

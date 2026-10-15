@@ -71,6 +71,34 @@ fn the_stem_is_star() {
     dir.make(&[]).ok("[a] [src/a.c]\n");
 }
 
+// `$<` and `$*` come from the rule with the commands, even when another rule
+// for the target listed its prerequisites first, as in GNU make. dash has
+// `mksyntax: token.h` before `$(HELPERS): %: %.c` with `$(CC) -o $@ $<`, and
+// compiled token.h. `$^` keeps the order the prerequisites were written in.
+#[test]
+fn the_input_is_the_first_prerequisite_of_the_rule_with_commands() {
+    let dir = Dir::new("static_input_first");
+    dir.write(
+        "Makefile",
+        "HELPERS = mksyntax\nmksyntax: token.h\n\
+         $(HELPERS): %: %.c\n\t@echo \"<$< *$* ^$^\"\n",
+    );
+    dir.write("mksyntax.c", "");
+    dir.write("token.h", "");
+    dir.make(&[])
+        .ok("<mksyntax.c *mksyntax ^token.h mksyntax.c\n");
+}
+
+#[test]
+fn a_plain_rule_with_commands_names_its_own_input() {
+    let dir = Dir::new("plain_input_first");
+    dir.write(
+        "Makefile",
+        "a: x\na: y\n\t@echo \"<$< ^$^ +$+\"\na: z\nx y z:\n\t@:\n",
+    );
+    dir.make(&[]).ok("<y ^x y z +x y z\n");
+}
+
 // A static pattern rule is an ordinary target rule for each target: the
 // first one is the default target, and an up-to-date one is left alone.
 #[test]

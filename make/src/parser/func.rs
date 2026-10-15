@@ -567,7 +567,7 @@ pub(crate) fn call(name: &str, raw: &str, ctx: &Ctx, expand: Expand) -> Result<S
             .map(|s| s.to_string())
             .unwrap_or_default(),
         "wildcard" => f_wildcard(arg(0)),
-        "shell" => f_shell(&all)?,
+        "shell" => f_shell(&crate::parser::preprocessor::unescape_dollars(&all))?,
         "error" => return Err(all),
         "warning" | "info" => {
             eprintln!("{all}");

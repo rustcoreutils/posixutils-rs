@@ -13,7 +13,9 @@
 //! is left is rule lines and command lines, which this walks one line at a
 //! time.
 
-use super::preprocessor::{is_include_line, is_macro_definition, preprocess_with, VPathEntry};
+use super::preprocessor::{
+    is_include_line, is_macro_definition, preprocess_with, Include, VPathEntry,
+};
 use super::scan::{self, RuleLine};
 use crate::Macro;
 use std::fmt::{self, Display, Formatter};
@@ -88,6 +90,8 @@ pub struct Makefile {
     vpaths: Vec<VPathEntry>,
     /// Macros an `export` directive named.
     exports: Vec<String>,
+    /// Every file an `include` line named; see [`Include`].
+    includes: Vec<Include>,
 }
 
 impl Makefile {
@@ -105,6 +109,10 @@ impl Makefile {
 
     pub fn exports(&self) -> &[String] {
         &self.exports
+    }
+
+    pub fn includes(&self) -> &[Include] {
+        &self.includes
     }
 
     /// Consume the makefile, yielding its rules, macros, search paths and
@@ -182,9 +190,18 @@ struct Builder {
 
 impl Builder {
     /// Close the rule under construction, if any.
+    ///
+    /// A rule whose target list expanded to nothing names no target, and is
+    /// dropped along with its command lines: `$(EXTRA_PROGRAMS): dep` with an
+    /// empty `EXTRA_PROGRAMS` is a rule for nothing, which automake output
+    /// writes routinely. POSIX asks the application for a non-null list
+    /// (105643) but says nothing of one that expands to null; GNU make
+    /// ignores it, and rejecting it failed the whole makefile.
     fn close(&mut self) {
         if let Some(rule) = self.current.take() {
-            self.rules.push(rule);
+            if !rule.targets.is_empty() {
+                self.rules.push(rule);
+            }
         }
     }
 
@@ -231,6 +248,7 @@ impl Builder {
                 macros,
                 vpaths,
                 exports,
+                includes: Vec::new(),
             })
         } else {
             Err(ParseError(self.errors))
@@ -282,11 +300,13 @@ impl Makefile {
     ) -> Result<Makefile, ParseError> {
         let scanned = preprocess_with(text, cmdline, builtins)
             .map_err(|e| ParseError(vec![e.to_string()]))?;
-        parse_scanned(
+        let mut makefile = parse_scanned(
             &scanned.text,
             scanned.macros,
             scanned.vpaths,
             scanned.exports,
-        )
+        )?;
+        makefile.includes = scanned.includes;
+        Ok(makefile)
     }
 }

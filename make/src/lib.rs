@@ -757,6 +757,75 @@ impl Make {
             None => Ok(updated.into_inner()),
         }
     }
+
+    /// Whether some rule can make `name`: a target rule, a pattern rule or an
+    /// inference rule.
+    fn has_rule_for(&self, name: &str) -> bool {
+        self.rule_by_target_name(name).is_some()
+            || self.find_pattern_rule(name).is_some()
+            || self.find_inference_rule(name).is_some()
+    }
+
+    /// Bring every included file up to date, after the makefiles are read.
+    ///
+    /// POSIX 105587-105600 ("delayed remaking"): once the makefiles have been
+    /// read, make uses any rule for an included file to create it or bring it
+    /// up to date, and the new contents are then used. Returns whether any
+    /// included file changed, in which case the caller reads the makefiles
+    /// again from the start.
+    ///
+    /// The recipes run even under `-n`, `-q` and `-t`: what is being made is
+    /// the makefile itself, which those options cannot answer for without
+    /// reading. GNU make does the same.
+    ///
+    /// A file is reported as changed only if its modification time did, so a
+    /// rule that runs and makes nothing -- `$(DEPFILES):` with no commands --
+    /// cannot restart the read forever.
+    pub fn remake_includes(&mut self, includes: &[parser::Include]) -> Result<bool, ErrorCode> {
+        let saved = (self.config.dry_run, self.config.quit, self.config.touch);
+        (self.config.dry_run, self.config.quit, self.config.touch) = (false, false, false);
+        let result = self.remake_each_include(includes);
+        (self.config.dry_run, self.config.quit, self.config.touch) = saved;
+        result
+    }
+
+    fn remake_each_include(&self, includes: &[parser::Include]) -> Result<bool, ErrorCode> {
+        let mut changed = false;
+        for include in includes {
+            let path = include.path.as_str();
+            let before = get_modified_time(path);
+            if !self.has_rule_for(path) {
+                if before.is_none() && !include.optional {
+                    return Err(missing_include(path));
+                }
+                continue;
+            }
+            match self.build_target(path) {
+                Ok(_) => {}
+                // GNU: a `-include` that cannot be made is passed over.
+                Err(_) if include.optional => continue,
+                Err(err) => return Err(err),
+            }
+            let after = get_modified_time(path);
+            if after.is_none() && !include.optional {
+                return Err(missing_include(path));
+            }
+            changed |= after != before;
+        }
+        Ok(changed)
+    }
+}
+
+/// The error for an `include` whose file neither exists nor can be made.
+fn missing_include(path: &str) -> ErrorCode {
+    let reason = std::io::Error::from_raw_os_error(libc::ENOENT);
+    let message = preprocessor::PreprocError::IncludeFailed {
+        path: path.to_string(),
+        reason: reason.to_string(),
+    };
+    ParserError {
+        constraint: parser::ParseError(vec![message.to_string()]),
+    }
 }
 
 /// How the rule about to run was selected.

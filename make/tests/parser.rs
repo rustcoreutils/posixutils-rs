@@ -117,10 +117,15 @@ all:
         assert!(result.unwrap().text.contains("@echo ok"));
     }
 
+    // POSIX 105587-105600: a missing `include` is read as empty and recorded,
+    // so that once the makefiles are read a rule can make it; only then is it
+    // an error if nothing could.
     #[test]
-    fn test_include_missing_errors() {
-        let result = preprocess("include /nonexistent_xyz.mk\nall:\n\t@echo ok\n");
-        assert!(result.is_err());
+    fn test_include_missing_is_recorded() {
+        let result = preprocess("include /nonexistent_xyz.mk\nall:\n\t@echo ok\n").unwrap();
+        assert_eq!(result.includes.len(), 1);
+        assert_eq!(result.includes[0].path, "/nonexistent_xyz.mk");
+        assert!(!result.includes[0].optional);
     }
 
     // Audit #19: `includedir = ...` is a macro definition, not an include
@@ -137,7 +142,7 @@ all:
     // swallowed into a misleading empty path.
     #[test]
     fn test_include_path_substitution_error_propagates() {
-        let result = preprocess("include $(UNDEF)/x.mk\nall:\n\t@echo hi\n");
+        let result = preprocess("include $(error bad)/x.mk\nall:\n\t@echo hi\n");
         assert!(result.is_err(), "expected an error, got: {result:?}");
     }
 
@@ -202,6 +207,7 @@ all:
         let names: Vec<String> = macros_of("B = 2\nA = 1\nB = 3\nall:\n\techo hi\n")
             .into_iter()
             .map(|(n, _)| n)
+            .filter(|n| n != "CURDIR")
             .collect();
         assert_eq!(names, vec!["B".to_string(), "A".to_string()]);
     }
@@ -750,9 +756,14 @@ mod functions {
         assert!(preprocess("A = $(and 1,$(A))\nall:\n\t@echo $(A)\n").is_err());
     }
 
+    // Not a function, so a macro whose name has a blank in it -- which is
+    // not defined, and expands to nothing (POSIX 105833), as in GNU make.
     #[test]
-    fn an_unknown_function_name_is_refused() {
-        assert!(preprocess("all:\n\t@echo $(nosuchthing foo)\n").is_err());
+    fn an_unknown_function_name_is_an_undefined_macro() {
+        let text = preprocess("all:\n\t@echo [$(nosuchthing foo)]\n")
+            .unwrap()
+            .text;
+        assert!(text.contains("@echo []"), "got: {text:?}");
     }
 }
 

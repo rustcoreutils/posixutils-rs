@@ -26,6 +26,10 @@ use posixutils_make::{
 const MAKEFILE_NAME: [&str; 2] = ["makefile", "Makefile"];
 const MAKEFILE_PATH: [&str; 2] = ["./makefile", "./Makefile"];
 
+/// How many times the makefiles are read again because an included file was
+/// remade.
+const MAX_RESTARTS: usize = 16;
+
 /// `MAKEFILE_PATH[i]` must stay `MAKEFILE_NAME[i]` prefixed with `./`; the two
 /// are spelled out separately rather than derived, so pin the invariant here.
 const _: () = {
@@ -392,31 +396,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         false => posixutils_make::builtin_macros(),
     };
 
-    let parsed = match parse_makefile(&makefile, &cmdline_macros, &builtins) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            // -p with no usable makefile still has a database to show: the
-            // built-in macros and inference rules. POSIX's own example is
-            // `make -p -f /dev/null`, which has no targets and so does not
-            // parse. Build an empty makefile to get the built-ins seeded.
-            if print {
-                let empty = Make::try_from((Makefile::default(), config)).map_err(|err| {
-                    eprintln!("make: {err}");
-                    err
-                })?;
-                print_database(&empty);
-                return Ok(());
-            } else {
-                eprintln!("make: {}", err);
+    // Read the makefiles, then bring the files they include up to date; if
+    // any of those changed, read everything again (POSIX "delayed remaking",
+    // 105587-105600). The bound only stops a rule that changes its own
+    // makefile on every run from looping forever.
+    let mut restarts = 0;
+    let make = loop {
+        let parsed = match parse_makefile(&makefile, &cmdline_macros, &builtins) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                // -p with no usable makefile still has a database to show:
+                // the built-in macros and inference rules. POSIX's own example
+                // is `make -p -f /dev/null`, which has no targets and so does
+                // not parse. Build an empty makefile to get the built-ins
+                // seeded.
+                if print {
+                    let empty = Make::try_from((Makefile::default(), config)).map_err(|err| {
+                        eprintln!("make: {err}");
+                        err
+                    })?;
+                    print_database(&empty);
+                    return Ok(());
+                } else {
+                    eprintln!("make: {}", err);
+                    process::exit(err.into());
+                }
+            }
+        };
+        let includes = parsed.includes().to_vec();
+
+        let mut make = Make::try_from((parsed, config.clone())).unwrap_or_else(|err| {
+            eprintln!("make: {err}");
+            process::exit(err.into());
+        });
+
+        match make.remake_includes(&includes) {
+            Ok(true) if restarts < MAX_RESTARTS => restarts += 1,
+            Ok(_) => break make,
+            Err(err) => {
+                eprintln!("make: {err}");
                 process::exit(err.into());
             }
         }
     };
-
-    let make = Make::try_from((parsed, config)).unwrap_or_else(|err| {
-        eprintln!("make: {err}");
-        process::exit(err.into());
-    });
 
     // -p: POSIX does not say this suppresses the build, unlike -q, so the
     // dump is written and the targets are still made.

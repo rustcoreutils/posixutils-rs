@@ -76,10 +76,10 @@ pub(crate) fn split_rule_line(line: &str) -> Result<RuleLine, String> {
         return Err("';' before ':'".to_string());
     }
 
+    // An empty target list is returned, not refused: the line was expanded
+    // before it got here, and a list that expanded to nothing is a rule for
+    // no target (see `Builder::close`).
     let targets = split_words(lhs);
-    if targets.is_empty() {
-        return Err("missing target before ':'".to_string());
-    }
 
     let (prereq_text, inline) = split_inline_command(rhs);
     Ok(RuleLine {
@@ -184,7 +184,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_an_empty_target_list() {
-        assert!(split_rule_line(": c").is_err());
+    fn an_empty_target_list_is_returned_empty() {
+        let r = rule(": c");
+        assert!(r.targets.is_empty());
+        assert_eq!(r.prerequisites, vec!["c"]);
     }
 }

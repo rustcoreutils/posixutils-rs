@@ -1,0 +1,22 @@
+//
+// Copyright (c) 2026 Hemi Labs, Inc.
+//
+// This file is part of the posixutils-rs project covered under
+// the MIT License.  For the full license text, please see the LICENSE
+// file in the root directory of this project.
+// SPDX-License-Identifier: MIT
+//
+
+//! Constructs the makefiles of real packages depend on: automake output,
+//! gettext's po Makefiles and the upstream Makefiles a Debian build runs
+//! `$(MAKE)` over. Each test writes its makefile into a directory of its own
+//! and runs make there. The expected output was checked against GNU make
+//! and against the POSIX.2024 text.
+
+mod common;
+
+mod computed_names;
+mod curdir;
+mod empty_targets;
+mod include_remaking;
+mod shell_status;

@@ -42,19 +42,29 @@ pub struct Recipe {
 
 impl Recipe {
     /// Creates a new recipe with the given inner recipe.
+    ///
+    /// Blanks before and among the prefix characters are dropped with them:
+    /// the line has already been expanded, and automake's silent rules put a
+    /// macro first that expands to nothing, a blank, or `@`
+    /// (`$(AM_V_CC)$(COMPILE)`, `$(AM_V_at) rm -f $@`). GNU make reads the
+    /// prefixes the same way.
     pub fn new(inner: impl Into<String>) -> Self {
-        let mut inner = inner.into();
-        let prefixes = inner
-            .chars()
-            .map_while(Prefix::get_prefix)
-            .collect::<Vec<_>>();
-
-        // remove the prefix from the inner;
-        inner.replace_range(..prefixes.len(), "");
+        let inner = inner.into();
+        let mut prefixes = HashSet::new();
+        let mut start = 0;
+        for (i, c) in inner.char_indices() {
+            if let Some(prefix) = Prefix::get_prefix(c) {
+                prefixes.insert(prefix);
+            } else if !matches!(c, ' ' | '\t') {
+                start = i;
+                break;
+            }
+            start = i + c.len_utf8();
+        }
 
         Recipe {
-            inner,
-            config: Config::from(prefixes.into_iter().collect::<HashSet<_>>()),
+            inner: inner[start..].to_string(),
+            config: Config::from(prefixes),
         }
     }
 

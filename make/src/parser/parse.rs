@@ -204,6 +204,9 @@ fn classify(line: &str) -> Line<'_> {
 }
 
 /// Start a rule from a parsed rule line, seeding its inline command if present.
+///
+/// Each target and prerequisite word holding a wildcard is globbed here, as
+/// the line is read, as in GNU make (see [`super::func::glob_name`]).
 fn rule_from(header: RuleLine, line: usize) -> Rule {
     let RuleLine {
         targets,
@@ -213,10 +216,16 @@ fn rule_from(header: RuleLine, line: usize) -> Rule {
         double_colon,
         target_pattern,
     } = header;
+    let glob = |words: Vec<String>| -> Vec<String> {
+        words
+            .iter()
+            .flat_map(|word| super::func::glob_name(word))
+            .collect()
+    };
     Rule {
-        targets,
-        prerequisites,
-        order_only,
+        targets: glob(targets),
+        prerequisites: glob(prerequisites),
+        order_only: glob(order_only),
         recipes: inline.into_iter().collect(),
         double_colon,
         target_pattern,

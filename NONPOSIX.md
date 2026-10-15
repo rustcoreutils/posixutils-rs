@@ -779,6 +779,14 @@ value) m4 does as POSIX says instead:
    flags per library and per pattern (`%-mt : CPPFLAGS_DYNLIB := ...`).
    Command lines are therefore expanded just before they run, with the
    target's macros, as GNU make does.
+ * A target or prerequisite word holding `*`, `?` or `[` is globbed
+   against the files there are when the rule is read, after macro
+   expansion, as in GNU make: the names found replace it, sorted, and a
+   word that matches nothing is kept as written.  `\` makes the next
+   character literal; a macro's value and a command line are not globbed.
+   libzstd's doc/educational_decoder/Makefile writes `HARNESS_FILES=*.c`
+   and `harness: $(HARNESS_FILES)`.  `$(wildcard)` takes `[...]` and `\`
+   the same way.
  * `\#` outside a command line is a literal `#`, not the start of a
    comment, as in GNU make.  libzstd writes `NUM_SYMBOL := \#`, and
    build-essential's debian/rules `$(shell grep -v '^\#' ...)`.

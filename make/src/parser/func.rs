@@ -370,11 +370,26 @@ fn f_wildcard(patterns: &str) -> String {
     join(hits)
 }
 
-/// Filename globbing for `$(wildcard ...)`: `*` and `?` in any component of
-/// the pattern, as glob(3) does. sysvinit looks for libcrypt with
-/// `$(wildcard $(ROOT)/$(usrdir)/lib*/libcrypt.*)`, a wildcard in a
-/// directory component. As in the shell, a name starting with `.` is
-/// matched only by a component that starts with `.`.
+/// What a target or prerequisite word names: GNU make globs a word holding
+/// `*`, `?` or `[` against the files there are, and keeps it as written if
+/// nothing matches. libzstd's doc/educational_decoder/Makefile writes
+/// `HARNESS_FILES=*.c` and `harness: $(HARNESS_FILES)`.
+pub(crate) fn glob_name(word: &str) -> Vec<String> {
+    if !word.contains(['*', '?', '[']) {
+        return vec![word.to_string()];
+    }
+    match glob(word) {
+        found if found.is_empty() => vec![word.to_string()],
+        found => found,
+    }
+}
+
+/// Filename globbing for `$(wildcard ...)` and target and prerequisite
+/// words: `*`, `?` and `[...]` in any component of the pattern, and `\` to
+/// make the next character literal, as glob(3) does. sysvinit looks for
+/// libcrypt with `$(wildcard $(ROOT)/$(usrdir)/lib*/libcrypt.*)`, a wildcard
+/// in a directory component. As in the shell, a name starting with `.` is
+/// matched only by a component that starts with a literal `.`.
 ///
 /// Each name found is spelled as the pattern spells it, `//` included, as
 /// glob(3) gives it: libzstd writes `$(LIB_SRCDIR)/decompress/*.c` with a
@@ -382,7 +397,7 @@ fn f_wildcard(patterns: &str) -> String {
 /// with `$(subst $(LIB_SRCDIR)/decompress/,zstdd_,...)`, which matches only
 /// if the `//` is still there.
 fn glob(pattern: &str) -> Vec<String> {
-    if !pattern.contains(['*', '?']) {
+    if !pattern.contains(['*', '?', '[']) {
         return match std::path::Path::new(pattern).exists() {
             true => vec![pattern.to_string()],
             false => Vec::new(),
@@ -425,8 +440,16 @@ fn glob_component(prefix: &str, component: &str, step: Step) -> Vec<String> {
             false => format!("{prefix}/{name}"),
         }
     };
-    if !component.contains(['*', '?']) {
-        let path = join(component);
+    let tokens = glob_tokens(component);
+    if tokens.iter().all(|t| matches!(t, GlobToken::Literal(_))) {
+        let literal: String = tokens
+            .iter()
+            .filter_map(|t| match t {
+                GlobToken::Literal(c) => Some(*c),
+                _ => None,
+            })
+            .collect();
+        let path = join(&literal);
         let keep = match step.last {
             true => std::path::Path::new(&path).exists(),
             false => true,
@@ -445,23 +468,107 @@ fn glob_component(prefix: &str, component: &str, step: Step) -> Vec<String> {
     entries
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|name| !name.starts_with('.') || component.starts_with('.'))
-        .filter(|name| glob_matches(component, name))
+        .filter(|name| tokens_match(&tokens, name))
         .map(|name| join(&name))
         .filter(|path| step.last || std::path::Path::new(path).is_dir())
         .collect()
 }
 
-/// Shell-style `*`/`?` match over a single name component.
-fn glob_matches(pattern: &str, name: &str) -> bool {
-    let (p, n): (Vec<char>, Vec<char>) = (pattern.chars().collect(), name.chars().collect());
+/// One element of a glob(3) pattern component.
+#[derive(Debug, PartialEq)]
+enum GlobToken {
+    /// A character matching itself, written plainly or after `\`.
+    Literal(char),
+    /// `?`: any one character.
+    One,
+    /// `*`: any run of characters.
+    Any,
+    /// `[...]`: one character in (or, after `!` or `^`, not in) the ranges;
+    /// a single character is a range of one.
+    Class {
+        negated: bool,
+        ranges: Vec<(char, char)>,
+    },
+}
+
+/// Split a pattern component into its tokens. A `[` with no `]` to close
+/// it is a literal, as is the character after a `\`.
+fn glob_tokens(component: &str) -> Vec<GlobToken> {
+    let chars: Vec<char> = component.chars().collect();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' if i + 1 < chars.len() => {
+                tokens.push(GlobToken::Literal(chars[i + 1]));
+                i += 1;
+            }
+            '*' => tokens.push(GlobToken::Any),
+            '?' => tokens.push(GlobToken::One),
+            '[' => match glob_class(&chars, i + 1) {
+                Some((class, close)) => {
+                    tokens.push(class);
+                    i = close;
+                }
+                None => tokens.push(GlobToken::Literal('[')),
+            },
+            c => tokens.push(GlobToken::Literal(c)),
+        }
+        i += 1;
+    }
+    tokens
+}
+
+/// The bracket expression whose body starts at `chars[start]`, and the
+/// index of its closing `]`. A `]` first in the body is a member.
+fn glob_class(chars: &[char], start: usize) -> Option<(GlobToken, usize)> {
+    let negated = matches!(chars.get(start), Some('!' | '^'));
+    let body = start + usize::from(negated);
+    let mut ranges = Vec::new();
+    let mut i = body;
+    loop {
+        let mut low = *chars.get(i)?;
+        if low == ']' && i > body {
+            return Some((GlobToken::Class { negated, ranges }, i));
+        }
+        if low == '\\' {
+            i += 1;
+            low = *chars.get(i)?;
+        }
+        let mut high = low;
+        if chars.get(i + 1) == Some(&'-') {
+            if let Some(&end) = chars.get(i + 2).filter(|&&c| c != ']') {
+                high = end;
+                i += 2;
+            }
+        }
+        ranges.push((low, high));
+        i += 1;
+    }
+}
+
+/// Whether one name matches a component's tokens. `*`, `?` and a bracket
+/// expression never match a leading `.`.
+fn tokens_match(tokens: &[GlobToken], name: &str) -> bool {
+    if name.starts_with('.') && tokens.first() != Some(&GlobToken::Literal('.')) {
+        return false;
+    }
+    let n: Vec<char> = name.chars().collect();
+    let one = |token: &GlobToken, c: char| match token {
+        GlobToken::Literal(l) => *l == c,
+        GlobToken::One => true,
+        GlobToken::Any => false,
+        GlobToken::Class { negated, ranges } => {
+            ranges.iter().any(|&(lo, hi)| lo <= c && c <= hi) != *negated
+        }
+    };
     let (mut pi, mut ni) = (0usize, 0usize);
     let (mut star, mut mark) = (None, 0usize);
     while ni < n.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+        if pi < tokens.len() && one(&tokens[pi], n[ni]) {
             pi += 1;
             ni += 1;
-        } else if pi < p.len() && p[pi] == '*' {
+        } else if pi < tokens.len() && tokens[pi] == GlobToken::Any {
             star = Some(pi);
             mark = ni;
             pi += 1;
@@ -473,7 +580,7 @@ fn glob_matches(pattern: &str, name: &str) -> bool {
             return false;
         }
     }
-    p[pi..].iter().all(|&c| c == '*')
+    tokens[pi..].iter().all(|t| *t == GlobToken::Any)
 }
 
 /// Functions whose arguments must NOT be expanded before the call.
@@ -724,11 +831,26 @@ mod tests {
 
     #[test]
     fn glob_matching() {
+        let glob_matches = |pattern: &str, name: &str| tokens_match(&glob_tokens(pattern), name);
         assert!(glob_matches("*.c", "foo.c"));
         assert!(!glob_matches("*.c", "foo.o"));
         assert!(glob_matches("f?o.c", "foo.c"));
         assert!(glob_matches("*", "anything"));
         assert!(glob_matches("a*b*c", "axxbyyc"));
+        assert!(glob_matches("[ab].c", "b.c"));
+        assert!(!glob_matches("[!ab].c", "b.c"));
+        assert!(glob_matches("[^ab].c", "c.c"));
+        assert!(glob_matches("[a-c]", "b"));
+        assert!(glob_matches("[]x]", "]"));
+        assert!(glob_matches("[a-]", "-"));
+        assert!(glob_matches("a[b", "a[b"));
+        assert!(glob_matches("\\*.c", "*.c"));
+        assert!(!glob_matches("\\*.c", "x.c"));
+        // `*`, `?` and `[...]` never match a leading `.`.
+        assert!(!glob_matches("*", ".hidden"));
+        assert!(!glob_matches("?h", ".h"));
+        assert!(!glob_matches("[.]h", ".h"));
+        assert!(glob_matches(".*", ".hidden"));
     }
 
     #[test]

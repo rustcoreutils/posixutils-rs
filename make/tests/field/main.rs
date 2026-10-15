@@ -30,6 +30,7 @@ mod no_rule;
 mod not_parallel;
 mod order_only;
 mod recipe_continuation;
+mod rule_globs;
 mod shell_status;
 mod static_pattern;
 mod substitution;

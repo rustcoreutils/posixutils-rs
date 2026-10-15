@@ -782,15 +782,42 @@ impl MacroTable {
         }
     }
 
-    /// Apply a target-specific assignment, for the target being made.
+    /// Whether `name`'s winning definition is one a target-specific
+    /// assignment not written `override` must yield to: a command-line
+    /// macro, or under `-e` the environment.
     ///
-    /// It ranks as a makefile definition made after every other, so it
-    /// replaces any from the makefile and the environment (but, without
-    /// `-e`, not over the environment's rank), and not a command-line macro
-    /// unless written `override` -- as in GNU make, where
+    /// A makefile `override` is not one of them: in GNU make
+    /// `sefcontext_compile: LDLIBS += ../src/libselinux.a` adds to
+    /// libselinux's `override LDLIBS += -lselinux`.
+    fn pins(&self, name: &str, env_wins: bool) -> bool {
+        let in_env = env_wins && std::env::var_os(name).is_some();
+        match self.values.get(name) {
+            Some(entry) => match entry.source {
+                MacroSource::CommandLine => true,
+                MacroSource::Override | MacroSource::Local => false,
+                MacroSource::Environment => env_wins,
+                MacroSource::Makefile | MacroSource::BuiltIn => in_env,
+            },
+            None => in_env,
+        }
+    }
+
+    /// Apply a target-specific assignment, for the target being made, to
+    /// this copy of `global`, the makefile's own table.
+    ///
+    /// It replaces whatever the makefile, the environment (without `-e`), a
+    /// makefile `override`, or a target it is made for gave the name. Unless
+    /// it is written `override`, a command-line macro -- or the environment
+    /// under `-e` -- replaces it in turn, `+=` and all, as in GNU make, where
     /// `make CFLAGS=-O0` holds for `foo: CFLAGS += -g` too.
-    pub fn apply(&mut self, var: &TargetVar) {
+    pub fn apply(&mut self, var: &TargetVar, global: &MacroTable) {
         let env_wins = ENV_MACROS.load(Acquire);
+        if !var.overriding && global.pins(&var.name, env_wins) {
+            if let Some(value) = global.resolve(&var.name, env_wins) {
+                self.force(var.name.clone(), value, MacroSource::CommandLine);
+            }
+            return;
+        }
         let current = self.resolve(&var.name, env_wins);
         let value = match (var.op, current) {
             (TargetAssign::IfUnset, Some(_)) => return,
@@ -799,10 +826,11 @@ impl MacroTable {
             }
             _ => var.value.clone(),
         };
-        match var.overriding {
-            true => self.force(var.name.clone(), value, MacroSource::Override),
-            false => self.set(var.name.clone(), value, MacroSource::Makefile),
-        }
+        let source = match var.overriding {
+            true => MacroSource::Override,
+            false => MacroSource::Makefile,
+        };
+        self.force(var.name.clone(), value, source);
     }
 
     /// The value the makefile, the command line or the built-ins gave

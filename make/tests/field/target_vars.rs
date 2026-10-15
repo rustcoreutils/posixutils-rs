@@ -180,3 +180,72 @@ fn an_empty_command_line_is_skipped() {
         "echo hi\n",
     );
 }
+
+// libselinux's utils/Makefile: `override LDLIBS += -lselinux` and then
+// `sefcontext_compile: LDLIBS += ../src/libselinux.a`. A global `override`
+// does not stop a target-specific assignment: only a command-line macro (or
+// the environment under -e) replaces one not itself written `override`.
+const OVERRIDE_GLOBAL: &str = "override L += -lsel\n\
+     t: L += extra\nt2: L = set\nt3: L := imm\nt4: L ?= q\n\
+     t5: override L += ov\n%.p: L += pat\n\
+     all: t t2 t3 t4 t5 x.p\nt t2 t3 t4 t5 x.p:\n\t@echo \"$@: [$(L)]\"\n";
+
+#[test]
+fn a_target_value_applies_over_a_global_override() {
+    run(
+        "tv_over_override",
+        OVERRIDE_GLOBAL,
+        &[],
+        "t: [-lsel extra]\nt2: [set]\nt3: [imm]\nt4: [-lsel]\nt5: [-lsel ov]\nx.p: [-lsel pat]\n",
+    );
+}
+
+#[test]
+fn a_global_override_lets_target_values_beat_the_command_line() {
+    run(
+        "tv_over_override_cmd",
+        OVERRIDE_GLOBAL,
+        &["L=cmd"],
+        "t: [cmd -lsel extra]\nt2: [set]\nt3: [imm]\nt4: [cmd -lsel]\n\
+         t5: [cmd -lsel ov]\nx.p: [cmd -lsel pat]\n",
+    );
+}
+
+// A prerequisite's own assignment wins over an `override` it inherits; a
+// command-line macro replaces it, inherited `override` or not.
+const INHERITED: &str = "L = base\np: override L += ov\nc: L = x\np2: L = pset\n\
+     c2: L += cadd\np: c\np2: c2\np c p2 c2:\n\t@echo \"$@: [$(L)]\"\n";
+
+#[test]
+fn an_own_value_beats_an_inherited_override() {
+    run(
+        "tv_inherit_override",
+        INHERITED,
+        &["p", "p2"],
+        "c: [x]\np: [base ov]\nc2: [pset cadd]\np2: [pset]\n",
+    );
+}
+
+#[test]
+fn a_command_line_macro_replaces_an_inherited_override() {
+    run(
+        "tv_inherit_override_cmd",
+        INHERITED,
+        &["L=cmd", "p", "p2"],
+        "c: [cmd]\np: [cmd ov]\nc2: [cmd]\np2: [cmd]\n",
+    );
+}
+
+#[test]
+fn the_environment_under_dash_e_replaces_a_target_value() {
+    let dir = Dir::new("tv_env_e");
+    dir.write(
+        "Makefile",
+        "L = base\nt: L += extra\nt2: L = set\nt5: override L += ov\n\
+         all: t t2 t5\nt t2 t5:\n\t@echo \"$@: [$(L)]\"\n",
+    );
+    dir.make_env(&["-e"], &[("L", "env")])
+        .ok("t: [env]\nt2: [env]\nt5: [env ov]\n");
+    dir.make_env(&[], &[("L", "env")])
+        .ok("t: [base extra]\nt2: [set]\nt5: [base ov]\n");
+}

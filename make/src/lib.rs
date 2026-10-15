@@ -884,7 +884,7 @@ impl Make {
             false => {
                 let mut table = self.table.clone();
                 for var in scope {
-                    table.apply(var);
+                    table.apply(var, &self.table);
                 }
                 std::borrow::Cow::Owned(table)
             }

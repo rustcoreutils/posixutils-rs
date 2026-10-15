@@ -770,7 +770,11 @@ value) m4 does as POSIX says instead:
    make: in force while the commands of each target named (or matching the
    `%` pattern) are expanded, and of every target made as one of its
    prerequisites unless that target assigns the name itself.  Without
-   `override` one does not replace a command-line macro.  sysvinit links
+   `override` one does not replace a command-line macro (or, under `-e`,
+   the environment), but it does replace, or with `+=` add to, a makefile
+   `override` definition: libselinux's utils link `sefcontext_compile`
+   with `override LDLIBS += -lselinux` and then
+   `sefcontext_compile: LDLIBS += ../src/libselinux.a ...`.  sysvinit links
    each program with `init: LDLIBS += $(INITLIBS) $(STATIC)`; libzstd sets
    flags per library and per pattern (`%-mt : CPPFLAGS_DYNLIB := ...`).
    Command lines are therefore expanded just before they run, with the

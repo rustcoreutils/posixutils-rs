@@ -651,16 +651,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
             Ok(_) if quit => {}
-            Ok(updated) => {
-                // As in GNU make: only a goal that needed no command at all
-                // is reported up to date.
-                if !updated && COMMANDS_SEEN.load(Relaxed) == seen {
-                    println!(
-                        "{}: `{}` {}",
-                        gettext("make"),
-                        target,
-                        gettext("is up to date.")
-                    );
+            // POSIX leaves the message for a goal that needed nothing done
+            // unspecified. It is GNU make's: written only when no command
+            // was shown or run for the goal, never under -s or a `.SILENT`
+            // with no prerequisites, and worded by whether the goal has
+            // commands of its own.
+            Ok(_) => {
+                if !make.config.silent && COMMANDS_SEEN.load(Relaxed) == seen {
+                    let message = match make.goal_has_commands(&target) {
+                        true => gettext("'%s' is up to date."),
+                        false => gettext("Nothing to be done for '%s'."),
+                    };
+                    println!("make: {}", message.replace("%s", &target));
                 }
             }
             Err(err) => {

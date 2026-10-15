@@ -593,6 +593,42 @@ impl Make {
         self.build_target_in(name.as_ref(), &[])
     }
 
+    /// Whether the goal `name` has commands of its own to bring it up to
+    /// date, wherever they come from: its own rules, the pattern or
+    /// inference rule that supplies them, or `.DEFAULT`. A phony target has
+    /// none. It decides between GNU make's two messages for a goal that
+    /// needed nothing done, and follows the choice `build_target` makes.
+    pub fn goal_has_commands(&self, name: &str) -> bool {
+        let name = rule::prerequisite::dot_slash_stripped(name);
+        if self.attributes.is_phony(name) {
+            return false;
+        }
+        let has_recipes = |rule: &Rule| rule.recipes().next().is_some();
+        if let Some(rule) = self.rule_by_target_name(name) {
+            if rule.is_double_colon() {
+                return self.double_colon_rules(name).into_iter().any(has_recipes);
+            }
+            return has_recipes(rule) || self.pattern_rule_for_commandless(rule, name).is_some();
+        }
+        if let Some(rule) = self
+            .inference_rules
+            .iter()
+            .find(|rule| rule.targets().any(|t| t.as_ref() == name))
+        {
+            return has_recipes(rule);
+        }
+        let found = self.resolve_vpath(name);
+        if found.as_ref() != name
+            && self.find_pattern_rule(&found).is_none()
+            && self.find_inference_rule(&found).is_none()
+        {
+            return false;
+        }
+        self.find_pattern_rule(name).is_some()
+            || self.find_inference_rule(name).is_some()
+            || self.default_rule.as_ref().is_some_and(has_recipes)
+    }
+
     /// Build `name` as a prerequisite of a target whose target-specific
     /// assignments are `inherited` (GNU make): they are in force for this
     /// target's commands too, under its own.

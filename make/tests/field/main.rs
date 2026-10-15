@@ -40,4 +40,5 @@ mod shell_status;
 mod static_pattern;
 mod substitution;
 mod target_vars;
+mod up_to_date;
 mod upstream_rules;

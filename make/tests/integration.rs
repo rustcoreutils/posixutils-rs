@@ -1180,13 +1180,14 @@ mod special_targets {
             destruct,
         );
 
-        // With the clearing line, the rule is gone and nothing runs.
+        // With the clearing line, the rule is gone and nothing runs:
+        // copied.out has no commands, so there is nothing to be done.
         run_test_helper_with_setup_and_destruct(
             &[
                 "-f",
                 "tests/makefiles/special_targets/suffixes/clear_suffixes.mk",
             ],
-            "",
+            "make: Nothing to be done for 'copied.out'.\n",
             "",
             0,
             setup,

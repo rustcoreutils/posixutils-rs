@@ -232,8 +232,12 @@ fn skip_blank(letters: &mut Peekable<impl Iterator<Item = char>>) {
     }
 }
 
+/// A character of a macro name. POSIX 105772: portable applications select
+/// macro names from the portable filename character set, which has `-` as
+/// well as letters, digits, `_` and `.`; binutils' top-level Makefile has
+/// `PGO-TRAINING-TARGETS = ...`.
 fn suitable_ident(c: &char) -> bool {
-    c.is_alphanumeric() || matches!(c, '_' | '.')
+    c.is_alphanumeric() || matches!(c, '_' | '.' | '-')
 }
 
 /// Decide whether a whole makefile line is a macro definition, as opposed to a

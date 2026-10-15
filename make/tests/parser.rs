@@ -183,6 +183,19 @@ all:
         assert!(result.is_err(), "expected an error, got: {result:?}");
     }
 
+    // POSIX 105772: a macro name may use any character of the portable
+    // filename character set, `-` among them. binutils' top-level Makefile
+    // defines `PGO-TRAINING-TARGETS`, and the line was a parse error.
+    #[test]
+    fn a_macro_name_may_contain_a_hyphen() {
+        let source = "PGO-TRAINING-TARGETS = a b\nX-Y := $(PGO-TRAINING-TARGETS:a=c)\n\
+                      X-Y += d\nall:\n\t@echo $(PGO-TRAINING-TARGETS) ${X-Y}\n";
+        assert_eq!(value_of(source, "PGO-TRAINING-TARGETS"), "a b");
+        assert_eq!(value_of(source, "X-Y"), "c b d");
+        let result = preprocess(source).unwrap().text;
+        assert!(result.contains("@echo a b c b d"), "got: {result:?}");
+    }
+
     fn macros_of(source: &str) -> Vec<(String, String)> {
         preprocess(source).expect("must preprocess").macros
     }

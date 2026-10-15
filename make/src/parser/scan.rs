@@ -39,15 +39,33 @@ pub(crate) struct RuleLine {
 /// `$(shell grep -v '^\#' ...)`, where a comment would cut the reference in
 /// half.
 pub(crate) fn strip_comment(line: &str) -> std::borrow::Cow<'_, str> {
+    // Most lines have no `#` at all, and then nothing is stripped.
+    let Some(first_hash) = line.find('#') else {
+        return std::borrow::Cow::Borrowed(line);
+    };
+    // Bytes rather than characters: `#` and `\` are ASCII, and every byte
+    // of a multibyte character ends an escape just as the character does.
+    // The scan starts at the backslashes just before the first `#`, if
+    // any, as the escape state there depends only on them.
+    let backslashes = line[..first_hash]
+        .bytes()
+        .rev()
+        .take_while(|&b| b == b'\\')
+        .count();
     let mut escaped = false;
     let mut end = line.len();
-    for (i, c) in line.char_indices() {
-        match c {
-            '#' if !escaped => {
+    for (i, &b) in line
+        .as_bytes()
+        .iter()
+        .enumerate()
+        .skip(first_hash - backslashes)
+    {
+        match b {
+            b'#' if !escaped => {
                 end = i;
                 break;
             }
-            '\\' => escaped = !escaped,
+            b'\\' => escaped = !escaped,
             _ => escaped = false,
         }
     }
@@ -60,8 +78,11 @@ pub(crate) fn strip_comment(line: &str) -> std::borrow::Cow<'_, str> {
 
 /// Write each `#` of `text` as `\#`, so that [`strip_comment`] gives it
 /// back as it is rather than taking it for a comment.
-pub(crate) fn escape_hashes(text: &str) -> String {
-    text.replace('#', "\\#")
+pub(crate) fn escape_hashes(text: &str) -> std::borrow::Cow<'_, str> {
+    match text.contains('#') {
+        true => std::borrow::Cow::Owned(text.replace('#', "\\#")),
+        false => std::borrow::Cow::Borrowed(text),
+    }
 }
 
 /// Split on runs of `<blank>`. Deliberately not `split_whitespace`, which also
@@ -171,6 +192,37 @@ mod tests {
         assert_eq!(strip_comment("X := \\# # c"), "X := # ");
         assert_eq!(strip_comment("X := a\\\\# c"), "X := a\\\\");
         assert_eq!(strip_comment(&escape_hashes("a#b")), "a#b");
+    }
+
+    /// The scan starts near the first `#`; it must still see the
+    /// backslashes before it, however many, and non-ASCII text.
+    #[test]
+    fn strips_comments_as_a_character_by_character_scan_does() {
+        fn by_characters(line: &str) -> String {
+            let mut escaped = false;
+            let mut end = line.len();
+            for (i, c) in line.char_indices() {
+                match c {
+                    '#' if !escaped => {
+                        end = i;
+                        break;
+                    }
+                    '\\' => escaped = !escaped,
+                    _ => escaped = false,
+                }
+            }
+            line[..end].replace("\\#", "#")
+        }
+        for slashes in 0..6 {
+            for line in [
+                format!("a{}# c", "\\".repeat(slashes)),
+                format!("{}#b # c", "\\".repeat(slashes)),
+                format!("é{}#ü\\# # ö", "\\".repeat(slashes)),
+                format!("x\\y{}#", "\\".repeat(slashes)),
+            ] {
+                assert_eq!(strip_comment(&line), by_characters(&line), "{line:?}");
+            }
+        }
     }
 
     #[test]

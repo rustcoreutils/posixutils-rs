@@ -45,6 +45,20 @@ pub(crate) enum Directive {
     Unexport(String),
 }
 
+impl Directive {
+    /// Whether this is part of a conditional: `ifeq`, `ifneq`, `ifdef`,
+    /// `ifndef`, `else` or `endif`.
+    pub(crate) fn is_conditional(&self) -> bool {
+        matches!(
+            self,
+            Directive::IfCompare { .. }
+                | Directive::IfDefined { .. }
+                | Directive::Else(_)
+                | Directive::EndIf
+        )
+    }
+}
+
 /// Split a directive line into its keyword and the rest.
 fn split_keyword(line: &str) -> Option<(&str, &str)> {
     let trimmed = line.trim_start_matches([' ']);

@@ -169,3 +169,24 @@ fn makefile_list_and_realpath() {
     dir.make(&[])
         .ok(&format!("[makefile inc.mk] [sub]\n[{here}]\n"));
 }
+
+// libselinux indents macro definitions inside a conditional with a <tab>:
+// `ifeq ($(USE_PCRE2),y)` / `<tab>PCRE_CFLAGS := -DUSE_PCRE2 ...`. A <tab>
+// line is a command line only in a rule (POSIX 105643-105646); elsewhere it
+// is read as any other line, as GNU make reads it. A blank line, a comment
+// or a conditional leaves a rule open; a macro definition closes it.
+#[test]
+fn a_tab_line_outside_a_rule_is_not_a_command_line() {
+    let dir = Dir::new("up_tab_outside_rule");
+    dir.write(
+        "Makefile",
+        "\tFIRST = 0\nUSE_PCRE2 ?= y\nifeq ($(USE_PCRE2),y)\n\
+         \tPCRE_MODULE := libpcre2-8\n\tPCRE_CFLAGS := -DUSE_PCRE2 \\\n\t\t-DW=8\n\
+         else\n\tPCRE_MODULE := libpcre\nendif\nexport PCRE_CFLAGS\n\
+         all:\n\t@echo \"[$(FIRST)] [$(PCRE_MODULE)] [$$PCRE_CFLAGS]\"\n\n# note\n\
+         ifeq (a,a)\n\t@echo second\nendif\nX = 1\n\tY = $(X)2\n\
+         show:\n\t@echo $(Y)\n",
+    );
+    dir.make(&["all", "show"])
+        .ok("[0] [libpcre2-8] [-DUSE_PCRE2 -DW=8]\nsecond\n12\n");
+}

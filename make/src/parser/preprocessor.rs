@@ -1267,6 +1267,10 @@ struct Reader {
     exports: Vec<String>,
     includes: Vec<Include>,
     target_vars: Vec<TargetVar>,
+    /// Whether a rule line was the last line read that was not blank, a
+    /// comment or a conditional: only then is a `<tab>` line a command line
+    /// (POSIX 105643-105646). See `handle_line`.
+    in_rule: bool,
     /// Shared by every expansion this reader performs, so recursion is bounded
     /// and `$(eval ...)` has somewhere to leave text.
     state: func::Expansion,
@@ -1284,6 +1288,7 @@ impl Reader {
             exports: Vec::new(),
             includes: Vec::new(),
             target_vars: Vec::new(),
+            in_rule: false,
             state: func::Expansion::new(),
         }
     }
@@ -1322,6 +1327,11 @@ impl Reader {
             // macro -- and the rule parser strips comments again.
             self.out.push_str(&super::scan::escape_hashes(&expanded));
             self.out.push_str(&super::scan::escape_hashes(command));
+            // A blank line or a comment leaves a rule open; a line that
+            // expands to nothing closes it, as in GNU make.
+            if !code.trim().is_empty() {
+                self.in_rule = !expanded.trim().is_empty() || !command.is_empty();
+            }
         }
         self.out.push('\n');
         Ok(())
@@ -1585,9 +1595,11 @@ impl Reader {
     /// which is right: the queue can only be filled while active.
     fn read_isolated(&mut self, text: &str) -> Result<()> {
         let saved = std::mem::take(&mut self.branches);
+        let in_rule = std::mem::replace(&mut self.in_rule, false);
         let result = self.read(text);
         let balanced = self.branches.is_empty();
         self.branches = saved;
+        self.in_rule = in_rule;
         result?;
         if !balanced {
             return Err(PreprocError::UnmatchedConditional("endif".to_string()));
@@ -1648,16 +1660,38 @@ impl Reader {
         // conditional at all -- the comment used to reach `parse_directive`
         // as part of the condition, so the makefile failed outright, and
         // `ifdef X  # why` silently took the `else` arm (audit #81).
+        //
+        // A `<tab>` line is a command line only in a rule (POSIX 105643-
+        // 105646: the lines after a target entry's rule line that begin
+        // with a `<tab>`); anything else, a macro definition or a directive
+        // included, ends the rule. Elsewhere POSIX gives a `<tab>` line no
+        // meaning, and GNU make reads it as any other line, so it is read
+        // here without its indentation, its continuations joined as outside
+        // a command line. libselinux indents macro definitions inside
+        // conditionals, `ifeq ($(USE_PCRE2),y)` / `<tab>PCRE_CFLAGS :=
+        // -DUSE_PCRE2 ...`.
+        let detabbed;
+        let raw = match lines[i].starts_with('\t') && !self.in_rule {
+            true => {
+                detabbed = join_escaped_newlines(lines[i].trim_start_matches([' ', '\t']));
+                detabbed.as_str()
+            }
+            false => lines[i],
+        };
         let stripped;
-        let line = match lines[i].starts_with('\t') {
-            true => lines[i],
+        let line = match raw.starts_with('\t') {
+            true => raw,
             false => {
-                stripped = super::scan::strip_comment(lines[i]);
+                stripped = super::scan::strip_comment(raw);
                 stripped.as_ref()
             }
         };
 
         if let Some(directive) = parse_directive(line) {
+            // Only a conditional leaves a rule open, as in GNU make.
+            if self.active() && !directive.is_conditional() {
+                self.in_rule = false;
+            }
             match directive {
                 Directive::Define(name) => return Ok(self.capture_define(&name, lines, i)),
                 Directive::EndDef => self.drop_line(),
@@ -1701,11 +1735,15 @@ impl Reader {
         }
 
         if is_include_directive(line) {
+            self.in_rule = false;
             self.splice_include(line)?;
+            self.in_rule = false;
         } else if is_macro_definition(line) {
+            self.in_rule = false;
             self.define_macro(line)?;
             self.drop_line();
         } else if let Some((targets, assignment)) = split_target_var(line) {
+            self.in_rule = false;
             self.define_target_var(targets, assignment)?;
             self.drop_line();
         } else {

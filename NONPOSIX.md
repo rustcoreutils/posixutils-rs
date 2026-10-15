@@ -811,6 +811,12 @@ value) m4 does as POSIX says instead:
  * `.NOTPARALLEL` with prerequisites is accepted, and the whole run is
    serial.  POSIX says an application shall not give it any; bash's
    debian/rules, run by this make, has `.NOTPARALLEL: build`.
+ * A line that begins with a `<tab>` but does not follow a rule line is
+   read as any other line, as in GNU make, rather than as a command line
+   of no target.  A macro definition or a directive other than a
+   conditional ends a rule; a blank line, a comment or a conditional does
+   not.  libselinux defines its macros indented inside `ifeq`
+   (`<tab>PCRE_CFLAGS := -DUSE_PCRE2 ...`).
 
 ### man
 

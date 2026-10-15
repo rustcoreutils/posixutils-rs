@@ -15,6 +15,8 @@
 
 mod common;
 
+mod automake;
+
 mod cancel_rules;
 mod computed_names;
 mod curdir;

@@ -37,7 +37,7 @@ fn suffix_ends_here(next: Option<&char>) -> bool {
 impl Target {
     /// Creates a new target with the given name.
     pub fn new(name: impl Into<String>) -> Self {
-        let name = name.into();
+        let name = super::prerequisite::without_dot_slash(name.into());
 
         if let Some(t) = Self::try_parse_special(&name) {
             return t;

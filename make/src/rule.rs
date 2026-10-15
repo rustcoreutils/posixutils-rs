@@ -47,6 +47,11 @@ pub struct InterruptInfo {
     pub original_mtime: Option<SystemTime>,
 }
 
+/// How many command lines have been shown or run, under any option. A goal
+/// whose build saw none is "up to date" even when something it depends on
+/// counted as remade without commands.
+pub static COMMANDS_SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Every target whose recipe is running right now.
 ///
 /// A list, not a single slot: under `-j` several recipes are in flight at once
@@ -485,6 +490,7 @@ impl Rule {
         if expanded.trim().is_empty() {
             return Ok(());
         }
+        COMMANDS_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         if !always_run {
             // -n flag
@@ -512,8 +518,12 @@ impl Rule {
             }
         }
 
-        // -s flag
-        if !silent {
+        // -s flag. Under -n a command that runs anyway (`+`, `$(MAKE)`) is
+        // written even with an `@`, as every other command is under -n:
+        // automake's `@fail=; ... $(MAKE) $$local_target` recursion is
+        // shown by GNU make too. `-s` and `.SILENT` still hide it.
+        let quiet_anyway = config.silent || step.flags.silent;
+        if !silent || (config.dry_run && !quiet_anyway) {
             println!("{}", expanded);
         }
 

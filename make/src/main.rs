@@ -23,6 +23,7 @@ use posixutils_make::{
         preprocessor::{ENV_MACROS, MAKEFILE_LIST},
         Makefile,
     },
+    rule::COMMANDS_SEEN,
     Make,
 };
 
@@ -595,6 +596,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
         };
+        let seen = COMMANDS_SEEN.load(Relaxed);
         match make.build_target(&target) {
             // -q asks a question and prints nothing: the answer is the exit
             // status. The build reports "not up to date" rather than calling
@@ -606,7 +608,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(_) if quit => {}
             Ok(updated) => {
-                if !updated {
+                // As in GNU make: only a goal that needed no command at all
+                // is reported up to date.
+                if !updated && COMMANDS_SEEN.load(Relaxed) == seen {
                     println!(
                         "{}: `{}` {}",
                         gettext("make"),

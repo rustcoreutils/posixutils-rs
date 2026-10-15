@@ -94,6 +94,9 @@ pub struct Make {
     /// Every name a target rule has as a target or a prerequisite: what
     /// GNU make says "ought to exist" when it picks a pattern rule.
     mentioned: std::collections::HashSet<String>,
+    /// The modification times of targets without commands, as they were
+    /// before their prerequisites were made; see `prerequisite_mtime`.
+    frozen_mtimes: std::sync::Mutex<HashMap<String, Option<SystemTime>>>,
     /// Target rules (non-special, non-inference).
     /// Invariant: inference rules are never stored here, so `first_target()`
     /// always returns a valid default target per POSIX.
@@ -466,6 +469,7 @@ impl Make {
     /// A target reached by several paths is built once, in the context of
     /// the first, as in GNU make.
     fn build_target_in(&self, name: &str, inherited: &[TargetVar]) -> Result<bool, ErrorCode> {
+        let name = &rule::prerequisite::without_dot_slash(name.to_string());
         match self.ledger.claim(name) {
             graph::Claim::Done(outcome) => return outcome.into_result(),
             graph::Claim::Build => {}
@@ -617,12 +621,28 @@ impl Make {
         prerequisites
             .iter()
             .filter(|name| *name != WAIT_TARGET)
-            .filter(|name| match get_modified_time(self.resolve_vpath(name)) {
+            .filter(|name| match self.prerequisite_mtime(name) {
                 Some(modified) => modified > target_modified,
                 None => true,
             })
             .cloned()
             .collect()
+    }
+
+    /// The modification time a prerequisite is judged by.
+    ///
+    /// For a target without commands it is the time it had before its own
+    /// prerequisites were made: no command of its own ran, so as far as make
+    /// knows it did not change, as in GNU make, which does not look again.
+    /// automake relies on it -- `$(srcdir)/version.texi:
+    /// $(srcdir)/stamp-vti` has no commands, the stamp's commands rewrite
+    /// version.texi, and the manual made from it is not remade, so a build
+    /// from a release needs no makeinfo.
+    fn prerequisite_mtime(&self, name: &str) -> Option<SystemTime> {
+        if let Some(frozen) = self.frozen_mtimes.lock().unwrap().get(name) {
+            return *frozen;
+        }
+        get_modified_time(self.resolve_vpath(name))
     }
 
     /// Runs a rule after bringing its prerequisites up to date.
@@ -642,6 +662,7 @@ impl Make {
             return Err(RecursivePrerequisite { origin });
         }
         let scope = self.scope_for(target.as_ref(), inherited);
+        let mtime_before = get_modified_time(self.resolve_vpath(target.as_ref()));
 
         let mut prerequisites = self.effective_prerequisites(rule, target, dispatch);
 
@@ -692,7 +713,8 @@ impl Make {
 
         if let Some(inference_rule) = inferred {
             let inference_rule = inference_rule.with_prerequisites(&prerequisites);
-            return self.run_inference(&inference_rule, target, up_to_date, &newer, &scope);
+            self.run_inference(&inference_rule, target, up_to_date, &newer, &scope)?;
+            return Ok(self.changed_since(target, mtime_before));
         }
 
         // An inference rule derives `$<` from its suffixes rather than from a
@@ -700,11 +722,41 @@ impl Make {
         // to `run` would leave `$<` empty.
         if dispatch == Dispatch::Inference {
             let rule = rule.with_prerequisites(&prerequisites);
-            return self.run_inference(&rule, target, up_to_date, &newer, &scope);
+            self.run_inference(&rule, target, up_to_date, &newer, &scope)?;
+            return Ok(self.changed_since(target, mtime_before));
+        }
+
+        // A rule without commands remakes nothing itself, so it counts as
+        // remade for its dependents only if its file does not exist, and they
+        // judge it by the time it had before (GNU make; see
+        // `prerequisite_mtime`).
+        if rule.recipes().count() == 0 {
+            self.frozen_mtimes
+                .lock()
+                .unwrap()
+                .insert(target.as_ref().to_string(), mtime_before);
+            return Ok(mtime_before.is_none());
         }
 
         self.with_env(&scope, |env| rule.run(env, target, up_to_date, &newer))?;
-        Ok(true)
+        Ok(self.changed_since(target, mtime_before))
+    }
+
+    /// Whether `target`, whose commands just ran, counts as remade for the
+    /// targets that depend on it: it does not exist (a phony target), its
+    /// file changed, or under -n, where nothing is run and everything that
+    /// would have been is taken as remade (GNU make).
+    ///
+    /// A target whose commands left it alone is not: automake's
+    /// `config.h: stamp-h1` runs `@test -f $@ || ...` whenever the stamp is
+    /// newer, and every object that includes config.h was compiled again on
+    /// every run.
+    fn changed_since(&self, target: &Target, before: Option<SystemTime>) -> bool {
+        if self.config.dry_run {
+            return true;
+        }
+        let after = get_modified_time(self.resolve_vpath(target.as_ref()));
+        after.is_none() || after != before
     }
 
     /// Register the built-in inference rules, skipping any the makefile already
@@ -815,11 +867,10 @@ impl Make {
         up_to_date: bool,
         newer: &[String],
         scope: &[TargetVar],
-    ) -> Result<bool, ErrorCode> {
+    ) -> Result<(), ErrorCode> {
         self.with_env(scope, |env| {
             rule.run_for_target(env, target, up_to_date, newer)
-        })?;
-        Ok(true)
+        })
     }
 
     /// Builds a target's prerequisites, honoring `.WAIT` barriers and, under
@@ -1035,7 +1086,8 @@ impl Make {
     fn remake_each_include(&self, includes: &[parser::Include]) -> Result<bool, ErrorCode> {
         let mut changed = false;
         for include in includes {
-            let path = include.path.as_str();
+            let path = rule::prerequisite::without_dot_slash(include.path.clone());
+            let path = path.as_str();
             let before = get_modified_time(path);
             if !self.has_rule_for(path) {
                 if before.is_none() && !include.optional {
@@ -1294,6 +1346,7 @@ impl TryFrom<(Makefile, Config)> for Make {
             target_vars,
             pattern_vars,
             mentioned: Default::default(),
+            frozen_mtimes: Default::default(),
             default_rule: None,
             sccs_get: None,
             pool,

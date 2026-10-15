@@ -22,6 +22,7 @@ mod double_colon;
 mod empty_targets;
 mod include_remaking;
 mod makeflags;
+mod order_only;
 mod recipe_continuation;
 mod shell_status;
 mod static_pattern;

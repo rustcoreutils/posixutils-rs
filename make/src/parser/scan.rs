@@ -17,6 +17,8 @@
 pub(crate) struct RuleLine {
     pub targets: Vec<String>,
     pub prerequisites: Vec<String>,
+    /// The prerequisites after a `|` word: GNU make's order-only ones.
+    pub order_only: Vec<String>,
     /// A command given inline after a `<semicolon>`, if any.
     pub inline: Option<String>,
     /// Written `target::`, the GNU double-colon form.
@@ -73,6 +75,20 @@ fn split_static_pattern(text: &str) -> (Option<String>, &str) {
     }
 }
 
+/// Split the prerequisite words at a `|` word into the normal and the
+/// order-only prerequisites (GNU make). libzstd writes
+/// `$(ZSTD_DYNLIB_DIR)/%.o : %.c | $(ZSTD_DYNLIB_DIR)`.
+fn split_order_only(mut words: Vec<String>) -> (Vec<String>, Vec<String>) {
+    match words.iter().position(|w| w == "|") {
+        Some(bar) => {
+            let order_only = words.split_off(bar + 1);
+            words.pop();
+            (words, order_only)
+        }
+        None => (words, Vec::new()),
+    }
+}
+
 /// Parse `target [target...]: [prerequisite...][; command]` (POSIX 105639).
 ///
 /// Every character that is not a `<blank>`, `:`, `;` or `#` is an ordinary name
@@ -103,9 +119,11 @@ pub(crate) fn split_rule_line(line: &str) -> Result<RuleLine, String> {
 
     let (prereq_text, inline) = split_inline_command(rhs);
     let (target_pattern, prereq_text) = split_static_pattern(prereq_text);
+    let (prerequisites, order_only) = split_order_only(split_words(prereq_text));
     Ok(RuleLine {
         targets,
-        prerequisites: split_words(prereq_text),
+        prerequisites,
+        order_only,
         inline,
         double_colon,
         target_pattern,
@@ -203,6 +221,18 @@ mod tests {
         let r = rule("all: a:b");
         assert_eq!(r.target_pattern, None);
         assert_eq!(r.prerequisites, vec!["a:b"]);
+    }
+
+    #[test]
+    fn splits_off_order_only_prerequisites() {
+        let r = rule("obj/a.o: a.c a.h | obj");
+        assert_eq!(r.prerequisites, vec!["a.c", "a.h"]);
+        assert_eq!(r.order_only, vec!["obj"]);
+        let r = rule("lib: | dir1 dir2");
+        assert!(r.prerequisites.is_empty());
+        assert_eq!(r.order_only, vec!["dir1", "dir2"]);
+        let r = rule("%.o: %.c | %.d");
+        assert_eq!(r.order_only, vec!["%.d"]);
     }
 
     #[test]

@@ -746,6 +746,10 @@ The GNU m4 extensions autoconf, automake and libtoolize cannot run without:
    GNU make: each target matching the target pattern gets the prerequisites
    the patterns name for its stem, the commands, and the stem as `$*`.
    bzip2's Makefile builds its objects with `$(OBJS): %.o: %.c`.
+ * Order-only prerequisites, `target: normal | order-only`, as in GNU make:
+   brought up to date before the target, but never a reason to remake it,
+   and not among `$^`, `$+`, `$?` or `$<`.  libzstd creates its build
+   directories this way (`$(ZSTD_DYNLIB_DIR)/%.o : %.c | $(ZSTD_DYNLIB_DIR)`).
  * A `%` pattern rule without commands is not used: in GNU make it cancels
    a built-in pattern rule.  automake ends every Makefile with
    `%:: %,v`, `%:: SCCS/s.%` and three more of them.

@@ -40,6 +40,8 @@ impl std::error::Error for ParseError {}
 pub struct Rule {
     targets: Vec<String>,
     prerequisites: Vec<String>,
+    /// GNU make's order-only prerequisites, written after a `|`.
+    order_only: Vec<String>,
     /// Command lines with their leading `<tab>` removed. Prefix characters
     /// (`@`, `-`, `+`) are still attached; `rule::Recipe` strips those.
     recipes: Vec<String>,
@@ -61,6 +63,10 @@ impl Rule {
 
     pub fn prerequisites(&self) -> impl Iterator<Item = &str> {
         self.prerequisites.iter().map(String::as_str)
+    }
+
+    pub fn order_only(&self) -> impl Iterator<Item = &str> {
+        self.order_only.iter().map(String::as_str)
     }
 
     pub fn recipes(&self) -> impl Iterator<Item = &str> {
@@ -187,6 +193,7 @@ fn rule_from(header: RuleLine, line: usize) -> Rule {
     let RuleLine {
         targets,
         prerequisites,
+        order_only,
         inline,
         double_colon,
         target_pattern,
@@ -194,6 +201,7 @@ fn rule_from(header: RuleLine, line: usize) -> Rule {
     Rule {
         targets,
         prerequisites,
+        order_only,
         recipes: inline.into_iter().collect(),
         double_colon,
         target_pattern,
@@ -215,20 +223,22 @@ fn expand_static_pattern(rule: Rule) -> Vec<Rule> {
         .iter()
         .map(|target| {
             let stem = crate::rule::pattern_stem(&pattern, target).map(String::from);
-            let prerequisites = match &stem {
-                Some(stem) => rule
-                    .prerequisites
-                    .iter()
-                    .map(|p| crate::rule::pattern_expand(p, stem))
-                    .collect(),
-                None => {
-                    eprintln!("make: target '{target}' doesn't match the target pattern");
-                    Vec::new()
+            let expand = |names: &[String]| -> Vec<String> {
+                match &stem {
+                    Some(stem) => names
+                        .iter()
+                        .map(|p| crate::rule::pattern_expand(p, stem))
+                        .collect(),
+                    None => Vec::new(),
                 }
             };
+            if stem.is_none() {
+                eprintln!("make: target '{target}' doesn't match the target pattern");
+            }
             Rule {
                 targets: vec![target.clone()],
-                prerequisites,
+                prerequisites: expand(&rule.prerequisites),
+                order_only: expand(&rule.order_only),
                 target_pattern: None,
                 stem,
                 ..rule.clone()

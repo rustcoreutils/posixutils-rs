@@ -123,13 +123,13 @@ impl graph::Edges for Make {
             return self
                 .double_colon_rules(target)
                 .into_iter()
-                .flat_map(|rule| edge_names(rule.prerequisites()))
+                .flat_map(|rule| edge_names(rule.prerequisites().chain(rule.order_only())))
                 .collect();
         }
         let mut edges = match named {
-            Some(rule) => edge_names(rule.prerequisites()),
+            Some(rule) => edge_names(rule.prerequisites().chain(rule.order_only())),
             None => match self.find_pattern_rule(target) {
-                Some(rule) => return edge_names(rule.prerequisites()),
+                Some(rule) => return edge_names(rule.prerequisites().chain(rule.order_only())),
                 None => Vec::new(),
             },
         };
@@ -564,6 +564,16 @@ impl Make {
         // say, and one that is merely older must still be visited -- it may be
         // phony, or stale against its own sources.
         let rebuilt = self.build_prerequisites(&prerequisites)?;
+
+        // Order-only prerequisites (GNU make) are brought up to date too, but
+        // whether they were remade, or are newer, says nothing about this
+        // target. A name that is also a normal prerequisite is a normal one.
+        let order_only: Vec<String> = rule
+            .order_only()
+            .map(|p| p.as_ref().to_string())
+            .filter(|name| !prerequisites.contains(name))
+            .collect();
+        self.build_prerequisites(&order_only)?;
 
         // `$?` is the prerequisites newer than the target.
         let newer = self.newer_prerequisites(target.as_ref(), &prerequisites);

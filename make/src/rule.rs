@@ -108,6 +108,9 @@ pub struct Rule {
     targets: Vec<Target>,
     /// The prerequisites of the rule
     prerequisites: Vec<Prerequisite>,
+    /// GNU make's order-only prerequisites: made before the target, but
+    /// never a reason to remake it.
+    order_only: Vec<Prerequisite>,
     /// The recipe of the rule
     recipes: Vec<Recipe>,
     /// Written `target::`: one of several independent rules for its target.
@@ -123,6 +126,10 @@ impl Rule {
 
     pub fn prerequisites(&self) -> impl Iterator<Item = &Prerequisite> {
         self.prerequisites.iter()
+    }
+
+    pub fn order_only(&self) -> impl Iterator<Item = &Prerequisite> {
+        self.order_only.iter()
     }
 
     pub fn recipes(&self) -> impl Iterator<Item = &Recipe> {
@@ -149,13 +156,16 @@ impl Rule {
     pub fn instantiate_pattern(&self, target: &str) -> Option<Rule> {
         let pattern = self.targets.first()?.as_ref().to_string();
         let stem = pattern_stem(&pattern, target)?;
-        Some(Rule {
-            targets: vec![Target::new(target)],
-            prerequisites: self
-                .prerequisites
+        let expand = |names: &[Prerequisite]| -> Vec<Prerequisite> {
+            names
                 .iter()
                 .map(|p| Prerequisite::new(pattern_expand(p.as_ref(), stem)))
-                .collect(),
+                .collect()
+        };
+        Some(Rule {
+            targets: vec![Target::new(target)],
+            prerequisites: expand(&self.prerequisites),
+            order_only: expand(&self.order_only),
             recipes: self.recipes.clone(),
             double_colon: false,
             stem: Some(stem.to_string()),
@@ -184,6 +194,7 @@ impl Rule {
             .map(|target| Rule {
                 targets: vec![target.clone()],
                 prerequisites: self.prerequisites.clone(),
+                order_only: self.order_only.clone(),
                 recipes: self.recipes.clone(),
                 double_colon: self.double_colon,
                 stem: self.stem.clone(),
@@ -204,6 +215,7 @@ impl Rule {
     /// does, rather than refusing a makefile that other makes accept.
     pub fn absorb(&mut self, other: Rule) {
         self.prerequisites.extend(other.prerequisites);
+        self.order_only.extend(other.order_only);
         if !other.recipes.is_empty() {
             if !self.recipes.is_empty() {
                 let target = self
@@ -724,9 +736,14 @@ impl fmt::Display for Rule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let targets: Vec<&str> = self.targets.iter().map(|t| t.as_ref()).collect();
         let prerequisites: Vec<&str> = self.prerequisites.iter().map(|p| p.as_ref()).collect();
-        write!(f, "{}:", targets.join(" "))?;
+        let colon = if self.double_colon { "::" } else { ":" };
+        write!(f, "{}{colon}", targets.join(" "))?;
         if !prerequisites.is_empty() {
             write!(f, " {}", prerequisites.join(" "))?;
+        }
+        if !self.order_only.is_empty() {
+            let order_only: Vec<&str> = self.order_only.iter().map(|p| p.as_ref()).collect();
+            write!(f, " | {}", order_only.join(" "))?;
         }
         writeln!(f)?;
         for recipe in &self.recipes {
@@ -741,6 +758,7 @@ impl From<ParsedRule> for Rule {
         Rule {
             targets: parsed.targets().map(Target::new).collect(),
             prerequisites: parsed.prerequisites().map(Prerequisite::new).collect(),
+            order_only: parsed.order_only().map(Prerequisite::new).collect(),
             recipes: parsed.recipes().map(Recipe::new).collect(),
             double_colon: parsed.is_double_colon(),
             stem: parsed.stem().map(String::from),

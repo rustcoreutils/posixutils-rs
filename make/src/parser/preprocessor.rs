@@ -276,33 +276,38 @@ pub fn is_macro_definition(line: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| suitable_ident(&c))
 }
 
-/// The byte offsets of the characters of `line` that are outside every
-/// `$(...)` and `${...}` reference, with the characters.
-fn top_level_chars(line: &str) -> Vec<(usize, char)> {
-    let mut out = Vec::new();
+/// The byte offsets of the bytes of `line` that are outside every `$(...)`
+/// and `${...}` reference, with the bytes.
+///
+/// An iterator over bytes rather than a vector of characters: every line of
+/// every makefile is scanned this way, most only as far as their first `:`.
+/// Every byte it looks for is ASCII, and in UTF-8 no byte of a multibyte
+/// character is, so an offset found is always a character boundary.
+fn top_level_chars(line: &str) -> impl Iterator<Item = (usize, u8)> + '_ {
     let mut depth = 0usize;
-    let mut chars = line.char_indices().peekable();
-    while let Some((i, c)) = chars.next() {
-        if depth > 0 {
-            match c {
-                '(' | '{' => depth += 1,
-                ')' | '}' => depth -= 1,
-                _ => {}
+    let mut bytes = line.bytes().enumerate();
+    std::iter::from_fn(move || {
+        while let Some((i, c)) = bytes.next() {
+            if depth > 0 {
+                match c {
+                    b'(' | b'{' => depth += 1,
+                    b')' | b'}' => depth -= 1,
+                    _ => {}
+                }
+                continue;
             }
-            continue;
-        }
-        if c != '$' {
-            out.push((i, c));
-            continue;
-        }
-        // A reference opens, or `$$` / `$x` is one token either way.
-        if let Some((_, next)) = chars.next() {
-            if matches!(next, '(' | '{') {
-                depth = 1;
+            if c != b'$' {
+                return Some((i, c));
+            }
+            // A reference opens, or `$$` / `$x` is one token either way.
+            if let Some((_, next)) = bytes.next() {
+                if matches!(next, b'(' | b'{') {
+                    depth = 1;
+                }
             }
         }
-    }
-    out
+        None
+    })
 }
 
 /// Split a target-specific assignment, `targets: [override] [export] name op
@@ -317,10 +322,7 @@ fn split_target_var(line: &str) -> Option<(&str, &str)> {
     if line.starts_with('\t') {
         return None;
     }
-    let colon = top_level_chars(line)
-        .into_iter()
-        .find(|&(_, c)| c == ':')?
-        .0;
+    let colon = top_level_chars(line).find(|&(_, c)| c == b':')?.0;
     let (targets, rest) = (&line[..colon], &line[colon + 1..]);
     // `targets:: ...` is a double-colon rule, never an assignment.
     if rest.starts_with([':', '=']) {
@@ -328,8 +330,8 @@ fn split_target_var(line: &str) -> Option<(&str, &str)> {
     }
     for (_, c) in top_level_chars(rest) {
         match c {
-            ';' => return None,
-            '=' => return Some((targets, rest)),
+            b';' => return None,
+            b'=' => return Some((targets, rest)),
             _ => {}
         }
     }
@@ -340,12 +342,12 @@ fn split_target_var(line: &str) -> Option<(&str, &str)> {
 /// 105644), if it has one: the first `;` after the first `:`, outside every
 /// macro reference. The second part keeps the `;`.
 fn split_inline_command(line: &str) -> (&str, &str) {
-    let chars = top_level_chars(line);
-    let Some(colon) = chars.iter().position(|&(_, c)| c == ':') else {
+    let mut chars = top_level_chars(line);
+    if !chars.any(|(_, c)| c == b':') {
         return (line, "");
-    };
-    match chars[colon..].iter().find(|&&(_, c)| c == ';') {
-        Some(&(at, _)) => line.split_at(at),
+    }
+    match chars.find(|&(_, c)| c == b';') {
+        Some((at, _)) => line.split_at(at),
         None => (line, ""),
     }
 }

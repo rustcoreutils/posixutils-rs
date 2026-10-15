@@ -82,6 +82,7 @@ impl AsRef<str> for Recipe {
 
 impl fmt::Display for Recipe {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.inner)
+        let text = crate::parser::preprocessor::restore_escaped_newlines(&self.inner);
+        write!(f, "{text}")
     }
 }

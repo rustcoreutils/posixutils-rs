@@ -86,6 +86,43 @@ fn ends_with_odd_backslash(s: &str) -> bool {
     s.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1
 }
 
+/// Stands for the newline of an escaped newline in a command line, from the
+/// time the line is folded until the rule stage puts the newline back (see
+/// [`restore_escaped_newlines`]). A private-use character, so it cannot be
+/// confused with anything a makefile means.
+pub(crate) const ESCAPED_NEWLINE: char = '\u{E000}';
+
+/// Put back the newlines [`ESCAPED_NEWLINE`] stands for.
+pub(crate) fn restore_escaped_newlines(text: &str) -> String {
+    text.replace(ESCAPED_NEWLINE, "\n")
+}
+
+/// Inside a macro expansion in a command line, an escaped newline and the
+/// blanks after it are a single space, as anywhere else in the makefile
+/// (POSIX 105556-105559: the newline is kept only "after macro expansion").
+pub(crate) fn join_escaped_newlines(raw: &str) -> String {
+    if !raw.contains(ESCAPED_NEWLINE) {
+        return raw.to_string();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek() == Some(&ESCAPED_NEWLINE) {
+            chars.next();
+            while matches!(chars.peek(), Some(' ' | '\t')) {
+                chars.next();
+            }
+            while out.ends_with([' ', '\t']) {
+                out.pop();
+            }
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Splice one logical line starting at `lines[i]`, advancing `i` past every
 /// physical line it consumed. Returns the joined text and how many extra
 /// physical lines went into it.
@@ -101,6 +138,12 @@ fn fold_one_line(lines: &[&str], i: &mut usize) -> (String, usize) {
         *i += 1;
         folded += 1;
         if is_recipe {
+            // POSIX 105559-105562: the command executed keeps the backslash,
+            // the newline and the next line, less a leading <tab>. The
+            // newline is held as a marker until the rule stage, because
+            // everything up to there works a line at a time.
+            current.push('\\');
+            current.push(ESCAPED_NEWLINE);
             current.push_str(next.strip_prefix('\t').unwrap_or(next));
         } else {
             // The continuation, the newline, and the next line's leading white
@@ -917,7 +960,7 @@ fn substitute(source: &str, table: &MacroTable, state: &func::Expansion) -> Resu
                     continue;
                 }
 
-                let raw = read_balanced(&mut letters, open, close)?;
+                let raw = join_escaped_newlines(&read_balanced(&mut letters, open, close)?);
                 let reference = Reference {
                     raw: &raw,
                     open,

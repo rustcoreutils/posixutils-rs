@@ -87,12 +87,18 @@ all:
         assert!(result.contains("@echo a b"), "got: {result:?}");
     }
 
-    // Audit #7: backslash-newline continuation in a recipe line is spliced
-    // (the leading tab of the continuation is removed).
+    // Audit #7: backslash-newline continuation in a recipe line joins the two
+    // lines into one command line, the leading tab of the continuation
+    // removed. POSIX 105559-105562 keeps the backslash and the newline in
+    // the command executed; until the rule stage the newline is held as a
+    // private-use marker, U+E000, so the text stays one line.
     #[test]
     fn test_continuation_recipe() {
         let result = preprocess("all:\n\t@echo one \\\n\ttwo\n").unwrap().text;
-        assert!(result.contains("@echo one two"), "got: {result:?}");
+        assert!(
+            result.contains("\t@echo one \\\u{E000}two\n"),
+            "got: {result:?}"
+        );
     }
 
     // Audit #15: internal-macro references survive preprocessing for the

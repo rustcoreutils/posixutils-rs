@@ -390,6 +390,7 @@ impl Rule {
                 // (or when not silent) is the line that executes.
                 let expanded =
                     self.substitute_internal_macros(env, target, recipe, &inout, newer)?;
+                let expanded = preprocessor::restore_escaped_newlines(expanded.inner());
 
                 if !always_run {
                     // -n flag
@@ -439,9 +440,9 @@ impl Rule {
                 // shall also be in effect, so the recipe aborts on the first
                 // failing command.
                 if ignore {
-                    command.args(["-c", recipe.as_ref()]);
+                    command.args(["-c", recipe.as_str()]);
                 } else {
-                    command.args(["-e", "-c", recipe.as_ref()]);
+                    command.args(["-e", "-c", recipe.as_str()]);
                 }
 
                 let status = match command.status() {
@@ -618,6 +619,7 @@ impl Rule {
                         }
                         inner.push(c);
                     }
+                    let inner = preprocessor::join_escaped_newlines(&inner);
                     let mut chars = inner.chars();
                     match chars.next() {
                         Some(sigil) if SIGILS.contains(&sigil) => {

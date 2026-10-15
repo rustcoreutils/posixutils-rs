@@ -10,6 +10,7 @@
 use super::directive::{parse_directive, split_condition_args, Directive};
 use super::func;
 use crate::Macro;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::fs;
@@ -100,9 +101,9 @@ pub(crate) fn restore_escaped_newlines(text: &str) -> String {
 /// Inside a macro expansion in a command line, an escaped newline and the
 /// blanks after it are a single space, as anywhere else in the makefile
 /// (POSIX 105556-105559: the newline is kept only "after macro expansion").
-pub(crate) fn join_escaped_newlines(raw: &str) -> String {
+pub(crate) fn join_escaped_newlines(raw: &str) -> Cow<'_, str> {
     if !raw.contains(ESCAPED_NEWLINE) {
-        return raw.to_string();
+        return Cow::Borrowed(raw);
     }
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
@@ -120,7 +121,7 @@ pub(crate) fn join_escaped_newlines(raw: &str) -> String {
             out.push(c);
         }
     }
-    out
+    Cow::Owned(out)
 }
 
 /// Splice one logical line starting at `lines[i]`, advancing `i` past every
@@ -518,25 +519,24 @@ impl Reference<'_> {
     }
 }
 
-/// Consume a function's argument text up to the delimiter that closes it,
-/// honouring nested `$(...)`/`${...}`.
-fn read_balanced(
-    letters: &mut Peekable<impl Iterator<Item = char>>,
-    open: char,
-    close: char,
-) -> Result<String> {
-    let mut raw = String::new();
+/// Consume a reference's text up to the delimiter that closes it, honouring
+/// nested `$(...)`/`${...}`: the text before it, with `text` moved past it.
+///
+/// Both delimiters are ASCII, which no byte of a multibyte character is.
+fn read_balanced<'a>(text: &mut &'a str, open: char, close: char) -> Result<&'a str> {
+    let (open, close) = (open as u8, close as u8);
     let mut depth = 0usize;
-    for c in letters.by_ref() {
-        if c == open {
+    for (i, &b) in text.as_bytes().iter().enumerate() {
+        if b == open {
             depth += 1;
-        } else if c == close {
+        } else if b == close {
             if depth == 0 {
+                let raw = &text[..i];
+                *text = &text[i + 1..];
                 return Ok(raw);
             }
             depth -= 1;
         }
-        raw.push(c);
     }
     Err(PreprocError::UnexpectedEOF)
 }
@@ -1078,20 +1078,21 @@ fn substitute(source: &str, table: &MacroTable, state: &func::Expansion) -> Resu
     let mut substitutions = 0;
     let mut result = String::with_capacity(source.len());
 
-    let mut letters = source.chars().peekable();
-    while let Some(letter) = letters.next() {
-        if letter != '$' {
-            result.push(letter);
-            continue;
-        }
+    // The text up to each `$` is copied a run at a time.
+    let mut rest = source;
+    while let Some(at) = rest.find('$') {
+        result.push_str(&rest[..at]);
+        let mut after = rest[at + 1..].chars();
 
         // A `$` with nothing after it is an ordinary character. Rejecting it
         // failed the whole makefile over a recipe as ordinary as
         // `@echo end$` (audit #87); the rule stage already emits it literally.
-        let Some(letter) = letters.next() else {
+        let Some(letter) = after.next() else {
             result.push('$');
+            rest = "";
             break;
         };
+        rest = after.as_str();
 
         match letter {
             // Internal macros - we leave them "as is"
@@ -1100,13 +1101,6 @@ fn substitute(source: &str, table: &MacroTable, state: &func::Expansion) -> Resu
             c @ ('$' | '@' | '%' | '?' | '<' | '*' | '^' | '+') => {
                 result.push('$');
                 result.push(c);
-                continue;
-            }
-            c if suitable_ident(&c) => {
-                let macro_body = lookup_macro(&c.to_string(), table, env_macros);
-                result.push_str(&macro_body);
-                substitutions += 1;
-                continue;
             }
             open @ ('(' | '{') => {
                 let close = if open == '(' { ')' } else { '}' };
@@ -1115,19 +1109,19 @@ fn substitute(source: &str, table: &MacroTable, state: &func::Expansion) -> Resu
                 // is left verbatim for the rule stage, which alone has the
                 // target/prerequisite context to expand it.
                 if matches!(
-                    letters.peek(),
+                    rest.chars().next(),
                     Some('@' | '%' | '?' | '<' | '*' | '^' | '+')
                 ) {
                     // To the matching close: a substitution may nest a
                     // reference, `$(@:.html=$(EXT))`.
                     result.push('$');
                     result.push(open);
-                    result.push_str(&read_balanced(&mut letters, open, close)?);
+                    result.push_str(read_balanced(&mut rest, open, close)?);
                     result.push(close);
                     continue;
                 }
 
-                let raw = join_escaped_newlines(&read_balanced(&mut letters, open, close)?);
+                let raw = join_escaped_newlines(read_balanced(&mut rest, open, close)?);
                 let reference = Reference {
                     raw: &raw,
                     open,
@@ -1135,16 +1129,18 @@ fn substitute(source: &str, table: &MacroTable, state: &func::Expansion) -> Resu
                 };
                 substitutions += reference.expand(table, state, env_macros, &mut result)?;
             }
-            // Any other single character names a macro, as GNU does -- so a
-            // stray `$` in a recipe expands to nothing rather than rejecting
-            // the whole makefile (audit #72).
+            // A single character names a macro, as GNU does -- so a stray
+            // `$` in a recipe expands to nothing rather than rejecting the
+            // whole makefile (audit #72).
             c => {
-                let macro_body = lookup_macro(&c.to_string(), table, env_macros);
-                result.push_str(&macro_body);
+                let mut name = [0; 4];
+                let name = c.encode_utf8(&mut name);
+                result.push_str(&lookup_macro(name, table, env_macros));
                 substitutions += 1;
             }
         }
     }
+    result.push_str(rest);
 
     Ok((result, substitutions))
 }
@@ -1704,7 +1700,7 @@ impl Reader {
         let raw = match lines[i].starts_with('\t') && !self.in_rule {
             true => {
                 detabbed = join_escaped_newlines(lines[i].trim_start_matches([' ', '\t']));
-                detabbed.as_str()
+                detabbed.as_ref()
             }
             false => lines[i],
         };

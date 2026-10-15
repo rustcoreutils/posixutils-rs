@@ -1526,9 +1526,7 @@ impl TryFrom<(Makefile, Config)> for Make {
 
             if SpecialTarget::try_from(target.clone()).is_ok() {
                 special_rules.push(rule);
-            } else if let Ok(inference) =
-                InferenceTarget::try_from((target.clone(), make.config.clone()))
-            {
+            } else if let Ok(inference) = InferenceTarget::try_from((target, &make.config)) {
                 // The suffixes as the known ones split the name, which only
                 // the suffix list can say for `.c.depends.o`.
                 make.inference_rules

@@ -151,7 +151,7 @@ impl TryFrom<Target> for SpecialTarget {
     }
 }
 
-impl TryFrom<(Target, Config)> for InferenceTarget {
+impl TryFrom<(&Target, &Config)> for InferenceTarget {
     type Error = ParseError;
 
     /// A dot-target is an inference rule only if it *parses* as `.s1` or
@@ -166,7 +166,12 @@ impl TryFrom<(Target, Config)> for InferenceTarget {
     /// its second `.`: perl's Makefile declares `.SUFFIXES: .c .o .i .s
     /// .c.depends` and has a `.c.c.depends:` rule, which the split at the dot
     /// read as a `.c.c` rule making every `.c` file from itself.
-    fn try_from((target, config): (Target, Config)) -> Result<Self, Self::Error> {
+    fn try_from((target, config): (&Target, &Config)) -> Result<Self, Self::Error> {
+        // Every suffix begins with a dot; most targets are ruled out here,
+        // before their name is parsed again.
+        if !target.as_ref().starts_with('.') {
+            return Err(ParseError);
+        }
         let Target::Inference { .. } = Target::new(target.to_string()) else {
             return Err(ParseError);
         };

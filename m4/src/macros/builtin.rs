@@ -30,11 +30,16 @@ use crate::state::{StackFrame, State};
 use crate::EOF;
 use plib::locale::mb_char_slices;
 
-/// The characters of `bytes` under the current `LC_CTYPE`. ASCII text, which
-/// is nearly all m4 sees, is a character per byte in every locale m4 runs
-/// in, so it skips the decoding.
-fn char_slices(bytes: &[u8]) -> Vec<&[u8]> {
-    if bytes.is_ascii() {
+/// The characters of `bytes`, as `len`, `index`, `substr` and `translit`
+/// count them: a byte each, as GNU m4 1.4 counts whatever the locale, or,
+/// under `POSIXLY_CORRECT`, the characters of the current `LC_CTYPE`, as
+/// POSIX specifies.  Autotools output depends on the byte count: tar's
+/// testsuite, which autotest generates from UTF-8 text, comes out broken
+/// when m4sugar's `m4_len` and `m4_substr` count characters.  ASCII text is
+/// a character per byte in every locale m4 runs in, so it skips the
+/// decoding.
+fn char_slices<'a>(state: &State, bytes: &'a [u8]) -> Vec<&'a [u8]> {
+    if !state.posixly_correct || bytes.is_ascii() {
         bytes.chunks(1).collect()
     } else {
         mb_char_slices(bytes)
@@ -42,13 +47,12 @@ fn char_slices(bytes: &[u8]) -> Vec<&[u8]> {
 }
 
 /// Convert a byte offset within `bytes` to the index of the character that
-/// begins at (or after) that offset, counting multibyte characters under the
-/// current `LC_CTYPE`. Used by `index` to report a character (not byte)
-/// position.
-fn byte_offset_to_char_index(bytes: &[u8], byte_offset: usize) -> usize {
+/// begins at (or after) that offset, counting characters as [`char_slices`]
+/// does. Used by `index` to report a character position.
+fn byte_offset_to_char_index(state: &State, bytes: &[u8], byte_offset: usize) -> usize {
     let mut consumed = 0;
     let mut index = 0;
-    for ch in char_slices(bytes) {
+    for ch in char_slices(state, bytes) {
         if consumed >= byte_offset {
             break;
         }
@@ -587,8 +591,8 @@ impl MacroImplementation for LenMacro {
             .into_iter()
             .next()
             .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
-        // POSIX: the length is in characters, not bytes (LC_CTYPE).
-        let len = char_slices(&first_arg).len();
+        // Bytes, or under POSIXLY_CORRECT characters (LC_CTYPE).
+        let len = char_slices(state, &first_arg).len();
         state.input.pushback_string(len.to_string().as_bytes());
         Ok(())
     }
@@ -631,10 +635,10 @@ impl MacroImplementation for IndexMacro {
             .windows(second_arg.len())
             .position(|window| window == second_arg);
         match byte_offset {
-            // POSIX: the position is a character index (zero origin), not a byte
-            // offset (LC_CTYPE).
+            // A byte offset, or under POSIXLY_CORRECT a character index
+            // (LC_CTYPE); zero origin either way.
             Some(byte_offset) => {
-                let char_index = byte_offset_to_char_index(&first_arg, byte_offset);
+                let char_index = byte_offset_to_char_index(state, &first_arg, byte_offset);
                 state
                     .input
                     .pushback_string(char_index.to_string().as_bytes());
@@ -727,13 +731,13 @@ impl MacroImplementation for TranslitMacro {
 
         let third_arg = args.next().unwrap_or_default();
 
-        // Transliterate by character, not byte (LC_CTYPE): each source character
-        // maps to the target character at the same position, or is deleted when
-        // the target list is shorter.
-        let from = expand_ranges(char_slices(&second_arg));
-        let to = expand_ranges(char_slices(&third_arg));
+        // Transliterate by byte, or under POSIXLY_CORRECT by character
+        // (LC_CTYPE): each source character maps to the target character at
+        // the same position, or is deleted when the target list is shorter.
+        let from = expand_ranges(char_slices(state, &second_arg));
+        let to = expand_ranges(char_slices(state, &third_arg));
         let mut output_buffer: Vec<u8> = Vec::with_capacity(first_arg.len());
-        for ch in char_slices(&first_arg) {
+        for ch in char_slices(state, &first_arg) {
             match from.iter().position(|source| source.as_slice() == ch) {
                 Some(pos) => {
                     if let Some(replacement) = to.get(pos) {
@@ -766,8 +770,9 @@ impl MacroImplementation for SubstrMacro {
             .next()
             .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
 
-        // Indices and lengths are in characters, not bytes (LC_CTYPE).
-        let chars = char_slices(&first_arg);
+        // Indices and lengths are in bytes, or under POSIXLY_CORRECT in
+        // characters (LC_CTYPE).
+        let chars = char_slices(state, &first_arg);
         if chars.is_empty() {
             return Ok(());
         }

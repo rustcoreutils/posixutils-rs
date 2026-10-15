@@ -76,6 +76,10 @@ pub struct State {
     pub regex_cache: HashMap<Vec<u8>, Rc<regex::bytes::Regex>>,
     /// `-L`. See [`State::check_nesting`].
     pub nesting_limit: usize,
+    /// `POSIXLY_CORRECT` is set in the environment: where GNU m4 1.4, the
+    /// default, departs from POSIX in a way autotools depends on, do as
+    /// POSIX says instead.
+    pub posixly_correct: bool,
 }
 
 impl State {
@@ -337,6 +341,7 @@ impl Default for State {
             nesting_limit: 0,
             debug: crate::debug::Debug::default(),
             regex_cache: HashMap::new(),
+            posixly_correct: std::env::var_os("POSIXLY_CORRECT").is_some(),
         }
     }
 }

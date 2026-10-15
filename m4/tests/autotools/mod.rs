@@ -10,7 +10,7 @@
 //! What autoconf, automake and libtoolize need from m4.  Every expected
 //! output below was produced by GNU m4 1.4.19 from the same input.
 
-use plib::testing::{run_test, run_test_base, TestPlan};
+use plib::testing::{run_test, run_test_base, run_test_base_with_env, TestPlan};
 
 /// Run m4 with `args` on `stdin` and require exactly this stdout, stderr and
 /// exit status.
@@ -739,4 +739,64 @@ fn help_lists_reload_state() {
     assert_eq!(status, Some(0));
     assert!(out.contains("--reload-state"), "{out}");
     assert!(out.contains("--freeze-state"), "{out}");
+}
+
+// ---------------------------------------------------------------------------
+// GNU m4 1.4 by default, POSIX under POSIXLY_CORRECT
+// ---------------------------------------------------------------------------
+
+/// Run m4 on `stdin` with the environment `env` and hand back stdout as
+/// bytes, requiring an empty stderr and a zero exit status.
+fn m4_env_stdout(env: &[(&str, &str)], stdin: &str) -> Vec<u8> {
+    let out = run_test_base_with_env("m4", &[], stdin.as_bytes(), env);
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+    assert_eq!(out.status.code(), Some(0));
+    out.stdout
+}
+
+const MULTIBYTE_COUNTING: &str = "len(é) index(aéb,b) substr(aéb,1,1)|substr(aéb,2) \
+                                  translit(aéb,é,X) translit(xéy,a-z,A-Z)\n";
+
+/// What GNU m4 1.4.19 gives for [`MULTIBYTE_COUNTING`], in every locale.
+const MULTIBYTE_COUNTING_BYTES: &[u8] = b"2 3 \xc3|\xa9b aXb X\xc3\xa9Y\n";
+
+// GNU m4 1.4.19 counts bytes in every locale.  tar's testsuite, which
+// autotest generates from UTF-8 text with m4sugar's `m4_len` and
+// `m4_substr`, came out with a broken test group when m4 counted characters.
+#[test]
+fn len_index_substr_translit_count_bytes_by_default() {
+    assert_eq!(
+        m4_env_stdout(&[("LC_ALL", "C")], MULTIBYTE_COUNTING),
+        MULTIBYTE_COUNTING_BYTES
+    );
+    if let Some(utf8) = plib::testing::utf8_locale() {
+        assert_eq!(
+            m4_env_stdout(&[("LC_ALL", &utf8)], MULTIBYTE_COUNTING),
+            MULTIBYTE_COUNTING_BYTES
+        );
+    }
+}
+
+// POSIX: len, index, substr and translit count characters (LC_CTYPE).
+#[test]
+fn len_index_substr_translit_count_characters_under_posixly_correct() {
+    // In the C locale a character is a byte.  Any value turns it on.
+    assert_eq!(
+        m4_env_stdout(
+            &[("LC_ALL", "C"), ("POSIXLY_CORRECT", "")],
+            MULTIBYTE_COUNTING
+        ),
+        MULTIBYTE_COUNTING_BYTES
+    );
+    let Some(utf8) = plib::testing::utf8_locale() else {
+        eprintln!("no UTF-8 locale installed: skipping the multibyte half");
+        return;
+    };
+    assert_eq!(
+        m4_env_stdout(
+            &[("LC_ALL", &utf8), ("POSIXLY_CORRECT", "1")],
+            MULTIBYTE_COUNTING
+        ),
+        "1 2 é|b aXb XéY\n".as_bytes()
+    );
 }

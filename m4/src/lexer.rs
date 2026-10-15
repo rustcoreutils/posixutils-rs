@@ -185,10 +185,10 @@ pub(crate) fn invalid_name_error(arg: &str, value: &[u8]) -> clap::Error {
 // create that divergence rather than remove one.
 //
 // Character semantics belong to the built-ins that count or index characters,
-// where POSIX 103776 puts them, and they already have them: `len`, `substr`,
-// `index` and `translit` go through `plib::locale::mb_char_slices`. That is
-// where m4 is ahead of GNU, not behind it -- `len(café)` is 4 here and 5
-// there, and GNU's `substr` will hand back half a UTF-8 sequence.
+// where POSIX 103776 puts them: under POSIXLY_CORRECT `len`, `substr`, `index`
+// and `translit` go through `plib::locale::mb_char_slices`. By default they
+// count bytes, as GNU m4 does (`len(café)` is 5), because autotools output
+// depends on it.
 fn is_word_char_end(c: u8) -> bool {
     (unsafe { libc::isalnum(c.into()) } != 0) || c == b'_'
 }

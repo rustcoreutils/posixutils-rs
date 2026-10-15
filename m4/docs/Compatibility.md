@@ -13,14 +13,19 @@ m4sugar is written in.  autom4te's run on a package's `configure.ac`, from
 autoconf's sources or from the frozen files Debian ships, gives the same
 output and traces as GNU m4 1.4.19.
 
-Two differences remain:
+Where GNU m4 1.4 departs from POSIX in a way autotools output depends on,
+this m4 does as GNU m4 does by default, and as POSIX says when
+`POSIXLY_CORRECT` is set in the environment (to any value):
 
-* `len`, `index`, `substr` and `translit` count characters in the locale's
-  encoding, as POSIX says; GNU m4 counts bytes.  Under a UTF-8 locale, text
-  with multibyte characters can wrap or split differently (m4sugar's
-  `m4_text_wrap` counts with `m4_len`).
-* `regexp` and `patsubst` take the first alternative that matches where
-  GNU regex takes the longest.
+* `len`, `index`, `substr` and `translit` count bytes, as GNU m4 does in
+  every locale; under `POSIXLY_CORRECT` they count the characters of
+  `LC_CTYPE`.  m4sugar measures and cuts text with `m4_len` and
+  `m4_substr`: tar's testsuite, which autotest generates from `.at` files
+  containing UTF-8 text, came out with a test group that no shell could
+  parse when m4 counted characters under `LANG=C.UTF-8`.
+
+One difference remains: `regexp` and `patsubst` take the first alternative
+that matches where GNU regex takes the longest.
 
 `m4wrap` text runs first-in first-out, as POSIX says; GNU m4 1.4 runs it
 last-in first-out.  m4sugar calls `m4wrap` once and orders its own hooks, so

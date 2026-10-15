@@ -13,7 +13,13 @@ use input::{Input, InputRead};
 use lexer::MacroName;
 use macros::MacroDefinition;
 use state::State;
-use std::{cell::RefCell, ffi::OsStr, io::Write, path::PathBuf, rc::Rc};
+use std::{
+    cell::RefCell,
+    ffi::{OsStr, OsString},
+    io::Write,
+    path::PathBuf,
+    rc::Rc,
+};
 
 mod debug;
 mod emacs_regex;
@@ -91,7 +97,18 @@ pub struct Args {
     pub fatal_warnings: u8,
     /// `-L`: the deepest macro calls may nest, 0 for no limit.
     pub nesting_limit: usize,
+    /// `-d`: the debug flags, as given.
+    pub debug_flags: Option<Vec<u8>>,
+    /// `--debugfile`: `Some(None)` for standard error, `Some(Some(name))`
+    /// for a file, nowhere if the name is empty.
+    pub debugfile: Option<Option<Vec<u8>>>,
+    /// `-t`: macros to trace.
+    pub trace: Vec<Vec<u8>>,
 }
+
+/// What clap records for a `--debugfile` without `=FILE`: standard error.
+/// No file operand can contain a NUL, so no name is mistaken for it.
+const DEBUGFILE_STDERR: &str = "\0";
 
 impl Args {
     fn command() -> clap::Command {
@@ -166,6 +183,47 @@ impl Args {
                     .value_parser(clap::value_parser!(usize)),
             )
             .arg(
+                // GNU getopt gives `-d` an argument only when attached
+                // (`-daq`); `parse` spells that `--debug=aq` for clap.
+                clap::Arg::new("debug")
+                    .short('d')
+                    .long("debug")
+                    .value_name("FLAGS")
+                    .help(gettext(
+                        "Set the debug flags (no FLAGS implies `aeq'): a args, c call, \
+                         e expansion, f file, i input, l line, p path, q quote, t trace all, \
+                         x call id, V all",
+                    ))
+                    .num_args(0..=1)
+                    .require_equals(true)
+                    .default_missing_value("")
+                    .value_parser(clap::value_parser!(OsString)),
+            )
+            .arg(
+                clap::Arg::new("debugfile")
+                    .long("debugfile")
+                    .value_name("FILE")
+                    .help(gettext(
+                        "Redirect debug and trace output to FILE (default stderr, \
+                         discard if empty string)",
+                    ))
+                    .num_args(0..=1)
+                    .require_equals(true)
+                    .default_missing_value(DEBUGFILE_STDERR)
+                    .value_parser(clap::value_parser!(OsString)),
+            )
+            .arg(
+                clap::Arg::new("trace")
+                    .short('t')
+                    .long("trace")
+                    .value_name("NAME")
+                    .help(gettext("Trace NAME when it is defined"))
+                    .num_args(1)
+                    .allow_hyphen_values(true)
+                    .value_parser(clap::value_parser!(OsString))
+                    .action(clap::ArgAction::Append),
+            )
+            .arg(
                 // autom4te always passes it; the extensions it names are the
                 // only mode there is.
                 clap::Arg::new("gnu")
@@ -178,11 +236,17 @@ impl Args {
     }
 
     pub fn parse() -> Self {
-        let argv = std::env::args_os().collect();
+        let argv = plib::optarg::spell_optional_argument(
+            std::env::args_os().collect(),
+            'd',
+            "debug",
+            &plib::optarg::OptionArguments::of(Self::command()),
+        );
         let matches = plib::optarg::get_matches_from(
             Self::command(),
             plib::optarg::keep_leading_equals_with(argv, Self::command),
         );
+        let bytes = |value: &OsString| value.as_encoded_bytes().to_vec();
 
         let line_synchronization = matches.get_flag("line_synchronization");
 
@@ -225,6 +289,15 @@ impl Args {
                 .get_one::<usize>("nesting_limit")
                 .copied()
                 .unwrap_or(0),
+            debug_flags: matches.get_one::<OsString>("debug").map(bytes),
+            debugfile: matches
+                .get_one::<OsString>("debugfile")
+                .map(|name| (name != DEBUGFILE_STDERR).then(|| bytes(name))),
+            trace: matches
+                .get_many::<OsString>("trace")
+                .unwrap_or_default()
+                .map(bytes)
+                .collect(),
         }
     }
 }
@@ -276,7 +349,7 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
 ) -> crate::error::Result<()> {
     let stdout = Rc::new(RefCell::new(stdout));
     let mut state = State::try_new(stdout.clone(), Vec::new(), args.line_synchronization)?;
-    state.configure(&args);
+    state.configure(&args, &mut stderr)?;
 
     let has_file = args
         .items
@@ -345,6 +418,7 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
     if state.input.input_len() > 0 {
         state = main_loop::finalize(state, &mut stderr)?;
     }
+    state.debug.flush()?;
 
     // A recoverable error (a diagnostic emitted via State::emit_error, e.g. a
     // bad eval expression, or an unreadable file operand) leaves processing

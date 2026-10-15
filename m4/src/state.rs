@@ -30,7 +30,7 @@ pub struct State {
     /// Whether the process should exit with an error once processing has completed.
     pub exit_error: bool,
     /// See [`M4wrapMacro`].
-    pub m4wrap: Vec<Vec<u8>>,
+    pub m4wrap: Vec<(Vec<u8>, Location)>,
     pub last_syscmd_status: Option<ExitStatus>,
     pub output: OutputState,
     pub input: InputStateRef,
@@ -187,7 +187,29 @@ impl State {
     }
 
     /// Apply the command-line options that shape the initial state.
-    pub fn configure(&mut self, args: &crate::Args) {
+    pub fn configure(&mut self, args: &crate::Args, stderr: &mut dyn Write) -> crate::Result<()> {
+        if let Some(flags) = &args.debug_flags {
+            match crate::debug::parse_flags(flags) {
+                Some(flags) => self.debug.flags = flags,
+                None => writeln!(
+                    stderr,
+                    "m4: bad debug flags: `{}'",
+                    String::from_utf8_lossy(flags)
+                )?,
+            }
+        }
+        if let Some(Some(name)) = &args.debugfile {
+            match crate::debug::Sink::open(name) {
+                Ok(sink) => self.debug.sink = sink,
+                Err(error) => writeln!(
+                    stderr,
+                    "m4: cannot set debug file `{}': {}",
+                    String::from_utf8_lossy(name),
+                    plib::diag::io_error_text(&error)
+                )?,
+            }
+        }
+        self.trace.traced.extend(args.trace.iter().cloned());
         self.include_dirs = args.include_dirs.clone();
         // GNU m4 searches `M4PATH` after the `-I` directories.
         if let Some(path) = std::env::var_os("M4PATH") {
@@ -206,6 +228,7 @@ impl State {
                 self.macro_definitions.insert(name, vec![definition]);
             }
         }
+        Ok(())
     }
 
     /// Diagnose an error m4 cannot continue past, in GNU m4's
@@ -292,9 +315,20 @@ pub struct StackFrame {
     /// Where the macro's name was read: GNU m4 reports a call, and runs it,
     /// at the line it began on rather than the line its arguments ended on.
     pub location: Location,
+    /// The arguments that are built-in tokens rather than text, by index
+    /// (their text is empty). See [`crate::output::OutputState::write_builtin`].
+    pub builtin_args: Vec<(usize, BuiltinMacro)>,
 }
 
 impl StackFrame {
+    /// The built-in token argument `index` is, if it is one.
+    pub fn builtin_arg(&self, index: usize) -> Option<BuiltinMacro> {
+        self.builtin_args
+            .iter()
+            .find(|(i, _)| *i == index)
+            .map(|(_, builtin)| *builtin)
+    }
+
     pub fn new(
         parenthesis_level: usize,
         definition: Rc<MacroDefinition>,
@@ -305,6 +339,7 @@ impl StackFrame {
             args: Vec::new(),
             definition,
             location,
+            builtin_args: Vec::new(),
         }
     }
 }

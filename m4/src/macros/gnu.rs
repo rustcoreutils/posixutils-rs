@@ -26,6 +26,12 @@ use crate::Result;
 fn inner_frame(frame: StackFrame, definition: Rc<MacroDefinition>) -> StackFrame {
     let mut inner = StackFrame::new(0, definition, frame.location);
     inner.args = frame.args.into_iter().skip(1).collect();
+    inner.builtin_args = frame
+        .builtin_args
+        .into_iter()
+        .filter(|(i, _)| *i > 0)
+        .map(|(i, builtin)| (i - 1, builtin))
+        .collect();
     inner
 }
 

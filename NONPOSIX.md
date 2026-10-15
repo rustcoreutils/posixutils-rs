@@ -702,6 +702,16 @@ The GNU m4 extensions autoconf, automake and libtoolize cannot run without:
    first alternative wins rather than the longest, and back-references in a
    pattern are not supported.  `format` takes C `printf` conversions, once,
    without backslash escapes.  `dumpdef` writes to the debug stream.
+ * Tracing: `-t NAME` / `--trace=NAME` (by name, so it holds before the macro
+   is defined and across redefinition), `-d[FLAGS]` / `--debug[=FLAGS]`
+   (`a` `c` `e` `f` `i` `l` `p` `q` `t` `x` `V`; trace lines honour `a` `e`
+   `f` `l` `q` `t`) and `--debugfile[=FILE]`, writing GNU m4's
+   `m4trace:FILE:LINE: -DEPTH- NAME(ARGS)` lines, which autom4te and
+   libtoolize parse.
+ * `$10` and up name the tenth and later arguments; m4sugar generates such
+   macros.  POSIX reads `$10` as `$1` followed by `0`: a deviation.
+ * `translit` expands `a-z` ranges, and `eval` reads `0rRADIX:DIGITS`
+   numbers; autoconf uses both.
 
 ### make
 

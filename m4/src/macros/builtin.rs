@@ -14,7 +14,7 @@ use std::process::ExitStatus;
 use std::{io::Write, rc::Rc};
 
 use super::eval::parse_integer;
-use super::{BuiltinMacro, MacroDefinitionImplementation, MacroImplementation};
+use super::{MacroDefinitionImplementation, MacroImplementation};
 use gettextrs::gettext;
 use nom::error::{ContextError, FromExternalError};
 use nom::IResult;
@@ -25,7 +25,7 @@ use crate::lexer::{
     MacroName, DEFAULT_COMMENT_CLOSE_TAG, DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG,
 };
 use crate::macros::MacroDefinition;
-use crate::output::{DivertBufferNumber, BUILTIN_DEFN_PREFIX, BUILTIN_DEFN_SUFFIX};
+use crate::output::DivertBufferNumber;
 use crate::state::{StackFrame, State};
 use crate::EOF;
 use plib::locale::mb_char_slices;
@@ -49,17 +49,6 @@ fn byte_offset_to_char_index(bytes: &[u8], byte_offset: usize) -> usize {
 
 const AT_LEAST_ONE_MACRO_DEFINITION_EXPECT: &str =
     "There should always be at least one macro definition";
-
-/// If `definition` is a `defn`-of-built-in marker, return the wrapped built-in
-/// name. The marker (emitted by `defn` for a built-in, spec: "useful for
-/// renaming macros, especially built-ins") wraps the name in control bytes that
-/// cannot occur in a macro name and are vanishingly unlikely in real text.
-fn decode_builtin_defn(definition: &[u8]) -> Option<&[u8]> {
-    match definition {
-        [BUILTIN_DEFN_PREFIX, name @ .., BUILTIN_DEFN_SUFFIX] => Some(name),
-        _ => None,
-    }
-}
 
 /// The dnl macro shall cause m4 to discard all input characters up to and including the next
 /// `<newline>`.
@@ -95,15 +84,15 @@ impl DefineMacro {
     /// reach it, and m4sugar keeps its state in macros such as
     /// `_m4_divert(KILL)`. A missing text defines the macro as empty.
     fn define(frame: StackFrame) -> MacroDefinition {
+        // A built-in token, `defn` of a built-in, defines that built-in
+        // under the new name.
+        let builtin = frame.builtin_arg(1);
         let mut args = frame.args.into_iter();
         let name = MacroName(args.next().unwrap_or_default());
-        let definition = args.next().unwrap_or_default();
-        // `defn(<built-in>)` produces a marker; reconstruct that built-in under
-        // the new name.
-        if let Some(builtin) = decode_builtin_defn(&definition).and_then(BuiltinMacro::from_name) {
-            return MacroDefinition::new_builtin(name, builtin);
+        match builtin {
+            Some(builtin) => MacroDefinition::new_builtin(name, builtin),
+            None => MacroDefinition::new_user_defined(name, args.next().unwrap_or_default()),
         }
-        MacroDefinition::new_user_defined(name, definition)
     }
 }
 
@@ -233,13 +222,8 @@ impl MacroImplementation for DefnMacro {
                         .builtin()
                         .expect("a definition that is not user-defined is a built-in");
                     if single {
-                        // Quoted, so it is not re-expanded while it is
-                        // collected as an argument.
-                        text.extend_from_slice(&state.parse_config.quote_open_tag);
-                        text.push(BUILTIN_DEFN_PREFIX);
-                        text.extend_from_slice(builtin.as_ref());
-                        text.push(BUILTIN_DEFN_SUFFIX);
-                        text.extend_from_slice(&state.parse_config.quote_close_tag);
+                        // With only one name, the text is empty.
+                        state.input.pushback_builtin(builtin);
                     } else {
                         let msg = gettext("cannot concatenate builtin `{}'").replacen(
                             "{}",
@@ -367,26 +351,24 @@ impl MacroImplementation for ChangequoteMacro {
         _stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
-        match frame.args.len() {
-            0 => {
-                DEFAULT_QUOTE_OPEN_TAG.clone_into(&mut state.parse_config.quote_open_tag);
-                DEFAULT_QUOTE_CLOSE_TAG.clone_into(&mut state.parse_config.quote_close_tag);
-            }
-            1 => {}
-            2.. => {
-                let mut args = frame.args.into_iter();
-                let open_tag = args.next().expect("2 arguments should be present");
-                let close_tag = args.next().expect("2 arguments should be present");
-                // The behavior is unspecified if there is a single argument or either argument is null.
-                if !open_tag.is_empty() && !close_tag.is_empty() {
-                    // It looks like GNU m4 only allows quote strings using non-alphanumeric
-                    // characters. The spec I'm following doesn't mention anything about that.
-                    state.parse_config.quote_open_tag = open_tag;
-                    state.parse_config.quote_close_tag = close_tag;
+        // As GNU m4: no arguments restore the defaults; an empty start string
+        // disables quoting; a non-empty one with no, or an empty, end string
+        // gets the default end string.
+        let mut args = frame.args.into_iter();
+        let (open_tag, close_tag) = match args.next() {
+            None => (
+                DEFAULT_QUOTE_OPEN_TAG.to_vec(),
+                DEFAULT_QUOTE_CLOSE_TAG.to_vec(),
+            ),
+            Some(open_tag) => match args.next() {
+                Some(close_tag) if open_tag.is_empty() || !close_tag.is_empty() => {
+                    (open_tag, close_tag)
                 }
-            }
-        }
-
+                _ => (open_tag, DEFAULT_QUOTE_CLOSE_TAG.to_vec()),
+            },
+        };
+        state.parse_config.quote_open_tag = open_tag;
+        state.parse_config.quote_close_tag = close_tag;
         Ok(state)
     }
 }
@@ -567,15 +549,18 @@ pub struct ShiftMacro;
 
 impl MacroImplementation for ShiftMacro {
     fn evaluate(&self, state: State, _stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
-        if frame.args.len() > 1 {
-            let args = &frame.args[1..];
-            for (i, arg) in args.iter().enumerate().rev() {
-                state.input.pushback_string(arg);
-                if i != 0 {
-                    state.input.pushback_character(b',');
-                }
+        // Every argument but the first, each quoted, as POSIX says: an empty
+        // one stays an argument, and none is expanded again.
+        let mut text = Vec::new();
+        for (i, arg) in frame.args.iter().skip(1).enumerate() {
+            if i > 0 {
+                text.push(b',');
             }
+            text.extend_from_slice(&state.parse_config.quote_open_tag);
+            text.extend_from_slice(arg);
+            text.extend_from_slice(&state.parse_config.quote_close_tag);
         }
+        state.input.pushback_string(&text);
         Ok(state)
     }
 }
@@ -656,6 +641,52 @@ impl MacroImplementation for IndexMacro {
 /// unspecified if translit is not immediately followed by a `<left-parenthesis>`.
 pub struct TranslitMacro;
 
+/// Expand the ranges in a `translit` character list, as GNU m4 does: `a-z`
+/// is every byte from `a` to `z`, a descending `z-a` runs backwards, and a
+/// `-` that starts or ends the list is itself. POSIX leaves a `-` elsewhere
+/// unspecified; autoconf writes ranges. A range's ends are single bytes; a
+/// multibyte character next to a `-` makes it literal.
+fn expand_ranges(chars: Vec<&[u8]>) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(chars.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let range = match (chars.get(i), chars.get(i + 1), chars.get(i + 2)) {
+            (Some(&&[from]), Some(&dash), Some(&&[to])) if dash == b"-" => Some((from, to)),
+            _ => None,
+        };
+        // The end of one range starts the next: `a-c-e` is `a` to `e`.
+        let continues = out.last().filter(|_| i > 0 && chars[i] == b"-");
+        match (range, continues) {
+            (Some((from, to)), _) => {
+                push_range(&mut out, from, to);
+                i += 3;
+            }
+            (None, Some(last))
+                if last.len() == 1 && chars.get(i + 1).is_some_and(|c| c.len() == 1) =>
+            {
+                let (from, to) = (last[0], chars[i + 1][0]);
+                out.pop();
+                push_range(&mut out, from, to);
+                i += 2;
+            }
+            _ => {
+                out.push(chars[i].to_vec());
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Push every byte from `from` to `to`, inclusive, either direction.
+fn push_range(out: &mut Vec<Vec<u8>>, from: u8, to: u8) {
+    if from <= to {
+        out.extend((from..=to).map(|b| vec![b]));
+    } else {
+        out.extend((to..=from).rev().map(|b| vec![b]));
+    }
+}
+
 impl MacroImplementation for TranslitMacro {
     fn evaluate(&self, state: State, _stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
         let mut args = frame.args.into_iter();
@@ -678,11 +709,11 @@ impl MacroImplementation for TranslitMacro {
         // Transliterate by character, not byte (LC_CTYPE): each source character
         // maps to the target character at the same position, or is deleted when
         // the target list is shorter.
-        let from = mb_char_slices(&second_arg);
-        let to = mb_char_slices(&third_arg);
+        let from = expand_ranges(mb_char_slices(&second_arg));
+        let to = expand_ranges(mb_char_slices(&third_arg));
         let mut output_buffer: Vec<u8> = Vec::with_capacity(first_arg.len());
         for ch in mb_char_slices(&first_arg) {
-            match from.iter().position(|source| *source == ch) {
+            match from.iter().position(|source| source.as_slice() == ch) {
                 Some(pos) => {
                     if let Some(replacement) = to.get(pos) {
                         output_buffer.extend_from_slice(replacement);
@@ -996,7 +1027,8 @@ impl MacroImplementation for M4wrapMacro {
             .into_iter()
             .next()
             .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
-        state.m4wrap.push(first_arg);
+        let location = state.location();
+        state.m4wrap.push((first_arg, location));
         Ok(state)
     }
 }

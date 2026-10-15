@@ -30,79 +30,73 @@ pub struct UserDefinedMacro {
 
 impl MacroImplementation for UserDefinedMacro {
     fn evaluate(&self, state: State, _stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
-        log::debug!(
-            "UserDefinedMacro::evaluate() evaluating {:?}: definition:{:?} args:{:?}",
-            frame.definition.parse_config.name.to_string(),
-            String::from_utf8_lossy(&self.definition),
-            frame
-                .args
-                .iter()
-                .map(|a| String::from_utf8_lossy(a))
-                .collect::<Vec<_>>(),
-        );
-
-        if self.definition.is_empty() {
-            return Ok(state);
-        }
-
-        let mut i = self.definition.len() - 1;
-        loop {
-            if i == 0 || self.definition[i - 1] != b'$' {
-                state.input.pushback_character(self.definition[i]);
-            } else {
-                let t = self.definition[i];
-                match t {
-                    b'#' => state
-                        .input
-                        .pushback_string(frame.args.len().to_string().as_bytes()),
-                    b'0' => state
-                        .input
-                        .pushback_string(&frame.definition.parse_config.name.0),
-                    b'1'..=b'9' => {
-                        let arg_index = (t - b'1') as usize;
-                        if arg_index < frame.args.len() {
-                            state.input.pushback_string(&frame.args[arg_index]);
-                        }
-                    }
-                    b'*' => {
-                        for (arg_index, arg) in frame.args.iter().enumerate().rev() {
-                            state.input.pushback_string(arg);
-                            if arg_index > 0 {
-                                state.input.pushback_character(b',');
+        let definition = &self.definition;
+        let args = &frame.args;
+        let mut expansion = Vec::with_capacity(definition.len());
+        let mut i = 0;
+        while i < definition.len() {
+            let c = definition[i];
+            let next = definition.get(i + 1).copied();
+            if c != b'$' || next.is_none() {
+                expansion.push(c);
+                i += 1;
+                continue;
+            }
+            match next.expect("checked") {
+                b'#' => expansion.extend_from_slice(args.len().to_string().as_bytes()),
+                b'0'..=b'9' => {
+                    // As in GNU m4, every digit after the `$` counts: `$10`
+                    // is the tenth argument, as m4sugar's generated macros
+                    // need, where POSIX reads `$1` followed by `0`.
+                    let digits = definition[i + 1..]
+                        .iter()
+                        .take_while(|c| c.is_ascii_digit())
+                        .count();
+                    let n = definition[i + 1..i + 1 + digits]
+                        .iter()
+                        .fold(0usize, |n, d| {
+                            n.saturating_mul(10).saturating_add(usize::from(d - b'0'))
+                        });
+                    match n {
+                        0 => expansion.extend_from_slice(&frame.definition.parse_config.name.0),
+                        n => {
+                            if let Some(arg) = args.get(n - 1) {
+                                expansion.extend_from_slice(arg);
                             }
                         }
                     }
-                    b'@' => {
-                        for (arg_index, arg) in frame.args.iter().enumerate().rev() {
-                            state
-                                .input
-                                .pushback_string(&state.parse_config.quote_close_tag);
-                            state.input.pushback_string(arg);
-                            state
-                                .input
-                                .pushback_string(&state.parse_config.quote_open_tag);
-                            if arg_index > 0 {
-                                state.input.pushback_character(b',');
-                            }
+                    i += 1 + digits;
+                    continue;
+                }
+                b'*' => {
+                    for (index, arg) in args.iter().enumerate() {
+                        if index > 0 {
+                            expansion.push(b',');
                         }
-                    }
-                    _ => {
-                        state.input.pushback_character(t);
-                        state.input.pushback_character(b'$');
+                        expansion.extend_from_slice(arg);
                     }
                 }
-                // TODO(performance): this might be able to skip an iteration with i==1?
-                if i == 0 {
-                    break;
+                b'@' => {
+                    for (index, arg) in args.iter().enumerate() {
+                        if index > 0 {
+                            expansion.push(b',');
+                        }
+                        expansion.extend_from_slice(&state.parse_config.quote_open_tag);
+                        expansion.extend_from_slice(arg);
+                        expansion.extend_from_slice(&state.parse_config.quote_close_tag);
+                    }
                 }
-                i -= 1;
+                // Not a parameter: the `$` is text, and what follows it is
+                // looked at afresh, so `$$1` is `$` and the first argument.
+                _ => {
+                    expansion.push(b'$');
+                    i += 1;
+                    continue;
+                }
             }
-            if i == 0 {
-                break;
-            }
-            i -= 1;
+            i += 2;
         }
-
+        state.input.pushback_string(&expansion);
         Ok(state)
     }
 }

@@ -446,3 +446,164 @@ fn debugfile_receives_dumpdef() {
     m4(&[], &input, "\n", "", 0);
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "a:\tA\n");
 }
+
+// ---------------------------------------------------------------------------
+// Tracing, as autom4te and libtoolize read it
+// ---------------------------------------------------------------------------
+
+/// The input of the trace tests: AC_INIT traced before it is defined,
+/// across a redefinition and an undefinition, with arguments that span
+/// lines and a built-in token among them.
+const TRACE_INPUT: &str = "changequote([,])dnl
+define([AC_INIT], [init($@)])dnl
+AC_INIT([pkg], [1.0])
+AC_INIT
+AC_INIT()
+define([X], [x])X([a
+b], [c])
+define([AC_INIT], [again])AC_INIT([z], defn([len]))
+undefine([AC_INIT])AC_INIT(1)
+define([AC_INIT],[third])dnl
+AC_INIT(2, [3])
+len(AC_INIT(4))
+";
+
+/// autom4te: `--debug=aflq --trace=NAME...`, read back from `--debugfile`.
+#[test]
+fn trace_lines_as_autom4te_reads_them() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let debugfile = dir.path().join("traces");
+    let debug_arg = format!("--debugfile={}", debugfile.display());
+    m4(
+        &["--debug=aflq", "--trace=AC_INIT", "--trace=X", &debug_arg],
+        TRACE_INPUT,
+        "init(pkg,1.0)\ninit()\ninit()\nx\nagain\nAC_INIT(1)\nthird\n5\n",
+        "",
+        0,
+    );
+    assert_eq!(
+        std::fs::read_to_string(&debugfile).unwrap(),
+        "m4trace:stdin:3: -1- AC_INIT([pkg], [1.0])
+m4trace:stdin:4: -1- AC_INIT
+m4trace:stdin:5: -1- AC_INIT([])
+m4trace:stdin:6: -1- X([a
+b], [c])
+m4trace:stdin:8: -1- AC_INIT([z], [])
+m4trace:stdin:11: -1- AC_INIT([2], [3])
+m4trace:stdin:12: -2- AC_INIT([4])
+"
+    );
+}
+
+/// libtoolize: `m4 -daq --prefix --trace=NAME - FILE`, traces on stderr.
+#[test]
+fn trace_lines_as_libtoolize_reads_them() {
+    m4(
+        &["-daq", "--prefix", "--trace=AC_CONFIG_MACRO_DIRS", "-"],
+        "m4_changequote([,])m4_define([AC_DEFUN], [m4_define([$1])])\
+         AC_DEFUN([AC_CONFIG_MACRO_DIRS])AC_CONFIG_MACRO_DIRS([m4], [build-aux])\n",
+        "\n",
+        "m4trace: -1- AC_CONFIG_MACRO_DIRS([m4], [build-aux])\n",
+        0,
+    );
+}
+
+#[test]
+fn trace_shows_expansions_and_builtin_arguments() {
+    let input = "define(`foo',`[$1]')dnl
+foo(`a',`b') len(`xyz')
+traceon(`len')len(foo(`q'))
+define(`d',defn(`define'))d(`e',`E')e
+";
+    m4(
+        &["-d", "-tfoo", "-td"],
+        input,
+        "[a] 3\n3\nE\n",
+        "m4trace: -1- foo(`a', `b') -> `[a]'
+m4trace: -2- foo(`q') -> `[q]'
+m4trace: -1- len(`[q]') -> `3'
+m4trace: -1- d(`e', `E')
+",
+        0,
+    );
+    m4(
+        &["-dq", "--trace=define"],
+        "define(`d',defn(`define'))\n",
+        "\n",
+        "m4trace: -1- define\n",
+        0,
+    );
+    m4(
+        &["-daq", "--trace=define"],
+        "define(`d',defn(`define'))\n",
+        "\n",
+        "m4trace: -1- define(`d', <define>)\n",
+        0,
+    );
+}
+
+#[test]
+fn trace_flag_t_traces_every_call() {
+    m4(
+        &["-dtl"],
+        "define(`x',`len(ab)')x\n",
+        "2\n",
+        "m4trace:1: -1- define\nm4trace:1: -1- x\nm4trace:1: -1- len\n",
+        0,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GNU m4 semantics autoconf's output depends on
+// ---------------------------------------------------------------------------
+
+#[test]
+fn engine_semantics_m4sugar_relies_on() {
+    m4(
+        &[],
+        "define(`w', `len(a,b)')dnl
+1 w(x,
+)
+2 [shift(`x',`a',`')] define(`a',`A')
+3 changequote(`')`a'changequote
+4 define(`f',`[$1]')f(defn(`len'))
+5 changequote([,])define([g],[$10|$11|$1])g(1,2,3,4,5,6,7,8,9,ten,eleven)
+6 translit([hello], [a-z], [A-Z]) translit([a-b], [a-], [X_]) eval([0r36:z])
+",
+        "1 1\n2 [a,] \n3 `A'\n4 []\n5 ten|eleven|1\n6 HELLO X_b 35\n",
+        // The warning names the line of the call whose expansion made it.
+        "m4:stdin:2: Warning: excess arguments to builtin `len' ignored\n",
+        0,
+    );
+}
+
+// Multi-character quotes, as m4sugar's m4_split sets them: a partial match
+// of the quote string is text.
+#[test]
+fn multi_character_quotes() {
+    m4(
+        &[],
+        "changequote([,])dnl
+define([f],[<$1|$2|$3>])dnl
+changequote([-=<{(], [)}>=-])dnl
+f(-=<{(-=<{( a b )}>=-)}>=-, -=<{([\t ]+)}>=-, -=<{(], [x], [79])[][]g([)}>=-)
+patsubst(-=<{(-=<{( a b )}>=-)}>=-, -=<{([\t ]+)}>=-, -=<{(]+[)}>=-)
+",
+        "< a b |[\t ]+|], [x], [79])[][]g([>\n]+[a]+[b]+[\n",
+        "",
+        0,
+    );
+}
+
+// Bytes 1 and 2 are text: m4sugar builds a string of every byte.
+#[test]
+fn control_bytes_are_text() {
+    m4(&[], "format(`%c%c|', 1, 2)\n", "\u{1}\u{2}|\n", "", 0);
+}
+
+// m4wrap text runs in the diversion current at the end of input.
+#[test]
+fn m4wrap_text_runs_in_the_current_diversion() {
+    m4(&[], "m4wrap(`wrapped')divert(-1)\n", "", "", 0);
+    m4(&[], "m4wrap(`__line__')\n\n", "\n\n1", "", 0);
+}

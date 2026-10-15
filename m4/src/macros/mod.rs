@@ -47,12 +47,20 @@ macro_rules! macro_enums {
         impl MacroImplementation for MacroDefinitionImplementation {
             fn evaluate(
                 &self,
-                state: State,
+                mut state: State,
                 stderr: &mut dyn Write,
                 f: StackFrame,
             ) -> Result<State> {
-                state.trace.trace(&state.output.stack, &f, stderr)?;
-                self.call(state, stderr, f)
+                let pending = if state.is_traced(&f) {
+                    state.trace_call(stderr, &f)?
+                } else {
+                    None
+                };
+                let mut state = self.call(state, stderr, f)?;
+                if let Some(pending) = pending {
+                    state.trace_expansion(stderr, pending)?;
+                }
+                Ok(state)
             }
         }
 
@@ -66,8 +74,13 @@ macro_rules! macro_enums {
                 stderr: &mut dyn Write,
                 f: StackFrame,
             ) -> Result<State> {
+                let outer_expansion_site = state.input.set_expansion_site(Some(f.location.clone()));
                 let builtin = match self {
-                    Self::UserDefined(d) => return d.evaluate(state, stderr, f),
+                    Self::UserDefined(d) => {
+                        let state = d.evaluate(state, stderr, f)?;
+                        state.input.set_expansion_site(outer_expansion_site);
+                        return Ok(state);
+                    }
                     _ => self.builtin().expect("not user-defined"),
                 };
                 let outer_call_site = state.call_site.replace(f.location.clone());
@@ -80,6 +93,7 @@ macro_rules! macro_enums {
                     state
                 };
                 state.call_site = outer_call_site;
+                state.input.set_expansion_site(outer_expansion_site);
                 Ok(state)
             }
         }
@@ -299,6 +313,15 @@ impl BuiltinMacro {
             Index => (2, Some(2)),
             Substr | Translit => (2, Some(3)),
         }
+    }
+
+    /// Whether a built-in (`defn` of one) passes through this macro's
+    /// arguments: only those that define or call macros take one. Every
+    /// other macro, user-defined ones included, sees it as empty text, as in
+    /// GNU m4.
+    pub fn takes_builtin_args(&self) -> bool {
+        use BuiltinMacro::*;
+        matches!(self, Builtin | Define | Indir | Pushdef)
     }
 
     /// Whether a call with too few arguments still runs, after the

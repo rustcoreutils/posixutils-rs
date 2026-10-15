@@ -9,6 +9,7 @@
 
 use std::io::Write;
 
+use crate::input::{Location, BUILTIN_TOKEN};
 use crate::lexer::{is_alpha, is_space};
 use crate::macros::MacroImplementation;
 use crate::state::{StackFrame, State};
@@ -28,6 +29,12 @@ pub(crate) fn process(mut state: State, stderr: &mut dyn Write) -> crate::error:
 
     'main_loop: loop {
         t = state.input.get_next_character()?;
+        if t == BUILTIN_TOKEN {
+            if let Some(builtin) = state.input.take_builtin() {
+                state.output.write_builtin(builtin);
+                continue 'main_loop;
+            }
+        }
         // Strip quotes
         if state
             .input
@@ -100,7 +107,9 @@ pub(crate) fn process(mut state: State, stderr: &mut dyn Write) -> crate::error:
             }
             state.input.leave_literal_scan();
         } else if t == b'_' || is_alpha(t) {
-            // Possibly a macro to be evaluated.
+            // Possibly a macro to be evaluated. A call is reported at the line
+            // of its name, before reading past the name moves on.
+            let location = state.input.current_location();
             let definition = state.parse_macro(t, &mut token)?;
             if definition.is_some() {
                 l = state.input.get_next_character()?;
@@ -113,8 +122,7 @@ pub(crate) fn process(mut state: State, stderr: &mut dyn Write) -> crate::error:
                 if l != b'(' && definition.parse_config.min_args > 0 {
                     state.output.write_all(&token)?;
                 } else {
-                    let mut frame =
-                        StackFrame::new(0, definition.clone(), state.input.current_location());
+                    let mut frame = StackFrame::new(0, definition.clone(), location);
                     state.check_nesting(stderr, state.output.stack.len() + 1)?;
 
                     if l == b'(' {
@@ -243,11 +251,14 @@ pub(crate) fn process(mut state: State, stderr: &mut dyn Write) -> crate::error:
 /// remaining diversion buffers to standard output in numerical order.
 pub(crate) fn finalize(mut state: State, stderr: &mut dyn Write) -> crate::error::Result<State> {
     // Wrapped text may itself expand macros, divert, or queue further m4wrap
-    // text, so loop until the queue is empty.
+    // text, so loop until the queue is empty. It runs in whatever diversion
+    // is current, as in GNU m4, and each piece keeps the location of its
+    // m4wrap call.
     while !state.m4wrap.is_empty() {
-        let wrapped: Vec<u8> = state.m4wrap.drain(..).flatten().collect();
-        state.output.output.divert(0)?;
-        state.input.pushback_string(&wrapped);
+        let wrapped: Vec<(Vec<u8>, Location)> = std::mem::take(&mut state.m4wrap);
+        for (text, location) in wrapped.iter().rev() {
+            state.input.pushback_string_at(text, location);
+        }
         state = process(state, stderr)?;
     }
 

@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::{error::Result, input::InputStateRef, state::StackFrame};
+use crate::{error::Result, input::InputStateRef, macros::BuiltinMacro, state::StackFrame};
 use std::{
     cell::RefCell,
     collections::BTreeMap,
@@ -15,68 +15,46 @@ use std::{
     rc::Rc,
 };
 
-/// Sentinel bytes wrapping a built-in macro name, emitted by `defn` for a
-/// built-in so that `define`/`pushdef` can reconstruct that built-in under a new
-/// name. When such a marker instead reaches real output (a built-in token used
-/// outside define/pushdef), it expands to nothing, as in GNU m4.
-pub(crate) const BUILTIN_DEFN_PREFIX: u8 = 0x01;
-pub(crate) const BUILTIN_DEFN_SUFFIX: u8 = 0x02;
-
 #[derive(Default)]
 pub struct OutputState {
     pub output: OutputRef,
     pub stack: Vec<StackFrame>,
-    /// Tracks a `defn`-of-built-in marker spanning multiple writes so its bytes
-    /// can be dropped from real output.
-    pub skipping_builtin_marker: bool,
 }
 
 impl OutputState {
     /// Write either to output, or to the buffer for the macro arg currently being parsed.
     pub fn write_all(&mut self, buf: &[u8]) -> crate::Result<()> {
-        if self.stack.is_empty() {
-            log::trace!("Writing to output: {}", String::from_utf8_lossy(buf));
-            // A built-in token (defn marker) that is not consumed by
-            // define/pushdef vanishes rather than emitting control bytes.
-            let clean = self.filter_builtin_markers(buf);
-            if !clean.is_empty() {
-                self.output.write_all(&clean)?;
+        match self.stack.last_mut() {
+            None => self.output.write_all(buf)?,
+            Some(frame) => {
+                if frame.args.is_empty() {
+                    frame.args.push(Vec::new());
+                }
+                frame
+                    .args
+                    .last_mut()
+                    .expect("at least one argument")
+                    .extend_from_slice(buf);
             }
-        } else {
-            log::trace!(
-                "Writing to macro arg in stack: {:?}",
-                String::from_utf8_lossy(buf)
-            );
-
-            let frame = self.stack.last_mut().expect("Stack not empty");
-            let arg_buffer = if let Some(arg_buffer) = frame.args.last_mut() {
-                arg_buffer
-            } else {
-                frame.args.push(Vec::new());
-                frame.args.last_mut().expect("At least one arg")
-            };
-
-            arg_buffer.extend(buf);
         }
         Ok(())
     }
 
-    /// Drop any `defn`-of-built-in marker byte ranges, carrying the in-marker
-    /// state across calls (a marker may be split over multiple writes).
-    fn filter_builtin_markers(&mut self, buf: &[u8]) -> Vec<u8> {
-        let mut clean = Vec::with_capacity(buf.len());
-        for &b in buf {
-            if self.skipping_builtin_marker {
-                if b == BUILTIN_DEFN_SUFFIX {
-                    self.skipping_builtin_marker = false;
-                }
-            } else if b == BUILTIN_DEFN_PREFIX {
-                self.skipping_builtin_marker = true;
-            } else {
-                clean.push(b);
-            }
+    /// Take a built-in token (what `defn` of a built-in expands to) where
+    /// text would go. As in GNU m4, it becomes the argument being collected
+    /// if nothing has been collected for it yet, and is otherwise dropped,
+    /// as it is outside any argument.
+    pub fn write_builtin(&mut self, builtin: BuiltinMacro) {
+        let Some(frame) = self.stack.last_mut() else {
+            return;
+        };
+        if frame.args.is_empty() {
+            frame.args.push(Vec::new());
         }
-        clean
+        let index = frame.args.len() - 1;
+        if frame.args[index].is_empty() && frame.builtin_arg(index).is_none() {
+            frame.builtin_args.push((index, builtin));
+        }
     }
 }
 

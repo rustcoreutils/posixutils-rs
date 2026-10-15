@@ -560,6 +560,17 @@ impl Make {
                     if self.retrieve_from_sccs(name.as_ref())? {
                         return Ok(true);
                     }
+                    // POSIX 105672: a prerequisite of `.PHONY` is a target
+                    // itself, so one with no rule of its own is a target
+                    // with no commands, and `.DEFAULT` is not for it. It is
+                    // always out of date, so it is made, by doing nothing,
+                    // and its dependents are remade after it, as in GNU
+                    // make. binutils' top-level Makefile declares
+                    // `.PHONY: clean-stage1` with no rule, under `do-clean:
+                    // clean-stage1`.
+                    if self.attributes.is_phony(name.as_ref()) {
+                        return Ok(true);
+                    }
                     // Per POSIX: "If a target exists and there is neither a target rule
                     // nor an inference rule for the target, the target shall be considered
                     // up-to-date."  Resolved through VPATH: a file supplied by a

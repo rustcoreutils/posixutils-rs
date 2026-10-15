@@ -55,3 +55,33 @@ fn under_k_make_does_not_say_it_stops() {
     );
     assert_eq!(run.code, Some(2));
 }
+
+/// POSIX 105672: a prerequisite of `.PHONY` is a target itself, so one with
+/// no rule is a target with no commands, not a missing file. binutils'
+/// top-level Makefile has `.PHONY: all-stage1 clean-stage1` and `do-clean:
+/// clean-stage1` with no rule for `clean-stage1`.
+#[test]
+fn a_phony_prerequisite_needs_no_rule() {
+    let dir = Dir::new("norule_phony");
+    dir.write(
+        "Makefile",
+        ".PHONY: all-stage1 clean-stage1\nclean: do-clean\ndo-clean: clean-stage1\n\t@echo do-clean\n",
+    );
+    dir.make(&["clean"]).ok("do-clean\n");
+    let run = dir.make(&["clean-stage1"]);
+    assert_eq!((run.code, run.stderr.as_str()), (Some(0), ""), "{run:?}");
+}
+
+/// A phony target with no rule is always out of date, so what depends on it
+/// is remade even when its file is newer, and `.DEFAULT`, which is for a
+/// target with no rule, does not run for it (GNU make agrees).
+#[test]
+fn a_phony_prerequisite_with_no_rule_remakes_its_dependent() {
+    let dir = Dir::new("norule_phony_remade");
+    dir.write(
+        "Makefile",
+        ".PHONY: a\nall: a\n\t@echo all\n.DEFAULT:\n\t@echo default $@\n",
+    );
+    dir.write("all", "");
+    dir.make(&[]).ok("all\n");
+}

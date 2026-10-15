@@ -18,6 +18,7 @@ mod common;
 mod automake;
 
 mod cancel_rules;
+mod colon_command;
 mod computed_names;
 mod curdir;
 mod deep_chain;

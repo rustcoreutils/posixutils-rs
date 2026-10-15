@@ -569,6 +569,13 @@ impl Rule {
             .defined(DEFAULT_SHELL_VAR)
             .map(String::from)
             .unwrap_or_else(|| DEFAULT_SHELL.to_string());
+        // `:` alone does nothing and succeeds, `-e` or not (POSIX `colon`),
+        // so the standard shell need not be started to run it. Makefiles
+        // write `@:` as a target's do-nothing command, and every sub-make
+        // of a recursive build ran a shell for it. GNU make skips it too.
+        if shell == DEFAULT_SHELL && expanded.trim() == ":" {
+            return Ok(());
+        }
         let mut command = Command::new(shell);
         command.envs(exported_macros(config.env_macros, env.table, env.exports));
         // POSIX: when errors are not being ignored, the shell -e option shall

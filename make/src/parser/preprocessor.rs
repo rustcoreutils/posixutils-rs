@@ -208,9 +208,13 @@ fn apply_substitution(value: &str, spec: &str) -> String {
                 } else {
                     word.to_string()
                 }
-            } else if !lhs.is_empty() && word.ends_with(lhs) {
-                // Suffix form.
-                format!("{}{}", &word[..word.len() - lhs.len()], rhs)
+            } else if let Some(base) = word.strip_suffix(lhs) {
+                // Suffix form. An empty `subst1` is a suffix of every word,
+                // so `$(TESTS:=.log)` appends `.log` to each (POSIX
+                // 105806-105807). automake's test harness writes exactly that,
+                // and then runs `rm -f` on the result: returning the words
+                // unchanged deleted gzip's test scripts.
+                format!("{base}{rhs}")
             } else {
                 word.to_string()
             }

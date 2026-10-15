@@ -19,6 +19,8 @@ pub(crate) struct RuleLine {
     pub prerequisites: Vec<String>,
     /// A command given inline after a `<semicolon>`, if any.
     pub inline: Option<String>,
+    /// Written `target::`, the GNU double-colon form.
+    pub double_colon: bool,
 }
 
 /// Drop a trailing comment. POSIX 105551: a `#` and everything after it, up to
@@ -61,14 +63,13 @@ pub(crate) fn split_rule_line(line: &str) -> Result<RuleLine, String> {
     let colon = line.find(':').ok_or("expected ':'")?;
     let (lhs, rhs) = (&line[..colon], &line[colon + 1..]);
 
-    // `target:: prerequisites` is the GNU double-colon rule: several rules for
-    // one target, each with its own commands, all of which run. POSIX has no
-    // such construct and we do not implement it. Say so: taking the first `:`
-    // made the second one a prerequisite literally named `:`, and the makefile
-    // failed with `no target ':'` (audit #86).
-    if rhs.starts_with(':') {
-        return Err("double-colon rules are not supported".to_string());
-    }
+    // `target:: prerequisites` is the GNU double-colon rule. Taking the first
+    // `:` alone made the second one a prerequisite literally named `:`, and the
+    // makefile failed with `no target ':'` (audit #86).
+    let (rhs, double_colon) = match rhs.strip_prefix(':') {
+        Some(rest) => (rest, true),
+        None => (rhs, false),
+    };
 
     // A semicolon left of the colon would otherwise yield a target literally
     // named `a;b`, silently.
@@ -86,6 +87,7 @@ pub(crate) fn split_rule_line(line: &str) -> Result<RuleLine, String> {
         targets,
         prerequisites: split_words(prereq_text),
         inline,
+        double_colon,
     })
 }
 
@@ -122,9 +124,12 @@ mod tests {
     // second one a prerequisite literally named `:`, which failed later with
     // `no target ':'` -- a diagnostic about the wrong thing entirely.
     #[test]
-    fn rejects_a_double_colon_rule() {
-        let err = split_rule_line("all:: a").expect_err("must be rejected");
-        assert!(err.contains("double-colon"), "err: {err}");
+    fn recognizes_a_double_colon_rule() {
+        let r = rule("all:: a");
+        assert!(r.double_colon);
+        assert_eq!(r.targets, vec!["all"]);
+        assert_eq!(r.prerequisites, vec!["a"]);
+        assert!(!rule("all: a").double_colon);
     }
 
     // A `:` on the prerequisite side is not the double-colon form.

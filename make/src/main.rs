@@ -144,6 +144,12 @@ struct Args {
     )]
     touch: bool,
 
+    /// GNU make's option to stop announcing directory changes. This make
+    /// never announces them, so there is nothing to turn off; it is accepted
+    /// because libzstd's Makefile passes it to `$(MAKE)`.
+    #[arg(long, hide = true)]
+    no_print_directory: bool,
+
     #[arg(help = "Targets to build")]
     targets: Vec<OsString>,
 }
@@ -167,20 +173,23 @@ fn target_not_remade(target: &str) -> String {
     )
 }
 
-/// Build the effective argument vector, seeding options from the `MAKEFLAGS`
-/// environment variable ahead of the real command line (POSIX). The letters-only
-/// first word (e.g. `MAKEFLAGS=kn`) becomes a combined short option (`-kn`);
-/// words containing `=` are macro operands; words already starting with `-` are
-/// passed verbatim. `MAKEFLAGS` is inherited by recipe sub-processes via the
-/// environment, so it propagates to sub-makes.
+/// The single-letter options a parent make may pass down in `MAKEFLAGS`.
+///
+/// `-f` and `-p` are left out by POSIX 105856 itself, `-C` and `-j` belong to
+/// the invocation, and a letter this make does not implement -- GNU's `w`,
+/// `B`, `R` and the rest -- is passed over when it arrives.
+const INHERITED_LETTERS: &str = "inqksSetr";
+
 /// Build the `MAKEFLAGS` value a sub-make should inherit.
 ///
-/// POSIX 105866 requires make to pass its options down through `MAKEFLAGS`.
-/// Only options that make sense to inherit are forwarded; `-f`, `-C` and the
-/// target operands are specific to this invocation. The letters-only first word
-/// is the form POSIX describes and the form `args_with_makeflags` parses back.
-fn makeflags_for_children(config: &Config) -> String {
-    let mut letters = String::new();
+/// POSIX 105856-105865: make's options, and its command-line macro
+/// definitions "quoted in an implementation-defined manner such that when
+/// MAKEFLAGS is read by another instance of the make command, the original
+/// macro's value is recovered". The form is GNU make's, so that either make
+/// reads the other's: the option letters, then `--`, then the macros, with a
+/// blank or a backslash in a value escaped by a backslash.
+fn makeflags_for_children(config: &Config, macros: &[String]) -> String {
+    let mut out = String::new();
     for (flag, ch) in [
         (config.ignore, 'i'),
         (config.dry_run, 'n'),
@@ -193,35 +202,119 @@ fn makeflags_for_children(config: &Config) -> String {
         (config.clear, 'r'),
     ] {
         if flag {
-            letters.push(ch);
+            out.push(ch);
         }
     }
-    letters
+    // The last definition of a name is the one in force; it alone is passed.
+    let name_of = |m: &str| -> String {
+        let name = m.split_once('=').map_or(m, |(name, _)| name);
+        name.trim_end_matches([':', '?', '+', '!'])
+            .trim()
+            .to_string()
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut macros: Vec<&String> = macros
+        .iter()
+        .rev()
+        .filter(|m| name_of(m) != "MAKEFLAGS" && seen.insert(name_of(m)))
+        .collect();
+    macros.reverse();
+    if macros.is_empty() {
+        return out;
+    }
+    if !out.is_empty() {
+        out.push(' ');
+    }
+    out.push_str("--");
+    for definition in macros {
+        out.push(' ');
+        for c in definition.chars() {
+            if matches!(c, ' ' | '\t' | '\\') {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+    }
+    out
 }
 
+/// Split a `MAKEFLAGS` value into words at unescaped blanks, removing the
+/// backslash from an escaped character.
+fn makeflags_words(flags: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut chars = flags.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => word.extend(chars.next()),
+            ' ' | '\t' => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            _ => word.push(c),
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+/// The options and macros a `MAKEFLAGS` value carries, as arguments.
+///
+/// POSIX's forms are a first word of option letters (`kn`), option words
+/// (`-k -n`) and macro definitions. A GNU make parent adds long options
+/// (`--jobserver-auth=3,4`, `--no-print-directory`), option words with an
+/// argument attached (`-j4`, `-Onone`, `-I/dir`), letters this make does not
+/// have (`w`), and a `--` before its macros. A Debian build runs debian/rules
+/// under GNU make and this make below it, so each of those reaches here; what
+/// this make does not implement is passed over rather than refused, since
+/// the parent's options were never addressed to it.
+fn makeflags_args(flags: &str) -> Vec<OsString> {
+    let known = |letters: &str| -> Option<OsString> {
+        let kept: String = letters
+            .chars()
+            .filter(|c| INHERITED_LETTERS.contains(*c))
+            .collect();
+        (!kept.is_empty()).then(|| OsString::from(format!("-{kept}")))
+    };
+
+    let mut args = Vec::new();
+    let mut macros_only = false;
+    for (i, word) in makeflags_words(flags).iter().enumerate() {
+        if macros_only || (word.contains('=') && !word.starts_with('-')) {
+            if word.contains('=') {
+                args.push(OsString::from(word));
+            }
+        } else if word == "--" {
+            macros_only = true;
+        } else if word.starts_with("--") {
+            // A GNU long option: nothing this make implements.
+        } else if let Some(letters) = word.strip_prefix('-') {
+            // An option word. One whose first letter takes an argument
+            // (`-j4`, `-Onone`) is dropped whole, so the argument is not read
+            // as more letters.
+            if letters.starts_with(|c: char| INHERITED_LETTERS.contains(c)) {
+                args.extend(known(letters));
+            }
+        } else if i == 0 {
+            args.extend(known(word));
+        }
+    }
+    args
+}
+
+/// Build the effective argument vector, seeding options and macros from the
+/// `MAKEFLAGS` environment variable ahead of the real command line, so that
+/// the command line wins (POSIX 105839-105851: source 1 before source 2).
 fn args_with_makeflags() -> Vec<OsString> {
     let mut args: Vec<OsString> = env::args_os().collect();
     let Ok(flags) = env::var("MAKEFLAGS") else {
         return args;
     };
-    let flags = flags.trim();
-    if flags.is_empty() {
-        return args;
-    }
-
-    let mut injected: Vec<OsString> = Vec::new();
-    for (i, word) in flags.split_whitespace().enumerate() {
-        if i == 0 && !word.starts_with('-') && !word.contains('=') {
-            // Letters-only form: `kn` -> `-kn`.
-            injected.push(OsString::from(format!("-{word}")));
-        } else {
-            injected.push(OsString::from(word));
-        }
-    }
-
-    // Insert the seeded options just after argv[0], before the real arguments.
     let tail = args.split_off(1);
-    args.extend(injected);
+    args.extend(makeflags_args(&flags));
     args.extend(tail);
     args
 }
@@ -312,6 +405,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         terminate,
         keep_going,
         jobs,
+        no_print_directory: _,
         mut targets,
     } = plib::optarg::parse_from::<Args>(plib::optarg::keep_leading_equals::<Args>(
         args_with_makeflags(),
@@ -350,14 +444,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     ENV_MACROS.store(env_macros, Relaxed);
 
-    // POSIX 105866: make passes its options to sub-makes through MAKEFLAGS.
-    // Only the flags worth inheriting go in; -f, -C and the target operands
-    // belong to this invocation (audit #40).
-    let inherited = makeflags_for_children(&config);
-    if !inherited.is_empty() {
-        env::set_var("MAKEFLAGS", inherited);
-    }
-
     // Separate command-line `macro=value` operands from target operands
     // (POSIX SYNOPSIS allows them to be intermixed).
     let mut cmdline_macros: Vec<String> = Vec::new();
@@ -370,6 +456,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             true
         }
     });
+
+    // POSIX 105856: make passes its options and command-line macros to
+    // sub-makes through MAKEFLAGS. -f, -C and the target operands belong to
+    // this invocation (audit #40). The value replaces whatever was
+    // inherited, a GNU parent's jobserver included.
+    env::set_var(
+        "MAKEFLAGS",
+        makeflags_for_children(&config, &cmdline_macros),
+    );
 
     // POSIX 105866: "all of the make utility command line macro definitions
     // (except the MAKEFLAGS macro or the SHELL macro) shall be added to the

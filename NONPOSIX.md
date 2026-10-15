@@ -726,6 +726,19 @@ The GNU m4 extensions autoconf, automake and libtoolize cannot run without:
    POSIX.
  * `export` directive.  POSIX mentions it only in the rationale.
  * `:=` assignment.  POSIX defines `=`, `::=`, `:::=`, `!=`, `?=` and `+=`.
+ * `MAKEFLAGS` as GNU make writes it.  A Debian build runs `debian/rules`
+   under GNU make and this make below it, which inherits GNU's
+   `MAKEFLAGS`: long options (`--jobserver-auth=R,W`,
+   `--no-print-directory`), option words with an argument attached (`-j4`,
+   `-Onone`) and letters this make does not implement (`w`) are passed
+   over, and the macro definitions after `--` are read, a blank escaped by
+   a backslash.  This make writes its own `MAKEFLAGS` in that form too:
+   the option letters, then `--` and the command-line macros.
+ * `--no-print-directory` — accepted and ignored; this make never announces
+   directory changes.  libzstd's `lib/Makefile` passes it to `$(MAKE)`.
+ * A `%` pattern rule without commands is not used: in GNU make it cancels
+   a built-in pattern rule.  automake ends every Makefile with
+   `%:: %,v`, `%:: SCCS/s.%` and three more of them.
 
 ### man
 

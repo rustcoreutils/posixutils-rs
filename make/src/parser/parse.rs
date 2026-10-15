@@ -43,6 +43,8 @@ pub struct Rule {
     /// Command lines with their leading `<tab>` removed. Prefix characters
     /// (`@`, `-`, `+`) are still attached; `rule::Recipe` strips those.
     recipes: Vec<String>,
+    /// Written `target::`, the GNU double-colon form.
+    double_colon: bool,
     /// 1-based line in the preprocessed text, for diagnostics.
     line: usize,
 }
@@ -58,6 +60,11 @@ impl Rule {
 
     pub fn recipes(&self) -> impl Iterator<Item = &str> {
         self.recipes.iter().map(String::as_str)
+    }
+
+    /// Whether the rule was written `target::`.
+    pub fn is_double_colon(&self) -> bool {
+        self.double_colon
     }
 
     /// Line in the preprocessed text where this rule's header appeared.
@@ -171,11 +178,13 @@ fn rule_from(header: RuleLine, line: usize) -> Rule {
         targets,
         prerequisites,
         inline,
+        double_colon,
     } = header;
     Rule {
         targets,
         prerequisites,
         recipes: inline.into_iter().collect(),
+        double_colon,
         line,
     }
 }
@@ -197,12 +206,29 @@ impl Builder {
     /// writes routinely. POSIX asks the application for a non-null list
     /// (105643) but says nothing of one that expands to null; GNU make
     /// ignores it, and rejecting it failed the whole makefile.
+    ///
+    /// A `%` pattern rule without commands is dropped too. In GNU make it
+    /// cancels the built-in rule of that shape; it never makes anything, so
+    /// keeping it would let it "make" every target it matches by running no
+    /// commands. automake ends every Makefile with five of them
+    /// (`%:: %,v`, `%:: SCCS/s.%`, ...), cancelling GNU rules this make does
+    /// not have.
     fn close(&mut self) {
-        if let Some(rule) = self.current.take() {
-            if !rule.targets.is_empty() {
-                self.rules.push(rule);
-            }
+        let Some(rule) = self.current.take() else {
+            return;
+        };
+        let pattern = rule.targets.iter().any(|t| t.contains('%'));
+        if rule.targets.is_empty() || (pattern && rule.recipes.is_empty()) {
+            return;
         }
+        if rule.double_colon {
+            self.errors.push(format!(
+                "{}: double-colon rules are not supported",
+                rule.line
+            ));
+            return;
+        }
+        self.rules.push(rule);
     }
 
     /// Add a command line to the rule under construction.

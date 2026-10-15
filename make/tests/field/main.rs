@@ -15,8 +15,10 @@
 
 mod common;
 
+mod cancel_rules;
 mod computed_names;
 mod curdir;
 mod empty_targets;
 mod include_remaking;
+mod makeflags;
 mod shell_status;

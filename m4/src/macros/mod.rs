@@ -57,6 +57,18 @@ macro_rules! macro_enums {
             }
         }
 
+        impl MacroDefinitionImplementation {
+            /// The built-in this implements, or `None` for a user-defined
+            /// macro. A built-in keeps this identity under any name it is
+            /// copied to, which is what `defn` and `dumpdef` report.
+            pub fn builtin(&self) -> Option<BuiltinMacro> {
+                match self {
+                    $(Self::$variant_name(_) => Some(BuiltinMacro::$variant_name)),*,
+                    Self::UserDefined(_) => None,
+                }
+            }
+        }
+
         impl BuiltinMacro {
             pub fn enumerate() -> &'static [Self] {
                 &[$(Self::$variant_name),*]
@@ -172,7 +184,7 @@ impl BuiltinMacro {
             Divert => 0,
             Divnum => 0,
             Dnl => 0,
-            Dumpdef => 1,
+            Dumpdef => 0,
             Errprint => 1,
             Eval => 1,
             File => 0,

@@ -259,51 +259,48 @@ pub struct DefnMacro;
 
 impl MacroImplementation for DefnMacro {
     fn evaluate(&self, state: State, stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
-        let first_arg = frame
-            .args
-            .into_iter()
-            .next()
-            .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
-        let name = match MacroName::try_from_slice(&first_arg) {
-            Ok(name) => name,
-            Err(_) => {
-                state.emit_warning(
-                    stderr,
-                    format_args!("{}", gettext("invalid macro name in builtin `defn'")),
-                )?;
-                return Ok(state);
-            }
-        };
-        if let Some(definitions) = state.macro_definitions.get(&name) {
-            let definition = definitions
-                .last()
-                .expect(AT_LEAST_ONE_MACRO_DEFINITION_EXPECT);
+        // The quoted definitions of every named macro, in order; an undefined
+        // name contributes nothing. A built-in has no text, so it can only be
+        // the whole result: with one argument it becomes the marker that
+        // define/pushdef turn back into that built-in, and with several it is
+        // dropped with a warning, as in GNU m4.
+        let single = frame.args.len() == 1;
+        let mut text = Vec::new();
+        for arg in &frame.args {
+            let name = MacroName(arg.clone());
+            let Some(definition) = state.macro_definitions.get(&name).and_then(|d| d.last()) else {
+                continue;
+            };
             match &definition.implementation {
                 MacroDefinitionImplementation::UserDefined(user_defined) => {
-                    state
-                        .input
-                        .pushback_string(&state.parse_config.quote_close_tag);
-                    state.input.pushback_string(&user_defined.definition);
-                    state
-                        .input
-                        .pushback_string(&state.parse_config.quote_open_tag);
+                    text.extend_from_slice(&state.parse_config.quote_open_tag);
+                    text.extend_from_slice(&user_defined.definition);
+                    text.extend_from_slice(&state.parse_config.quote_close_tag);
                 }
-                // A built-in has no textual body; emit the internal marker
-                // (quoted, so it is not re-expanded while collecting arguments)
-                // that define/pushdef decode back into the built-in.
-                _ => {
-                    state
-                        .input
-                        .pushback_string(&state.parse_config.quote_close_tag);
-                    state.input.pushback_character(BUILTIN_DEFN_SUFFIX);
-                    state.input.pushback_string(&definition.parse_config.name.0);
-                    state.input.pushback_character(BUILTIN_DEFN_PREFIX);
-                    state
-                        .input
-                        .pushback_string(&state.parse_config.quote_open_tag);
+                implementation => {
+                    let builtin = implementation
+                        .builtin()
+                        .expect("a definition that is not user-defined is a built-in");
+                    if single {
+                        // Quoted, so it is not re-expanded while it is
+                        // collected as an argument.
+                        text.extend_from_slice(&state.parse_config.quote_open_tag);
+                        text.push(BUILTIN_DEFN_PREFIX);
+                        text.extend_from_slice(builtin.as_ref());
+                        text.push(BUILTIN_DEFN_SUFFIX);
+                        text.extend_from_slice(&state.parse_config.quote_close_tag);
+                    } else {
+                        let msg = gettext("cannot concatenate builtin `{}'").replacen(
+                            "{}",
+                            &String::from_utf8_lossy(arg),
+                            1,
+                        );
+                        state.emit_warning(stderr, format_args!("{msg}"))?;
+                    }
                 }
             }
         }
+        state.input.pushback_string(&text);
         Ok(state)
     }
 }
@@ -891,60 +888,58 @@ pub struct DumpdefMacro;
 
 impl MacroImplementation for DumpdefMacro {
     fn evaluate(&self, state: State, stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
-        let dumpdef = |stderr: &mut dyn Write, n: &MacroName, d: &MacroDefinition| {
-            write!(stderr, "{n}:\t")?;
-            match &d.implementation {
-                MacroDefinitionImplementation::UserDefined(user_defined) => {
-                    stderr.write_all(&user_defined.definition)?;
-                }
-                _ => {
-                    stderr.write_all(b"<")?;
-                    stderr.write_all(&n.0)?;
-                    stderr.write_all(b">")?;
-                }
-            }
-            Result::Ok(())
-        };
+        // Collect first, then print sorted by name -- with no arguments every
+        // macro, otherwise the named ones -- as GNU m4 does; autom4te reads
+        // the list of built-ins out of a bare `dumpdef`.
+        let mut found: Vec<(&MacroName, &MacroDefinition)> = Vec::new();
         if frame.args.is_empty() {
             for (name, definitions) in state.macro_definitions.iter() {
-                dumpdef(
-                    stderr,
+                let definition = definitions
+                    .last()
+                    .expect(AT_LEAST_ONE_MACRO_DEFINITION_EXPECT);
+                found.push((name, definition));
+            }
+        }
+        for arg in &frame.args {
+            match state
+                .macro_definitions
+                .get_key_value(&MacroName(arg.clone()))
+            {
+                Some((name, definitions)) => found.push((
                     name,
                     definitions
                         .last()
                         .expect(AT_LEAST_ONE_MACRO_DEFINITION_EXPECT),
-                )?;
-                stderr.write_all(b"\n")?;
+                )),
+                None => {
+                    let msg = gettext("undefined macro `{}'").replacen(
+                        "{}",
+                        &String::from_utf8_lossy(arg),
+                        1,
+                    );
+                    state.emit_message(stderr, format_args!("{msg}"))?;
+                }
             }
         }
+        found.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
 
-        for arg in frame.args.into_iter() {
-            let name = match MacroName::try_from_slice(&arg) {
-                Ok(name) => name,
-                Err(_) => {
-                    state.emit_warning(
-                        stderr,
-                        format_args!("{}", gettext("invalid macro name in builtin `dumpdef'")),
-                    )?;
-                    continue;
+        for (name, definition) in found {
+            stderr.write_all(&name.0)?;
+            stderr.write_all(b":\t")?;
+            match &definition.implementation {
+                MacroDefinitionImplementation::UserDefined(user_defined) => {
+                    stderr.write_all(&user_defined.definition)?;
                 }
-            };
-            match state.macro_definitions.get(&name) {
-                Some(definition) => {
-                    dumpdef(
-                        stderr,
-                        &name,
-                        definition
-                            .last()
-                            .expect(AT_LEAST_ONE_MACRO_DEFINITION_EXPECT),
-                    )?;
-                    stderr.write_all(b"\n")?;
-                }
-                None => {
-                    let msg = gettext("undefined macro `{}'").replacen("{}", &name.to_string(), 1);
-                    state.emit_warning(stderr, format_args!("{msg}"))?;
+                implementation => {
+                    let builtin = implementation
+                        .builtin()
+                        .expect("a definition that is not user-defined is a built-in");
+                    stderr.write_all(b"<")?;
+                    stderr.write_all(builtin.as_ref())?;
+                    stderr.write_all(b">")?;
                 }
             }
+            stderr.write_all(b"\n")?;
         }
 
         Ok(state)

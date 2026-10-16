@@ -61,6 +61,8 @@ tre_fill_pmatch(size_t nmatch, regmatch_t pmatch[], int cflags,
 
 #define IS_WORD_CHAR(c)	 ((c) == L'_' || tre_isalnum(c))
 
+/* plib: under REG_STARTEND (see regexec()) the text does not begin at pos 0,
+   so `\b` and `\B` there look at prev_c, the character before it */
 #define CHECK_ASSERTIONS(assertions)					      \
   (((assertions & ASSERT_AT_BOL)					      \
     && (pos > 0 || reg_notbol)						      \
@@ -73,10 +75,10 @@ tre_fill_pmatch(size_t nmatch, regmatch_t pmatch[], int cflags,
    || ((assertions & ASSERT_AT_EOW)					      \
        && (!IS_WORD_CHAR(prev_c) || IS_WORD_CHAR(next_c)))		      \
    || ((assertions & ASSERT_AT_WB)					      \
-       && (pos != 0 && next_c != L'\0'					      \
+       && ((pos != 0 || reg_startend) && next_c != L'\0'		      \
 	   && IS_WORD_CHAR(prev_c) == IS_WORD_CHAR(next_c)))		      \
    || ((assertions & ASSERT_AT_WB_NEG)					      \
-       && (pos == 0 || next_c == L'\0'					      \
+       && ((pos == 0 && !reg_startend) || next_c == L'\0'		      \
 	   || IS_WORD_CHAR(prev_c) != IS_WORD_CHAR(next_c))))
 
 #define CHECK_CHAR_CLASSES(trans_i, tnfa, eflags)                             \
@@ -169,10 +171,12 @@ typedef struct {
 static reg_errcode_t
 tre_tnfa_run_parallel(const tre_tnfa_t *tnfa, const void *string,
 		      regoff_t *match_tags, int eflags,
-		      regoff_t *match_end_ofs)
+		      regoff_t *match_end_ofs, tre_char_t before)
 {
   /* State variables required by GET_NEXT_WCHAR. */
-  tre_char_t prev_c = 0, next_c = 0;
+  /* plib: next_c starts as the character before the text, `before`, which
+     the first GET_NEXT_WCHAR() makes prev_c */
+  tre_char_t prev_c = 0, next_c = before;
   const char *str_byte = string;
   regoff_t pos = -1;
   regoff_t pos_add_next = 1;
@@ -182,6 +186,7 @@ tre_tnfa_run_parallel(const tre_tnfa_t *tnfa, const void *string,
   int reg_notbol = eflags & REG_NOTBOL;
   int reg_noteol = eflags & REG_NOTEOL;
   int reg_newline = tnfa->cflags & REG_NEWLINE;
+  int reg_startend = eflags & REG_STARTEND; /* plib */
   reg_errcode_t ret;
 
   char *buf;
@@ -595,10 +600,13 @@ typedef struct tre_backtrack_struct {
 
 static reg_errcode_t
 tre_tnfa_run_backtrack(const tre_tnfa_t *tnfa, const void *string,
-		       regoff_t *match_tags, int eflags, regoff_t *match_end_ofs)
+		       regoff_t *match_tags, int eflags, regoff_t *match_end_ofs,
+		       tre_char_t before)
 {
   /* State variables required by GET_NEXT_WCHAR. */
-  tre_char_t prev_c = 0, next_c = 0;
+  /* plib: next_c starts as the character before the text, `before`, which
+     the first GET_NEXT_WCHAR() makes prev_c */
+  tre_char_t prev_c = 0, next_c = before;
   const char *str_byte = string;
   regoff_t pos = 0;
   regoff_t pos_add_next = 1;
@@ -608,6 +616,7 @@ tre_tnfa_run_backtrack(const tre_tnfa_t *tnfa, const void *string,
   int reg_notbol = eflags & REG_NOTBOL;
   int reg_noteol = eflags & REG_NOTEOL;
   int reg_newline = tnfa->cflags & REG_NEWLINE;
+  int reg_startend = eflags & REG_STARTEND; /* plib */
 
   /* These are used to remember the necessary values of the above
      variables to return to the position where the current search
@@ -1002,6 +1011,24 @@ tre_fill_pmatch(size_t nmatch, regmatch_t pmatch[], int cflags,
   Wrapper functions for POSIX compatible regexp matching.
 */
 
+/* plib: the character that ends just before string[so], or 0 when the
+   bytes there do not end one */
+static tre_char_t
+tre_char_before(const char *string, regoff_t so)
+{
+  wchar_t wc;
+  int len;
+  for (len = 1; len <= MB_LEN_MAX && len <= so; len++)
+    if (mbtowc(&wc, string + so - len, len) == len)
+      return wc;
+  return 0;
+}
+
+/* plib: REG_STARTEND, as glibc's: the search starts at pmatch[0].rm_so, a
+   match found there or later is reported with offsets into `string`, and
+   the text before rm_so is context, so `^` does not match at rm_so > 0 and
+   a word boundary there looks at the character before it. The matchers read
+   up to the NUL, so pmatch[0].rm_eo must be the length of `string`. */
 /* plib: `regmatch_t *restrict pmatch` for `regmatch_t pmatch[restrict]`, the
    same type; MSVC does not document support for a qualifier inside a
    parameter's [] */
@@ -1012,6 +1039,24 @@ regexec(const regex_t *restrict preg, const char *restrict string,
   tre_tnfa_t *tnfa = (void *)preg->TRE_REGEX_T_FIELD;
   reg_errcode_t status;
   regoff_t *tags = NULL, eo;
+  regoff_t so = 0;
+  tre_char_t before = 0;
+  size_t i;
+  if (eflags & REG_STARTEND)
+    {
+      so = pmatch[0].rm_so;
+      if (so < 0 || pmatch[0].rm_eo < so
+	  || strlen(string + so) != (size_t)(pmatch[0].rm_eo - so))
+	return REG_NOMATCH;
+      if (so > 0)
+	{
+	  before = tre_char_before(string, so);
+	  eflags |= REG_NOTBOL;
+	}
+      else
+	eflags &= ~REG_STARTEND;
+      string += so;
+    }
   if (tnfa->cflags & REG_NOSUB) nmatch = 0;
   if (tnfa->num_tags > 0 && nmatch > 0)
     {
@@ -1024,17 +1069,25 @@ regexec(const regex_t *restrict preg, const char *restrict string,
   if (tnfa->have_backrefs)
     {
       /* The regex has back references, use the backtracking matcher. */
-      status = tre_tnfa_run_backtrack(tnfa, string, tags, eflags, &eo);
+      status = tre_tnfa_run_backtrack(tnfa, string, tags, eflags, &eo, before);
     }
   else
     {
       /* Exact matching, no back references, use the parallel matcher. */
-      status = tre_tnfa_run_parallel(tnfa, string, tags, eflags, &eo);
+      status = tre_tnfa_run_parallel(tnfa, string, tags, eflags, &eo, before);
     }
 
   if (status == REG_OK)
     /* A match was found, so fill the submatch registers. */
-    tre_fill_pmatch(nmatch, pmatch, tnfa->cflags, tnfa, tags, eo);
+    {
+      tre_fill_pmatch(nmatch, pmatch, tnfa->cflags, tnfa, tags, eo);
+      for (i = 0; i < nmatch; i++)
+	if (pmatch[i].rm_so >= 0)
+	  {
+	    pmatch[i].rm_so += so;
+	    pmatch[i].rm_eo += so;
+	  }
+    }
   if (tags)
     xfree(tags);
   return status;

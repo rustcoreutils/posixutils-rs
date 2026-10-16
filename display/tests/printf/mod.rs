@@ -976,3 +976,73 @@ fn test_audit_integer_operand_forms_unchanged() {
     printf_test(&["%d", ""], "0");
     printf_status_test(&["%d", "08"], "0", 1);
 }
+
+#[test]
+fn test_g_style_follows_the_rounded_exponent() {
+    // C17 7.21.6.1: %g picks its style from the exponent X of the value
+    // rounded to P significant digits, not from the unrounded value.
+    // Expected outputs are glibc printf(3)'s.
+    printf_test(&["%g", "999999.5"], "1e+06");
+    printf_test(&["%G", "999999.5"], "1E+06");
+    printf_test(&["%g", "999999.4"], "999999");
+    printf_test(&["%g", "0.000099999999"], "0.0001");
+    printf_test(&["%.3g", "0.000099999999"], "0.0001");
+    printf_test(&["%.0g", "0.000099999999"], "0.0001");
+    printf_test(&["%.0g", "9.5"], "1e+01");
+    printf_test(&["%.3g", "99.95"], "100");
+    printf_test(&["%.3g", "999.5"], "1e+03");
+}
+
+#[test]
+fn test_hex_float_zero_precision_rounds_the_leading_digit() {
+    // With no fraction digits kept, a tie rounds the leading digit to even,
+    // as glibc printf(3) does: 1.5 is 0x1.8p+0.
+    printf_test(&["%.0a", "1.5"], "0x2p+0");
+    printf_test(&["%.0a", "2.5"], "0x1p+1"); // 0x1.4p+1: below the tie
+    printf_test(&["%.0a", "3"], "0x2p+1"); // 0x1.8p+1
+    printf_test(&["%.0a", "1"], "0x1p+0");
+    printf_test(&["%.1a", "1.03125"], "0x1.0p+0"); // 0x1.08p+0, to even
+    printf_test(&["%.1a", "1.09375"], "0x1.2p+0"); // 0x1.18p+0, to even
+}
+
+#[test]
+fn test_alt_form_always_has_a_radix_character() {
+    // C17 7.21.6.1: under '#', a floating conversion always has a
+    // decimal-point character, and %g keeps its trailing zeros.  Expected
+    // outputs are glibc printf(3)'s.
+    printf_test(&["%#g", "100000"], "100000.");
+    printf_test(&["%#g", "0.000099999999"], "0.000100000");
+    printf_test(&["%#.3g", "99.95"], "100.");
+    printf_test(&["%#.0g", "2.5"], "2.");
+    printf_test(&["%#.0g", "100000"], "1.e+05");
+    printf_test(&["%#.0g", "0"], "0.");
+    // glibc writes "1.e+06" here, dropping the zeros '#' keeps; C17 asks
+    // for P - 1 = 5 fraction digits in the e style.
+    printf_test(&["%#g", "999999.5"], "1.00000e+06");
+    printf_test(&["%#.0f", "1.5"], "2.");
+    printf_test(&["%#.0e", "1.5"], "2.e+00");
+    printf_test(&["%#.0a", "1"], "0x1.p+0");
+    printf_test(&["%#.0a", "0"], "0x0.p+0");
+    printf_test(&["%#.0f", "inf"], "inf");
+    printf_test(&["%#5.0f", "3"], "   3.");
+}
+
+#[test]
+fn test_format_ending_inside_a_conversion() {
+    // A format that ends after '%' and before a conversion specifier is
+    // diagnosed: the text before it is written and the status is 1, as GNU
+    // printf does.
+    for format in ["abc%", "abc%-5", "abc%.", "abc%5.2", "abc%#", "abc%1$"] {
+        printf_status_test(&[format], "abc", 1);
+        printf_status_test(&[format, "x", "y"], "abc", 1);
+    }
+    let output = Command::new(get_binary_path("printf"))
+        .arg("abc%-5")
+        .output()
+        .expect("failed to run printf");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "printf: missing conversion specifier: %-5\n"
+    );
+    printf_status_test(&["abc%%"], "abc%", 0);
+}

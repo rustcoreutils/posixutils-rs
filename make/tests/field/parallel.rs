@@ -236,3 +236,108 @@ fn messages_for_goals_made_in_parallel() {
         "make: 'a' is up to date.\nmake: 'b' is up to date.\nmake: Nothing to be done for 'c'.\n",
     );
 }
+
+// A goal another goal's walk remade first is not "up to date": its command
+// lines count to it, as they would have made one after another, and as GNU
+// make counts them under -j. `make -j4 a b` with `b: a` said
+// `make: 'a' is up to date.` after `built a`, or not, by which thread
+// reached `a` first. Each order is made several times to catch either
+// winner.
+#[test]
+fn a_goal_another_goal_remade_is_not_up_to_date() {
+    let dir = Dir::new("parallel_goal_remade_by_another");
+    dir.write("Makefile", "a b:\n\t@echo built $@\nb: a\nall: a\n");
+    for _ in 0..5 {
+        dir.make(&["-j4", "a", "b"]).ok("built a\nbuilt b\n");
+        dir.make(&["-j4", "b", "a"])
+            .ok("built a\nbuilt b\nmake: 'a' is up to date.\n");
+        dir.make(&["-j4", "a", "all"])
+            .ok("built a\nmake: Nothing to be done for 'all'.\n");
+        dir.make(&["-j4", "all", "a"])
+            .ok("built a\nmake: 'a' is up to date.\n");
+    }
+}
+
+/// Whether `fd`'s open file description is non-blocking.
+fn is_nonblocking(fd: std::os::fd::RawFd) -> bool {
+    // SAFETY: fcntl(2) F_GETFL on a descriptor this test owns.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    assert!(flags >= 0, "F_GETFL: {}", std::io::Error::last_os_error());
+    flags & libc::O_NONBLOCK != 0
+}
+
+// A sub-make shares its parent's pool through descriptors whose open file
+// descriptions the parent and every other sub-make share too, so it must
+// not change their file status flags: it set O_NONBLOCK on both, and a
+// GNU make parent then found its write end, which it writes blocking,
+// non-blocking. The read end is GNU make's own convention to make
+// non-blocking, so only where a private one can be opened (Linux) is it
+// kept as it was. The pipe here stands for the parent's, given to make at
+// descriptors 200 and 201 as `$(MAKE)` gives it.
+#[test]
+fn a_sub_make_leaves_the_parents_pool_flags_alone() {
+    use std::os::unix::process::CommandExt;
+
+    let dir = Dir::new("parallel_pool_flags");
+    dir.write("Makefile", "all:\n\t@echo made\n");
+    let mut fds = [0; 2];
+    // SAFETY: pipe(2) writes two descriptors into `fds`; FD_CLOEXEC keeps
+    // them from the children of other tests.
+    unsafe {
+        assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+        for fd in fds {
+            assert_eq!(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC), 0);
+        }
+    }
+    let [read, write] = fds;
+    let mut command = Command::new(get_binary_path("make"));
+    command
+        .current_dir(dir.path(""))
+        .env_remove("MAKELEVEL")
+        .env("MAKEFLAGS", " -j2 --jobserver-auth=200,201");
+    // SAFETY: dup2(2) is async-signal-safe; the copies it makes are not
+    // close-on-exec.
+    unsafe {
+        command.pre_exec(move || {
+            for (from, to) in [(read, 200), (write, 201)] {
+                if libc::dup2(from, to) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    let output = command.output().expect("run make");
+    assert_eq!(
+        (
+            String::from_utf8_lossy(&output.stdout).as_ref(),
+            String::from_utf8_lossy(&output.stderr).as_ref(),
+            output.status.code()
+        ),
+        ("made\n", "", Some(0))
+    );
+    let flags = (is_nonblocking(read), is_nonblocking(write));
+    // SAFETY: closing the descriptors this test opened.
+    unsafe {
+        libc::close(read);
+        libc::close(write);
+    }
+    if cfg!(target_os = "linux") {
+        assert_eq!(flags, (false, false), "(read, write) O_NONBLOCK");
+    } else {
+        assert!(!flags.1, "the write end was made non-blocking");
+    }
+}
+
+// A -j larger than a pipe holds (64 KiB on Linux, 16 KiB on macOS) used to
+// fill the pool's pipe forever: the last token write never finished, so make
+// never started. GNU make 4.3 hangs the same way.
+#[test]
+fn a_job_count_larger_than_the_pipe_holds() {
+    let dir = Dir::new("parallel_huge_j");
+    dir.write("Makefile", &wide_makefile(4, "0"));
+    std::fs::create_dir(dir.path("running")).unwrap();
+    let (code, _) = make_within(&dir, &["-j1000000"], Duration::from_secs(60));
+    assert_eq!(code, Some(0));
+    assert_eq!(concurrency(&dir, 4).1, 4, "every target is made");
+}

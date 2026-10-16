@@ -93,6 +93,9 @@ enum Token {
     IgnoreRestOfFormat,
     /// a literal string
     Literal(Vec<u8>),
+    /// a conversion the format ends inside of, before its specifier: the
+    /// text from its '%'
+    Unfinished(String),
 }
 
 enum ParseState {
@@ -277,6 +280,8 @@ fn tokenize_format_str(format: &[u8]) -> Result<Vec<Token>, Box<dyn Error>> {
     let mut width = String::with_capacity(8_usize);
 
     let mut peekable = format.iter().peekable();
+    // Where the conversion being parsed starts in `format`.
+    let mut conv_start = 0;
 
     while let Some(&current_byte) = peekable.next() {
         let mut done_with_char = false;
@@ -291,6 +296,7 @@ fn tokenize_format_str(format: &[u8]) -> Result<Vec<Token>, Box<dyn Error>> {
                             literal.clear();
                         }
 
+                        conv_start = format.len() - peekable.len() - 1;
                         conv_spec.arg_number = parse_arg_number(&mut peekable);
                         state = ParseState::Flags;
                     } else if current_byte == b'\\' {
@@ -405,6 +411,11 @@ fn tokenize_format_str(format: &[u8]) -> Result<Vec<Token>, Box<dyn Error>> {
         literal.shrink_to_fit();
 
         tokens.push(Token::Literal(literal));
+    }
+
+    if !matches!(state, ParseState::Literal) {
+        let text = String::from_utf8_lossy(&format[conv_start..]).into_owned();
+        tokens.push(Token::Unfinished(text));
     }
 
     Ok(tokens)
@@ -742,34 +753,27 @@ fn format_general(value: f64, precision: usize, upper: bool, alt_form: bool) -> 
         };
     }
 
-    // %g uses precision as "significant figures", minimum 1
-    let sig_figs = precision.max(1);
+    // C17 7.21.6.1: P is the precision, or 1 if it is zero, and X the
+    // exponent the e style would have: that of the value rounded to P
+    // significant digits.  999999.5 rounds to 1.00000e+06, so X is 6, not
+    // the 5 of the unrounded value.
+    let p = precision.max(1);
+    let e_style = format_scientific(value, p - 1, upper);
+    let x = e_style
+        .rsplit(['e', 'E'])
+        .next()
+        .and_then(|exp| exp.parse::<i64>().ok())
+        .unwrap_or(0);
 
-    // Get the exponent
-    let exp = if value == 0.0 {
-        0
+    // If P > X >= -4, the f style with precision P - 1 - X; else the e
+    // style with precision P - 1.
+    let result = if (-4..p as i64).contains(&x) {
+        format!("{:.prec$}", value, prec = (p as i64 - 1 - x) as usize)
     } else {
-        value.abs().log10().floor() as i32
+        e_style
     };
 
-    // Use %e if exponent < -4 or >= precision, else %f style
-    let result = if exp < -4 || exp >= sig_figs as i32 {
-        // Use scientific notation with sig_figs - 1 decimal places
-        let e_prec = sig_figs.saturating_sub(1);
-        format_scientific(value, e_prec, upper)
-    } else {
-        // Use fixed notation
-        // Number of decimal places = sig_figs - 1 - exp (for positive exp)
-        // or sig_figs - 1 + |exp| (for negative exp)
-        let decimal_places = if exp >= 0 {
-            sig_figs.saturating_sub(1).saturating_sub(exp as usize)
-        } else {
-            sig_figs.saturating_sub(1) + (-exp) as usize
-        };
-        format!("{:.prec$}", value, prec = decimal_places)
-    };
-
-    // Remove trailing zeros (unless # flag)
+    // Unless '#', trailing zeros are removed from the fraction.
     if !alt_form {
         remove_trailing_zeros(&result)
     } else {
@@ -830,10 +834,13 @@ fn format_hex_float(value: f64, precision: Option<usize>, upper: bool) -> String
     // An explicit precision shorter than the mantissa rounds (half-to-even),
     // rather than truncating, so the printed value is the nearest one
     // representable in the requested number of hexadecimal digits.
+    // The digit before the point takes part: with no fraction digits kept,
+    // it is the last digit kept, and decides a tie (0x1.8p+0 is 0x2p+0).
     if let Some(prec) = precision.filter(|&p| p < HEX_MANTISSA_DIGITS) {
         let shift = 4 * (HEX_MANTISSA_DIGITS - prec) as u32;
-        let kept = mantissa >> shift;
-        let rest = mantissa & ((1_u64 << shift) - 1);
+        let digits = (leading_digit << (4 * HEX_MANTISSA_DIGITS)) | mantissa;
+        let kept = digits >> shift;
+        let rest = digits & ((1_u64 << shift) - 1);
         let half = 1_u64 << (shift - 1);
 
         let rounded = if rest > half || (rest == half && kept & 1 == 1) {
@@ -842,13 +849,10 @@ fn format_hex_float(value: f64, precision: Option<usize>, upper: bool) -> String
             kept
         };
 
-        if rounded >> (4 * prec as u32) != 0 {
-            // Carry out of the fraction bumps the digit before the point.
-            leading_digit += 1;
-            mantissa = 0;
-        } else {
-            mantissa = rounded << shift;
-        }
+        // A carry out of the fraction bumps the digit before the point.
+        let fraction_bits = 4 * prec as u32;
+        leading_digit = rounded >> fraction_bits;
+        mantissa = (rounded & ((1_u64 << fraction_bits) - 1)) << shift;
     }
 
     // XBD 3600-3601: "The letters "abcdef" shall be used for a conversion and
@@ -938,6 +942,14 @@ fn float_body(conv: &ConvSpec, abs_value: f64) -> Body {
         excess = 0;
     }
 
+    // C17 7.21.6.1: under '#' the result always has a decimal-point
+    // character, even with no digits after it.
+    let formatted = if conv.alt_form && abs_value.is_finite() {
+        force_radix_point(formatted, conv.spec)
+    } else {
+        formatted
+    };
+
     // POSIX 111924-111926 / XBD 3623-3624: LC_NUMERIC determines the radix
     // character.  Rust's formatting always produces a <period>.
     let formatted = apply_radix_char(formatted).into_bytes();
@@ -958,6 +970,20 @@ fn float_body(conv: &ConvSpec, abs_value: f64) -> Body {
         zeros: excess,
         tail,
     }
+}
+
+/// Give `formatted`, a finite value under conversion `spec`, a <period>
+/// before its exponent (or at its end) if it has none.
+fn force_radix_point(mut formatted: String, spec: char) -> String {
+    if formatted.contains('.') {
+        return formatted;
+    }
+    let exponent_at = match spec {
+        'a' | 'A' => formatted.find(['p', 'P']),
+        _ => formatted.find(['e', 'E']),
+    };
+    formatted.insert(exponent_at.unwrap_or(formatted.len()), '.');
+    formatted
 }
 
 /// Format a floating point number with all POSIX flags applied
@@ -1545,6 +1571,18 @@ pub fn printf(
                     stop_output = true;
                     break;
                 }
+                // The format ends inside a conversion.  As in GNU printf
+                // (and dash and bash), it is diagnosed, nothing more is
+                // written, and the status is non-zero.
+                Token::Unfinished(text) => {
+                    diag(&format!(
+                        "{}: {text}",
+                        gettext("missing conversion specifier")
+                    ));
+                    had_error = true;
+                    stop_output = true;
+                    break;
+                }
                 Token::Literal(vec) => {
                     output.write_all(vec.as_slice())?;
                 }
@@ -1601,6 +1639,30 @@ mod tests {
         assert_eq!(out, "a-b\nc-\n");
         assert!(diags.is_empty());
         assert_eq!(result, Ok(false));
+    }
+
+    /// A format that ends inside a conversion writes what came before it,
+    /// is diagnosed, and is not reused for the operands left.
+    #[test]
+    fn format_ending_inside_a_conversion_is_diagnosed() {
+        for (format, unfinished) in [
+            ("a%", "%"),
+            ("a%-5", "%-5"),
+            ("a%.2", "%.2"),
+            ("a%1$#", "%1$#"),
+        ] {
+            let (out, diags, result) = run(format, &["x", "y"]);
+            assert_eq!(out, "a", "{format}");
+            assert_eq!(
+                diags,
+                [format!("missing conversion specifier: {unfinished}")]
+            );
+            assert_eq!(result, Ok(true), "{format}");
+        }
+        let (out, diags, result) = run("%s|%", &["x", "y"]);
+        assert_eq!(out, "x|");
+        assert_eq!(diags, ["missing conversion specifier: %"]);
+        assert_eq!(result, Ok(true));
     }
 
     #[test]

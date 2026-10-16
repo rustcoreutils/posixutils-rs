@@ -104,9 +104,9 @@ fn is_word_at(line: &[u8], start: usize, end: usize) -> bool {
 /// stands as a word, as its start and end. As GNU grep does, a match that does not is tried
 /// again shorter from the same start, and then the search goes on from the next character.
 fn regex_find_word(re: &Regex, line: &[u8], mut from: usize) -> Option<(usize, usize)> {
-    while let Some(m) = re.find_bytes_in_line(&line[from..], from > 0, false) {
-        let start = from + m.start;
-        let mut end = from + m.end;
+    while let Some(m) = re.find_bytes_at(line, from, false) {
+        let start = m.start;
+        let mut end = m.end;
         loop {
             if is_word_at(line, start, end) {
                 return Some((start, end));
@@ -116,9 +116,10 @@ fn regex_find_word(re: &Regex, line: &[u8], mut from: usize) -> Option<(usize, u
             }
             // The longest match from `start` shorter than this one, if any match starts there:
             // the leftmost-longest match in the shortened text.
-            let shorter = &line[start..end - 1];
-            match re.find_bytes_in_line(shorter, start > 0, end - 1 < line.len()) {
-                Some(m) if m.start == 0 && m.end > 0 => end = start + m.end,
+            // The line up to the shorter end, searched from `start`, the text before it context.
+            let shorter = &line[..end - 1];
+            match re.find_bytes_at(shorter, start, end - 1 < line.len()) {
+                Some(m) if m.start == start && m.end > start => end = m.end,
                 _ => break,
             }
         }
@@ -155,8 +156,8 @@ fn regex_find(re: &Regex, line: &[u8], whole: Whole, from: usize) -> Option<(usi
     match whole {
         Whole::Word => regex_find_word(re, line, from),
         Whole::Any | Whole::Line => re
-            .find_bytes_in_line(&line[from..], from > 0, false)
-            .map(|m| (from + m.start, from + m.end)),
+            .find_bytes_at(line, from, false)
+            .map(|m| (m.start, m.end)),
     }
 }
 

@@ -120,20 +120,16 @@ struct Segment<'a> {
     stop: AtomicBool,
     updated: AtomicBool,
     errors: std::sync::Mutex<Vec<ErrorCode>>,
-    /// For goals named on the command line, the count of command lines
-    /// shown or run for each, by position.
-    goals: Option<&'a [std::sync::Arc<AtomicUsize>]>,
 }
 
 impl<'a> Segment<'a> {
-    fn new(names: &'a [&'a str], goals: Option<&'a [std::sync::Arc<AtomicUsize>]>) -> Self {
+    fn new(names: &'a [&'a str]) -> Self {
         Segment {
             names,
             next: AtomicUsize::new(0),
             stop: AtomicBool::new(false),
             updated: AtomicBool::new(false),
             errors: std::sync::Mutex::new(Vec::new()),
-            goals,
         }
     }
 }
@@ -159,6 +155,9 @@ pub struct Make {
     /// Targets whose commands ran in this run: known by the name they are
     /// written under from then on, never by one `VPATH` found.
     remade: std::sync::Mutex<fast_hash::Set<String>>,
+    /// How many command lines were shown or run for each target's own
+    /// commands, for those with any.
+    target_commands: std::sync::Mutex<HashMap<String, usize>>,
     /// `stat` results since the last command ran.
     stats: stat_cache::StatCache,
     /// Targets already known to reach no dependency cycle.
@@ -644,7 +643,16 @@ impl Make {
             graph::Claim::Done(outcome) => return outcome.into_result(),
             graph::Claim::Build => {}
         }
+        let outer = rule::take_target_commands();
         let result = self.build_target_uncached(name, inherited);
+        let own = rule::take_target_commands();
+        rule::restore_target_commands(outer);
+        if own > 0 {
+            self.target_commands
+                .lock()
+                .unwrap()
+                .insert(name.to_string(), own);
+        }
         self.ledger.finish(name, &result);
         result
     }
@@ -656,13 +664,11 @@ impl Make {
         name: &str,
         inherited: &[TargetVar],
     ) -> Result<bool, ErrorCode> {
-        let goal = rule::goal_commands();
         std::thread::scope(|scope| {
             let walk = std::thread::Builder::new()
                 .stack_size(BUILD_STACK_SIZE)
                 .spawn_scoped(scope, || {
                     WalkLevel::on_build_stack();
-                    rule::set_goal_commands(goal);
                     self.build_target_in(name, inherited)
                 })
                 .expect("cannot start a thread to continue a deep build");
@@ -1177,7 +1183,7 @@ impl Make {
             };
         }
 
-        let segment = Segment::new(names, None);
+        let segment = Segment::new(names);
         std::thread::scope(|threads| self.work_on(&segment, scope, threads));
 
         // Report the first error (if any).
@@ -1210,11 +1216,43 @@ impl Make {
         if !self.parallel() || goals.len() <= 1 {
             return None;
         }
-        let counts: Vec<std::sync::Arc<AtomicUsize>> =
-            goals.iter().map(|_| Default::default()).collect();
-        let segment = Segment::new(goals, Some(&counts));
+        let segment = Segment::new(goals);
         std::thread::scope(|threads| self.work_on(&segment, &[], threads));
-        Some(counts.iter().map(|count| count.load(Relaxed)).collect())
+        Some(self.commands_per_goal(goals))
+    }
+
+    /// The command lines shown or run for each goal, counted as a serial run
+    /// counts them: each target's go to the first goal, in command-line
+    /// order, whose walk reaches it, whichever thread made it. GNU make
+    /// counts them so under `-j` too. Counted by the thread that made each
+    /// target, `make -j4 a b` with `b: a` called `a` up to date, after
+    /// making it, whenever `b`'s thread reached `a` first.
+    fn commands_per_goal(&self, goals: &[&str]) -> Vec<usize> {
+        let commands = self.target_commands.lock().unwrap();
+        if commands.is_empty() {
+            return vec![0; goals.len()];
+        }
+        let mut reached = fast_hash::Set::default();
+        goals
+            .iter()
+            .map(|goal| {
+                let mut count = 0;
+                let mut stack = vec![rule::prerequisite::dot_slash_stripped(goal).to_string()];
+                while let Some(name) = stack.pop() {
+                    if reached.contains(&name) {
+                        continue;
+                    }
+                    count += commands.get(&name).copied().unwrap_or(0);
+                    stack.extend(
+                        graph::Edges::prerequisites_of(self, &name)
+                            .iter()
+                            .map(|p| rule::prerequisite::dot_slash_stripped(p).to_string()),
+                    );
+                    reached.insert(name);
+                }
+                count
+            })
+            .collect()
     }
 
     /// Make prerequisites of `segment` until none is left, first starting a
@@ -1265,12 +1303,10 @@ impl Make {
                 self.pool.release();
                 return;
             }
-            let goal = rule::goal_commands();
             let spawned = std::thread::Builder::new()
                 .stack_size(BUILD_STACK_SIZE)
                 .spawn_scoped(threads, move || {
                     WalkLevel::on_build_stack();
-                    rule::set_goal_commands(goal);
                     self.make_one(segment, next, scope);
                     self.work_on(segment, scope, threads);
                     self.pool.release();
@@ -1287,18 +1323,7 @@ impl Make {
     /// `-k` a failure stops the segment starting any more, as when it is made
     /// serially.
     fn make_one(&self, segment: &Segment<'_>, index: usize, scope: &[TargetVar]) {
-        let name = segment.names[index];
-        // A goal's command lines are counted as its own.
-        let outer = segment.goals.map(|goals| {
-            let outer = rule::goal_commands();
-            rule::set_goal_commands(Some(std::sync::Arc::clone(&goals[index])));
-            outer
-        });
-        let result = self.build_target_in(name, scope);
-        if let Some(outer) = outer {
-            rule::set_goal_commands(outer);
-        }
-        match result {
+        match self.build_target_in(segment.names[index], scope) {
             Ok(true) => segment.updated.store(true, Relaxed),
             Ok(false) => {}
             Err(err) => {
@@ -1700,6 +1725,7 @@ impl TryFrom<(Makefile, Config)> for Make {
             mentioned: Default::default(),
             frozen_mtimes: Default::default(),
             remade: Default::default(),
+            target_commands: Default::default(),
             stats: Default::default(),
             acyclic: Default::default(),
             default_rule: None,

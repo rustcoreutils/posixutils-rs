@@ -43,8 +43,12 @@ release commits. Commit the `Cargo.lock` change on its own.
 First check that nothing outside the member manifests pins the old version:
 
 ```sh
-grep -rn 'OLD\.VER\.SION' --include=Cargo.toml --include='*.md' --include='*.rs' . | grep -v '^./target'
+grep -rn 'OLD\.VER\.SION' --include=Cargo.toml --include='*.md' --include='*.rs' \
+    --include=Dockerfile --include='*.yml' . | grep -v '^./target'
 ```
+
+`Dockerfile` (`ARG VERSION`) and `docker-compose.yml` (`VERSION:`) carry the
+version for local image builds; bump both by hand.
 
 The `[package] version` is the first `version =` in each member manifest, so:
 

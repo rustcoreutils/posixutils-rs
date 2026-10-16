@@ -140,6 +140,19 @@ fn printf_conversions() {
     sh_c("printf '%b|' 'c\\cd' e; echo", "c\n");
 }
 
+// A format that ends inside a conversion is diagnosed and the status is 1,
+// as in the standalone utility (dash and bash also fail).
+#[test]
+fn printf_format_ending_inside_a_conversion() {
+    sh_c_full(
+        "printf 'abc%-5' x",
+        "abc",
+        "printf: missing conversion specifier: %-5\n",
+        1,
+    );
+    sh_c("printf 'abc%' 2>/dev/null; echo \" st=$?\"", "abc st=1\n");
+}
+
 // The diagnostic text is the standalone utility's; dash and bash agree that
 // the value is still printed and the status is 1.
 #[test]

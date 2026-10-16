@@ -4,8 +4,9 @@
  * Changes from musl's header: <features.h> and <bits/alltypes.h> are
  * replaced by plib_musl.h, and regoff_t, which musl defines as its
  * pointer-sized `_Addr`, is ptrdiff_t (so 64 bits on 64-bit Windows, where
- * `long` is 32). The exported names are renamed by plib_musl.h. The layouts
- * and constants here are mirrored by plib/src/regex.rs.
+ * `long` is 32). REG_STARTEND is added. The exported names are renamed by
+ * plib_musl.h. The layouts and constants here are mirrored by
+ * plib/src/regex.rs.
  */
 #ifndef _REGEX_H
 #define _REGEX_H
@@ -37,6 +38,8 @@ typedef struct {
 
 #define REG_NOTBOL      1
 #define REG_NOTEOL      2
+/* plib: REG_STARTEND, which musl does not have; see regexec() */
+#define REG_STARTEND    4
 
 #define REG_OK          0
 #define REG_NOMATCH     1

@@ -52,25 +52,24 @@ pub struct InterruptInfo {
 /// counted as remade without commands.
 pub static COMMANDS_SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// A count of the command lines shown or run for one goal, when goals are
-/// made in parallel and `COMMANDS_SEEN` cannot tell them apart.
-pub type GoalCommands = Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>;
-
 std::thread_local! {
-    /// The count of the goal this thread is working for. A thread started
-    /// to work below it carries the count on.
-    static GOAL_COMMANDS: std::cell::RefCell<GoalCommands> =
-        const { std::cell::RefCell::new(None) };
+    /// The command lines this thread has shown or run for the target it is
+    /// making now; see `take_target_commands`.
+    static TARGET_COMMANDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// The count of the goal this thread is working for.
-pub fn goal_commands() -> GoalCommands {
-    GOAL_COMMANDS.with(|goal| goal.borrow().clone())
+/// Take the count of command lines this thread has shown or run since the
+/// count was last taken, leaving it at zero. Making a target takes the count
+/// of the target it was called below first and gives it back after, so what
+/// is left is the target's own: its prerequisites are made in between and
+/// take theirs.
+pub fn take_target_commands() -> usize {
+    TARGET_COMMANDS.with(|count| count.replace(0))
 }
 
-/// Make `goal` the count this thread's command lines go to.
-pub fn set_goal_commands(goal: GoalCommands) {
-    GOAL_COMMANDS.with(|current| *current.borrow_mut() = goal);
+/// Put back a count taken by `take_target_commands`.
+pub fn restore_target_commands(count: usize) {
+    TARGET_COMMANDS.with(|current| current.set(count));
 }
 
 /// Every target whose recipe is running right now.
@@ -555,11 +554,7 @@ impl Rule {
             return Ok(());
         }
         COMMANDS_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        GOAL_COMMANDS.with(|goal| {
-            if let Some(goal) = goal.borrow().as_ref() {
-                goal.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        });
+        TARGET_COMMANDS.with(|count| count.set(count.get() + 1));
 
         if !always_run {
             // -n flag

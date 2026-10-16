@@ -30,8 +30,14 @@ const TOKEN: u8 = b'+';
 pub enum Pool {
     /// Tokens no other process takes part in.
     Local(Mutex<usize>),
-    /// Tokens in a pipe, shared with the sub-makes started for it.
-    Pipe { read: RawFd, write: RawFd },
+    /// Tokens in a pipe, shared with the sub-makes started for it: `read`
+    /// and `write` are the ends they are given, and `reader` the
+    /// non-blocking descriptor this make takes tokens through.
+    Pipe {
+        read: RawFd,
+        write: RawFd,
+        reader: RawFd,
+    },
 }
 
 /// The pool `main` set up for the run, if it set one up.
@@ -95,21 +101,27 @@ pub fn setup(jobs: Jobs<'_>) -> (usize, String) {
     if jobs <= 1 {
         return (1, String::new());
     }
-    let pool = match pool.or_else(|| create(jobs - 1)) {
-        Some(pool) => pool,
-        // No pipe to be had: the tokens stay in this make.
-        None => return (jobs, String::new()),
+    let (jobs, pool) = match pool {
+        Some(pool) => (jobs, pool),
+        None => match create(jobs - 1) {
+            // A pipe holds fewer tokens than were asked for: the jobs are as
+            // many as it holds, plus the one this make has without a token.
+            Some((pool, tokens)) => (tokens + 1, pool),
+            // No pipe to be had: the tokens stay in this make.
+            None => return (jobs, String::new()),
+        },
     };
     let flags = match &pool {
-        Pool::Pipe { read, write } => format!("-j{jobs} --jobserver-auth={read},{write}"),
+        Pool::Pipe { read, write, .. } => format!("-j{jobs} --jobserver-auth={read},{write}"),
         Pool::Local(_) => String::new(),
     };
     let _ = SHARED.set(Arc::new(pool));
     (jobs, flags)
 }
 
-/// A new pipe holding `tokens` tokens.
-fn create(tokens: usize) -> Option<Pool> {
+/// A new pipe holding `tokens` tokens, or as many as fit in it, and how many
+/// it holds.
+fn create(tokens: usize) -> Option<(Pool, usize)> {
     let mut fds = [0; 2];
     // SAFETY: `fds` has room for the two descriptors pipe(2) writes.
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -118,15 +130,85 @@ fn create(tokens: usize) -> Option<Pool> {
     let pool = Pool::Pipe {
         read: fds[0],
         write: fds[1],
+        reader: fds[0],
     };
-    if !own(fds[0]) || !own(fds[1]) {
+    if !own(fds[0]) || !own(fds[1]) || !set_nonblocking(fds[0]) {
         close(fds);
         return None;
     }
-    for _ in 0..tokens {
-        pool.release();
+    // A pipe holds a fixed number of bytes, 64 KiB on Linux, so a blocking
+    // write of more tokens than that would wait forever for a reader. No one
+    // else has the pipe yet: fill it through a non-blocking write end, stop
+    // where it is full, keep half of what it held, and leave the write end
+    // blocking again.
+    let filled = match fill(fds[1], tokens) {
+        Some(filled) if filled < tokens => drain_half(fds[0], filled),
+        filled => filled,
+    };
+    // SAFETY: fcntl(2) on a descriptor number, with integer arguments.
+    let restored = unsafe {
+        let flags = libc::fcntl(fds[1], libc::F_GETFL);
+        flags >= 0 && libc::fcntl(fds[1], libc::F_SETFL, flags & !libc::O_NONBLOCK) == 0
+    };
+    match filled {
+        Some(filled) if restored => Some((pool, filled)),
+        _ => {
+            close(fds);
+            None
+        }
     }
-    Some(pool)
+}
+
+/// Write up to `tokens` tokens to the new pipe's write end `fd` and return
+/// how many went in before the pipe was full.
+fn fill(fd: RawFd, tokens: usize) -> Option<usize> {
+    if !set_nonblocking(fd) {
+        return None;
+    }
+    let chunk = [TOKEN; 4096];
+    let mut filled = 0;
+    while filled < tokens {
+        let want = (tokens - filled).min(chunk.len());
+        // SAFETY: writing at most `chunk.len()` bytes from `chunk`.
+        let wrote = unsafe { libc::write(fd, chunk.as_ptr().cast(), want) };
+        if wrote > 0 {
+            filled += wrote as usize;
+            continue;
+        }
+        match std::io::Error::last_os_error().kind() {
+            std::io::ErrorKind::Interrupted => continue,
+            std::io::ErrorKind::WouldBlock => return Some(filled),
+            _ => return None,
+        }
+    }
+    Some(filled)
+}
+
+/// Take back half of the tokens of a pipe `fill` found full, through its
+/// non-blocking read end `fd`, and return how many are left.
+///
+/// A full pipe has no room to give a token back: Linux keeps a pipe's bytes
+/// in a ring of pages, and the page a token was read from is not free again
+/// until all of it has been read, so the first token returned after one was
+/// taken would wait forever.
+fn drain_half(fd: RawFd, filled: usize) -> Option<usize> {
+    let mut chunk = [0u8; 4096];
+    let mut left = filled;
+    while left > filled / 2 {
+        let want = (left - filled / 2).min(chunk.len());
+        // SAFETY: reading at most `chunk.len()` bytes into `chunk`.
+        let got = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), want) };
+        if got > 0 {
+            left -= got as usize;
+        } else if got < 0
+            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+        {
+            continue;
+        } else {
+            return None;
+        }
+    }
+    Some(left)
 }
 
 /// The descriptors of a pool named as `R,W`.
@@ -173,19 +255,60 @@ fn join([read, write]: [RawFd; 2]) -> Option<Pool> {
     if !own(read) || !own(write) {
         return None;
     }
-    Some(Pool::Pipe { read, write })
+    let reader = match private_reader(read) {
+        Some(reader) => reader,
+        None if set_nonblocking(read) => read,
+        None => return None,
+    };
+    Some(Pool::Pipe {
+        read,
+        write,
+        reader,
+    })
 }
 
 /// Make `fd` close when a command is run, so that only a sub-make is given
-/// it, and make reading it never wait.
+/// it. The flag is this process's own, unlike the file status flags.
 fn own(fd: RawFd) -> bool {
+    // SAFETY: fcntl(2) on a descriptor number, with an integer argument.
+    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) == 0 }
+}
+
+/// Make reading `fd` never wait. O_NONBLOCK is a flag of the open file
+/// description, which every process holding a copy of `fd` shares.
+fn set_nonblocking(fd: RawFd) -> bool {
     // SAFETY: fcntl(2) on a descriptor number, with integer arguments.
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
-        flags >= 0
-            && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == 0
-            && libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) == 0
+        flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == 0
     }
+}
+
+/// A non-blocking descriptor for reading a parent's pipe `read` of an open
+/// file description of this make's own.
+///
+/// A parent's descriptors share theirs with the parent and every other
+/// sub-make, so setting O_NONBLOCK on them changed the pipe under all of
+/// them. Linux opens the pipe again through `/proc`, as a new description.
+/// Elsewhere there is no such path (`/dev/fd/N` on macOS duplicates the
+/// descriptor), and `read` itself is made non-blocking, as GNU make makes
+/// it, which every client of the pool then copes with.
+#[cfg(target_os = "linux")]
+fn private_reader(read: RawFd) -> Option<RawFd> {
+    let path = std::ffi::CString::new(format!("/proc/self/fd/{read}")).ok()?;
+    // SAFETY: open(2) on a NUL-terminated path.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    (fd >= 0).then_some(fd)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn private_reader(_read: RawFd) -> Option<RawFd> {
+    None
 }
 
 fn close(fds: [RawFd; 2]) {
@@ -208,10 +331,10 @@ impl Pool {
                     false
                 }
             }
-            Pool::Pipe { read, .. } => loop {
+            Pool::Pipe { reader, .. } => loop {
                 let mut byte = 0u8;
                 // SAFETY: reading one byte into `byte`.
-                let got = unsafe { libc::read(*read, (&raw mut byte).cast(), 1) };
+                let got = unsafe { libc::read(*reader, (&raw mut byte).cast(), 1) };
                 if got == 1 {
                     return true;
                 }
@@ -242,9 +365,10 @@ impl Pool {
                         std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
                     )
                 {
-                    // A pipe holds far more than maxjobs bytes; it is full
-                    // only for an instant, if a token is being written as
-                    // fast as it is read.
+                    // This make leaves the write end blocking, but another
+                    // client of the pool may not. A pipe holds far more
+                    // than maxjobs bytes; it is full only for an instant,
+                    // if a token is being written as fast as it is read.
                     continue;
                 }
                 return;
@@ -255,7 +379,7 @@ impl Pool {
     /// The descriptors a sub-make must be given to take part in the pool.
     pub fn descriptors(&self) -> Option<[RawFd; 2]> {
         match self {
-            Pool::Pipe { read, write } => Some([*read, *write]),
+            Pool::Pipe { read, write, .. } => Some([*read, *write]),
             Pool::Local(_) => None,
         }
     }

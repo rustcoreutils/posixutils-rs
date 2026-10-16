@@ -119,3 +119,21 @@ fn a_bare_j_takes_no_operand() {
     dir.make(&["-j", "t"]).ok("t\n");
     dir.make(&["t", "-j"]).ok("t\n");
 }
+
+// A flag given twice is given once, as GNU make takes it: a recursive build
+// that runs `$(MAKE) -s` under `make -s` finds `s` in MAKEFLAGS as well as
+// on its command line. POSIX processes MAKEFLAGS as if its options were on
+// the command line, so the repeat must not be an error.
+#[test]
+fn a_flag_given_twice_is_given_once() {
+    run("s", &["-s"]).ok("[] [s]\n");
+    run("k", &["-k"]).ok("[] [k]\n");
+    let dir = Dir::new("makeflags_twice");
+    dir.write("Makefile", SHOW);
+    dir.make(&["-s", "-s"]).ok("[] [s]\n");
+    dir.make(&["-k", "-s", "-k", "-s"]).ok("[] [sk]\n");
+    // -f still adds a makefile each time it is given.
+    dir.write("one.mk", "all: two\n");
+    dir.write("two.mk", "two:\n\t@echo two\n");
+    dir.make(&["-f", "one.mk", "-f", "two.mk"]).ok("two\n");
+}

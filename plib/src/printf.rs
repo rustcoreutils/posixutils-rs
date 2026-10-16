@@ -742,34 +742,27 @@ fn format_general(value: f64, precision: usize, upper: bool, alt_form: bool) -> 
         };
     }
 
-    // %g uses precision as "significant figures", minimum 1
-    let sig_figs = precision.max(1);
+    // C17 7.21.6.1: P is the precision, or 1 if it is zero, and X the
+    // exponent the e style would have: that of the value rounded to P
+    // significant digits.  999999.5 rounds to 1.00000e+06, so X is 6, not
+    // the 5 of the unrounded value.
+    let p = precision.max(1);
+    let e_style = format_scientific(value, p - 1, upper);
+    let x = e_style
+        .rsplit(['e', 'E'])
+        .next()
+        .and_then(|exp| exp.parse::<i64>().ok())
+        .unwrap_or(0);
 
-    // Get the exponent
-    let exp = if value == 0.0 {
-        0
+    // If P > X >= -4, the f style with precision P - 1 - X; else the e
+    // style with precision P - 1.
+    let result = if (-4..p as i64).contains(&x) {
+        format!("{:.prec$}", value, prec = (p as i64 - 1 - x) as usize)
     } else {
-        value.abs().log10().floor() as i32
+        e_style
     };
 
-    // Use %e if exponent < -4 or >= precision, else %f style
-    let result = if exp < -4 || exp >= sig_figs as i32 {
-        // Use scientific notation with sig_figs - 1 decimal places
-        let e_prec = sig_figs.saturating_sub(1);
-        format_scientific(value, e_prec, upper)
-    } else {
-        // Use fixed notation
-        // Number of decimal places = sig_figs - 1 - exp (for positive exp)
-        // or sig_figs - 1 + |exp| (for negative exp)
-        let decimal_places = if exp >= 0 {
-            sig_figs.saturating_sub(1).saturating_sub(exp as usize)
-        } else {
-            sig_figs.saturating_sub(1) + (-exp) as usize
-        };
-        format!("{:.prec$}", value, prec = decimal_places)
-    };
-
-    // Remove trailing zeros (unless # flag)
+    // Unless '#', trailing zeros are removed from the fraction.
     if !alt_form {
         remove_trailing_zeros(&result)
     } else {

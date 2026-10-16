@@ -976,3 +976,19 @@ fn test_audit_integer_operand_forms_unchanged() {
     printf_test(&["%d", ""], "0");
     printf_status_test(&["%d", "08"], "0", 1);
 }
+
+#[test]
+fn test_g_style_follows_the_rounded_exponent() {
+    // C17 7.21.6.1: %g picks its style from the exponent X of the value
+    // rounded to P significant digits, not from the unrounded value.
+    // Expected outputs are glibc printf(3)'s.
+    printf_test(&["%g", "999999.5"], "1e+06");
+    printf_test(&["%G", "999999.5"], "1E+06");
+    printf_test(&["%g", "999999.4"], "999999");
+    printf_test(&["%g", "0.000099999999"], "0.0001");
+    printf_test(&["%.3g", "0.000099999999"], "0.0001");
+    printf_test(&["%.0g", "0.000099999999"], "0.0001");
+    printf_test(&["%.0g", "9.5"], "1e+01");
+    printf_test(&["%.3g", "99.95"], "100");
+    printf_test(&["%.3g", "999.5"], "1e+03");
+}

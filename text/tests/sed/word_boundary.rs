@@ -10,6 +10,13 @@
 //! `s///g` searches on from each match with the whole line as context, so a
 //! word boundary right where the last match ended is decided by the
 //! character before it.  Expectations are GNU sed 4.9's output.
+//!
+//! Not on macOS: its regcomp takes `\b`, `\B`, `\<` and `\>` as GNU does
+//! only under `REG_ENHANCED`, which plib does not ask for, and its regexec
+//! cannot be shown the character before where a search starts (see
+//! `plib::regex::Regex::find_bytes_at`).
+
+#![cfg(not(target_vendor = "apple"))]
 
 use super::sed_test;
 
@@ -22,14 +29,9 @@ fn ok(script: &str, expected: &str) {
 #[test]
 fn test_s_global_word_boundary_after_a_match() {
     ok("s/\\>/|/g", "xx| yxx| ab_c|\n");
-    // macOS's regexec cannot be shown the character before where a search
-    // starts (see `plib::regex::Regex::find_bytes_at`), so these hold
-    // everywhere but there.
-    if cfg!(not(target_vendor = "apple")) {
-        ok("s/\\bx/Z/g", "Zx yxx ab_c\n");
-        ok("s/\\<x/Z/g", "Zx yxx ab_c\n");
-        ok("s/\\Bx/Z/g", "xZ yZZ ab_c\n");
-        ok("s/\\b/|/g", "|xx| |yxx| |ab_c|\n");
-        ok("s/\\B/|/g", "x|x y|x|x a|b|_|c\n");
-    }
+    ok("s/\\bx/Z/g", "Zx yxx ab_c\n");
+    ok("s/\\<x/Z/g", "Zx yxx ab_c\n");
+    ok("s/\\Bx/Z/g", "xZ yZZ ab_c\n");
+    ok("s/\\b/|/g", "|xx| |yxx| |ab_c|\n");
+    ok("s/\\B/|/g", "x|x y|x|x a|b|_|c\n");
 }

@@ -93,6 +93,9 @@ enum Token {
     IgnoreRestOfFormat,
     /// a literal string
     Literal(Vec<u8>),
+    /// a conversion the format ends inside of, before its specifier: the
+    /// text from its '%'
+    Unfinished(String),
 }
 
 enum ParseState {
@@ -277,6 +280,8 @@ fn tokenize_format_str(format: &[u8]) -> Result<Vec<Token>, Box<dyn Error>> {
     let mut width = String::with_capacity(8_usize);
 
     let mut peekable = format.iter().peekable();
+    // Where the conversion being parsed starts in `format`.
+    let mut conv_start = 0;
 
     while let Some(&current_byte) = peekable.next() {
         let mut done_with_char = false;
@@ -291,6 +296,7 @@ fn tokenize_format_str(format: &[u8]) -> Result<Vec<Token>, Box<dyn Error>> {
                             literal.clear();
                         }
 
+                        conv_start = format.len() - peekable.len() - 1;
                         conv_spec.arg_number = parse_arg_number(&mut peekable);
                         state = ParseState::Flags;
                     } else if current_byte == b'\\' {
@@ -405,6 +411,11 @@ fn tokenize_format_str(format: &[u8]) -> Result<Vec<Token>, Box<dyn Error>> {
         literal.shrink_to_fit();
 
         tokens.push(Token::Literal(literal));
+    }
+
+    if !matches!(state, ParseState::Literal) {
+        let text = String::from_utf8_lossy(&format[conv_start..]).into_owned();
+        tokens.push(Token::Unfinished(text));
     }
 
     Ok(tokens)
@@ -1560,6 +1571,18 @@ pub fn printf(
                     stop_output = true;
                     break;
                 }
+                // The format ends inside a conversion.  As in GNU printf
+                // (and dash and bash), it is diagnosed, nothing more is
+                // written, and the status is non-zero.
+                Token::Unfinished(text) => {
+                    diag(&format!(
+                        "{}: {text}",
+                        gettext("missing conversion specifier")
+                    ));
+                    had_error = true;
+                    stop_output = true;
+                    break;
+                }
                 Token::Literal(vec) => {
                     output.write_all(vec.as_slice())?;
                 }
@@ -1616,6 +1639,30 @@ mod tests {
         assert_eq!(out, "a-b\nc-\n");
         assert!(diags.is_empty());
         assert_eq!(result, Ok(false));
+    }
+
+    /// A format that ends inside a conversion writes what came before it,
+    /// is diagnosed, and is not reused for the operands left.
+    #[test]
+    fn format_ending_inside_a_conversion_is_diagnosed() {
+        for (format, unfinished) in [
+            ("a%", "%"),
+            ("a%-5", "%-5"),
+            ("a%.2", "%.2"),
+            ("a%1$#", "%1$#"),
+        ] {
+            let (out, diags, result) = run(format, &["x", "y"]);
+            assert_eq!(out, "a", "{format}");
+            assert_eq!(
+                diags,
+                [format!("missing conversion specifier: {unfinished}")]
+            );
+            assert_eq!(result, Ok(true), "{format}");
+        }
+        let (out, diags, result) = run("%s|%", &["x", "y"]);
+        assert_eq!(out, "x|");
+        assert_eq!(diags, ["missing conversion specifier: %"]);
+        assert_eq!(result, Ok(true));
     }
 
     #[test]

@@ -1026,3 +1026,23 @@ fn test_alt_form_always_has_a_radix_character() {
     printf_test(&["%#.0f", "inf"], "inf");
     printf_test(&["%#5.0f", "3"], "   3.");
 }
+
+#[test]
+fn test_format_ending_inside_a_conversion() {
+    // A format that ends after '%' and before a conversion specifier is
+    // diagnosed: the text before it is written and the status is 1, as GNU
+    // printf does.
+    for format in ["abc%", "abc%-5", "abc%.", "abc%5.2", "abc%#", "abc%1$"] {
+        printf_status_test(&[format], "abc", 1);
+        printf_status_test(&[format, "x", "y"], "abc", 1);
+    }
+    let output = Command::new(get_binary_path("printf"))
+        .arg("abc%-5")
+        .output()
+        .expect("failed to run printf");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "printf: missing conversion specifier: %-5\n"
+    );
+    printf_status_test(&["abc%%"], "abc%", 0);
+}

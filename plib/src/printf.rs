@@ -823,10 +823,13 @@ fn format_hex_float(value: f64, precision: Option<usize>, upper: bool) -> String
     // An explicit precision shorter than the mantissa rounds (half-to-even),
     // rather than truncating, so the printed value is the nearest one
     // representable in the requested number of hexadecimal digits.
+    // The digit before the point takes part: with no fraction digits kept,
+    // it is the last digit kept, and decides a tie (0x1.8p+0 is 0x2p+0).
     if let Some(prec) = precision.filter(|&p| p < HEX_MANTISSA_DIGITS) {
         let shift = 4 * (HEX_MANTISSA_DIGITS - prec) as u32;
-        let kept = mantissa >> shift;
-        let rest = mantissa & ((1_u64 << shift) - 1);
+        let digits = (leading_digit << (4 * HEX_MANTISSA_DIGITS)) | mantissa;
+        let kept = digits >> shift;
+        let rest = digits & ((1_u64 << shift) - 1);
         let half = 1_u64 << (shift - 1);
 
         let rounded = if rest > half || (rest == half && kept & 1 == 1) {
@@ -835,13 +838,10 @@ fn format_hex_float(value: f64, precision: Option<usize>, upper: bool) -> String
             kept
         };
 
-        if rounded >> (4 * prec as u32) != 0 {
-            // Carry out of the fraction bumps the digit before the point.
-            leading_digit += 1;
-            mantissa = 0;
-        } else {
-            mantissa = rounded << shift;
-        }
+        // A carry out of the fraction bumps the digit before the point.
+        let fraction_bits = 4 * prec as u32;
+        leading_digit = rounded >> fraction_bits;
+        mantissa = (rounded & ((1_u64 << fraction_bits) - 1)) << shift;
     }
 
     // XBD 3600-3601: "The letters "abcdef" shall be used for a conversion and

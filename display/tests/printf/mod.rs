@@ -992,3 +992,15 @@ fn test_g_style_follows_the_rounded_exponent() {
     printf_test(&["%.3g", "99.95"], "100");
     printf_test(&["%.3g", "999.5"], "1e+03");
 }
+
+#[test]
+fn test_hex_float_zero_precision_rounds_the_leading_digit() {
+    // With no fraction digits kept, a tie rounds the leading digit to even,
+    // as glibc printf(3) does: 1.5 is 0x1.8p+0.
+    printf_test(&["%.0a", "1.5"], "0x2p+0");
+    printf_test(&["%.0a", "2.5"], "0x1p+1"); // 0x1.4p+1: below the tie
+    printf_test(&["%.0a", "3"], "0x2p+1"); // 0x1.8p+1
+    printf_test(&["%.0a", "1"], "0x1p+0");
+    printf_test(&["%.1a", "1.03125"], "0x1.0p+0"); // 0x1.08p+0, to even
+    printf_test(&["%.1a", "1.09375"], "0x1.2p+0"); // 0x1.18p+0, to even
+}

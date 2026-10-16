@@ -691,6 +691,10 @@ impl Regex {
     /// * `text` - The string to search (full string, not a slice)
     /// * `offset` - Byte offset to start searching from
     ///
+    /// The text before `offset` is context, as for [`Regex::find_bytes_at`]:
+    /// `^` matches only at the start of `text`, and a word boundary at
+    /// `offset` looks at the character before it.
+    ///
     /// # Returns
     ///
     /// `Some(Vec<Match>)` with captures (positions relative to start of `text`),
@@ -701,10 +705,35 @@ impl Regex {
 
     /// As [`Regex::captures_at`], over bytes.
     pub fn captures_at_bytes(&self, text: &[u8], offset: usize) -> Option<Vec<Match>> {
-        self.captures_at_bytes_notbol(text, offset, offset > 0)
+        if offset > text.len() {
+            return None;
+        }
+        if self.empty {
+            return Some(Self::empty_captures(offset));
+        }
+        let mut pmatch: [RegMatchT; MAX_CAPTURES] = unsafe { std::mem::zeroed() };
+        if !self.exec_from(text, offset, &mut pmatch, 0) {
+            return None;
+        }
+        Some(
+            pmatch
+                .iter()
+                .map(|m| {
+                    if m.rm_so >= 0 && m.rm_eo >= 0 {
+                        Match {
+                            start: m.rm_so as usize,
+                            end: m.rm_eo as usize,
+                        }
+                    } else {
+                        Match::default()
+                    }
+                })
+                .collect(),
+        )
     }
 
-    /// As [`Regex::captures_at_bytes`], with the caller saying whether
+    /// As [`Regex::captures_at_bytes`], but `text[offset..]` is searched on
+    /// its own, with no context before it, and the caller says whether
     /// `offset` is not the beginning of a line (`not_bol`), so `^` must not
     /// match there.
     ///
@@ -825,24 +854,17 @@ impl Iterator for MatchIter<'_, '_> {
             return None;
         }
 
-        let substring = &self.text[self.offset..];
-        let m = if self.offset == 0 {
-            self.regex.find(substring)?
-        } else {
-            self.regex.find_notbol(substring)?
-        };
+        // The text before the offset is context for `^` and word boundaries.
+        let result = self
+            .regex
+            .find_bytes_at(self.text.as_bytes(), self.offset, false)?;
 
-        let result = Match {
-            start: self.offset + m.start,
-            end: self.offset + m.end,
-        };
-
-        // Move past this match for next iteration
-        // Ensure we make progress even on zero-width matches
-        self.offset = if m.end > 0 {
-            self.offset + m.end
+        // Move past this match for the next iteration, and past one more
+        // character after an empty match, so that each is found once.
+        self.offset = if !result.is_empty() {
+            result.end
         } else {
-            let mut next = self.offset + 1;
+            let mut next = result.end + 1;
             while next < self.text.len() && !self.text.is_char_boundary(next) {
                 next += 1;
             }
@@ -1339,6 +1361,41 @@ mod tests {
             // A back-reference takes the other matcher in musl.
             assert_eq!(find(r"\b\(x\)\1", "xxx xx", 1), at(4, 6));
             assert_eq!(find(r"\B\(x\)\1", "xxx xx", 1), at(1, 3));
+        }
+    }
+
+    /// `find_iter` and `captures_at` search on with the text before the
+    /// offset as context, and find an empty match once.
+    #[test]
+    fn later_searches_see_the_text_before_them() {
+        let re = Regex::bre("$").unwrap();
+        let found: Vec<Match> = re.find_iter("ab").collect();
+        assert_eq!(found, [Match { start: 2, end: 2 }]);
+        let re = Regex::bre("x*").unwrap();
+        let found: Vec<Match> = re.find_iter("axb").collect();
+        assert_eq!(
+            found,
+            [
+                Match { start: 0, end: 0 },
+                Match { start: 1, end: 2 },
+                Match { start: 2, end: 2 },
+                Match { start: 3, end: 3 },
+            ]
+        );
+        let re = Regex::bre(r"\(x\)\(y\)*").unwrap();
+        let caps = re.captures_at("axx", 2).unwrap();
+        assert_eq!(caps[0], Match { start: 2, end: 3 });
+        assert_eq!(caps[1], Match { start: 2, end: 3 });
+        assert_eq!(caps[2], Match::default());
+        assert_eq!(re.captures_at("axx", 4), None);
+        if cfg!(not(target_vendor = "apple")) {
+            let re = Regex::bre(r"\bx").unwrap();
+            let found: Vec<Match> = re.find_iter("xx yxx").collect();
+            assert_eq!(found, [Match { start: 0, end: 1 }]);
+            assert_eq!(re.captures_at("xx", 1), None);
+            let re = Regex::bre(r"\B").unwrap();
+            let found: Vec<usize> = re.find_iter("ab c").map(|m| m.start).collect();
+            assert_eq!(found, [1]);
         }
     }
 

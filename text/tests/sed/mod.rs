@@ -17,6 +17,7 @@ mod options;
 mod separate;
 #[cfg(unix)]
 mod wfile;
+mod word_boundary;
 
 use plib::testing::{run_test, run_test_with_checker, TestPlan};
 

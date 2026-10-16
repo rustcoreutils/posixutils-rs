@@ -59,7 +59,13 @@ const _: () = {
 /// make - maintain, update, and regenerate groups of programs
 // todo: sort arguments
 #[derive(Parser, Debug)]
-#[command(version, about = gettext("make - maintain, update, and regenerate groups of programs"))]
+#[command(
+    version,
+    about = gettext("make - maintain, update, and regenerate groups of programs"),
+    // A flag given twice is given once: MAKEFLAGS and the command line
+    // often both carry it (POSIX 105856), and GNU make accepts the repeat.
+    args_override_self = true
+)]
 struct Args {
     #[arg(
         short = 'C',

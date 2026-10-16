@@ -328,3 +328,16 @@ fn a_sub_make_leaves_the_parents_pool_flags_alone() {
         assert!(!flags.1, "the write end was made non-blocking");
     }
 }
+
+// A -j larger than a pipe holds (64 KiB on Linux, 16 KiB on macOS) used to
+// fill the pool's pipe forever: the last token write never finished, so make
+// never started. GNU make 4.3 hangs the same way.
+#[test]
+fn a_job_count_larger_than_the_pipe_holds() {
+    let dir = Dir::new("parallel_huge_j");
+    dir.write("Makefile", &wide_makefile(4, "0"));
+    std::fs::create_dir(dir.path("running")).unwrap();
+    let (code, _) = make_within(&dir, &["-j1000000"], Duration::from_secs(60));
+    assert_eq!(code, Some(0));
+    assert_eq!(concurrency(&dir, 4).1, 4, "every target is made");
+}

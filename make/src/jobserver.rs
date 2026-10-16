@@ -101,10 +101,15 @@ pub fn setup(jobs: Jobs<'_>) -> (usize, String) {
     if jobs <= 1 {
         return (1, String::new());
     }
-    let pool = match pool.or_else(|| create(jobs - 1)) {
-        Some(pool) => pool,
-        // No pipe to be had: the tokens stay in this make.
-        None => return (jobs, String::new()),
+    let (jobs, pool) = match pool {
+        Some(pool) => (jobs, pool),
+        None => match create(jobs - 1) {
+            // A pipe holds fewer tokens than were asked for: the jobs are as
+            // many as it holds, plus the one this make has without a token.
+            Some((pool, tokens)) => (tokens + 1, pool),
+            // No pipe to be had: the tokens stay in this make.
+            None => return (jobs, String::new()),
+        },
     };
     let flags = match &pool {
         Pool::Pipe { read, write, .. } => format!("-j{jobs} --jobserver-auth={read},{write}"),
@@ -114,8 +119,9 @@ pub fn setup(jobs: Jobs<'_>) -> (usize, String) {
     (jobs, flags)
 }
 
-/// A new pipe holding `tokens` tokens.
-fn create(tokens: usize) -> Option<Pool> {
+/// A new pipe holding `tokens` tokens, or as many as fit in it, and how many
+/// it holds.
+fn create(tokens: usize) -> Option<(Pool, usize)> {
     let mut fds = [0; 2];
     // SAFETY: `fds` has room for the two descriptors pipe(2) writes.
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -130,10 +136,79 @@ fn create(tokens: usize) -> Option<Pool> {
         close(fds);
         return None;
     }
-    for _ in 0..tokens {
-        pool.release();
+    // A pipe holds a fixed number of bytes, 64 KiB on Linux, so a blocking
+    // write of more tokens than that would wait forever for a reader. No one
+    // else has the pipe yet: fill it through a non-blocking write end, stop
+    // where it is full, keep half of what it held, and leave the write end
+    // blocking again.
+    let filled = match fill(fds[1], tokens) {
+        Some(filled) if filled < tokens => drain_half(fds[0], filled),
+        filled => filled,
+    };
+    // SAFETY: fcntl(2) on a descriptor number, with integer arguments.
+    let restored = unsafe {
+        let flags = libc::fcntl(fds[1], libc::F_GETFL);
+        flags >= 0 && libc::fcntl(fds[1], libc::F_SETFL, flags & !libc::O_NONBLOCK) == 0
+    };
+    match filled {
+        Some(filled) if restored => Some((pool, filled)),
+        _ => {
+            close(fds);
+            None
+        }
     }
-    Some(pool)
+}
+
+/// Write up to `tokens` tokens to the new pipe's write end `fd` and return
+/// how many went in before the pipe was full.
+fn fill(fd: RawFd, tokens: usize) -> Option<usize> {
+    if !set_nonblocking(fd) {
+        return None;
+    }
+    let chunk = [TOKEN; 4096];
+    let mut filled = 0;
+    while filled < tokens {
+        let want = (tokens - filled).min(chunk.len());
+        // SAFETY: writing at most `chunk.len()` bytes from `chunk`.
+        let wrote = unsafe { libc::write(fd, chunk.as_ptr().cast(), want) };
+        if wrote > 0 {
+            filled += wrote as usize;
+            continue;
+        }
+        match std::io::Error::last_os_error().kind() {
+            std::io::ErrorKind::Interrupted => continue,
+            std::io::ErrorKind::WouldBlock => return Some(filled),
+            _ => return None,
+        }
+    }
+    Some(filled)
+}
+
+/// Take back half of the tokens of a pipe `fill` found full, through its
+/// non-blocking read end `fd`, and return how many are left.
+///
+/// A full pipe has no room to give a token back: Linux keeps a pipe's bytes
+/// in a ring of pages, and the page a token was read from is not free again
+/// until all of it has been read, so the first token returned after one was
+/// taken would wait forever.
+fn drain_half(fd: RawFd, filled: usize) -> Option<usize> {
+    let mut chunk = [0u8; 4096];
+    let mut left = filled;
+    while left > filled / 2 {
+        let want = (left - filled / 2).min(chunk.len());
+        // SAFETY: reading at most `chunk.len()` bytes into `chunk`.
+        let got = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), want) };
+        if got > 0 {
+            left -= got as usize;
+        } else if got < 0
+            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+        {
+            continue;
+        } else {
+            return None;
+        }
+    }
+    Some(left)
 }
 
 /// The descriptors of a pool named as `R,W`.

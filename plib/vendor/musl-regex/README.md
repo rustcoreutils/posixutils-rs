@@ -63,6 +63,13 @@ Every change inside a musl file is marked with a `plib:` comment.
 - **`regexec`'s `pmatch[restrict]`** is spelled `*restrict pmatch` (the same
   type): MSVC does not document support for a qualifier inside a parameter's
   `[]`.
+- **`REG_STARTEND`** (`regexec.c`, `include/regex.h`), which musl does not
+  have, as glibc's: the search starts at `pmatch[0].rm_so`, offsets are into
+  the whole string, and the text before `rm_so` is context, so `^` does not
+  match there and a word boundary there looks at the character before it.
+  The matchers still read to the NUL, so `rm_eo` must be the string's
+  length. `plib::regex` uses it to search a line from an offset, as
+  `grep -o` does after each match.
 - **Back-references after a multibyte character** (`regexec.c`, a bug in
   musl itself). The backtracking matcher, used for any pattern with a
   back-reference, assumed the lookahead character was one byte: the

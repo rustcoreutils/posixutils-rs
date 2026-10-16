@@ -52,6 +52,8 @@ use std::ptr;
 /// The C library's regex.
 #[cfg(unix)]
 mod ffi {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    pub use libc::REG_STARTEND;
     pub use libc::{
         regcomp, regerror, regex_t as RegexT, regexec, regfree, regmatch_t as RegMatchT,
         REG_EXTENDED, REG_ICASE, REG_NOTBOL, REG_NOTEOL,
@@ -87,6 +89,8 @@ mod ffi {
     pub const REG_ICASE: c_int = 2;
     pub const REG_NOTBOL: c_int = 1;
     pub const REG_NOTEOL: c_int = 2;
+    /// plib's addition to musl; see `vendor/musl-regex/README.md`.
+    pub const REG_STARTEND: c_int = 4;
 
     extern "C" {
         #[link_name = "plib_regcomp"]
@@ -359,7 +363,30 @@ impl Regex {
             return false;
         }
         match crate::locale::wchar_runs(text) {
-            Some(runs) => self.exec_runs(text, &runs, pmatch, eflags),
+            Some(runs) => self.exec_runs(text, &runs, 0, pmatch, eflags),
+            None => false,
+        }
+    }
+
+    /// As [`Regex::exec`], for a match that starts at or after `from`, the
+    /// text before `from` being context: `^` does not match at `from` unless
+    /// it is 0, and a word boundary at `from` looks at the character before
+    /// it. Offsets are into `text`; `pmatch` must not be empty.
+    fn exec_from(&self, text: &[u8], from: usize, pmatch: &mut [RegMatchT], eflags: c_int) -> bool {
+        if from == 0 {
+            return self.exec(text, pmatch, eflags);
+        }
+        let Ok(c_text) = CString::new(text) else {
+            return false;
+        };
+        if self.exec_c_from(&c_text, from, pmatch, eflags) {
+            return true;
+        }
+        if REGEXEC_SEARCHES_UNDECODABLE {
+            return false;
+        }
+        match crate::locale::wchar_runs(text) {
+            Some(runs) => self.exec_runs(text, &runs, from, pmatch, eflags),
             None => false,
         }
     }
@@ -379,15 +406,23 @@ impl Regex {
     /// A word boundary is the exception: next to such a sequence the run's
     /// own start or end counts as a non-word character, so `\<` matches
     /// after one, where glibc's `regexec` takes the byte as part of a word.
+    ///
+    /// A match must start at or after `from`, as for [`Regex::exec_from`]:
+    /// runs that end before it are skipped, and the one it falls inside is
+    /// searched from there.
     fn exec_runs(
         &self,
         text: &[u8],
         runs: &[std::ops::Range<usize>],
+        from: usize,
         pmatch: &mut [RegMatchT],
         eflags: c_int,
     ) -> bool {
         let last = runs.len() - 1;
         for (i, run) in runs.iter().enumerate() {
+            if run.end < from {
+                continue;
+            }
             let mut run_eflags = eflags;
             if i > 0 {
                 run_eflags |= REG_NOTBOL;
@@ -399,7 +434,12 @@ impl Regex {
             let Ok(c_run) = CString::new(&text[run.clone()]) else {
                 return false;
             };
-            if self.exec_c(&c_run, pmatch, run_eflags) {
+            let found = if from > run.start {
+                self.exec_c_from(&c_run, from - run.start, pmatch, run_eflags)
+            } else {
+                self.exec_c(&c_run, pmatch, run_eflags)
+            };
+            if found {
                 for m in pmatch.iter_mut().filter(|m| m.rm_so >= 0) {
                     m.rm_so = (m.rm_so as usize + run.start) as _;
                     m.rm_eo = (m.rm_eo as usize + run.start) as _;
@@ -419,6 +459,59 @@ impl Regex {
         };
         let result = unsafe { regexec(&self.raw, text.as_ptr(), pmatch.len(), pmatch_ptr, eflags) };
         matched(result)
+    }
+
+    /// One `regexec` call on a C string, for a match that starts at or after
+    /// byte `from`, the text before it being context, as for
+    /// [`Regex::exec_from`]. `REG_STARTEND` does that here: glibc's
+    /// `regexec`, and plib's musl on Windows, read the character before
+    /// `rm_so`. Offsets are into `text`.
+    #[cfg(any(windows, all(target_os = "linux", target_env = "gnu")))]
+    fn exec_c_from(
+        &self,
+        text: &CStr,
+        from: usize,
+        pmatch: &mut [RegMatchT],
+        eflags: c_int,
+    ) -> bool {
+        pmatch[0].rm_so = from as _;
+        pmatch[0].rm_eo = text.count_bytes() as _;
+        let result = unsafe {
+            regexec(
+                &self.raw,
+                text.as_ptr(),
+                pmatch.len(),
+                pmatch.as_mut_ptr(),
+                eflags | ffi::REG_STARTEND,
+            )
+        };
+        matched(result)
+    }
+
+    /// As the `REG_STARTEND` version above, where the C library's
+    /// `regexec` has no such flag that reads the text before `rm_so`
+    /// (Apple's starts afresh there): the rest of the text is searched on
+    /// its own, with `REG_NOTBOL`. The character before `from` is then
+    /// unseen, and a word boundary at `from` is taken as if a non-word
+    /// character came before it.
+    #[cfg(not(any(windows, all(target_os = "linux", target_env = "gnu"))))]
+    fn exec_c_from(
+        &self,
+        text: &CStr,
+        from: usize,
+        pmatch: &mut [RegMatchT],
+        eflags: c_int,
+    ) -> bool {
+        let rest = CStr::from_bytes_with_nul(&text.to_bytes_with_nul()[from..])
+            .expect("a C string's tail is a C string");
+        if !self.exec_c(rest, pmatch, eflags | REG_NOTBOL) {
+            return false;
+        }
+        for m in pmatch.iter_mut().filter(|m| m.rm_so >= 0) {
+            m.rm_so = (m.rm_so as usize + from) as _;
+            m.rm_eo = (m.rm_eo as usize + from) as _;
+        }
+        true
     }
 
     /// Returns true if the pattern matches anywhere in the input string.
@@ -501,25 +594,38 @@ impl Regex {
         })
     }
 
-    /// As [`Regex::find_bytes`], for `text` that is part of a line: `not_bol` says its start is
-    /// not the beginning of the line, so `^` cannot match there, and `not_eol` that its end is
-    /// not the end of the line, so `$` cannot match there.
-    pub fn find_bytes_in_line(&self, text: &[u8], not_bol: bool, not_eol: bool) -> Option<Match> {
+    /// The first match in `text`, a whole line, that starts at or after
+    /// `from`: the text before `from` is context, so `^` matches only at the
+    /// start of `text`, and a word boundary (`\<`, `\>`, `\b`, `\B`) at
+    /// `from` looks at the character before it. `not_eol` says the end of
+    /// `text` is not the end of the line, so `$` cannot match there. Offsets
+    /// are into `text`.
+    ///
+    /// Searching `&text[from..]` instead loses the character before `from`:
+    /// after `grep -o '\bx'` matched the first `x` of `xx`, `\b` matched
+    /// again before the second.
+    ///
+    /// On macOS the C library cannot see that character (see
+    /// [`Regex::exec_c_from`]), and a word boundary at `from` is taken as if
+    /// a non-word character came before it.
+    pub fn find_bytes_at(&self, text: &[u8], from: usize, not_eol: bool) -> Option<Match> {
+        if from > text.len() {
+            return None;
+        }
         if self.empty {
-            return Some(Match { start: 0, end: 0 });
+            return Some(Match {
+                start: from,
+                end: from,
+            });
         }
         let mut pmatch = RegMatchT {
             rm_so: -1,
             rm_eo: -1,
         };
-        let mut eflags = 0;
-        if not_bol {
-            eflags |= REG_NOTBOL;
-        }
-        if not_eol {
-            eflags |= REG_NOTEOL;
-        }
-        if !self.exec(text, std::slice::from_mut(&mut pmatch), eflags) || pmatch.rm_so < 0 {
+        let eflags = if not_eol { REG_NOTEOL } else { 0 };
+        if !self.exec_from(text, from, std::slice::from_mut(&mut pmatch), eflags)
+            || pmatch.rm_so < 0
+        {
             return None;
         }
         Some(Match {
@@ -1205,6 +1311,62 @@ mod tests {
         }
     }
 
+    /// A search from an offset sees the text before it: `^` does not match
+    /// there, and a word boundary there looks at the character before it.
+    #[test]
+    fn find_bytes_at_sees_the_character_before() {
+        let find = |pattern: &str, text: &str, from| {
+            Regex::bre(pattern)
+                .unwrap()
+                .find_bytes_at(text.as_bytes(), from, false)
+        };
+        let at = |start, end| Some(Match { start, end });
+        assert_eq!(find("^x", "xx", 0), at(0, 1));
+        assert_eq!(find("^x", "xx", 1), None);
+        assert_eq!(find("x", "xx yxx", 1), at(1, 2));
+        assert_eq!(find("x$", "xx", 1), at(1, 2));
+        assert_eq!(find("x*", "xx", 2), at(2, 2));
+        assert_eq!(find("x", "xx", 3), None);
+        assert_eq!(find("", "xx", 1), at(1, 1));
+        let re = Regex::bre("x$").unwrap();
+        assert_eq!(re.find_bytes_at(b"xx", 1, true), None);
+        // Apple's regexec cannot be shown the character before `from`.
+        if cfg!(not(target_vendor = "apple")) {
+            assert_eq!(find(r"\bx", "xx yxx", 1), None);
+            assert_eq!(find(r"\<x", "xx yxx", 1), None);
+            assert_eq!(find(r"\Bx", "xx yxx", 1), at(1, 2));
+            assert_eq!(find(r"\bx", "xx yx x", 1), at(6, 7));
+            // A back-reference takes the other matcher in musl.
+            assert_eq!(find(r"\b\(x\)\1", "xxx xx", 1), at(4, 6));
+            assert_eq!(find(r"\B\(x\)\1", "xxx xx", 1), at(1, 3));
+        }
+    }
+
+    /// Under a UTF-8 `LC_CTYPE` the character before the offset a search
+    /// starts from may be several bytes, or none at all.
+    #[test]
+    fn utf8_find_bytes_at_sees_the_character_before() {
+        let _guard = crate::locale_test_lock();
+        let Some(_ctype) = utf8_ctype() else {
+            return;
+        };
+        let find = |pattern: &str, text: &[u8], from| {
+            Regex::bre(pattern)
+                .unwrap()
+                .find_bytes_at(text, from, false)
+        };
+        let at = |start, end| Some(Match { start, end });
+        assert_eq!(find("x", b"\xffx\xffx", 2), at(3, 4));
+        if cfg!(not(target_vendor = "apple")) {
+            assert_eq!(find(r"\bx", "éx".as_bytes(), 2), None);
+            assert_eq!(find(r"\Bx", "éx".as_bytes(), 2), at(2, 3));
+            assert_eq!(find(r"\Bx", "·éx".as_bytes(), 4), at(4, 5));
+            assert_eq!(find(r"\bx", "·x".as_bytes(), 2), at(2, 3));
+            // After a byte that begins no character.
+            assert_eq!(find(r"\Bx", b"\xffxx", 2), at(2, 3));
+        }
+    }
+
     /// Under a UTF-8 `LC_CTYPE` a byte that begins no character is no
     /// character: nothing in a pattern matches it, `^` and `$` do not match
     /// beside it, and the rest of the text is still searched, on every
@@ -1318,7 +1480,7 @@ mod tests {
                         let whole = 0..text.len();
                         let runs = crate::locale::wchar_runs(text);
                         let runs = runs.as_deref().unwrap_or(std::slice::from_ref(&whole));
-                        let found_by_runs = re.exec_runs(text, runs, &mut by_runs, eflags);
+                        let found_by_runs = re.exec_runs(text, runs, 0, &mut by_runs, eflags);
                         let what = format!("{pattern:?} (ere {ere}) in {text:?}, eflags {eflags}");
                         assert_eq!(found, found_by_runs, "{what}");
                         if found {

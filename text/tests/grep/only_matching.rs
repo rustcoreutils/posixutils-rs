@@ -36,6 +36,23 @@ fn test_grep_only_matching() {
     grep_test(&["-o", "z"], "abc\n", "", "", 1);
 }
 
+/// The search after a match still sees the character before it, so a word boundary or a
+/// non-boundary right where the last match ended is decided by the whole line.
+#[test]
+fn test_grep_only_matching_word_boundary_after_match() {
+    let line = "xx yxx ab_c\n";
+    grep_test(&["-o", "x\\b"], line, "x\nx\n", "", 0);
+    grep_test(&["-o", "\\w\\>"], line, "x\nx\nc\n", "", 0);
+    // macOS's regexec cannot be shown the character before where a search starts (see
+    // `plib::regex::Regex::find_bytes_at`), so these hold everywhere but there.
+    if cfg!(not(target_vendor = "apple")) {
+        grep_test(&["-o", "\\bx"], line, "x\n", "", 0);
+        grep_test(&["-o", "\\<x"], line, "x\n", "", 0);
+        grep_test(&["-o", "\\Bx"], line, "x\nx\nx\n", "", 0);
+        grep_test(&["-o", "\\b\\w"], line, "x\ny\na\n", "", 0);
+    }
+}
+
 /// Across several patterns the earliest match wins, and of those starting there the longest.
 #[test]
 fn test_grep_only_matching_several_patterns() {

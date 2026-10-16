@@ -1004,3 +1004,25 @@ fn test_hex_float_zero_precision_rounds_the_leading_digit() {
     printf_test(&["%.1a", "1.03125"], "0x1.0p+0"); // 0x1.08p+0, to even
     printf_test(&["%.1a", "1.09375"], "0x1.2p+0"); // 0x1.18p+0, to even
 }
+
+#[test]
+fn test_alt_form_always_has_a_radix_character() {
+    // C17 7.21.6.1: under '#', a floating conversion always has a
+    // decimal-point character, and %g keeps its trailing zeros.  Expected
+    // outputs are glibc printf(3)'s.
+    printf_test(&["%#g", "100000"], "100000.");
+    printf_test(&["%#g", "0.000099999999"], "0.000100000");
+    printf_test(&["%#.3g", "99.95"], "100.");
+    printf_test(&["%#.0g", "2.5"], "2.");
+    printf_test(&["%#.0g", "100000"], "1.e+05");
+    printf_test(&["%#.0g", "0"], "0.");
+    // glibc writes "1.e+06" here, dropping the zeros '#' keeps; C17 asks
+    // for P - 1 = 5 fraction digits in the e style.
+    printf_test(&["%#g", "999999.5"], "1.00000e+06");
+    printf_test(&["%#.0f", "1.5"], "2.");
+    printf_test(&["%#.0e", "1.5"], "2.e+00");
+    printf_test(&["%#.0a", "1"], "0x1.p+0");
+    printf_test(&["%#.0a", "0"], "0x0.p+0");
+    printf_test(&["%#.0f", "inf"], "inf");
+    printf_test(&["%#5.0f", "3"], "   3.");
+}

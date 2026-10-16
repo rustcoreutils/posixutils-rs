@@ -931,6 +931,14 @@ fn float_body(conv: &ConvSpec, abs_value: f64) -> Body {
         excess = 0;
     }
 
+    // C17 7.21.6.1: under '#' the result always has a decimal-point
+    // character, even with no digits after it.
+    let formatted = if conv.alt_form && abs_value.is_finite() {
+        force_radix_point(formatted, conv.spec)
+    } else {
+        formatted
+    };
+
     // POSIX 111924-111926 / XBD 3623-3624: LC_NUMERIC determines the radix
     // character.  Rust's formatting always produces a <period>.
     let formatted = apply_radix_char(formatted).into_bytes();
@@ -951,6 +959,20 @@ fn float_body(conv: &ConvSpec, abs_value: f64) -> Body {
         zeros: excess,
         tail,
     }
+}
+
+/// Give `formatted`, a finite value under conversion `spec`, a <period>
+/// before its exponent (or at its end) if it has none.
+fn force_radix_point(mut formatted: String, spec: char) -> String {
+    if formatted.contains('.') {
+        return formatted;
+    }
+    let exponent_at = match spec {
+        'a' | 'A' => formatted.find(['p', 'P']),
+        _ => formatted.find(['e', 'E']),
+    };
+    formatted.insert(exponent_at.unwrap_or(formatted.len()), '.');
+    formatted
 }
 
 /// Format a floating point number with all POSIX flags applied

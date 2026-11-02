@@ -1288,17 +1288,6 @@ pub fn intervals_by_pseudo(intervals: &[LiveInterval]) -> HashMap<PseudoId, &Liv
     by_pseudo
 }
 
-/// Identify pseudo-registers that should use floating-point registers.
-/// This is a shared implementation used by both x86-64 and AArch64.
-///
-/// A pseudo is marked as FP if:
-/// 1. It's an FVal constant
-/// 2. It's the target of an FP arithmetic operation (FAdd, FSub, FMul, FDiv, FNeg)
-/// 3. It's the target of an FP conversion (FCvtF, UCvtF, SCvtF)
-/// 4. It has a float type (excluding FP comparisons which produce integer results)
-///
-/// Note: FP comparisons (`Opcode::is_float_comparison`) produce integer results (0 or 1), so their
-/// targets should NOT be in FP registers.
 /// Every argument pseudo with the declared type of the parameter it carries.
 ///
 /// What an argument *is* comes from the parameter list, not from the
@@ -1319,6 +1308,62 @@ pub fn arg_pseudo_types(func: &Function) -> Vec<(PseudoId, TypeId)> {
         .collect()
 }
 
+/// The pseudos `insn` reads or writes as whole `__int128` values: those that
+/// need a 16-byte home.
+///
+/// An instruction's type describes its result, or for `Lo64`/`Hi64` the
+/// 128-bit value split, and that is all it describes. The other operands
+/// have types of their own: an address, a condition, a call's arguments.
+/// Taking every operand of a 128-bit instruction for a 128-bit value gave a
+/// `_Float128` argument of a call returning `__int128` an integer's slot,
+/// filled from its XMM register by a 64-bit move with the high half zeroed,
+/// and gave a `long` argument a 128-bit extension that dropped its sign.
+pub fn int128_operands(insn: &Instruction, types: &TypeTable) -> Vec<PseudoId> {
+    let is_int128 = |t: TypeId| types.is_plain_int128(t);
+    if insn.op == Opcode::Call {
+        // The arguments are typed by the parameters, whatever the call
+        // returns.
+        let arg_types = &insn.extra().arg_types;
+        let args = insn
+            .src
+            .iter()
+            .zip(arg_types)
+            .filter(|&(_, &t)| is_int128(t))
+            .map(|(&p, _)| p);
+        let ret = insn.target.filter(|_| insn.typ.is_some_and(is_int128));
+        return ret.into_iter().chain(args).collect();
+    }
+    if !insn.typ.is_some_and(is_int128) {
+        return Vec::new();
+    }
+    let target = insn.target.into_iter();
+    match insn.op {
+        // The 128-bit source split into 64-bit halves.
+        Opcode::Lo64 | Opcode::Hi64 => insn.src.clone(),
+        // A 128-bit value assembled from 64-bit halves.
+        Opcode::Pair64 => target.collect(),
+        // `src[0]` is the address.
+        Opcode::Load => target.collect(),
+        Opcode::Store => insn.src.get(1).copied().into_iter().collect(),
+        // `src[0]` is the condition.
+        Opcode::Select => target.chain(insn.src.iter().skip(1).copied()).collect(),
+        // A comparison never gets here: its result is an `int`, and
+        // `mapping` has split its 128-bit operands.
+        _ => target.chain(insn.src.iter().copied()).collect(),
+    }
+}
+
+/// Identify pseudo-registers that should use floating-point registers.
+/// This is a shared implementation used by both x86-64 and AArch64.
+///
+/// A pseudo is marked as FP if:
+/// 1. It's an FVal constant
+/// 2. It's the target of an FP arithmetic operation (FAdd, FSub, FMul, FDiv, FNeg)
+/// 3. It's the target of an FP conversion (FCvtF, UCvtF, SCvtF)
+/// 4. It has a float type (excluding FP comparisons which produce integer results)
+///
+/// Note: FP comparisons (`Opcode::is_float_comparison`) produce integer results (0 or 1), so their
+/// targets should NOT be in FP registers.
 pub fn identify_fp_pseudos<F>(func: &Function, is_float_type: F) -> HashSet<PseudoId>
 where
     F: Fn(TypeId) -> bool,
@@ -2158,6 +2203,39 @@ impl AbiLowering {
 mod tests {
     use super::*;
     use crate::units::Bits;
+
+    /// Each operand of a 128-bit instruction is judged by its own type: a
+    /// call's arguments by the parameters, whatever the call returns; a
+    /// memory access's address and a select's condition never.
+    #[test]
+    fn int128_operands_are_judged_by_their_own_type() {
+        let types = TypeTable::new(&crate::target::Target::host());
+        let p = PseudoId;
+        let (u128_t, q_t, long_t) = (types.uint128_id, types.float128_id, types.long_id);
+        let b128 = Bits::new(128);
+        let call = |ret, args: Vec<TypeId>| {
+            let srcs = (1..=args.len() as u32).map(p).collect();
+            Instruction::call(Some(p(0)), "f", srcs, args, ret, b128)
+        };
+
+        // A call returning `__int128`: its binary128 and `long` arguments
+        // are not 128-bit integers, its `__int128` one is.
+        let c = call(u128_t, vec![q_t, long_t, u128_t]);
+        assert_eq!(int128_operands(&c, &types), vec![p(0), p(3)]);
+        // A call returning something else still passes `__int128`s.
+        let c = call(q_t, vec![u128_t, q_t]);
+        assert_eq!(int128_operands(&c, &types), vec![p(1)]);
+
+        let load = Instruction::load(p(0), p(1), 0, u128_t, b128);
+        assert_eq!(int128_operands(&load, &types), vec![p(0)]);
+        let store = Instruction::store(p(0), p(1), 0, u128_t, b128);
+        assert_eq!(int128_operands(&store, &types), vec![p(0)]);
+        let sel = Instruction::select(p(0), p(1), p(2), p(3), u128_t, b128);
+        assert_eq!(int128_operands(&sel, &types), vec![p(0), p(2), p(3)]);
+        // Not a 128-bit integer at all.
+        let fload = Instruction::load(p(0), p(1), 0, q_t, b128);
+        assert!(int128_operands(&fload, &types).is_empty());
+    }
 
     /// The asm register operands are the ones the template needs in a
     /// register of their own: `"r"`, and a `"0"` tied to one. An operand

@@ -2116,11 +2116,8 @@ impl RegAlloc {
             .collect();
         let mut multi_reg_returns: HashMap<PseudoId, TypeId> = HashMap::new();
         for insn in func.blocks.iter().flat_map(|b| &b.insns) {
+            int128_pseudos.extend(crate::arch::regalloc::int128_operands(insn, types));
             let Some(typ) = insn.typ else { continue };
-            if types.is_plain_int128(typ) {
-                int128_pseudos.extend(insn.target);
-                int128_pseudos.extend(insn.src.iter().copied());
-            }
             // A multi-register call return: complex, struct or union.
             if insn.op == Opcode::Call
                 && (types.is_complex_float(typ)

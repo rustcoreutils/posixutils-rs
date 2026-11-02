@@ -1006,6 +1006,40 @@ impl X86_64CodeGen {
         let src_loc = self.get_location(src);
         let dst_loc = self.get_location(dst);
 
+        // A `_Float128` meeting an `__int128` through a copy can be in an XMM
+        // register on either side: all sixteen bytes move at once. Through
+        // the fallback below, the low eight went over and the high eight
+        // were zeroed.
+        match (&src_loc, &dst_loc) {
+            (Loc::Xmm(s), Loc::Xmm(d)) => {
+                if s != d {
+                    self.push_lir(X86Inst::MovFp {
+                        size: FpSize::Quad,
+                        src: XmmOperand::Reg(*s),
+                        dst: XmmOperand::Reg(*d),
+                    });
+                }
+                return;
+            }
+            (Loc::Xmm(s), _) => {
+                self.push_lir(X86Inst::MovFp {
+                    size: FpSize::Quad,
+                    src: XmmOperand::Reg(*s),
+                    dst: XmmOperand::Mem(self.int128_lo_mem_loc(&dst_loc)),
+                });
+                return;
+            }
+            (Loc::Stack(_) | Loc::IncomingArg(_), Loc::Xmm(d)) => {
+                self.push_lir(X86Inst::MovFp {
+                    size: FpSize::Quad,
+                    src: XmmOperand::Mem(self.int128_lo_mem_loc(&src_loc)),
+                    dst: XmmOperand::Reg(*d),
+                });
+                return;
+            }
+            _ => {}
+        }
+
         match &src_loc {
             Loc::Imm(v) => self.store_int128_imm(*v, &dst_loc),
             Loc::Stack(_) | Loc::IncomingArg(_) => {

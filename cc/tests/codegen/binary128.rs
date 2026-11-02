@@ -126,7 +126,8 @@ fn binary128_long_double_folds_exactly_on_aarch64() {
 }
 
 /// `_Float128` on the host, which links libgcc's soft-float routines. Apple's
-/// runtime library does not provide them.
+/// runtime library does not provide them. At -O0 nothing folds and the
+/// helpers are real calls, so that level is named explicitly.
 #[test]
 fn binary128_float128_folds_exactly_on_the_host() {
     if !cfg!(target_os = "linux") {
@@ -134,6 +135,82 @@ fn binary128_float128_folds_exactly_on_the_host() {
     }
     let src = EXACT.replace("TY", "_Float128").replace("SFX", "F128");
     assert_eq!(compile_and_run("b128_exact_host", &src, &[]), 0);
+    for opt in ["-O0", "-O2"] {
+        let level = vec![opt.to_string()];
+        assert_eq!(
+            compile_and_run("b128_exact_host", &src, &level),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+/// A binary128 parameter still in its argument register, passed straight on
+/// to another call, goes over whole. At -O0 on x86-64 the copy moved only the
+/// low eight bytes of %xmm0 and zeroed the high eight.
+///
+/// Not on macOS: Apple's targets have no `_Float128`, as with clang.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn binary128_parameter_forwarded_from_its_register() {
+    let src = r#"
+#include <string.h>
+typedef unsigned __int128 u128;
+static u128 bits(_Float128 x) { u128 u; memcpy(&u, &x, 16); return u; }
+static u128 one(_Float128 c) { return bits(c); }
+static int agree(_Float128 c, _Float128 r) { return bits(c) == bits(r); }
+volatile _Float128 a = 4.0F128;
+int main(void)
+{
+    _Float128 x = a;
+    if (one(x) != bits(x)) return 1;
+    if (!agree(x, x)) return 2;
+    return 0;
+}
+"#;
+    crate::common::compile_and_run_everywhere("binary128_param_forward", src);
+}
+
+/// The binary128 arguments of a call returning `__int128` are binary128
+/// values: the call's return type was read as its arguments' type too, so
+/// each was given an integer's home. Covers register arguments, stacked ones
+/// past the eighth XMM register, arguments mixed with integer and `double`
+/// ones, and a binary128 return passed on, with nothing inlined. At -O0 on
+/// x86-64 `fw9`, forwarding its parameters in reverse, passed `nine` the low
+/// halves of its register parameters.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn binary128_arguments_of_an_int128_returning_call() {
+    let src = r#"
+#include <string.h>
+typedef unsigned __int128 u128;
+typedef _Float128 Q;
+__attribute__((noinline)) static u128 bits(Q x) { u128 u; memcpy(&u, &x, 16); return u; }
+__attribute__((noinline)) static u128 nine(Q a, Q b, Q c, Q d, Q e, Q f, Q g, Q h, Q i)
+{
+    return bits(i) ^ (bits(a) << 1);
+}
+__attribute__((noinline)) static u128 fw(Q a) { return nine(a, a, a, a, a, a, a, a, a); }
+__attribute__((noinline)) static u128 fw9(Q a, Q b, Q c, Q d, Q e, Q f, Q g, Q h, Q i)
+{
+    return nine(i, h, g, f, e, d, c, b, a);
+}
+__attribute__((noinline)) static Q id(Q a) { return a; }
+__attribute__((noinline)) static u128 pass(Q a) { return bits(id(a)); }
+__attribute__((noinline)) static u128 mix(int k, Q a, double d) { return bits(a) + k + (u128)d; }
+__attribute__((noinline)) static u128 fmix(Q a) { return mix(3, a, 2.0); }
+volatile Q A = 4.0F128, B = 3.0F128;
+int main(void)
+{
+    Q a = A, b = B;
+    if (fw(a) != (bits(a) ^ (bits(a) << 1))) return 1;
+    if (fw9(a, b, b, b, b, b, b, b, b) != (bits(a) ^ (bits(b) << 1))) return 2;
+    if (pass(a) != bits(a)) return 3;
+    if (fmix(a) != bits(a) + 5) return 4;
+    return 0;
+}
+"#;
+    crate::common::compile_and_run_everywhere("binary128_int128_call_args", src);
 }
 
 /// Eighteen binary128 values live at once outrun the fourteen allocatable

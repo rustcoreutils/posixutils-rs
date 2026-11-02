@@ -1768,57 +1768,10 @@ impl RegAlloc {
                 self.int128_pseudos.insert(p);
             }
         }
-        // First pass: identify targets of 128-bit instructions and all sources
-        // of 128-bit binary/unary ops.
-        for block in &func.blocks {
-            for insn in &block.insns {
-                // Only match Int128 type, not 16-byte structs or long doubles
-                let is_int128 = insn.typ.is_some_and(|t| types.is_plain_int128(t));
-
-                if is_int128 {
-                    // Lo64/Hi64: target is 64-bit (not int128), source is int128
-                    // Pair64: target is int128, sources are 64-bit (not int128)
-                    // AddC/AdcC/SubC/SbcC/UMulHi: 64-bit ops, not int128
-                    match insn.op {
-                        Opcode::Lo64 | Opcode::Hi64 => {
-                            // Source is int128, target is 64-bit
-                            for &src in &insn.src {
-                                self.int128_pseudos.insert(src);
-                            }
-                        }
-                        Opcode::Pair64 => {
-                            // Target is int128, sources are 64-bit
-                            if let Some(target) = insn.target {
-                                self.int128_pseudos.insert(target);
-                            }
-                        }
-                        _ => {
-                            // For Load: target is int128, but src[0] is the address (64-bit pointer).
-                            // For Store: src[0] is address (64-bit), src[1] is the int128 value.
-                            // A comparison is never here: its result is an `int`,
-                            // and `mapping` has split its 128-bit operands.
-                            if !matches!(insn.op, Opcode::Load) {
-                                if let Some(target) = insn.target {
-                                    self.int128_pseudos.insert(target);
-                                }
-                            }
-                            if matches!(insn.op, Opcode::Load) {
-                                if let Some(target) = insn.target {
-                                    self.int128_pseudos.insert(target);
-                                }
-                            } else if matches!(insn.op, Opcode::Store) {
-                                if let Some(&val) = insn.src.get(1) {
-                                    self.int128_pseudos.insert(val);
-                                }
-                            } else {
-                                for &src in &insn.src {
-                                    self.int128_pseudos.insert(src);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        // First pass: the operands each instruction itself types as 128-bit.
+        for insn in func.blocks.iter().flat_map(|b| &b.insns) {
+            self.int128_pseudos
+                .extend(crate::arch::regalloc::int128_operands(insn, types));
         }
         // Second pass: propagate through Copy instructions only.
         // Load src is an address (not int128), so don't propagate through Load.

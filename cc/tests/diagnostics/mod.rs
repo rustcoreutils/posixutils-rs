@@ -29,7 +29,8 @@ mod narrow_initializers;
 mod parse_error_location;
 
 use crate::common::{
-    compile_and_run, compile_expect_error, compile_expect_ok, create_c_file, run_c17,
+    compile_and_run, compile_and_run_two_units, compile_expect_error, compile_expect_ok,
+    create_c_file, run_c17,
 };
 
 // ============================================================================
@@ -1039,6 +1040,10 @@ fn diagnostics_fpermissive_is_not_a_dialect() {
 /// though it too has no out-of-line copy here. Its external definition may be
 /// in another translation unit, which is exactly the idiom a header uses, so
 /// an unsubstituted call is correct and the linker resolves it.
+///
+/// The second unit supplies that external definition (C17 6.7.4p7). Without
+/// it the program does not link at -O0, under gcc as well: nothing inlines the
+/// call, and the inline definition provides no external one.
 #[test]
 fn diagnostics_plain_inline_definition_is_not_an_error() {
     let code = r#"
@@ -1046,7 +1051,15 @@ inline int helper(int a) { return a + 1; }
 int use(int a) { return helper(a); }
 int main(void) { return use(1) == 2 ? 0 : 1; }
 "#;
-    assert_eq!(compile_and_run("diag_plain_inline_ok", code, &[]), 0);
+    let external = "int helper(int a) { return a + 1; }\n";
+    for opt in ["-O0", "-O2"] {
+        let level = vec![opt.to_string()];
+        assert_eq!(
+            compile_and_run_two_units("diag_plain_inline_ok", code, external, &level),
+            0,
+            "at {opt}"
+        );
+    }
 }
 
 /// An `always_inline` call in a large recursive caller is spliced, at every

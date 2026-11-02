@@ -1625,3 +1625,46 @@ int main(void) {
 "#;
     compile_and_run_everywhere("cg_int128_return_constant", code);
 }
+
+/// The arguments of a call returning `__int128` are typed by the callee's
+/// parameters, not by its return type.
+///
+/// x86-64's allocator took every operand of a 128-bit instruction for a
+/// 128-bit value, a call's arguments included. A `long` converted from an
+/// `int` on its way into such a call was then extended as a 128-bit
+/// integer, which skipped the sign extension: `f((long)-5)` passed
+/// 4294967291.
+#[test]
+fn codegen_int128_returning_call_takes_narrow_arguments() {
+    let code = r#"
+typedef unsigned __int128 u128;
+
+__attribute__((noinline)) u128 from_int(int a) { return (u128)(unsigned)a * 3; }
+__attribute__((noinline)) u128 from_long(long a) { return (u128)(unsigned long)a * 3; }
+__attribute__((noinline)) u128 from_double(double a) { return (u128)a; }
+__attribute__((noinline)) u128 from_float(float a) { return (u128)a; }
+__attribute__((noinline)) u128 from_schar(signed char a) { return (u128)(a + 1000); }
+__attribute__((noinline)) u128 from_ptr(int *p) { return *p; }
+
+volatile long L = 0x1234567890L;
+volatile int I = -5;
+volatile double D = 12.0;
+volatile float F = 7.0f;
+
+int main(void) {
+    long l = L;
+    int i = I;
+    double d = D;
+    float f = F;
+    if (from_int((int)l) != (u128)0x34567890u * 3) return 1;
+    if (from_long((long)i) != (u128)(unsigned long)-5L * 3) return 2;
+    if (from_double(d + 1) != 13) return 3;
+    if (from_float(f * 2) != 14) return 4;
+    if (from_schar((signed char)l) != (u128)(0x90 - 256 + 1000)) return 5;
+    if (from_ptr(&i) != (u128)-5) return 6;
+    if (from_int(i & 0xff) != 0xfb * 3) return 7;
+    return 0;
+}
+"#;
+    compile_and_run_everywhere("cg_int128_call_narrow_args", code);
+}

@@ -27,7 +27,9 @@
 #include <complex.h>
 
 /* The C library's feature tests, as flags this header can test without
-   `__GLIBC_USE`, which only glibc defines. */
+   `__GLIBC_USE`, which only glibc defines. glibc 2.40 renamed the C2X tests
+   C23 and kept no alias: a test that names a feature glibc does not define
+   is 0, so each is asked under both names. */
 #ifdef __GLIBC_USE
 #if __GLIBC_USE (IEC_60559_TYPES_EXT)
 #define __TG_TYPES 1
@@ -35,13 +37,13 @@
 #if __GLIBC_USE (IEC_60559_BFP_EXT)
 #define __TG_BFP 1
 #endif
-#if __GLIBC_USE (IEC_60559_BFP_EXT_C2X)
+#if __GLIBC_USE (IEC_60559_BFP_EXT_C2X) || __GLIBC_USE (IEC_60559_BFP_EXT_C23)
 #define __TG_BFP_C2X 1
 #endif
-#if __GLIBC_USE (IEC_60559_FUNCS_EXT_C2X)
+#if __GLIBC_USE (IEC_60559_FUNCS_EXT_C2X) || __GLIBC_USE (IEC_60559_FUNCS_EXT_C23)
 #define __TG_FUNCS_C2X 1
 #endif
-#if __GLIBC_USE (ISOC2X)
+#if __GLIBC_USE (ISOC2X) || __GLIBC_USE (ISOC23)
 #define __TG_C2X 1
 #endif
 #endif

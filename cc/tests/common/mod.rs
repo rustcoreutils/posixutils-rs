@@ -429,6 +429,7 @@ pub fn compile_with_host_cc(name: &str, c17_unit: &str, host_unit: &str) -> Opti
     );
 
     let linked = Command::new(host_cc)
+        .args(HOST_CC_BASELINE)
         .arg("-w")
         .arg("-o")
         .arg(&exe_path)
@@ -598,6 +599,19 @@ pub const HOST_CC: &str = if cfg!(target_os = "macos") {
     "gcc"
 };
 
+/// The options that hold the host compiler to what c17 implements -- C17 and
+/// the baseline ISA -- ahead of a test's own.
+///
+/// A distribution may default to neither. gcc 15 compiles C23, where
+/// `int f();` takes no arguments. Ubuntu 26.04's amd64v3 build defaults to
+/// `-march=x86-64-v3`, which passes a 32-byte vector in a YMM register where
+/// the baseline psABI passes it in memory.
+pub const HOST_CC_BASELINE: &[&str] = if cfg!(target_arch = "x86_64") {
+    &["-std=gnu17", "-march=x86-64"]
+} else {
+    &["-std=gnu17"]
+};
+
 /// Compile `src` with `extra` options to a host object in a scratch
 /// directory and return the run, its warnings included -- and the
 /// assembler's, which `-S` never reaches.
@@ -668,7 +682,12 @@ pub fn host_link_and_run_with(
     let exe = dir.join(name);
     let files: Vec<_> = c_srcs.iter().map(|s| create_c_file(name, s)).collect();
     let mut cmd = Command::new(HOST_CC);
-    cmd.arg("-w").arg(opt).args(extra).arg("-o").arg(&exe);
+    cmd.args(HOST_CC_BASELINE)
+        .arg("-w")
+        .arg(opt)
+        .args(extra)
+        .arg("-o")
+        .arg(&exe);
     for f in &files {
         cmd.arg(f.path());
     }

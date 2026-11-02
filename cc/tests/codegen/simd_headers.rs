@@ -296,19 +296,47 @@ fn simd_cpuid_bits_match_gcc() {
         "signature_SHANGHAI_ecx",
         "signature_SHANGHAI_edx",
     ];
-    let table = |var: &str| {
-        let values: Vec<String> = NAMES.iter().map(|n| format!("    {n},")).collect();
-        format!(
-            "#include <cpuid.h>\nconst unsigned {var}[] = {{\n{}\n}};\n",
-            values.join("\n")
-        )
+    // Xeon Phi's bits, which gcc 15's <cpuid.h> dropped along with the
+    // processors. c17 keeps them, as gcc 14 and earlier define them, and
+    // they are compared wherever the host's header still has them.
+    const RETIRED: &[&str] = &[
+        "bit_AVX512PF",
+        "bit_AVX512ER",
+        "bit_PREFETCHWT1",
+        "bit_AVX5124VNNIW",
+        "bit_AVX5124FMAPS",
+    ];
+    // One entry per name: `present` where the header must define it, and
+    // for a retired name `present` under `#ifdef`, else `absent`.
+    let array = |var: &str, present: &dyn Fn(&str) -> String, absent: &str| {
+        let values: Vec<String> = NAMES
+            .iter()
+            .map(|n| {
+                if RETIRED.contains(n) {
+                    format!(
+                        "#ifdef {n}\n    {},\n#else\n    {absent},\n#endif",
+                        present(n)
+                    )
+                } else {
+                    format!("    {},", present(n))
+                }
+            })
+            .collect();
+        format!("const unsigned {var}[] = {{\n{}\n}};\n", values.join("\n"))
     };
-    let c17_unit = table("c17_bits");
+    // c17's header must define every name, the retired ones included.
+    let c17_values: Vec<String> = NAMES.iter().map(|n| format!("    {n},")).collect();
+    let c17_unit = format!(
+        "#include <cpuid.h>\nconst unsigned c17_bits[] = {{\n{}\n}};\n",
+        c17_values.join("\n")
+    );
     let host_unit = format!(
-        "{}extern const unsigned c17_bits[];\nint main(void) {{\n    \
+        "#include <cpuid.h>\n{}{}extern const unsigned c17_bits[];\nint main(void) {{\n    \
          for (unsigned i = 0; i < sizeof host_bits / sizeof *host_bits; i++)\n        \
-         if (c17_bits[i] != host_bits[i]) return 10 + (int)i;\n    return 0;\n}}\n",
-        table("host_bits")
+         if (host_has[i] && c17_bits[i] != host_bits[i]) return 10 + (int)i;\n    \
+         return 0;\n}}\n",
+        array("host_bits", &|n| n.to_string(), "0"),
+        array("host_has", &|_| "1".to_string(), "0"),
     );
     if let Some(code) = crate::common::compile_with_host_cc("cpuid_bits", &c17_unit, &host_unit) {
         assert_eq!(

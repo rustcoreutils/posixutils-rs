@@ -84,3 +84,33 @@ int main(void)
         0
     );
 }
+
+/// Which C23 macros `<tgmath.h>` defines follows glibc's feature tests under
+/// either of their names: `_C2X` up to glibc 2.39, `_C23` from 2.40, which
+/// kept no alias. Asking only the old names lost `exp10`, `roundeven`,
+/// `fmaximum` and the rest on every newer glibc.
+///
+/// A stand-in `<math.h>` defines each spelling in turn, so the test needs no
+/// particular glibc on the host.
+#[test]
+fn tgmath_c23_macros_follow_both_glibc_spellings() {
+    let src = "#include <tgmath.h>\n\
+               #if !defined exp10 || !defined roundeven || !defined nextdown \\\n\
+               \x20   || !defined fmaximum\n\
+               #error \"missing\"\n\
+               #endif\n";
+    for c23 in ["C2X", "C23"] {
+        let dir = crate::common::work_dir("tgmath_c23_names");
+        let math = format!(
+            "#define __GLIBC_USE(F) __GLIBC_USE_ ## F\n\
+             #define __GLIBC_USE_IEC_60559_BFP_EXT_{c23} 1\n\
+             #define __GLIBC_USE_IEC_60559_FUNCS_EXT_{c23} 1\n\
+             #define __GLIBC_USE_ISO{c23} 1\n"
+        );
+        std::fs::write(dir.path().join("math.h"), math).unwrap();
+        std::fs::write(dir.path().join("complex.h"), "").unwrap();
+        let include = format!("-I{}", dir.path().display());
+        let run = crate::common::preprocess_text("tgmath_c23_names", src, &[&include]);
+        assert!(run.success, "glibc's {c23} names:\n{}", run.stderr);
+    }
+}

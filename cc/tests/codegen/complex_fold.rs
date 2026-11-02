@@ -166,23 +166,73 @@ fn exact_failure(code: i32, formats: &[Format]) -> String {
     format!("{what}: case {} disagrees", code % SECTION_CODES)
 }
 
+/// Whether the host's libgcc fuses the products of its `float` and `double`
+/// routines into their sums, as an x86-64-v3 build does -- Ubuntu 26.04's
+/// amd64v3 variant. c17 folds as the baseline x86-64 libgcc computes, the
+/// one the psABI's ISA builds, so on such a host a fold and the routine may
+/// differ in the last place: the comparisons between them are not made
+/// there. The fold itself is pinned for both contractions by
+/// `a_division_rounds_as_the_targets_libgcc_does`, on any host.
+///
+/// `(1 + i) / (3 + 7i)` is one place apart between the two.
+fn host_libgcc_fuses() -> bool {
+    let src = r#"
+#include <string.h>
+double _Complex __divdc3(double, double, double, double);
+static int is(double x, unsigned long long want) {
+    unsigned long long u;
+    memcpy(&u, &x, sizeof u);
+    return u == want;
+}
+int main(void) {
+    volatile double a = 1, b = 1, c = 3, d = 7;
+    double _Complex q = __divdc3(a, b, c, d);
+    if (is(__real__ q, 0x3fc611a7b9611a7cULL) && is(__imag__ q, 0xbfb1a7b9611a7b96ULL))
+        return 0;
+    if (is(__real__ q, 0x3fc611a7b9611a7bULL) && is(__imag__ q, 0xbfb1a7b9611a7b95ULL))
+        return 1;
+    return 2;
+}
+"#;
+    match compile_and_run("libgcc_fuses", src, &[]) {
+        0 => false,
+        1 => true,
+        code => panic!("the host's __divdc3 is neither libgcc's separate nor fused one: {code}"),
+    }
+}
+
 /// On the host, where libgcc is the runtime: x86-64 Linux.
 ///
 /// Also `float16_folds_exactly_on_x86_64`: `_Float16` folded from constants
 /// and computed from `volatile` operands on the host, bit for bit -- the
 /// last section of the same program.
+///
+/// Where the host's libgcc fuses ([`host_libgcc_fuses`]), the formats whose
+/// routines it fuses -- `float` and `double`, and `_Float16` through
+/// `float`'s -- are not compared.
 #[test]
 fn complex_folds_exactly_on_x86_64() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
     }
-    let formats: [Format; 5] = [
+    let all: [Format; 5] = [
         ("float", "float", "s", 4, FLOAT),
         ("double", "double", "d", 8, WIDE),
         ("long double", "long double", "x", 10, WIDE),
         ("_Float16", "float", "s", 2, HALF),
         ("_Float128", "_Float128", "t", 16, WIDE),
     ];
+    let fuses = host_libgcc_fuses();
+    let formats: Vec<Format> = all
+        .into_iter()
+        .filter(|f| !(fuses && matches!(f.1, "float" | "double")))
+        .collect();
+    if fuses {
+        eprintln!(
+            "SKIP float, double and complex _Float16 against the routine: \
+             the host's libgcc fuses them (x86-64-v3 build)"
+        );
+    }
     let src = exact_all(&formats, Some(F16_EXACT));
     for opt in ["-O0", "-O2"] {
         let code = compile_and_run("cfold_exact", &src, &[opt.to_string()]);
@@ -267,9 +317,18 @@ const F16_EXACT: &str = r#"
 /// Each pair below is computed twice in the one program -- once as a static
 /// initializer, which c17 folds, and once from `volatile` operands, which
 /// calls the routine -- so the comparison is against whatever the host
-/// actually links, and the test says nothing about which routine that is.
+/// actually links, and the test says nothing about which routine that is --
+/// except an x86-64 libgcc that fuses ([`host_libgcc_fuses`]), which c17
+/// does not fold as.
 #[test]
 fn folded_complex_arithmetic_matches_the_hosts_own_routine() {
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) && host_libgcc_fuses() {
+        eprintln!(
+            "SKIP folded double complex against the routine: \
+             the host's libgcc fuses it (x86-64-v3 build)"
+        );
+        return;
+    }
     let mut src = String::from(
         r#"
 #include <complex.h>

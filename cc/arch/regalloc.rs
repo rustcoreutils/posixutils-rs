@@ -1311,9 +1311,9 @@ pub fn arg_pseudo_types(func: &Function) -> Vec<(PseudoId, TypeId)> {
 /// The pseudos `insn` reads or writes as whole `__int128` values: those that
 /// need a 16-byte home.
 ///
-/// An instruction's type describes its result, or for `Lo64`/`Hi64` the
-/// 128-bit value split, and that is all it describes. The other operands
-/// have types of their own: an address, a condition, a call's arguments.
+/// An instruction's type describes its result, and that is all it
+/// describes. The other operands have types of their own: an address, a
+/// condition, a call's arguments.
 /// Taking every operand of a 128-bit instruction for a 128-bit value gave a
 /// `_Float128` argument of a call returning `__int128` an integer's slot,
 /// filled from its XMM register by a 64-bit move with the high half zeroed,
@@ -1336,10 +1336,10 @@ pub fn int128_operands(insn: &Instruction, types: &TypeTable) -> Vec<PseudoId> {
     if !insn.typ.is_some_and(is_int128) {
         return Vec::new();
     }
+    // `Lo64`/`Hi64` never get here: their type is the `long` half they
+    // produce. The 128-bit value they split is marked where it was made.
     let target = insn.target.into_iter();
     match insn.op {
-        // The 128-bit source split into 64-bit halves.
-        Opcode::Lo64 | Opcode::Hi64 => insn.src.clone(),
         // A 128-bit value assembled from 64-bit halves.
         Opcode::Pair64 => target.collect(),
         // `src[0]` is the address.

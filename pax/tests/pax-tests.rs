@@ -15,6 +15,7 @@ mod archive;
 mod compression;
 mod copy;
 mod cpio;
+mod header_fields;
 mod list;
 mod malformed;
 mod multivolume;

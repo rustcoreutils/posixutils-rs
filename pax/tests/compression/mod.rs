@@ -537,7 +537,7 @@ fn test_gzip_trailer_is_verified() {
 fn test_gzip_to_a_pipe_ends_with_the_trailer() {
     let temp = TempDir::new().unwrap();
     fs::write(temp.path().join("f"), b"contents\n").unwrap();
-    let out = run_pax_in_dir(&["-wz", "f"], temp.path());
+    let out = run_pax_in_dir(&["-wz", "-x", "ustar", "f"], temp.path());
     assert_success(&out, "pax -wz to a pipe");
     let gz = &out.stdout;
     let isize = u32::from_le_bytes(gz[gz.len() - 4..].try_into().unwrap());

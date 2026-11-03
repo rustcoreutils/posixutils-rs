@@ -1211,6 +1211,61 @@ impl OptionRecords {
         records.merge(&self.per_file);
         records.apply_to(entry);
     }
+
+    /// The records as they apply to the fields of a member about to be
+    /// written -- as a reader of the archive will apply them, the global
+    /// records and then the per-file ones over them -- or `None` when they
+    /// change none (`WrittenFields`).
+    ///
+    /// Only the attributes a ustar header has a field for -- never `size`,
+    /// which frames the data -- and only those whose record reaches the
+    /// archive past `-o delete=`.
+    fn written_fields(&self, options: &FormatOptions) -> Option<WrittenFields> {
+        let mut records = self.global.clone();
+        records.merge(&self.per_file);
+        let keep = |keyword: &str| !options.should_delete_keyword(keyword);
+        let mut fields = ExtendedHeader::new();
+        macro_rules! take {
+            ($($field:ident),*) => {$(
+                if keep(stringify!($field)) {
+                    fields.$field = records.$field.take();
+                }
+            )*};
+        }
+        take!(path, linkpath, uid, gid, uname, gname, mtime);
+        for keyword in ["uname", "gname"] {
+            if records.deleted.contains(keyword) && keep(keyword) {
+                fields.delete(keyword);
+            }
+        }
+        let changes =
+            STANDARD_KEYWORDS.iter().any(|k| fields.holds(k)) || !fields.deleted.is_empty();
+        changes.then_some(WrittenFields(fields))
+    }
+}
+
+/// The `-o` records that replace fields of each member a pax archive is
+/// written with (`OptionRecords::written_fields`).
+///
+/// The member's own fields then say what its records say, so a reader that
+/// ignores extended headers sees the same owner, time and name as one that
+/// honours them, and no record is computed from the value an operand
+/// replaced.
+#[derive(Debug, Clone)]
+struct WrittenFields(ExtendedHeader);
+
+impl WrittenFields {
+    /// `entry` as its records describe it. `linkpath` names the target of a
+    /// member that is a link, and gives no other member one.
+    fn apply(&self, entry: &ArchiveEntry) -> ArchiveEntry {
+        let mut fields = self.0.clone();
+        if entry.link_target.is_none() {
+            fields.linkpath = None;
+        }
+        let mut described = entry.clone();
+        fields.apply_to(&mut described);
+        described
+    }
 }
 
 /// The most bytes one extended attribute's value may hold: Linux's
@@ -1770,6 +1825,8 @@ pub struct PaxWriter<W: Write> {
     current_size: u64,
     sequence: u64,          // For generating unique names for extended header files
     options: FormatOptions, // Format-specific options
+    /// The `-o` operands that replace fields of every member.
+    fields: Option<WrittenFields>,
     global_header_written: bool, // Track if global header has been written
     /// Skip data writes for a symlink, which has no data blocks
     skip_data: bool,
@@ -1781,16 +1838,19 @@ impl<W: Write> PaxWriter<W> {
     /// There is deliberately no options-free constructor: the one caller that
     /// used it was append mode, where it silently discarded every `-o` option
     /// the user had passed.
-    pub fn with_options(writer: W, options: FormatOptions) -> Self {
-        PaxWriter {
+    ///
+    /// Fails on an operand whose value no record could carry.
+    pub fn with_options(writer: W, options: FormatOptions) -> PaxResult<Self> {
+        Ok(PaxWriter {
             writer,
             bytes_written: 0,
             current_size: 0,
             sequence: 0,
+            fields: OptionRecords::new(&options)?.written_fields(&options),
             options,
             global_header_written: false,
             skip_data: false,
-        }
+        })
     }
 
     /// Write global extended header (typeflag 'g') if there are global options
@@ -1844,45 +1904,12 @@ impl<W: Write> PaxWriter<W> {
             file_name.unwrap_or_default().as_bytes().to_vec()
         });
 
-        // Mode, uid, gid (use reasonable defaults)
-        write_octal(&mut header[MODE_OFF..], 0o644, 8);
-        write_octal(&mut header[UID_OFF..], 0, 8);
-        write_octal(&mut header[GID_OFF..], 0, 8);
-
-        // Size of global header data
-        write_octal(&mut header[SIZE_OFF..], data.len() as u64, 12);
-
-        // Mtime (use current time)
+        // Dated now: the records describe no one file.
         let mtime = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        write_octal(&mut header[MTIME_OFF..], mtime, 12);
-
-        // Typeflag 'g' for global extended header
-        header[TYPEFLAG_OFF] = PAX_GHDR;
-
-        // Magic and version
-        header[MAGIC_OFF..MAGIC_OFF + 6].copy_from_slice(b"ustar\0");
-        header[VERSION_OFF..VERSION_OFF + 2].copy_from_slice(b"00");
-
-        // Calculate and write checksum
-        let checksum = calculate_checksum(&header);
-        write_octal(&mut header[CHKSUM_OFF..], checksum as u64, 8);
-
-        // Write header
-        self.writer.write_all(&header)?;
-
-        // Write global header data
-        self.writer.write_all(&data)?;
-
-        // Pad to block boundary using static buffer
-        let padding = padding_needed(data.len() as u64);
-        if padding > 0 {
-            self.writer.write_all(&ZERO_BLOCK[..padding])?;
-        }
-
-        Ok(())
+        self.write_header_records(header, PAX_GHDR, mtime, &data)
     }
 
     /// Write extended header block
@@ -1911,40 +1938,42 @@ impl<W: Write> PaxWriter<W> {
                 .expand_exthdr_name(std::path::Path::new(file_name), self.sequence)
         });
 
-        // Mode, uid, gid (use reasonable defaults)
+        self.write_header_records(header, PAX_XHDR, ustar_time(entry.mtime), &data)
+    }
+
+    /// Write a `g` or `x` header block, its name already in `header`, and
+    /// the records `data` it frames.
+    ///
+    /// Every numeric field is filled, device numbers included: the block is a
+    /// ustar header like any other to a reader that does not know typeflag `g`
+    /// or `x`, and a strict one (star's tartest) rejects a field of NULs where
+    /// an octal number belongs.
+    fn write_header_records(
+        &mut self,
+        mut header: [u8; BLOCK_SIZE],
+        typeflag: u8,
+        mtime: u64,
+        data: &[u8],
+    ) -> PaxResult<()> {
         write_octal(&mut header[MODE_OFF..], 0o644, 8);
         write_octal(&mut header[UID_OFF..], 0, 8);
         write_octal(&mut header[GID_OFF..], 0, 8);
-
-        // Size of extended header data
         write_octal(&mut header[SIZE_OFF..], data.len() as u64, 12);
-
-        // Mtime (use entry's mtime)
-        write_octal(&mut header[MTIME_OFF..], ustar_time(entry.mtime), 12);
-
-        // Typeflag 'x' for per-file extended header
-        header[TYPEFLAG_OFF] = PAX_XHDR;
-
-        // Magic and version
+        write_octal(&mut header[MTIME_OFF..], mtime, 12);
+        header[TYPEFLAG_OFF] = typeflag;
         header[MAGIC_OFF..MAGIC_OFF + 6].copy_from_slice(b"ustar\0");
         header[VERSION_OFF..VERSION_OFF + 2].copy_from_slice(b"00");
-
-        // Calculate and write checksum
+        write_octal(&mut header[DEVMAJOR_OFF..], 0, 8);
+        write_octal(&mut header[DEVMINOR_OFF..], 0, 8);
         let checksum = calculate_checksum(&header);
         write_octal(&mut header[CHKSUM_OFF..], checksum as u64, 8);
 
-        // Write header
         self.writer.write_all(&header)?;
-
-        // Write extended header data
-        self.writer.write_all(&data)?;
-
-        // Pad to block boundary using static buffer
+        self.writer.write_all(data)?;
         let padding = padding_needed(data.len() as u64);
         if padding > 0 {
             self.writer.write_all(&ZERO_BLOCK[..padding])?;
         }
-
         Ok(())
     }
 }
@@ -1953,6 +1982,12 @@ impl<W: Write> ArchiveWriter for PaxWriter<W> {
     fn write_entry(&mut self, entry: &ArchiveEntry) -> PaxResult<()> {
         // Write global header if this is the first entry and we have global options
         self.write_global_header()?;
+
+        // The member as its records describe it, `-o keyword=value` and
+        // `keyword:=value` applied: both the ustar fields and the records
+        // they need are computed from that.
+        let described = self.fields.as_ref().map(|fields| fields.apply(entry));
+        let entry = described.as_ref().unwrap_or(entry);
 
         // Build extended header (respecting -o times option). Emit an `x`
         // extended header only when some field actually needs one; a pax archive
@@ -2374,7 +2409,7 @@ mod tests {
         let long = "n".repeat(MAX_NAME as usize + 1);
         let entry = ArchiveEntry::new(PathBuf::from(&long), EntryType::Regular);
         let mut out = Vec::new();
-        let mut writer = PaxWriter::with_options(&mut out, FormatOptions::default());
+        let mut writer = PaxWriter::with_options(&mut out, FormatOptions::default()).unwrap();
         assert!(writer.write_entry(&entry).is_err());
         assert!(out.is_empty(), "no header may be left behind");
     }
@@ -2531,7 +2566,7 @@ mod tests {
     fn test_xattrs_are_per_member_and_never_global() {
         let mut out = Vec::new();
         let options = FormatOptions::parse("SCHILY.xattr.user.g=G").unwrap();
-        let mut writer = PaxWriter::with_options(&mut out, options);
+        let mut writer = PaxWriter::with_options(&mut out, options).unwrap();
         let mut first = ArchiveEntry::new(PathBuf::from("a"), EntryType::Regular);
         first.xattrs = vec![
             xattr(b"SCHILY.xattr.user.a", b"1"),
@@ -2698,7 +2733,7 @@ mod tests {
     /// A pax archive of one empty member whose name needs a `path=` record.
     fn archive_with_extended_header() -> Vec<u8> {
         let mut out = Vec::new();
-        let mut writer = PaxWriter::with_options(&mut out, FormatOptions::default());
+        let mut writer = PaxWriter::with_options(&mut out, FormatOptions::default()).unwrap();
         let name = "n".repeat(NAME_LEN + 1);
         let entry = ArchiveEntry::new(PathBuf::from(name), EntryType::Regular);
         writer.write_entry(&entry).unwrap();
@@ -2713,7 +2748,7 @@ mod tests {
     #[test]
     fn test_long_extended_header_name_keeps_the_template() {
         let mut out = Vec::new();
-        let mut writer = PaxWriter::with_options(&mut out, FormatOptions::default());
+        let mut writer = PaxWriter::with_options(&mut out, FormatOptions::default()).unwrap();
         let path = format!("{}/{}", "x".repeat(200), "y".repeat(90));
         let entry = ArchiveEntry::new(PathBuf::from(path), EntryType::Regular);
         writer.write_entry(&entry).unwrap();

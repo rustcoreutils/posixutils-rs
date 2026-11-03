@@ -163,7 +163,7 @@ pub fn create_archive<W: Write>(
             options,
         ),
         ArchiveFormat::Pax => write_archive(
-            &mut PaxWriter::with_options(writer, options.format_options.clone()),
+            &mut PaxWriter::with_options(writer, options.format_options.clone())?,
             files,
             options,
         ),

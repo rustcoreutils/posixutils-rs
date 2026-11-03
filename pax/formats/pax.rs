@@ -1844,45 +1844,12 @@ impl<W: Write> PaxWriter<W> {
             file_name.unwrap_or_default().as_bytes().to_vec()
         });
 
-        // Mode, uid, gid (use reasonable defaults)
-        write_octal(&mut header[MODE_OFF..], 0o644, 8);
-        write_octal(&mut header[UID_OFF..], 0, 8);
-        write_octal(&mut header[GID_OFF..], 0, 8);
-
-        // Size of global header data
-        write_octal(&mut header[SIZE_OFF..], data.len() as u64, 12);
-
-        // Mtime (use current time)
+        // Dated now: the records describe no one file.
         let mtime = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        write_octal(&mut header[MTIME_OFF..], mtime, 12);
-
-        // Typeflag 'g' for global extended header
-        header[TYPEFLAG_OFF] = PAX_GHDR;
-
-        // Magic and version
-        header[MAGIC_OFF..MAGIC_OFF + 6].copy_from_slice(b"ustar\0");
-        header[VERSION_OFF..VERSION_OFF + 2].copy_from_slice(b"00");
-
-        // Calculate and write checksum
-        let checksum = calculate_checksum(&header);
-        write_octal(&mut header[CHKSUM_OFF..], checksum as u64, 8);
-
-        // Write header
-        self.writer.write_all(&header)?;
-
-        // Write global header data
-        self.writer.write_all(&data)?;
-
-        // Pad to block boundary using static buffer
-        let padding = padding_needed(data.len() as u64);
-        if padding > 0 {
-            self.writer.write_all(&ZERO_BLOCK[..padding])?;
-        }
-
-        Ok(())
+        self.write_header_records(header, PAX_GHDR, mtime, &data)
     }
 
     /// Write extended header block
@@ -1911,40 +1878,42 @@ impl<W: Write> PaxWriter<W> {
                 .expand_exthdr_name(std::path::Path::new(file_name), self.sequence)
         });
 
-        // Mode, uid, gid (use reasonable defaults)
+        self.write_header_records(header, PAX_XHDR, ustar_time(entry.mtime), &data)
+    }
+
+    /// Write a `g` or `x` header block, its name already in `header`, and
+    /// the records `data` it frames.
+    ///
+    /// Every numeric field is filled, device numbers included: the block is a
+    /// ustar header like any other to a reader that does not know typeflag `g`
+    /// or `x`, and a strict one (star's tartest) rejects a field of NULs where
+    /// an octal number belongs.
+    fn write_header_records(
+        &mut self,
+        mut header: [u8; BLOCK_SIZE],
+        typeflag: u8,
+        mtime: u64,
+        data: &[u8],
+    ) -> PaxResult<()> {
         write_octal(&mut header[MODE_OFF..], 0o644, 8);
         write_octal(&mut header[UID_OFF..], 0, 8);
         write_octal(&mut header[GID_OFF..], 0, 8);
-
-        // Size of extended header data
         write_octal(&mut header[SIZE_OFF..], data.len() as u64, 12);
-
-        // Mtime (use entry's mtime)
-        write_octal(&mut header[MTIME_OFF..], ustar_time(entry.mtime), 12);
-
-        // Typeflag 'x' for per-file extended header
-        header[TYPEFLAG_OFF] = PAX_XHDR;
-
-        // Magic and version
+        write_octal(&mut header[MTIME_OFF..], mtime, 12);
+        header[TYPEFLAG_OFF] = typeflag;
         header[MAGIC_OFF..MAGIC_OFF + 6].copy_from_slice(b"ustar\0");
         header[VERSION_OFF..VERSION_OFF + 2].copy_from_slice(b"00");
-
-        // Calculate and write checksum
+        write_octal(&mut header[DEVMAJOR_OFF..], 0, 8);
+        write_octal(&mut header[DEVMINOR_OFF..], 0, 8);
         let checksum = calculate_checksum(&header);
         write_octal(&mut header[CHKSUM_OFF..], checksum as u64, 8);
 
-        // Write header
         self.writer.write_all(&header)?;
-
-        // Write extended header data
-        self.writer.write_all(&data)?;
-
-        // Pad to block boundary using static buffer
+        self.writer.write_all(data)?;
         let padding = padding_needed(data.len() as u64);
         if padding > 0 {
             self.writer.write_all(&ZERO_BLOCK[..padding])?;
         }
-
         Ok(())
     }
 }

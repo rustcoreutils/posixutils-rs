@@ -235,3 +235,28 @@ fn test_deleted_override_leaves_the_ustar_field() {
     );
     assert_eq!(members(&archive)[0].uid(), real);
 }
+
+/// The default write format is pax: a name no ustar header can hold is
+/// archived, through a `path` record, in records of pax's 5120 bytes.
+#[test]
+fn test_default_write_format_is_pax() {
+    let temp = setup();
+    let long = "n".repeat(150);
+    fs::write(temp.path().join(&long), "x").unwrap();
+    let archive = write(temp.path(), &[], &[&long]);
+    assert_eq!(archive.len(), 5120);
+    let headers = headers(&archive);
+    assert_eq!(headers[0].typeflag(), b'x');
+    let listed = run_pax_with_stdin_bytes(&[], &archive);
+    assert_success(&listed, "list");
+    assert_eq!(stdout_str(&listed), format!("{long}\n"));
+}
+
+/// And `-o` keywords need no `-x pax` to be written.
+#[test]
+fn test_default_write_format_takes_keywords() {
+    let temp = setup();
+    let archive = write(temp.path(), &["-o", "uid:=0"], &["file"]);
+    assert_eq!(members(&archive)[0].uid(), 0);
+    assert!(headers(&archive).iter().any(|h| h.typeflag() == b'x'));
+}

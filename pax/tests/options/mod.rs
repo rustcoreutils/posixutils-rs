@@ -2649,7 +2649,7 @@ fn test_write_refuses_option_values_no_reader_accepts() {
 fn test_read_leaves_standard_input_after_the_archive() {
     let temp = TempDir::new().unwrap();
     fs::write(temp.path().join("f"), "x").unwrap();
-    let out = run_pax_in_dir(&["-w", "-f", "a.tar", "f"], temp.path());
+    let out = run_pax_in_dir(&["-w", "-x", "ustar", "-f", "a.tar", "f"], temp.path());
     assert_success(&out, "pax -w");
     let mut data = fs::read(temp.path().join("a.tar")).unwrap();
     assert_eq!(data.len(), 10240, "padded to a whole record");

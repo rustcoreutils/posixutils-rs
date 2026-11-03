@@ -164,7 +164,7 @@ struct Args {
     verbose: bool,
 
     // Left as an Option (rather than a defaulted value) so append mode can tell
-    // an explicit `-x` from the ustar default and reject a format that conflicts
+    // an explicit `-x` from the default and reject a format that conflicts
     // with the existing archive.
     #[arg(short = 'x', long, value_enum, allow_hyphen_values = true, help = gettext("Specify the output archive format"))]
     format: Option<Format>,
@@ -536,7 +536,15 @@ fn run_write(args: &Args, name_lists: Vec<NameList>, archive_bytes: &ByteCounter
     let substitutions = parse_substitutions(args)?;
     let format_options = parse_write_format_options(args)?;
 
-    let selected = args.format.unwrap_or(Format::Ustar);
+    // POSIX leaves the default implementation-defined. pax holds every name,
+    // size, owner and time a ustar header cannot, and a member that needs
+    // none of its records is a ustar member. The multi-volume writer writes
+    // ustar only, and keeps it as its default.
+    let selected = args.format.unwrap_or(if args.multi_volume {
+        Format::Ustar
+    } else {
+        Format::Pax
+    });
     let mut options = WriteOptions {
         cli_dereference: args.cli_dereference,
         dereference: args.dereference,

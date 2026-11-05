@@ -1126,11 +1126,11 @@ fn cmd_undelete(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Co
 
     for num in &msg_nums {
         if let Some(m) = mb.get_mut(*num) {
-            if m.disposition == Disposition::Deleted {
-                // Clear the deletion and leave the read state alone. Undeleting
-                // used to mark the message read, so a message that arrived new,
-                // was deleted, and was undeleted came back as already read.
+            // "Change the state of the specified messages from deleted to
+            // read."
+            if m.is_deleted() {
                 m.disposition = Disposition::Keep;
+                m.read = ReadState::Read;
             }
         }
     }

@@ -154,9 +154,10 @@ fn read_state_survives_a_reopen() {
     assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
-/// `undelete` must restore the state the message had, not blanket it as read.
+/// `undelete` changes a message "from deleted to read", whatever its state
+/// before it was deleted.
 #[test]
-fn undelete_restores_the_previous_read_state() {
+fn undelete_marks_the_message_read() {
     let mbox = create_temp_mbox(
         "From alice@example.com Fri Nov 29 10:00:00 2024\n\
          From: alice@example.com\n\
@@ -178,8 +179,8 @@ fn undelete_restores_the_previous_read_state() {
         .unwrap_or_else(|| panic!("no header row: {}", out));
     // The state is the row's second column; the date may hold `Nov`.
     assert!(
-        row.chars().nth(1) == Some('N'),
-        "undelete marked an unread message as read: {}",
+        row.chars().nth(1) == Some('R'),
+        "undelete should leave the message read: {}",
         row
     );
     assert_eq!(output.status.code(), Some(0), "exit status");

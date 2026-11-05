@@ -12,6 +12,7 @@ mod commands;
 mod compose;
 mod error;
 mod escapes;
+mod filename;
 mod lock;
 mod mailbox;
 mod mbox;

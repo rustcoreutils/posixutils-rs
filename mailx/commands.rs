@@ -16,11 +16,11 @@ use std::process::Command;
 
 use crate::compose::compose_body;
 use crate::error::{IoContext, Result};
+use crate::filename::{expand_local_prefixes, expand_typed_filename};
 use crate::mailbox::Mailbox;
 use crate::message::{author_filename, Disposition, ReadState};
 use crate::msglist::{msglist_or_current, parse_message, parse_msglist};
 use crate::send::{compose_reply, send_message, ComposedMessage};
-use crate::util::expand_local_prefixes;
 use crate::variables::{parse_set_arg, split_args, Variables};
 
 /// Result of executing a command
@@ -616,11 +616,11 @@ fn msglist_and_file(
         }
         1 => match parse_msglist(parts[0], mb, false, vars) {
             Ok(nums) if !file_required => Ok((nums, crate::util::mbox_path(vars))),
-            _ => Ok((vec![mb.current], expand_filename(parts[0], vars))),
+            _ => Ok((vec![mb.current], expand_typed_filename(parts[0], vars))),
         },
         n => {
             let nums = parse_msglist(&parts[..n - 1].join(" "), mb, false, vars)?;
-            Ok((nums, expand_filename(parts[n - 1], vars)))
+            Ok((nums, expand_typed_filename(parts[n - 1], vars)))
         }
     }
 }
@@ -711,7 +711,7 @@ fn cmd_copy_author(
 
     if let Some(first_msg) = msg_nums.first().and_then(|&n| mb.get(n)) {
         let filename = author_filename(first_msg.from())?;
-        let filename = expand_author_filename(&filename, vars);
+        let filename = expand_local_prefixes(&filename, vars);
 
         let written = mb.save_messages(&msg_nums, &filename, true)?;
 
@@ -838,7 +838,7 @@ fn cmd_file(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
             None => return Err("No previous folder".into()),
         }
     } else {
-        expand_filename(args, vars)
+        expand_typed_filename(args, vars)
     };
 
     // Remember the folder we are leaving for a later `#`.
@@ -863,7 +863,7 @@ fn cmd_file(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
 
 fn cmd_folders(vars: &mut Variables) -> Result<CommandResult> {
     if let Some(folder) = vars.get("folder") {
-        let folder = expand_filename(folder, vars);
+        let folder = expand_typed_filename(folder, vars);
         let lister = vars.get("LISTER").unwrap_or("ls");
         crate::util::shell(&format!("{} {}", lister, folder), vars)?;
     } else {
@@ -889,7 +889,7 @@ fn cmd_followup(
 
     // Record to file named after first recipient
     let record_file = author_filename(original.from())?;
-    let record_file = expand_author_filename(&record_file, vars);
+    let record_file = expand_local_prefixes(&record_file, vars);
 
     // Enter input mode
     compose_body(&mut composed, Some(mb), vars)?;
@@ -1322,7 +1322,7 @@ fn cmd_size(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
 /// directly, which recognized those words and did nothing with them -- a
 /// conditional in a sourced file was silently ignored.
 fn cmd_source(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult> {
-    let path = expand_filename(args.trim(), vars);
+    let path = expand_typed_filename(args.trim(), vars);
     let content = fs::read_to_string(&path).context(&path)?;
     crate::script::run_script(&content, &path, mb, vars);
     Ok(CommandResult::Continue)
@@ -1498,56 +1498,3 @@ fn cmd_scroll(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comm
 }
 
 // ============ Helper functions ============
-
-/// Resolve a filename typed in command mode.
-///
-/// POSIX applies two transformations in sequence (spec 104704-104711): a
-/// leading unquoted `+` becomes the `folder` variable and a slash, then shell
-/// word expansion. mailx's own `%`, `%user`, and `&` notations are resolved
-/// first; `#` needs the previous folder, so `cmd_file` handles it.
-///
-/// Only one pathname may result. The old expansion interpolated the name into
-/// `sh -c "printf '%s' <name>"` unquoted and joined whatever came back, so
-/// `my file.txt` silently became `myfile.txt`; a name the shell could not parse
-/// fell back to itself with no diagnostic.
-fn expand_filename(name: &str, vars: &Variables) -> String {
-    let expanded = expand_local_prefixes(name, vars);
-    shell_expand(&expanded, vars).unwrap_or(expanded)
-}
-
-/// Resolve a filename derived from message content, without the shell.
-///
-/// `Save`, `Copy`, `followup`, and `Followup` name their file after the
-/// message author. That name is attacker-controlled, so it gets the `+folder`
-/// and `%`/`&` notations that are mailx's own, and stops there -- the shell
-/// word expansion POSIX applies to a *typed* filename (spec 104709) would make
-/// a `From:` header a command line.
-fn expand_author_filename(name: &str, vars: &Variables) -> String {
-    expand_local_prefixes(name, vars)
-}
-
-/// Apply shell word expansion to a filename, requiring a single result.
-///
-/// `printf '%s\n'` puts each resulting word on its own line, so a name that
-/// expands to several pathnames can be recognized rather than silently
-/// concatenated. Returns `None` when the name is left as typed.
-fn shell_expand(name: &str, vars: &Variables) -> Option<String> {
-    // The word is interpolated into a shell command, so this must only ever be
-    // reached for a name the user typed. A filename derived from message
-    // content goes through `expand_author_filename`, which stops short of the
-    // shell.
-    // Nothing to expand: no shell metacharacter, no `~`, no variable.
-    if !name.contains(['~', '$', '*', '?', '[', '`', '"', '\'', '\\']) {
-        return None;
-    }
-
-    let out = crate::util::shell_output(&format!("printf '%s\\n' {}", name), vars).ok()?;
-    let mut words = out.lines();
-    let first = words.next()?;
-    if words.next().is_some() {
-        // More than one pathname where one is expected: effects are unspecified
-        // (spec 104710-104711), so leave the name alone rather than guess.
-        return None;
-    }
-    Some(first.to_string())
-}

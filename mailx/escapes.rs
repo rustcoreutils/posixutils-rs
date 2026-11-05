@@ -14,6 +14,7 @@ use std::io::{self, IsTerminal, Write};
 use std::process::{Command, Stdio};
 
 use crate::error::{Error, IoContext, Result};
+use crate::filename::expand_local_prefixes;
 use crate::mailbox::Mailbox;
 use crate::msglist::msglist_or_current;
 use crate::send::ComposedMessage;
@@ -246,7 +247,7 @@ pub fn handle_escape(
                 println!("{} bytes", output.len());
             } else {
                 // Read file
-                let path = expand_filename(args, vars);
+                let path = expand_local_prefixes(args, vars);
                 match fs::read(&path) {
                     Ok(content) => {
                         msg.body.extend_from_slice(&content);
@@ -279,7 +280,7 @@ pub fn handle_escape(
         'w' => {
             // Write body to file: create, or append if it already exists
             // (spec 105094-105097).
-            let path = expand_filename(args, vars);
+            let path = expand_local_prefixes(args, vars);
             let result = crate::util::private_open()
                 .create(true)
                 .append(true)
@@ -358,20 +359,6 @@ fn print_escape_help() {
 
 fn expand_escapes(s: &str) -> String {
     s.replace("\\t", "\t").replace("\\n", "\n")
-}
-
-/// Resolve a filename named by a command escape.
-///
-/// A command escape names "the file named by the pathname file" (spec
-/// 105085, 105094) -- unlike a command-mode filename, which POSIX does put
-/// through shell word expansion (spec 104704-104711). The `+folder` prefix is
-/// still honored, since that is mailx's own notation rather than the shell's.
-///
-/// This used to run the name through `sh -c "printf '%s' <name>"` unquoted, so
-/// `~w my file.txt` wrote to `myfile.txt`, `~w $(cmd)out` executed `cmd`, and a
-/// name the shell could not parse silently fell back to itself.
-fn expand_filename(name: &str, vars: &Variables) -> String {
-    crate::util::expand_local_prefixes(name, vars)
 }
 
 fn edit_message(msg: &mut ComposedMessage, editor: &str) -> Result<()> {

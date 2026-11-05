@@ -1415,3 +1415,21 @@ fn save_reports_the_bytes_written() {
         report
     );
 }
+
+/// An unclosed `<` still yields the address, not the display name.
+#[test]
+fn header_summary_sender_unclosed_angle() {
+    let (summary, _) = summary_and_commands(
+        "From x@example.com Mon Jan 29 10:29:21 2007\n\
+         From: Some Name <broken@example.com\n\
+         Subject: s\n\
+         \n\
+         body\n",
+        "",
+    );
+    assert!(
+        summary.contains(" broken@example.com ") && !summary.contains("Some Name"),
+        "{:?}",
+        summary
+    );
+}

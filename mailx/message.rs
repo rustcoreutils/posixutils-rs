@@ -258,9 +258,16 @@ impl Message {
 
 /// An address with its display name and any `(comment)` removed:
 /// `Name <a@b>` and `a@b (Name)` are both `a@b`.
+///
+/// An unclosed `<`, as in `Name <a@b`, still introduces the address;
+/// passing such a value through whole showed the display name instead.
 pub fn bare_address(s: &str) -> String {
-    if s.contains('<') {
-        return extract_address(s).trim().to_string();
+    if let Some(start) = s.find('<') {
+        if let Some(len) = s[start + 1..].find('>') {
+            return s[start + 1..start + 1 + len].trim().to_string();
+        }
+        // Unclosed: the address is what follows the `<`.
+        return s[start + 1..].trim().to_string();
     }
     let mut out = String::new();
     let mut depth = 0usize;

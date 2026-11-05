@@ -461,3 +461,28 @@ fn send_uses_sendmail_variable() {
     assert!(delivered.contains("Subject: Hi\n"), "{}", delivered);
     assert!(delivered.ends_with("\nbody line\n"), "{}", delivered);
 }
+
+/// A delivery agent that exits without reading the message is a failed
+/// delivery, reported as one: the write into its closed pipe does not kill
+/// mailx with SIGPIPE.
+#[test]
+fn send_reports_sendmail_that_exits_unread() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let (_dir, script, _) = stub_sendmail("echo 'no such user' >&2; exit 1");
+    let mailrc = create_temp_mailrc(&format!("set sendmail={}\n", script));
+    let body = "x".repeat(1023) + "\n";
+    let output = mailx_env(
+        &["-n", "-s", "Big", "rcpt@example.com"],
+        body.repeat(1024),
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+    );
+    assert_eq!(output.status.signal(), None, "{:?}", output);
+    assert_eq!(output.status.code(), Some(1), "{:?}", output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("sendmail failed: no such user"),
+        "{}",
+        stderr
+    );
+}

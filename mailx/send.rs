@@ -287,23 +287,51 @@ fn deliver(msg: &ComposedMessage, vars: &Variables) -> Result<()> {
         .spawn()
         .context("Failed to run sendmail")?;
 
-    child
-        .stdin
-        .as_mut()
-        .ok_or("Failed to open stdin")?
-        .write_all(&msg.format())
-        .context("Failed to write message")?;
+    // A sendmail that exits before reading all of the message -- it failed,
+    // or rejected a recipient -- closes the pipe: that is its failure to
+    // report, not a reason for mailx to die of SIGPIPE.
+    let written = {
+        let _sigpipe = plib::io::SigPipeIgnored::new();
+        let mut stdin = child.stdin.take().ok_or("Failed to open stdin")?;
+        stdin.write_all(&msg.format())
+    };
+    match written {
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+            let output = child
+                .wait_with_output()
+                .context("Failed to wait for sendmail")?;
+            if output.status.success() {
+                return Err("sendmail exited without reading the message".into());
+            }
+            return Err(sendmail_failure(&output).into());
+        }
+        Err(e) => {
+            let _ = child.wait();
+            return Err(e).context("Failed to write message");
+        }
+        Ok(()) => {}
+    }
 
     if vars.is_set("sendwait") {
         let output = child
             .wait_with_output()
             .context("Failed to wait for sendmail")?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("sendmail failed: {}", stderr).into());
+            return Err(sendmail_failure(&output).into());
         }
     }
     Ok(())
+}
+
+/// How sendmail failed: what it said, or else how it exited.
+fn sendmail_failure(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim_end();
+    if stderr.is_empty() {
+        format!("sendmail failed: {}", output.status)
+    } else {
+        format!("sendmail failed: {}", stderr)
+    }
 }
 
 /// Append an outgoing message to a record file, in mbox format.

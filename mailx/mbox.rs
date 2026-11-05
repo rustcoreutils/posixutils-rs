@@ -13,147 +13,147 @@ use std::io::{self, Write};
 
 use crate::message::{Message, ReadState};
 
+/// Where the parser is within the current message.
+#[derive(Debug, Clone, Copy)]
+enum Section {
+    /// The header block. `folding` says whether a continuation line belongs
+    /// to the field before it; it does not after a dropped `Status:`.
+    Headers {
+        folding: bool,
+    },
+    Body,
+}
+
 /// Split a mailbox file into its messages.
 pub(crate) fn parse(bytes: &[u8]) -> Vec<Message> {
     let mut messages = Vec::new();
-    let mut current_msg: Option<Message> = None;
-    let mut in_headers = false;
-    let mut header_continuation = false;
-    // A `From ` line only begins a message at the start of the file or
-    // after an empty line (spec 104427-104428). Splitting on every body
-    // line that happened to start with `From ` tore messages in half --
-    // and the format explicitly permits such a line when it does not
-    // follow an empty line.
-    let mut at_message_boundary = true;
+    let mut current: Option<(Message, Section)> = None;
+    // A `From ` line begins a message only at the start of the file or after
+    // an empty line (spec 104427-104428); anywhere else it is message text.
+    let mut after_blank = true;
 
     for raw in bytes.split_inclusive(|&b| b == b'\n') {
-        // The same line `str::lines` would yield; `raw` keeps the
-        // terminator so the message's on-disk size can be counted.
-        let line = match raw.strip_suffix(b"\n") {
-            Some(l) => l.strip_suffix(b"\r").unwrap_or(l),
-            None => raw,
-        };
-        let boundary = at_message_boundary;
-        at_message_boundary = line.is_empty();
+        let line = without_terminator(raw);
+        let in_headers = matches!(current, Some((_, Section::Headers { .. })));
+        let starts_message = after_blank && !in_headers && line.starts_with(b"From ");
+        after_blank = line.is_empty();
 
-        // Check for message separator (From line)
-        if line.starts_with(b"From ") && !in_headers && boundary {
-            // Save previous message if any
-            if let Some(msg) = current_msg.take() {
-                messages.push(msg);
-            }
-
-            // Start new message.  Absent a Status: header it is `new`
-            // (spec 104491-104496); a Status: header may downgrade it below.
-            let mut msg = Message::new();
-            msg.from_line = line.to_vec();
-            msg.read = ReadState::New;
-            msg.raw_lines = 1;
-            msg.raw_bytes = raw.len();
-            current_msg = Some(msg);
-            in_headers = true;
-            header_continuation = false;
-            continue;
-        }
-
-        if let Some(ref mut msg) = current_msg {
-            // Every physical line up to the next `From ` line is part of
-            // this message as stored: folded header lines, `Status:`, and
-            // the separating blank line included. The header summary and
+        if starts_message {
+            messages.extend(current.take().map(|(msg, _)| finish(msg)));
+            current = Some((start(line, raw), Section::Headers { folding: false }));
+        } else if let Some((msg, section)) = current.as_mut() {
+            // Every physical line up to the next `From ` line is part of the
+            // message as stored, framing included; the header summary and
             // `size` report these counts, as traditional mailx does.
             msg.raw_lines += 1;
             msg.raw_bytes += raw.len();
-
-            if in_headers {
-                if line.is_empty() {
-                    // End of headers
-                    in_headers = false;
-                } else if line.starts_with(b" ") || line.starts_with(b"\t") {
-                    // Header continuation. Skipped entirely when the header
-                    // it continues was not retained.
-                    if !header_continuation {
-                        continue;
-                    }
-                    if let Some((_, val)) = msg.headers.last_mut() {
-                        val.push(' ');
-                        val.push_str(String::from_utf8_lossy(line).trim());
-                    }
-                    // Append to last header line
-                    if let Some(last) = msg.header_lines.last_mut() {
-                        last.push(b'\n');
-                        last.extend_from_slice(line);
-                    }
-                } else if let Some(colon_pos) = line.iter().position(|&b| b == b':') {
-                    // New header. The parsed value is text, for matching
-                    // and display; the line itself is kept as stored.
-                    let key = String::from_utf8_lossy(&line[..colon_pos]).to_lowercase();
-                    let value = String::from_utf8_lossy(&line[colon_pos + 1..])
-                        .trim()
-                        .to_string();
-
-                    // A Status: header records prior disposition: `R`
-                    // (read) wins; `O` alone (seen but not read) is unread.
-                    // Absence of Status: leaves the message `new`.
-                    if key == "status" {
-                        if value.contains('R') {
-                            msg.read = ReadState::Read;
-                        } else if value.contains('O') {
-                            msg.read = ReadState::Unread;
-                        }
-                        msg.loaded_read = msg.read;
-                        // Not retained in `header_lines`: the writer
-                        // regenerates it from `read`, and keeping the loaded
-                        // copy would emit a stale one beside the fresh one.
-                        // Its continuation lines go with it -- leaving the
-                        // previous header current would append them to
-                        // whatever came before `Status:`.
-                        header_continuation = false;
-                        continue;
-                    }
-
-                    msg.headers.push((key, value));
-                    msg.header_lines.push(line.to_vec());
-                    header_continuation = true;
-                } else {
-                    // Malformed header, treat as body start
-                    in_headers = false;
-                    msg.body.extend_from_slice(line);
-                    msg.body.push(b'\n');
+            *section = match *section {
+                Section::Headers { folding } => header_line(msg, folding, line),
+                Section::Body => {
+                    push_line(&mut msg.body, unquote_from_line(line));
+                    Section::Body
                 }
-            } else {
-                // Body. Undo the mbox `From ` quoting: a run of `>`
-                // followed by `From ` loses one `>`. Stripping it only from
-                // `>From ` (and never adding one to `>>From `) meant a body
-                // line that genuinely read `>From x` was silently turned
-                // into `From x`.
-                msg.body.extend_from_slice(unquote_from_line(line));
-                msg.body.push(b'\n');
-            }
+            };
         }
     }
-
-    // Don't forget the last message
-    if let Some(msg) = current_msg {
-        messages.push(msg);
-    }
-
-    // The empty line that separates one message from the next belongs to
-    // the mbox framing, not to the message. Leaving it in the body meant
-    // the writer round-tripped it by accident for messages that had one and
-    // omitted it entirely for those that did not -- and an unconditional
-    // separator on write would then have doubled it, growing the mailbox by
-    // a blank line every session.
-    for msg in &mut messages {
-        if msg.body == b"\n" {
-            // A message with no body at all: the one line present is the
-            // framing blank, not content.
-            msg.body.clear();
-        } else if msg.body.ends_with(b"\n\n") {
-            msg.body.pop();
-        }
-    }
-
+    messages.extend(current.map(|(msg, _)| finish(msg)));
     messages
+}
+
+/// `raw` without its line terminator, as `str::lines` would give it.
+fn without_terminator(raw: &[u8]) -> &[u8] {
+    match raw.strip_suffix(b"\n") {
+        Some(l) => l.strip_suffix(b"\r").unwrap_or(l),
+        None => raw,
+    }
+}
+
+/// A message begun by the envelope `line`, `raw` with its terminator.
+fn start(line: &[u8], raw: &[u8]) -> Message {
+    let mut msg = Message::new();
+    msg.from_line = line.to_vec();
+    msg.raw_lines = 1;
+    msg.raw_bytes = raw.len();
+    msg
+}
+
+/// Add one line of the header block, returning where the next line falls.
+fn header_line(msg: &mut Message, folding: bool, line: &[u8]) -> Section {
+    if line.is_empty() {
+        return Section::Body;
+    }
+    if line.starts_with(b" ") || line.starts_with(b"\t") {
+        if folding {
+            append_continuation(msg, line);
+        }
+        return Section::Headers { folding };
+    }
+    let Some(colon) = line.iter().position(|&b| b == b':') else {
+        // Not a header field: the body began without its empty line.
+        push_line(&mut msg.body, line);
+        return Section::Body;
+    };
+
+    // The parsed value is text, for matching and display; the line itself is
+    // kept as stored.
+    let name = String::from_utf8_lossy(&line[..colon]).to_lowercase();
+    let value = String::from_utf8_lossy(&line[colon + 1..])
+        .trim()
+        .to_string();
+    if name == "status" {
+        if let Some(state) = status_read_state(&value) {
+            msg.read = state;
+            msg.loaded_read = state;
+        }
+        // Dropped, with any continuation lines: the writer regenerates
+        // `Status:` from the read state, and keeping this copy would write a
+        // stale one beside it.
+        return Section::Headers { folding: false };
+    }
+    msg.headers.push((name, value));
+    msg.header_lines.push(line.to_vec());
+    Section::Headers { folding: true }
+}
+
+/// Fold a continuation line into the last header field.
+fn append_continuation(msg: &mut Message, line: &[u8]) {
+    if let Some((_, value)) = msg.headers.last_mut() {
+        value.push(' ');
+        value.push_str(String::from_utf8_lossy(line).trim());
+    }
+    if let Some(last) = msg.header_lines.last_mut() {
+        last.push(b'\n');
+        last.extend_from_slice(line);
+    }
+}
+
+/// The read state a `Status:` value records: `R` is read, and `O` without
+/// it is seen but unread. Anything else says nothing, leaving the message
+/// `new` (spec 104491-104496).
+fn status_read_state(value: &str) -> Option<ReadState> {
+    if value.contains('R') {
+        Some(ReadState::Read)
+    } else if value.contains('O') {
+        Some(ReadState::Unread)
+    } else {
+        None
+    }
+}
+
+fn push_line(body: &mut Vec<u8>, line: &[u8]) {
+    body.extend_from_slice(line);
+    body.push(b'\n');
+}
+
+/// Drop the empty line that separates a message from the next: it belongs
+/// to the mbox framing, which the writer adds back, not to the message.
+fn finish(mut msg: Message) -> Message {
+    if msg.body == b"\n" {
+        msg.body.clear();
+    } else if msg.body.ends_with(b"\n\n") {
+        msg.body.pop();
+    }
+    msg
 }
 
 /// Serialize messages in mbox format (spec 104420-104436).
@@ -242,5 +242,65 @@ impl<W: Write> Write for CountingWriter<W> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bodies(mbox: &str) -> Vec<String> {
+        parse(mbox.as_bytes())
+            .iter()
+            .map(|m| String::from_utf8_lossy(&m.body).into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn from_line_splits_only_after_an_empty_line() {
+        let mbox = "From a Mon Jan  1 00:00:00 2024\nSubject: one\n\nbody\nFrom here on\n\n\
+                    From b Mon Jan  1 00:00:00 2024\nSubject: two\n\nsecond\n";
+        assert_eq!(bodies(mbox), ["body\nFrom here on\n", "second\n"]);
+    }
+
+    #[test]
+    fn quoted_from_lines_lose_one_mark() {
+        let mbox = "From a Mon Jan  1 00:00:00 2024\n\n>From x\n>>From y\n>Fromage\n";
+        assert_eq!(bodies(mbox), ["From x\n>From y\n>Fromage\n"]);
+    }
+
+    #[test]
+    fn status_is_dropped_with_its_continuation() {
+        let mbox = "From a Mon Jan  1 00:00:00 2024\nSubject: s\nStatus: RO\n x\nTo: t\n\nb\n";
+        let msg = &parse(mbox.as_bytes())[0];
+        assert_eq!(msg.read, ReadState::Read);
+        assert_eq!(msg.loaded_read, ReadState::Read);
+        assert_eq!(
+            msg.header_lines,
+            [b"Subject: s".to_vec(), b"To: t".to_vec()]
+        );
+        assert_eq!(msg.get_header("subject"), Some("s"));
+    }
+
+    #[test]
+    fn folded_field_keeps_its_lines_and_unfolds_its_value() {
+        let mbox = "From a Mon Jan  1 00:00:00 2024\nSubject: one\n\ttwo\n\nb\n";
+        let msg = &parse(mbox.as_bytes())[0];
+        assert_eq!(msg.header_lines, [b"Subject: one\n\ttwo".to_vec()]);
+        assert_eq!(msg.get_header("subject"), Some("one two"));
+    }
+
+    #[test]
+    fn a_line_that_is_not_a_field_starts_the_body() {
+        let mbox = "From a Mon Jan  1 00:00:00 2024\nSubject: s\nno colon here\nmore\n";
+        assert_eq!(bodies(mbox), ["no colon here\nmore\n"]);
+    }
+
+    #[test]
+    fn counts_cover_every_stored_line() {
+        let mbox = "From a Mon Jan  1 00:00:00 2024\nStatus: O\n\nbody\n\n";
+        let msg = &parse(mbox.as_bytes())[0];
+        assert_eq!((msg.raw_lines, msg.raw_bytes), (5, mbox.len()));
+        assert_eq!(msg.body, b"body\n");
     }
 }

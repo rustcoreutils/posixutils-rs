@@ -129,16 +129,27 @@ pub(crate) fn open_read_locked(path: &str) -> io::Result<(File, Option<DotLock>)
 ///
 /// The dotlock returned with the file must be held until the file is
 /// committed.
+///
+/// A file renamed over `path` while the lock was awaited -- another mailx
+/// prepending to the same mbox -- would leave the lock on a file no longer
+/// there, so the lock is taken again until it is on the file `path` names.
 pub(crate) fn open_locked(path: &str) -> io::Result<(File, Option<DotLock>)> {
+    use std::os::unix::fs::MetadataExt;
+
     let dotlock = dotlock(path);
-    let file = crate::util::private_open()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
-    lock(&file, true)?;
-    Ok((file, dotlock))
+    loop {
+        let file = crate::util::private_open()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        lock(&file, true)?;
+        let (held, named) = (file.metadata()?, fs::metadata(path)?);
+        if (held.dev(), held.ino()) == (named.dev(), named.ino()) {
+            return Ok((file, dotlock));
+        }
+    }
 }
 
 /// Flush and commit `file`, reporting any deferred write error.
@@ -148,4 +159,36 @@ pub(crate) fn open_locked(path: &str) -> io::Result<(File, Option<DotLock>)> {
 pub(crate) fn commit(mut file: File) -> io::Result<()> {
     file.flush()?;
     file.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    /// A file renamed over the mailbox while a writer waits for its lock is
+    /// the one the writer ends up holding, not the inode it first opened.
+    #[test]
+    fn a_lock_taken_after_a_rename_is_on_the_new_file() {
+        let dir = plib::tmp::TempDir::new().unwrap();
+        let path = dir.path().join("mbox");
+        fs::write(&path, "old\n").unwrap();
+        let holder = File::open(&path).unwrap();
+        // SAFETY: the fd is valid for the lifetime of `holder`.
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        let waiting = path.to_str().unwrap().to_string();
+        let waiter = std::thread::spawn(move || open_locked(&waiting).map(|(f, _)| f));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let replacement = dir.path().join("new");
+        fs::write(&replacement, "new\n").unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        drop(holder);
+
+        let locked = waiter.join().unwrap().unwrap();
+        assert_eq!(
+            locked.metadata().unwrap().ino(),
+            fs::metadata(&path).unwrap().ino()
+        );
+    }
 }

@@ -199,64 +199,80 @@ pub fn send_mode(args: &Args, vars: &mut Variables, interp: &mut Interp) -> Resu
     Ok(())
 }
 
-/// Send a composed message
+/// Send a composed message, then record it as `-F` or `record` asks.
 pub fn send_message(
     msg: &ComposedMessage,
     vars: &Variables,
     record_to_recipient: bool,
 ) -> Result<()> {
-    let recipients = msg.all_recipients();
-    if recipients.is_empty() {
+    if msg.all_recipients().is_empty() {
         return Err("No recipients".into());
     }
-
-    // `debug`: report the message instead of sending it.
     if vars.is_set("debug") {
-        eprintln!("--- Debug mode: message not sent ---");
-        // The envelope is what the delivery software is handed; the headers are
-        // what the recipients see. Blind recipients appear in the first and not
-        // the second, so the two are reported separately.
-        eprintln!(
-            "Envelope: {}",
-            msg.all_recipients()
-                .into_iter()
-                .map(crate::message::extract_address)
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        eprintln!("To: {}", msg.to.join(", "));
-        if !msg.cc.is_empty() {
-            eprintln!("Cc: {}", msg.cc.join(", "));
-        }
-        if !msg.bcc.is_empty() {
-            eprintln!("Bcc(envelope only): {}", msg.bcc.join(", "));
-        }
-        eprintln!("Subject: {}", msg.subject);
-        eprintln!("Body: {} bytes", msg.body.len());
-        eprintln!("---");
+        report_unsent(msg);
         return Ok(());
     }
 
-    let sendmail_paths = [
-        "/usr/sbin/sendmail",
-        "/usr/lib/sendmail",
-        "/usr/bin/sendmail",
-    ];
+    deliver(msg, vars)?;
 
-    let sendmail = sendmail_paths
+    if record_to_recipient {
+        if let Some(first_to) = msg.to.first() {
+            let filename = crate::message::author_filename(first_to)?;
+            record_message(msg, &filename, vars)?;
+        }
+    } else if let Some(record_file) = vars.get_nonempty("record") {
+        record_message(msg, record_file, vars)?;
+    }
+    Ok(())
+}
+
+/// `debug`: report on standard error what would have been sent.
+///
+/// The envelope is what the delivery software is handed; the headers are
+/// what the recipients see. Blind recipients appear in the first and not the
+/// second, so the two are reported separately.
+fn report_unsent(msg: &ComposedMessage) {
+    eprintln!("--- Debug mode: message not sent ---");
+    eprintln!(
+        "Envelope: {}",
+        msg.all_recipients()
+            .into_iter()
+            .map(crate::message::extract_address)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    eprintln!("To: {}", msg.to.join(", "));
+    if !msg.cc.is_empty() {
+        eprintln!("Cc: {}", msg.cc.join(", "));
+    }
+    if !msg.bcc.is_empty() {
+        eprintln!("Bcc(envelope only): {}", msg.bcc.join(", "));
+    }
+    eprintln!("Subject: {}", msg.subject);
+    eprintln!("Body: {} bytes", msg.body.len());
+    eprintln!("---");
+}
+
+const SENDMAIL_PATHS: [&str; 3] = [
+    "/usr/sbin/sendmail",
+    "/usr/lib/sendmail",
+    "/usr/bin/sendmail",
+];
+
+/// Hand the message to sendmail, waiting for it when `sendwait` is set.
+///
+/// The recipients are named on sendmail's command line rather than read from
+/// the headers with `-t`: the message carries no `Bcc:` header, so under `-t`
+/// blind recipients were never delivered to, and naming them keeps a blind
+/// address out of the delivered message however the mail system is set up.
+/// They are bare addresses, since a display name holding a comma or a quote
+/// is not something to hand an MTA as a recipient.
+fn deliver(msg: &ComposedMessage, vars: &Variables) -> Result<()> {
+    let sendmail = SENDMAIL_PATHS
         .iter()
         .find(|p| std::path::Path::new(p).exists())
         .ok_or("Cannot find sendmail")?;
 
-    // Name the recipients on the command line rather than asking sendmail to
-    // read them from the headers with `-t`. `format()` deliberately emits no
-    // `Bcc:` header, so under `-t` the blind recipients were simply never
-    // delivered to; naming them here also means a blind address cannot leak
-    // into the delivered message however the mail system is configured.
-    // Envelope operands are bare addresses. `compose_reply` fills the recipient
-    // lists from header values, so they carry display names -- and a display
-    // name containing a comma or a quote is not something to hand an MTA as a
-    // recipient.
     let recipients: Vec<String> = msg
         .all_recipients()
         .into_iter()
@@ -267,43 +283,32 @@ pub fn send_message(
         return Err("No recipients specified".into());
     }
 
-    let mut cmd = Command::new(sendmail);
-    cmd.arg("-oi") // Don't treat . as end of message
+    let mut child = Command::new(sendmail)
+        .arg("-oi") // a line of "." does not end the message
         .arg("--")
         .args(&recipients)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Failed to run sendmail")?;
 
-    let mut child = cmd.spawn().context("Failed to run sendmail")?;
-
-    {
-        let stdin = child.stdin.as_mut().ok_or("Failed to open stdin")?;
-        stdin
-            .write_all(&msg.format())
-            .context("Failed to write message")?;
-    }
+    child
+        .stdin
+        .as_mut()
+        .ok_or("Failed to open stdin")?
+        .write_all(&msg.format())
+        .context("Failed to write message")?;
 
     if vars.is_set("sendwait") {
         let output = child
             .wait_with_output()
             .context("Failed to wait for sendmail")?;
-
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!("sendmail failed: {}", stderr).into());
         }
     }
-
-    if record_to_recipient {
-        if let Some(first_to) = msg.to.first() {
-            let filename = crate::message::author_filename(first_to)?;
-            record_message(msg, &filename, vars)?;
-        }
-    } else if let Some(record_file) = vars.get_nonempty("record") {
-        record_message(msg, record_file, vars)?;
-    }
-
     Ok(())
 }
 

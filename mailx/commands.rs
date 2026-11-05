@@ -827,6 +827,9 @@ fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
     let (msg_nums, cmd) = pipe_arguments(args, mb, vars)?;
 
     let page = vars.is_set("page");
+    // A command that exits without reading all of a message closes the pipe;
+    // the message was handed over, so that is not an error.
+    let _sigpipe = plib::io::SigPipeIgnored::new();
 
     for num in &msg_nums {
         if let Some(msg) = mb.get(*num) {
@@ -834,19 +837,21 @@ fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
                 .stdin(std::process::Stdio::piped())
                 .spawn()
                 .map_err(|e| e.to_string())?;
-
-            // As the pager above: quitting it closes this pipe.
-            let _sigpipe = plib::io::SigPipeIgnored::new();
-
-            if let Some(stdin) = child.stdin.as_mut() {
-                let content = msg.format_display(false, vars);
-                stdin.write_all(&content).map_err(|e| e.to_string())?;
-                if page {
-                    stdin.write_all(b"\x0c").map_err(|e| e.to_string())?; // form feed
-                }
+            let mut input = msg.format_display(false, vars);
+            if page {
+                input.push(b'\x0c');
             }
-
+            let written = child
+                .stdin
+                .take()
+                .map_or(Ok(()), |mut s| s.write_all(&input));
             child.wait().map_err(|e| e.to_string())?;
+            match written {
+                Err(e) if e.kind() != io::ErrorKind::BrokenPipe => {
+                    return Err(e.to_string().into())
+                }
+                _ => {}
+            }
         }
     }
 

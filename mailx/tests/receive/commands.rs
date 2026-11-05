@@ -1210,3 +1210,26 @@ fn editor_may_take_arguments() {
         calls
     );
 }
+
+/// A `pipe` command that stops reading early is not an error: the message
+/// was handed over, so it is marked read.
+#[test]
+fn pipe_to_a_command_that_stops_reading() {
+    let body = "x".repeat(80).repeat(4000);
+    let mbox = create_temp_mbox(&format!(
+        "From a@x Mon Jan  1 00:00:00 2024\nFrom: a@x\nSubject: big\n\n{}\n",
+        body
+    ));
+    let output = mailx(
+        &["-n", "-N", "-f", mbox.path().to_str().unwrap()],
+        "pipe 1 \"head -c 1 >/dev/null\"\nfrom 1\nexit\n",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.is_empty(), "no error expected: {}", stderr);
+    assert!(
+        stdout.lines().any(|l| l.starts_with(">R")),
+        "message 1 should be read: {}",
+        stdout
+    );
+}

@@ -426,11 +426,8 @@ fn pipe_through_command(input: &[u8], cmd: &str, vars: &Variables) -> Result<Vec
 
 /// Execute a mailx command-level request from input mode (`~:` / `~_`).
 ///
-/// Per spec 105048-105049 this performs the command-level request. It goes
-/// through the one interpreter, which decides what is legal here from each
-/// command's context mask -- this used to be a third hand-written dispatcher
-/// with its own copy of the argument parser and its own `!` handling that,
-/// unlike the other two, did no bang expansion.
+/// The one interpreter runs it (spec 105048-105049), and each command's
+/// context mask decides whether it is legal in input mode.
 fn execute_input_mode_command(line: &str, vars: &mut Variables, interp: &mut Interp) -> Result<()> {
     // Input mode has no message store; commands needing one are excluded by
     // their context mask, so this scratch mailbox is never read from.

@@ -172,9 +172,7 @@ pub fn page_or_print(text: &[u8], vars: &Variables) {
 
 /// Prompt for a header field value, showing `current` as the initial text.
 ///
-/// Returns `None` when the user accepts what is there. Seven copies of this
-/// read-a-line-and-trim block existed across three files, which is why `mail`
-/// never honored `askcc`/`askbcc` while Send Mode did.
+/// Returns `None` when the user accepts what is there.
 pub fn prompt_field(label: &str, current: &str) -> Result<Option<String>> {
     print!("{}: {}", label, current);
     io::stdout().flush().map_err(|e| e.to_string())?;

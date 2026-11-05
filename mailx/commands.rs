@@ -35,11 +35,8 @@ pub enum CommandResult {
 
 /// Where a command line came from, which decides what is legal there.
 ///
-/// The three contexts used to be three separate interpreters -- command mode,
-/// start-up files, and `~:` from input mode -- each with its own abbreviation
-/// list, its own `!` handling, and its own idea of which commands existed. They
-/// drifted, so they are one interpreter and one table now, with the differences
-/// expressed as a mask on each command.
+/// One interpreter and one table serve all three; what differs is expressed
+/// as a mask on each command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Context {
     /// The interactive command loop.
@@ -117,8 +114,7 @@ const fn cmd(name: &'static str, min: usize, ctx: u8, run: Handler) -> Cmd {
 /// Matching is case-sensitive, which is the whole point: `Copy`, `Save`,
 /// `Print`, `Type`, `Reply`, and `Followup` are distinct commands from their
 /// lowercase forms (spec 104734-104742, 104949-104961, 104876, 104893-104902,
-/// 104803-104813). Dispatching on a lowercased command word made all six
-/// unreachable, and their handlers dead code.
+/// 104803-104813).
 ///
 /// The start-up exclusions are spec 104557-104559 exactly: `!`, `edit`, `hold`,
 /// `mail`, `preserve`, `reply`, `Reply`, `Save`, `shell`, `visual`, `Copy`,
@@ -331,8 +327,6 @@ fn parse_command_line(line: &str) -> (&str, &str) {
     }
 }
 
-// ============ Command implementations ============
-
 /// Report what a `save`, `copy`, `Save`, or `Copy` wrote.
 fn report_written(msg_nums: &[usize], filename: &str, total: u64) {
     println!(
@@ -343,7 +337,7 @@ fn report_written(msg_nums: &[usize], filename: &str, total: u64) {
     );
 }
 
-/// Mark messages saved and note that the mailbox needs writing back.
+/// Mark messages saved, so that quitting the mailbox removes them.
 fn mark_messages_saved(mb: &mut Mailbox, msg_nums: &[usize]) {
     for &num in msg_nums {
         if let Some(m) = mb.get_mut(num) {
@@ -396,7 +390,6 @@ fn msglist_and_file(
 
 pub(crate) fn cmd_alias(args: &str, vars: &mut Variables) -> Result<CommandResult> {
     if args.is_empty() {
-        // Print all aliases
         let mut names: Vec<&String> = vars.aliases.keys().collect();
         names.sort();
         for name in names {
@@ -407,12 +400,10 @@ pub(crate) fn cmd_alias(args: &str, vars: &mut Variables) -> Result<CommandResul
     } else {
         let parts: Vec<&str> = args.split_whitespace().collect();
         if parts.len() == 1 {
-            // Print specific alias
             if let Some(addrs) = vars.aliases.get(parts[0]) {
                 println!("{}\t{}", parts[0], addrs.join(" "));
             }
         } else {
-            // Set alias
             let name = parts[0].to_string();
             let addrs: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
             vars.aliases.insert(name, addrs);
@@ -448,9 +439,7 @@ fn cmd_cd(args: &str) -> Result<CommandResult> {
 /// `Copy` and `Save`: file the messages under the author's name.
 ///
 /// The two differ only in whether the messages are then marked saved
-/// (spec 104738-104742, 104958-104961), so they are one function. They were two
-/// near-identical copies, and -- because dispatch lowercased the command word
-/// before matching -- both were unreachable.
+/// (spec 104738-104742, 104958-104961).
 fn cmd_copy_author(
     args: &str,
     mb: &mut Mailbox,
@@ -565,7 +554,6 @@ fn edit_messages(msg_nums: &[usize], mb: &Mailbox, editor: &str) -> Result<Comma
 
 fn cmd_file(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult> {
     if args.is_empty() {
-        // Print current mailbox info
         println!("\"{}\" {} messages", mb.path, mb.undeleted_count());
         return Ok(CommandResult::Continue);
     }
@@ -627,17 +615,13 @@ fn cmd_followup(
     let original = mb.get(msg_num).ok_or("No message")?;
     let mut composed = compose_reply(original, reply_to_all, vars);
 
-    // Record to file named after first recipient
     let record_file = author_filename(original.from())?;
     let record_file = expand_local_prefixes(&record_file, vars);
 
-    // Enter input mode
     compose_body(&mut composed, Some(mb), vars, interp)?;
 
-    // Send and record
     send_message(&composed, vars, false)?;
-    // `followup` records through the same writer as `record`, so it honors
-    // `outfolder` -- its private copy of this logic did not.
+    // Recorded by the same writer as `record`, so `outfolder` applies.
     crate::send::record_message(&composed, &record_file, vars)?;
 
     if let Some(m) = mb.get_mut(msg_num) {
@@ -667,11 +651,8 @@ fn cmd_headers(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Com
     Ok(CommandResult::Continue)
 }
 
-/// The command list, generated from the dispatch table.
-///
-/// `help` and `list` used to carry hand-written inventories. They had already
-/// drifted from what dispatch accepted: `list` advertised `Copy`, `Save`,
-/// `Print`, `Type`, `Reply`, and `Followup`, none of which could run.
+/// The command list for `help` and `list`, taken from the dispatch table so
+/// it cannot disagree with what dispatch accepts.
 fn command_names() -> Vec<&'static str> {
     let mut names: Vec<&'static str> = COMMANDS.iter().map(|c| c.name).collect();
     names.extend(PUNCTUATION.iter().map(|c| c.name));
@@ -725,9 +706,7 @@ fn cmd_mail(
         composed.add_to(&addr);
     }
 
-    // `mail` prompts for the same optional headers Send Mode does; its own
-    // copy of this asked only for the subject, so `askcc`/`askbcc` were
-    // silently ignored here.
+    // The same optional headers Send Mode prompts for.
     if io::stdin().is_terminal() {
         crate::send::prompt_optional_headers(&mut composed, vars)?;
     }
@@ -957,12 +936,9 @@ pub(crate) fn cmd_set(args: &str, vars: &mut Variables) -> Result<CommandResult>
 
 /// The variable `arg` clears, if it is a `noname` form (spec 104963-104966).
 ///
-/// `no` is stripped when what follows names a variable that is currently set,
-/// or one of the internal booleans mailx knows about even when unset. Stripping
-/// it from any name merely beginning with those two letters turned `set notify`
-/// into `unset tify`; requiring the remainder to be a *known* boolean was the
-/// opposite mistake, and stopped `set nocrt` and every user-defined variable
-/// from being cleared at all.
+/// `no` is stripped when what follows names a variable that is set, or one of
+/// the binary internal variables even when unset: `set notify` does not unset
+/// `tify`, and `set nocrt` does unset `crt`.
 fn variable_being_cleared<'a>(arg: &'a str, vars: &Variables) -> Option<&'a str> {
     if arg.contains('=') {
         return None;
@@ -1037,10 +1013,7 @@ fn cmd_size(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
 
 /// `source`: read commands from a file and return to command mode.
 ///
-/// The file goes through the same interpreter as a start-up file, so its
-/// `if`/`else`/`endif` work. `source` used to call the start-up dispatcher
-/// directly, which recognized those words and did nothing with them -- a
-/// conditional in a sourced file was silently ignored.
+/// The file is run as a start-up file is, conditionals included.
 fn cmd_source(
     args: &str,
     mb: &mut Mailbox,
@@ -1060,7 +1033,6 @@ fn cmd_top(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Command
 
     for num in &msg_nums {
         if let Some(msg) = mb.get(*num) {
-            // Print headers
             let mut out = Vec::new();
             for line in &msg.header_lines {
                 out.extend_from_slice(line);
@@ -1068,7 +1040,6 @@ fn cmd_top(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Command
             }
             out.push(b'\n');
 
-            // Print first toplines of body
             for line in crate::util::byte_lines(&msg.body).take(toplines) {
                 out.extend_from_slice(line);
                 out.push(b'\n');
@@ -1167,7 +1138,7 @@ fn cmd_visual(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comm
 fn cmd_write(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult> {
     let (msg_nums, filename) = msglist_and_file(args, mb, vars, true)?;
 
-    // Write without headers
+    // `write` copies only the body.
     let mut file = crate::util::private_open()
         .create(true)
         .append(true)

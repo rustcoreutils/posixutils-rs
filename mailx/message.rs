@@ -11,13 +11,12 @@
 
 use crate::error::Result;
 
-/// Message state as defined by POSIX
 /// How much of a message the user has seen.
 ///
 /// This is the axis the `Status:` header records and the `:n`/`:o`/`:r`/`:u`
-/// selectors ask about. It is deliberately separate from [`Disposition`]:
-/// folding both into one enum meant deleting, preserving, or saving a message
-/// erased the knowledge of whether it had been read.
+/// selectors ask about. It is kept apart from [`Disposition`] so that
+/// deleting, preserving or saving a message does not forget whether it was
+/// read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadState {
     /// Never seen in any session; no `Status:` header.
@@ -147,38 +146,32 @@ impl Message {
             .map(|(_, value)| value.as_str())
     }
 
-    /// Get the From: header address
+    /// The `From:` value, or `(unknown)`.
     pub fn from(&self) -> &str {
         self.get_header("from").unwrap_or("(unknown)")
     }
 
-    /// Get the Subject: header
+    /// The `Subject:` value, or `(no subject)`.
     pub fn subject(&self) -> &str {
         self.get_header("subject").unwrap_or("(no subject)")
     }
 
-    /// Get the To: header
+    /// The `To:` value, or empty.
     pub fn to(&self) -> &str {
         self.get_header("to").unwrap_or("")
     }
 
-    /// Get the Date: header
+    /// The `Date:` value, or empty.
     pub fn date(&self) -> &str {
         self.get_header("date").unwrap_or("")
     }
 
-    /// The message's size in bytes, as stored in the mailbox file.
-    ///
-    /// Reconstructing it from the parsed parts undercounted: the separating
-    /// blank line and any `Status:` header are not kept in them.
+    /// The message's size in bytes as stored, framing and `Status:` included.
     pub fn size(&self) -> usize {
         self.raw_bytes
     }
 
-    /// The number of lines the message occupies in the mailbox file.
-    ///
-    /// Counting parsed header entries undercounted, since each folded header
-    /// is one entry spanning several lines.
+    /// The lines the message occupies as stored, folded header lines included.
     pub fn line_count(&self) -> usize {
         self.raw_lines
     }

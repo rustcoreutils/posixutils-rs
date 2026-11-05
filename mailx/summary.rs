@@ -176,8 +176,7 @@ fn envelope_date(s: &str) -> Option<String> {
 /// The abbreviation `s` stands for, when it is one of `abbrevs` or the
 /// matching full name in `names` (`Nov`, `November`), ignoring case.
 ///
-/// Only whole words count: matching on the first three letters took any
-/// word that began like one, so `marked` read as March.
+/// Only whole words count, so `marked` is not March.
 fn abbreviation(s: &str, abbrevs: &[&'static str], names: &[&str]) -> Option<&'static str> {
     abbrevs
         .iter()
@@ -214,8 +213,8 @@ fn header_date(s: &str) -> Option<String> {
 /// Truncate `s` to at most `max_len` characters for header-summary display,
 /// appending an ellipsis when shortened.
 ///
-/// Counts and slices by characters (not bytes) so a multibyte `From:`/`Subject:`
-/// value cannot land a slice on a non-char boundary and panic (audit #3).
+/// Counts by characters, not bytes, so a multibyte value is never cut inside
+/// a character.
 fn truncate_display(s: &str, max_len: usize) -> String {
     if s.chars().count() <= max_len {
         s.to_string()

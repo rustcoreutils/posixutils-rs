@@ -62,18 +62,11 @@ impl Mailbox {
 
     /// Load a mailbox from a file
     pub fn load(path: &str) -> Result<Self> {
-        // Read the file in one go rather than streaming it, so the byte length
-        // we record is exactly the extent we parsed. A delivery that lands
-        // mid-read would otherwise leave `loaded_len` disagreeing with the
-        // messages in hand, and the tail would be written back twice.
-        //
-        // Mail is not necessarily UTF-8, so the mailbox is parsed as bytes.
-        // Reading it as a string refused the whole mailbox when any message
-        // carried a raw 8-bit byte, so one Latin-1 message from anyone made
-        // all of a user's mail unreadable.
-        //
-        // The read is done under a shared lock, so a delivery in progress is
-        // waited for rather than half read.
+        // Read in one go, under a shared lock, so the length recorded is
+        // exactly the extent parsed and a delivery in progress is waited for
+        // rather than half read; otherwise `loaded_len` could disagree with the
+        // messages in hand and the tail be written back twice. Mail need not
+        // be UTF-8, so it is parsed as bytes.
         let bytes = read_locked(path).context(path)?;
         let mut mailbox = Mailbox::new(path.to_string());
         mailbox.loaded_len = bytes.len() as u64;
@@ -91,12 +84,11 @@ impl Mailbox {
         Ok(mailbox)
     }
 
-    /// Get the number of messages
     pub fn message_count(&self) -> usize {
         self.messages.len()
     }
 
-    /// Get number of undeleted messages
+    /// The number of messages not marked deleted.
     pub fn undeleted_count(&self) -> usize {
         self.messages
             .iter()
@@ -120,7 +112,7 @@ impl Mailbox {
         self.current = Some(num);
     }
 
-    /// Get a message by number (1-based)
+    /// Message `num`, counting from 1.
     pub fn get(&self, num: usize) -> Option<&Message> {
         if num > 0 && num <= self.messages.len() {
             Some(&self.messages[num - 1])
@@ -129,7 +121,7 @@ impl Mailbox {
         }
     }
 
-    /// Get a mutable message by number (1-based)
+    /// Message `num`, counting from 1, to change.
     pub fn get_mut(&mut self, num: usize) -> Option<&mut Message> {
         if num > 0 && num <= self.messages.len() {
             Some(&mut self.messages[num - 1])
@@ -159,7 +151,9 @@ impl Mailbox {
         self.messages.iter().any(|m| m.read != m.loaded_read)
     }
 
-    /// Handle quit - save read messages to mbox, delete saved, etc.
+    /// Close the mailbox as `quit` does: move read messages to mbox, drop
+    /// deleted and saved ones as `hold` and `keepsave` direct, and write the
+    /// rest back.
     pub fn quit(&mut self, vars: &Variables) -> Result<()> {
         let hold = vars.is_set("hold");
         let keepsave = vars.is_set("keepsave");
@@ -184,9 +178,7 @@ impl Mailbox {
                     // Without `keepsave` an explicitly saved message is dropped
                     // from the mailbox it was saved out of (spec 104890-104892).
                     // With it set, a system-mailbox message goes to mbox
-                    // (spec 104638-104640) and a secondary folder keeps its own
-                    // copy -- previously the folder case ignored `keepsave`
-                    // entirely and discarded the message either way.
+                    // (spec 104638-104640) and a secondary folder keeps it.
                     if keepsave {
                         if self.is_system_mailbox {
                             mbox_messages.push(msg);
@@ -195,10 +187,8 @@ impl Mailbox {
                         }
                     }
                 }
-                // `hold` and `preserve` keep a message where it is, whatever
-                // its read state. That state is no longer overwritten by the
-                // request, so `:r` still matches a preserved message that was
-                // read, and the `Status:` written back stays accurate.
+                // `hold` and `preserve` keep a message where it is, with its
+                // read state.
                 Disposition::Preserved => keep_messages.push(msg),
                 Disposition::Keep => {
                     let migrate = self.is_system_mailbox && !hold && msg.read == ReadState::Read;
@@ -211,26 +201,15 @@ impl Mailbox {
             }
         }
 
-        // Save to mbox if needed
         if !mbox_messages.is_empty() {
             let mbox_path = crate::util::mbox_path(vars);
             let append = vars.is_set("append");
             migrate_to_mbox(&mbox_path, &mbox_messages, append).context(&mbox_path)?;
         }
 
-        // Rewrite the current mailbox only when its set of messages actually
-        // changed. A message that merely left the mailbox is enough; a message
-        // deleted is covered too, since it is absent from `keep_messages`.
-        //
-        // Leaving the file alone otherwise is not just an optimization: it is
-        // what keeps mail delivered while mailx was running untouched in the
-        // common case, and it avoids rewriting -- and so re-timestamping -- a
-        // mailbox nobody changed.
-        // Rewrite when the set of messages changed, or when a message's
-        // recorded state no longer matches what is on disk. The second case is
-        // what lets read state survive a reopen at all: a session that only
-        // read messages changes no membership, but it does change every
-        // `Status:` header the mailbox should now carry.
+        // Rewrite only if messages left the mailbox or a read state changed.
+        // Leaving it alone otherwise keeps mail delivered meanwhile untouched
+        // and does not re-timestamp a mailbox nobody changed.
         if keep_messages.len() != self.messages.len() || self.state_differs_from_disk() {
             rewrite_mailbox(&self.path, &keep_messages, self.loaded_len, keep)
                 .context(&self.path)?;
@@ -239,12 +218,10 @@ impl Mailbox {
         Ok(())
     }
 
-    /// Save messages to a file
     /// Append messages to `path`.
     ///
     /// `include_from_line` distinguishes a mailbox (`save`, `copy`) from a
-    /// plain text dump (`write`). It was previously named `include_headers`,
-    /// which is not what the value controls.
+    /// plain text dump (`write`).
     pub fn save_messages(
         &self,
         msg_nums: &[usize],

@@ -96,7 +96,7 @@ impl ComposedMessage {
         msg
     }
 
-    /// Get all recipients
+    /// Every recipient: To, Cc and Bcc.
     pub fn all_recipients(&self) -> Vec<&str> {
         let mut recipients: Vec<&str> = self.to.iter().map(|s| s.as_str()).collect();
         recipients.extend(self.cc.iter().map(|s| s.as_str()));
@@ -171,14 +171,13 @@ pub fn send_mode(args: &Args, vars: &mut Variables, interp: &mut Interp) -> Resu
         prompt_optional_headers(&mut msg, vars)?;
     }
 
-    // Read message body
     let stdin = io::stdin();
 
     if is_tty {
         crate::compose::compose_body(&mut msg, None, vars, interp)?;
     } else {
-        // Non-interactive - just read stdin, as bytes: mail need not be UTF-8,
-        // and reading it as text refused any body that was not.
+        // Not a terminal: the body is all of standard input, as bytes, since
+        // mail need not be UTF-8.
         let mut input = Vec::new();
         stdin
             .lock()
@@ -195,7 +194,6 @@ pub fn send_mode(args: &Args, vars: &mut Variables, interp: &mut Interp) -> Resu
         return Ok(());
     }
 
-    // Send the message
     send_message(&msg, vars, args.record_to_recipient)?;
 
     Ok(())
@@ -212,7 +210,7 @@ pub fn send_message(
         return Err("No recipients".into());
     }
 
-    // Debug mode - don't actually send, just print diagnostics
+    // `debug`: report the message instead of sending it.
     if vars.is_set("debug") {
         eprintln!("--- Debug mode: message not sent ---");
         // The envelope is what the delivery software is handed; the headers are
@@ -239,7 +237,6 @@ pub fn send_message(
         return Ok(());
     }
 
-    // Try to use sendmail
     let sendmail_paths = [
         "/usr/sbin/sendmail",
         "/usr/lib/sendmail",
@@ -287,7 +284,6 @@ pub fn send_message(
             .context("Failed to write message")?;
     }
 
-    // Wait for sendmail if sendwait is set
     if vars.is_set("sendwait") {
         let output = child
             .wait_with_output()
@@ -299,7 +295,6 @@ pub fn send_message(
         }
     }
 
-    // Record the message if requested
     if record_to_recipient {
         if let Some(first_to) = msg.to.first() {
             let filename = crate::message::author_filename(first_to)?;
@@ -356,7 +351,6 @@ pub fn save_dead_letter(msg: &ComposedMessage, vars: &Variables) {
 pub fn compose_reply(original: &Message, reply_all: bool, vars: &Variables) -> ComposedMessage {
     let mut msg = ComposedMessage::new();
 
-    // Set subject
     let original_subject = original.subject();
     if original_subject.to_lowercase().starts_with("re:") {
         msg.subject = original_subject.to_string();
@@ -364,13 +358,10 @@ pub fn compose_reply(original: &Message, reply_all: bool, vars: &Variables) -> C
         msg.subject = format!("Re: {}", original_subject);
     }
 
-    // Add recipients
     if reply_all {
-        // Reply to all recipients.  The sender portion comes from Reply-To when
-        // present, otherwise from From (spec 104911-104916: in the lowercase
-        // form, From/To/Cc are used only when there is no Reply-To).
-        // Lists are split with `util::addresses`: a bare `split(',')` broke
-        // `"Smith, John" <j@x>` into two recipients, neither of them valid.
+        // The sender's part is Reply-To, or From without one. Whether To and
+        // Cc join a Reply-To is implementation-defined (spec 104911-104916);
+        // here they do.
         if let Some(reply_to) = original.get_header("reply-to") {
             for addr in crate::util::addresses(reply_to) {
                 msg.add_to(addr);
@@ -379,8 +370,8 @@ pub fn compose_reply(original: &Message, reply_all: bool, vars: &Variables) -> C
             msg.add_to(original.from());
         }
 
-        // Add all To: recipients.  Unless metoo is set, the user's own login
-        // and any declared alternates come out of the list (spec 104926-104928).
+        // Unless `metoo` is set, the user's own login and alternates come out
+        // of the list (spec 104926-104928).
         let include_self = vars.is_set("metoo");
 
         for addr in crate::util::addresses(original.to()) {
@@ -390,7 +381,6 @@ pub fn compose_reply(original: &Message, reply_all: bool, vars: &Variables) -> C
             msg.add_to(addr);
         }
 
-        // Add Cc: recipients
         if let Some(cc) = original.get_header("cc") {
             for addr in crate::util::addresses(cc) {
                 if !include_self && vars.is_me(addr) {
@@ -400,9 +390,8 @@ pub fn compose_reply(original: &Message, reply_all: bool, vars: &Variables) -> C
             }
         }
     } else {
-        // Reply only to sender
-        // Check Reply-To first
-        // Reply-To may name several addresses; each is a recipient.
+        // Reply-To may name several addresses, each a recipient; without
+        // one, the sender.
         if let Some(reply_to) = original.get_header("reply-to") {
             for addr in crate::util::addresses(reply_to) {
                 msg.add_to(addr);

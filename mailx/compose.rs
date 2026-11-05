@@ -47,10 +47,7 @@ fn interrupt_message(
 /// Read a message body from standard input, handling command escapes.
 ///
 /// Shared by every entry into input mode: `mail`, `reply`, `followup`, and Send
-/// Mode. There were two copies of this loop, and they had diverged -- the one
-/// used by `mail`/`reply`/`followup` ignored the escape result's request to
-/// save the partial message, so `~q` from those commands never wrote
-/// `dead.letter` although `~q` in Send Mode did.
+/// Mode.
 pub(crate) fn compose_body(
     composed: &mut ComposedMessage,
     mb: Option<&Mailbox>,

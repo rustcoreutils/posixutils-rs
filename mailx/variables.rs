@@ -203,9 +203,8 @@ impl Variables {
     /// Expand `name`, with `active` naming the aliases already being expanded.
     ///
     /// An alias that refers back to one further up the chain is emitted
-    /// literally rather than followed. Without this, `alias a b` plus
-    /// `alias b a` -- or simply `alias a a` -- recursed until the stack died,
-    /// and a start-up file is a natural place for such a definition to appear.
+    /// literally rather than followed, so `alias a b` with `alias b a`, or
+    /// `alias a a`, ends.
     fn expand_alias_inner(&self, name: &str, active: &mut Vec<String>) -> Vec<String> {
         let Some(addrs) = self.aliases.get(name) else {
             return Vec::new();
@@ -251,10 +250,8 @@ impl Variables {
     /// set as the user's login name plus the addresses declared with
     /// `alternates`, compared case-insensitively (spec 104728).
     ///
-    /// The comparison is on whole names, not substrings. It used to ask whether
-    /// the address *contained* the login, which made a short login like `ed`
-    /// match `edward@example.com` -- and made an empty `$USER` match every
-    /// address there is, so a reply-all silently addressed no one.
+    /// Whole names are compared, not substrings: a login of `ed` is not
+    /// `edward@example.com`, and an unknown login matches nothing.
     pub fn is_me(&self, addr: &str) -> bool {
         let addr = crate::message::extract_address(addr);
         let addr = addr.as_str();
@@ -303,9 +300,7 @@ fn strip_one_quote_pair(s: &str) -> &str {
 /// Per spec 104694-104703: an argument enclosed in a matched pair of double or
 /// single quotes keeps its whitespace and backslashes literally, each quote
 /// character is ordinary inside the other kind, and an unquoted backslash makes
-/// the next character literal. Splitting on bare whitespace instead meant no
-/// variable value could contain a blank -- `set prompt="mail > "` was simply
-/// unusable.
+/// the next character literal.
 pub fn split_args(line: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut word = String::new();

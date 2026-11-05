@@ -169,11 +169,7 @@ fn finish(mut msg: Message) -> Message {
 /// regenerated `Status:`, an empty line, the `From `-quoted body, and one
 /// trailing empty line -- so the next `From ` line is preceded by an empty
 /// line, as the format requires.
-pub(crate) fn write_messages<W: Write>(
-    w: &mut W,
-    messages: &[&Message],
-    include_from_line: bool,
-) -> io::Result<()> {
+pub(crate) fn write_messages<W: Write>(w: &mut W, messages: &[&Message]) -> io::Result<()> {
     for msg in messages {
         // Stored lines keep their own CR; the lines written here take the
         // message's line ending, CRLF when its `From ` line had one.
@@ -182,9 +178,7 @@ pub(crate) fn write_messages<W: Write>(
         } else {
             b"\n"
         };
-        if include_from_line {
-            write_line(w, &msg.from_line)?;
-        }
+        write_line(w, &msg.from_line)?;
         for header in &msg.header_lines {
             write_line(w, header)?;
         }
@@ -318,7 +312,7 @@ mod tests {
         let messages = parse(mbox.as_bytes());
         assert_eq!(messages[0].get_header("subject"), Some("s x"));
         let mut out = Vec::new();
-        write_messages(&mut out, &[&messages[0]], true).unwrap();
+        write_messages(&mut out, &[&messages[0]]).unwrap();
         assert_eq!(String::from_utf8_lossy(&out), mbox);
     }
 

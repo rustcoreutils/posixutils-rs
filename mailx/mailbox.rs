@@ -219,18 +219,10 @@ impl Mailbox {
         Ok(())
     }
 
-    /// Append messages to `path`.
-    ///
-    /// `include_from_line` distinguishes a mailbox (`save`, `copy`) from a
-    /// plain text dump (`write`).
-    pub fn save_messages(
-        &self,
-        msg_nums: &[usize],
-        path: &str,
-        include_from_line: bool,
-    ) -> Result<u64> {
+    /// Append messages `msg_nums` to the mailbox `path`.
+    pub fn save_messages(&self, msg_nums: &[usize], path: &str) -> Result<u64> {
         let messages: Vec<&Message> = msg_nums.iter().filter_map(|&n| self.get(n)).collect();
-        append_messages_to_file(path, &messages, include_from_line).context(path)
+        append_messages_to_file(path, &messages).context(path)
     }
 }
 
@@ -268,7 +260,7 @@ fn rewrite_mailbox(
     file.set_len(0)?;
     {
         let mut w = io::BufWriter::new(&mut file);
-        write_messages(&mut w, messages, true)?;
+        write_messages(&mut w, messages)?;
         w.write_all(&tail)?;
         w.flush()?;
     }
@@ -294,7 +286,7 @@ fn migrate_to_mbox(path: &str, messages: &[&Message], append: bool) -> io::Resul
 
     {
         let mut w = io::BufWriter::new(&mut file);
-        write_messages(&mut w, messages, true)?;
+        write_messages(&mut w, messages)?;
         w.write_all(&existing)?;
         w.flush()?;
     }
@@ -311,11 +303,7 @@ fn migrate_to_mbox(path: &str, messages: &[&Message], append: bool) -> io::Resul
 /// regular files where it means something.
 ///
 /// Returns the number of bytes appended.
-pub(crate) fn append_messages_to_file(
-    path: &str,
-    messages: &[&Message],
-    include_from_line: bool,
-) -> io::Result<u64> {
+pub(crate) fn append_messages_to_file(path: &str, messages: &[&Message]) -> io::Result<u64> {
     let mut file = crate::util::private_open()
         .create(true)
         .append(true)
@@ -329,7 +317,7 @@ pub(crate) fn append_messages_to_file(
             inner: io::BufWriter::new(&mut file),
             count: 0,
         };
-        write_messages(&mut w, messages, include_from_line)?;
+        write_messages(&mut w, messages)?;
         w.flush()?;
         w.count
     };

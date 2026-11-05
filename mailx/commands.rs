@@ -482,7 +482,7 @@ fn cmd_copy_author(
         let filename = author_filename(first_msg.from())?;
         let filename = expand_local_prefixes(&filename, vars);
 
-        let written = mb.save_messages(&msg_nums, &filename, true)?;
+        let written = mb.save_messages(&msg_nums, &filename)?;
 
         if mark_saved {
             mark_messages_saved(mb, &msg_nums);
@@ -918,7 +918,7 @@ fn cmd_save(
 ) -> Result<CommandResult> {
     let (msg_nums, filename) = msglist_and_file(args, mb, vars, false)?;
 
-    let written = mb.save_messages(&msg_nums, &filename, true)?;
+    let written = mb.save_messages(&msg_nums, &filename)?;
 
     if mark_saved {
         mark_messages_saved(mb, &msg_nums);

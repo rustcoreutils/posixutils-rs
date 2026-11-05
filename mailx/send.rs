@@ -332,7 +332,7 @@ pub(crate) fn record_message(
     let date = chrono::Local::now().format("%a %b %e %H:%M:%S %Y");
     let entry = msg.to_message(format!("From {} {}", user, date));
 
-    crate::mailbox::append_messages_to_file(&path, &[&entry], true).context(&path)?;
+    crate::mailbox::append_messages_to_file(&path, &[&entry]).context(&path)?;
     Ok(())
 }
 

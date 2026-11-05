@@ -18,6 +18,16 @@ use crate::mbox::{write_messages, CountingWriter};
 use crate::message::{Disposition, Message, ReadState};
 use crate::variables::Variables;
 
+/// What quitting does with a message.
+enum Fate {
+    /// Move it to the secondary mbox.
+    Mbox,
+    /// Leave it in the mailbox.
+    Keep,
+    /// Drop it.
+    Discard,
+}
+
 /// Which way `Mailbox::find` searches.
 #[derive(Debug, Clone, Copy)]
 pub enum Direction {
@@ -146,6 +156,29 @@ impl Mailbox {
         }
     }
 
+    /// Where quitting puts `msg`, given the `hold` and `keepsave` variables.
+    fn fate(&self, msg: &Message, hold: bool, keepsave: bool) -> Fate {
+        match msg.disposition {
+            Disposition::Deleted => Fate::Discard,
+            // `mbox` and `touch` send a message to mbox whatever `hold` says
+            // (spec 104853-104855).
+            _ if msg.force_mbox => Fate::Mbox,
+            // Without `keepsave` a saved message leaves the mailbox it was
+            // saved from (spec 104890-104892). With it, a system-mailbox
+            // message goes to mbox (spec 104638-104640) and a secondary
+            // folder keeps it.
+            Disposition::Saved if !keepsave => Fate::Discard,
+            Disposition::Saved if self.is_system_mailbox => Fate::Mbox,
+            Disposition::Saved => Fate::Keep,
+            // `hold` and `preserve` keep a message where it is.
+            Disposition::Preserved => Fate::Keep,
+            Disposition::Keep if self.is_system_mailbox && !hold && msg.read == ReadState::Read => {
+                Fate::Mbox
+            }
+            Disposition::Keep => Fate::Keep,
+        }
+    }
+
     /// Whether any message's read state differs from the one it loaded with.
     fn state_differs_from_disk(&self) -> bool {
         self.messages.iter().any(|m| m.read != m.loaded_read)
@@ -159,45 +192,13 @@ impl Mailbox {
         let keepsave = vars.is_set("keepsave");
         let keep = vars.is_set("keep");
 
-        // Collect messages for mbox
         let mut mbox_messages = Vec::new();
         let mut keep_messages = Vec::new();
-
         for msg in &self.messages {
-            // The mbox/touch commands force a message into the secondary mbox,
-            // overriding a set `hold` variable (spec 104853-104855).
-            if msg.force_mbox && msg.disposition != Disposition::Deleted {
-                mbox_messages.push(msg);
-                continue;
-            }
-            match msg.disposition {
-                Disposition::Deleted => {
-                    // Discard
-                }
-                Disposition::Saved => {
-                    // Without `keepsave` an explicitly saved message is dropped
-                    // from the mailbox it was saved out of (spec 104890-104892).
-                    // With it set, a system-mailbox message goes to mbox
-                    // (spec 104638-104640) and a secondary folder keeps it.
-                    if keepsave {
-                        if self.is_system_mailbox {
-                            mbox_messages.push(msg);
-                        } else {
-                            keep_messages.push(msg);
-                        }
-                    }
-                }
-                // `hold` and `preserve` keep a message where it is, with its
-                // read state.
-                Disposition::Preserved => keep_messages.push(msg),
-                Disposition::Keep => {
-                    let migrate = self.is_system_mailbox && !hold && msg.read == ReadState::Read;
-                    if migrate {
-                        mbox_messages.push(msg);
-                    } else {
-                        keep_messages.push(msg);
-                    }
-                }
+            match self.fate(msg, hold, keepsave) {
+                Fate::Mbox => mbox_messages.push(msg),
+                Fate::Keep => keep_messages.push(msg),
+                Fate::Discard => {}
             }
         }
 

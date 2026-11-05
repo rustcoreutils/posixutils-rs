@@ -1047,3 +1047,32 @@ fn repeated_header_field_uses_the_first() {
         summary
     );
 }
+
+/// `-H` with a bare `-f` summarizes mbox, the mailbox `-f` names when no
+/// file is given, not the system mailbox.
+#[test]
+fn opt_h_with_bare_f_reads_mbox() {
+    let mbox = create_temp_mbox(
+        "From saved@example.com Fri Nov 29 10:00:00 2024\n\
+         From: saved@example.com\n\
+         Subject: kept in mbox\n\
+         \n\
+         body\n",
+    );
+    let output = mailx_env(
+        &["-n", "-H", "-f"],
+        "",
+        &[
+            ("MBOX", mbox.path().to_str().unwrap()),
+            ("MAIL", "/nonexistent/system/mailbox"),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("kept in mbox"),
+        "-H -f should summarize mbox: {}\n{}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
+}

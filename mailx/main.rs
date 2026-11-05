@@ -82,7 +82,7 @@ fn run_check_mail(args: &Args) -> i32 {
 
 fn run_headers_only(args: &Args) -> i32 {
     let (vars, _) = start_up(args, false);
-    let mb = match Mailbox::load(&named_or_system_mailbox(args)) {
+    let mb = match open_mailbox(args, &vars) {
         Ok(mb) => mb,
         Err(e) => {
             eprintln!("mailx: {}", e);
@@ -261,8 +261,8 @@ fn run_startup_file(content: &str, path: &str, vars: &mut Variables, interp: &mu
     script::run_script(content, path, &mut scratch, vars, interp);
 }
 
-/// The mailbox Receive Mode reads: the `-u` user's system mailbox, the `-f`
-/// file, mbox for a bare `-f`, or the user's own system mailbox.
+/// The mailbox to read: the `-u` user's system mailbox, the `-f` file, mbox
+/// for a bare `-f`, or the user's own system mailbox.
 fn open_mailbox(args: &Args, vars: &Variables) -> error::Result<Mailbox> {
     if args.file.is_none() && args.user.is_none() && args.read_mbox {
         // mbox need not exist yet.

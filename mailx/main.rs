@@ -11,6 +11,7 @@ mod args;
 mod commands;
 mod error;
 mod escapes;
+mod lock;
 mod mailbox;
 mod message;
 mod msglist;

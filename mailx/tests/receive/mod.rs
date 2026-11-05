@@ -5304,3 +5304,46 @@ fn mailbox_honors_fcntl_lock_of_delivery_agent() {
         after
     );
 }
+
+/// The header summary does not write a sender's control characters to the
+/// terminal.
+///
+/// It is shown for every message without the user choosing to read one, so
+/// an escape sequence in `From:` or `Subject:` could clear or retitle the
+/// terminal, or redraw the summary to hide or forge entries.
+#[test]
+fn header_summary_shows_control_characters_as_question_marks() {
+    let mbox = create_temp_mbox(
+        "From x@y Mon Jan  1 00:00:00 2024\n\
+         From: \x1b]0;pwned\x07evil@example.com\n\
+         Subject: hi\x1b[2J\x1b[Hgone\r\n\
+         \n\
+         body\n\
+         \n",
+    );
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-H"),
+                String::from("-n"),
+                String::from("-f"),
+                mbox.path().to_str().unwrap().to_string(),
+            ],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let out = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                !out.contains('\x1b') && !out.contains('\x07'),
+                "control characters reached the terminal: {:?}",
+                out
+            );
+            assert!(out.contains("hi?[2J?[Hgone"), "subject: {:?}", out);
+        },
+    );
+}

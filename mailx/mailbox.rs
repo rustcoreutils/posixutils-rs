@@ -327,7 +327,14 @@ impl Mailbox {
                 let date = msg.short_date();
                 let lines = msg.line_count();
                 let size = msg.size();
-                let subject = truncate_display(msg.subject(), 25);
+                // Both fields are text the sender chose, written to the
+                // terminal for every message in the mailbox without the user
+                // asking to read it. A raw escape sequence there could
+                // retitle or clear the window, or redraw the summary to hide
+                // or misrepresent messages, so control characters are shown
+                // as `?`.
+                let address_field = printable(&address_field);
+                let subject = truncate_display(&printable(msg.subject()), 25);
 
                 // The traditional layout: sender cut to 20 columns, date
                 // `Www Mmm dd hh:mm`, then lines/bytes.
@@ -450,6 +457,13 @@ impl Mailbox {
         append_messages_to_file(path, &msgs, include_from_line)
             .map_err(|e| format!("{}: {}", path, plib::diag::io_error_text(&e)))
     }
+}
+
+/// `s` with each control character replaced by `?`.
+fn printable(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }
 
 /// The first of the private-use characters that stand for undecodable bytes.

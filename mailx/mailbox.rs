@@ -126,6 +126,12 @@ impl Mailbox {
             .count()
     }
 
+    /// Whether the mailbox file's size has changed since it was read: a
+    /// cheap check, without locks, for whether to [`Mailbox::incorporate`].
+    pub fn changed_size(&self) -> bool {
+        fs::metadata(&self.path).is_ok_and(|m| m.len() != self.loaded_len)
+    }
+
     /// Take in mail delivered to the mailbox since it was read, returning
     /// how many messages were added.
     ///

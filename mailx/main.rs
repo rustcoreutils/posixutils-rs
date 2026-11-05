@@ -131,9 +131,14 @@ fn run_receive_mode(args: &Args) -> i32 {
 fn command_loop(mb: &mut Mailbox, vars: &mut Variables, interp: &mut Interp, is_tty: bool) -> i32 {
     let mut ignored_eofs = 0;
     loop {
-        // `autoinc` takes in new mail before each prompt, as in BSD mailx.
-        if vars.is_set("autoinc") && mb.incorporate().unwrap_or(0) > 0 {
-            println!("New mail has arrived.");
+        // `autoinc` takes in new mail before each prompt, as in BSD mailx;
+        // the locks are taken only when the mailbox has changed.
+        if vars.is_set("autoinc") && mb.changed_size() {
+            match mb.incorporate() {
+                Ok(0) => {}
+                Ok(_) => println!("New mail has arrived."),
+                Err(e) => eprintln!("mailx: {}", e),
+            }
         }
         if is_tty {
             if let Some(prompt) = vars.get("prompt") {

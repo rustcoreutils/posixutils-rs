@@ -306,3 +306,49 @@ fn quit_waiting_for_a_lock_can_be_terminated() {
     assert_eq!(status.signal(), Some(libc::SIGTERM), "{:?}", status);
     assert_eq!(std::fs::read(mbox.path()).unwrap(), before);
 }
+
+/// With `autoinc` set, the prompt checks for new mail without taking the
+/// mailbox's locks when nothing has arrived, so another process holding
+/// them does not stall the session.
+#[test]
+fn autoinc_does_not_lock_an_unchanged_mailbox() {
+    use std::time::{Duration, Instant};
+
+    let mbox = copy_test_data("testdata.mbox");
+    let lock = format!("{}.lock", mbox.path().display());
+    let home = plib::tmp::TempDir::new().unwrap();
+    let rc = create_temp_mailrc("set autoinc\n");
+    let mut child = spawn(
+        mbox.path().to_str().unwrap(),
+        home.path(),
+        rc.path().to_str().unwrap(),
+    );
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"echo READY\n").unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    while !line.contains("READY") {
+        line.clear();
+        assert!(
+            stdout.read_line(&mut line).unwrap() > 0,
+            "mailx exited early"
+        );
+    }
+    std::fs::write(&lock, "").unwrap();
+    stdin.write_all(b"echo DONE\nexit\n").unwrap();
+    drop(stdin);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            let _ = std::fs::remove_file(&lock);
+            panic!("the prompt waited on the mailbox lock");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let _ = std::fs::remove_file(&lock);
+    assert!(status.success(), "{:?}", status);
+}

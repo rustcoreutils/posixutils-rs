@@ -14,7 +14,7 @@
 
 use crate::error::Result;
 use crate::mailbox::{Direction, Mailbox};
-use crate::message::{extract_login, Message, ReadState};
+use crate::message::{extract_login, Headers, Message, ReadState};
 use crate::variables::Variables;
 
 /// Which messages a list may name. Deleted messages are invisible to every
@@ -137,9 +137,8 @@ impl Selector {
             ),
             Selector::Subject(text) => {
                 let lower = text.to_lowercase();
-                let found = matching(mb, |m| {
-                    visible(m) && m.subject().to_lowercase().contains(&lower)
-                });
+                let found =
+                    searching(mb, visible, |h| h.subject().to_lowercase().contains(&lower))?;
                 nonempty(found, || format!("No messages matching /{}", text))
             }
             Selector::Type(kind) => {
@@ -147,7 +146,7 @@ impl Selector {
                 nonempty(found, || format!("No messages of type :{}", kind))
             }
             Selector::Address(addr) => {
-                let found = matching(mb, |m| visible(m) && is_from(m, addr, allnet));
+                let found = searching(mb, visible, |h| is_from(h, addr, allnet))?;
                 nonempty(found, || format!("No messages from {}", addr))
             }
         }
@@ -186,6 +185,22 @@ fn matching(mb: &Mailbox, pred: impl Fn(&Message) -> bool) -> Vec<usize> {
         .collect()
 }
 
+/// The numbers of the messages among those `candidate` accepts whose
+/// headers, read from the store, satisfy `pred`.
+fn searching(
+    mb: &Mailbox,
+    candidate: impl Fn(&Message) -> bool,
+    pred: impl Fn(&Headers) -> bool,
+) -> Result<Vec<usize>> {
+    let mut found = Vec::new();
+    for num in matching(mb, candidate) {
+        if pred(&mb.headers(num)?) {
+            found.push(num);
+        }
+    }
+    Ok(found)
+}
+
 fn nonempty(found: Vec<usize>, diagnostic: impl FnOnce() -> String) -> Result<Vec<usize>> {
     if found.is_empty() {
         Err(diagnostic().into())
@@ -208,7 +223,7 @@ fn is_of_type(msg: &Message, kind: char) -> bool {
 
 /// Whether `msg` is from `addr`, compared case-insensitively. With `allnet`
 /// only the login parts are compared (spec 104575-104577).
-fn is_from(msg: &Message, addr: &str, allnet: bool) -> bool {
+fn is_from(msg: &Headers, addr: &str, allnet: bool) -> bool {
     if allnet {
         let login = extract_login(addr).to_lowercase();
         extract_login(msg.from()).to_lowercase().contains(&login)

@@ -9,27 +9,33 @@
 
 //! The header summary: one line per message, as `headers` and `from` print it.
 
+use crate::error::Result;
 use crate::mailbox::Mailbox;
-use crate::message::{extract_address, Message};
+use crate::message::{extract_address, Headers};
 use crate::variables::Variables;
 
 /// Print the header summary of the messages `nums`.
-pub fn print_headers(mb: &Mailbox, nums: impl IntoIterator<Item = usize>, vars: &Variables) {
+pub fn print_headers(
+    mb: &Mailbox,
+    nums: impl IntoIterator<Item = usize>,
+    vars: &Variables,
+) -> Result<()> {
     let show_to = vars.is_set("showto");
 
     for num in nums {
         if let Some(msg) = mb.get(num) {
+            let headers = mb.headers(num)?;
             let current_marker = if Some(num) == mb.current() { '>' } else { ' ' };
             let state_char = msg.status_char();
 
             // Decide whether to show To or From
-            let address_field = if show_to && vars.is_me(msg.from()) {
-                format!("To {}", crate::util::bare_addresses(msg.to()))
+            let address_field = if show_to && vars.is_me(headers.from()) {
+                format!("To {}", crate::util::bare_addresses(headers.to()))
             } else {
-                sender_of(msg)
+                sender_of(&headers)
             };
 
-            let date = date_of(msg);
+            let date = date_of(&headers);
             let lines = msg.line_count();
             let size = msg.size();
             // Both fields are text the sender chose, written to the
@@ -39,7 +45,7 @@ pub fn print_headers(mb: &Mailbox, nums: impl IntoIterator<Item = usize>, vars: 
             // or misrepresent messages, so control characters are shown
             // as `?`.
             let address_field = printable(&address_field);
-            let subject = truncate_display(&printable(msg.subject()), 25);
+            let subject = truncate_display(&printable(headers.subject()), 25);
 
             // The traditional layout: sender cut to 20 columns, date
             // `Www Mmm dd hh:mm`, then lines/bytes.
@@ -49,13 +55,14 @@ pub fn print_headers(mb: &Mailbox, nums: impl IntoIterator<Item = usize>, vars: 
             );
         }
     }
+    Ok(())
 }
 
 /// Print the page of `screen` summaries that holds the current message.
-pub fn print_page(mb: &Mailbox, vars: &Variables) {
+pub fn print_page(mb: &Mailbox, vars: &Variables) -> Result<()> {
     let screen = vars.screen_lines().get();
     let start = mb.current().map_or(1, |c| page_start(c, vars));
-    print_headers(mb, start..=mb.message_count().min(start + screen - 1), vars);
+    print_headers(mb, start..=mb.message_count().min(start + screen - 1), vars)
 }
 
 /// The first message on the page of `screen` summaries holding `num`.
@@ -69,7 +76,7 @@ pub fn page_start(num: usize, vars: &Variables) -> usize {
 /// Traditional mailx takes it from the `From ` line, which records when
 /// the message was delivered here. A missing or malformed one falls back
 /// to the `Date:` header.
-fn date_of(msg: &Message) -> String {
+fn date_of(msg: &Headers) -> String {
     let line = msg.envelope();
     let envelope = line
         .strip_prefix("From ")
@@ -83,7 +90,7 @@ fn date_of(msg: &Message) -> String {
 
 /// The sender for the header summary: the `From:` address, or failing
 /// that the `From ` line's, as traditional mailx shows it.
-fn sender_of(msg: &Message) -> String {
+fn sender_of(msg: &Headers) -> String {
     match msg.get_header("from").map(extract_address) {
         Some(addr) if !addr.is_empty() => addr,
         _ => msg

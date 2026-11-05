@@ -15,7 +15,7 @@ use std::process::{Command, Stdio};
 use crate::args::Args;
 use crate::commands::Interp;
 use crate::error::{IoContext, Result};
-use crate::message::Message;
+use crate::message::Headers;
 use crate::variables::Variables;
 
 /// A message being composed
@@ -353,7 +353,7 @@ pub enum ReplyForm {
 
 /// A reply to `originals`, addressed as `form` says, its subject that of
 /// the first with `Re: ` before it unless it already begins so.
-pub fn compose_reply(originals: &[&Message], form: ReplyForm, vars: &Variables) -> ComposedMessage {
+pub fn compose_reply(originals: &[Headers], form: ReplyForm, vars: &Variables) -> ComposedMessage {
     let mut msg = ComposedMessage::new();
     let Some(first) = originals.first() else {
         return msg;
@@ -386,7 +386,7 @@ pub fn compose_reply(originals: &[&Message], form: ReplyForm, vars: &Variables) 
 
 /// Address `msg` to the sender of `original`: its Reply-To addresses, or
 /// without one its From.
-fn add_sender(msg: &mut ComposedMessage, original: &Message) {
+fn add_sender(msg: &mut ComposedMessage, original: &Headers) {
     match original.get_header("reply-to") {
         Some(reply_to) => crate::util::addresses(reply_to).for_each(|a| msg.add_to(a)),
         None => msg.add_to(original.from()),

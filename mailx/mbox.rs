@@ -119,7 +119,6 @@ fn store_line(
 /// A message begun by the envelope `line`, `raw` with its terminator.
 fn start(line: &[u8], raw: &[u8]) -> Message {
     let mut msg = Message::new();
-    msg.from_line = line.to_vec();
     msg.crlf = line.ends_with(b"\r");
     msg.raw_lines = 1;
     msg.raw_bytes = raw.len();
@@ -133,9 +132,6 @@ fn header_line(msg: &mut Message, folding: bool, line: &[u8]) -> Section {
         return Section::Body;
     }
     if line.starts_with(b" ") || line.starts_with(b"\t") {
-        if folding {
-            append_continuation(msg, line);
-        }
         return Section::Headers { folding };
     }
     let Some(colon) = line.iter().position(|&b| b == b':') else {
@@ -143,13 +139,8 @@ fn header_line(msg: &mut Message, folding: bool, line: &[u8]) -> Section {
         return Section::Body;
     };
 
-    // The parsed value is text, for matching and display; the line itself is
-    // kept as stored.
-    let name = String::from_utf8_lossy(&line[..colon]).to_lowercase();
-    let value = String::from_utf8_lossy(&line[colon + 1..])
-        .trim()
-        .to_string();
-    if name == "status" {
+    if line[..colon].eq_ignore_ascii_case(b"status") {
+        let value = String::from_utf8_lossy(&line[colon + 1..]);
         if let Some(state) = status_read_state(&value) {
             msg.read = state;
             msg.loaded_read = state;
@@ -159,21 +150,7 @@ fn header_line(msg: &mut Message, folding: bool, line: &[u8]) -> Section {
         // stale one beside it.
         return Section::Headers { folding: false };
     }
-    msg.headers.push((name, value));
-    msg.header_lines.push(line.to_vec());
     Section::Headers { folding: true }
-}
-
-/// Fold a continuation line into the last header field.
-fn append_continuation(msg: &mut Message, line: &[u8]) {
-    if let Some((_, value)) = msg.headers.last_mut() {
-        value.push(' ');
-        value.push_str(String::from_utf8_lossy(line).trim());
-    }
-    if let Some(last) = msg.header_lines.last_mut() {
-        last.push(b'\n');
-        last.extend_from_slice(line);
-    }
 }
 
 /// The read state a `Status:` value records: `R` is read, and `O` without
@@ -352,6 +329,7 @@ impl<W: Write> Write for CountingWriter<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::Headers;
 
     fn parsed(mbox: &str) -> (Vec<Message>, Store) {
         let mut store = Store::default();
@@ -389,24 +367,22 @@ mod tests {
     #[test]
     fn status_is_dropped_with_its_continuation() {
         let mbox = "From a Mon Jan  1 00:00:00 2024\nSubject: s\nStatus: RO\n x\nTo: t\n\nb\n";
-        let (messages, _) = parsed(mbox);
+        let (messages, store) = parsed(mbox);
         let msg = &messages[0];
         assert_eq!(msg.read, ReadState::Read);
         assert_eq!(msg.loaded_read, ReadState::Read);
-        assert_eq!(
-            msg.header_lines,
-            [b"Subject: s".to_vec(), b"To: t".to_vec()]
-        );
-        assert_eq!(msg.get_header("subject"), Some("s"));
+        let headers = Headers::parse(&store.read(msg.head).unwrap());
+        assert_eq!(headers.lines, [b"Subject: s".to_vec(), b"To: t".to_vec()]);
+        assert_eq!(headers.get_header("subject"), Some("s"));
     }
 
     #[test]
     fn folded_field_keeps_its_lines_and_unfolds_its_value() {
         let mbox = "From a Mon Jan  1 00:00:00 2024\nSubject: one\n\ttwo\n\nb\n";
-        let (messages, _) = parsed(mbox);
-        let msg = &messages[0];
-        assert_eq!(msg.header_lines, [b"Subject: one\n\ttwo".to_vec()]);
-        assert_eq!(msg.get_header("subject"), Some("one two"));
+        let (messages, store) = parsed(mbox);
+        let headers = Headers::parse(&store.read(messages[0].head).unwrap());
+        assert_eq!(headers.lines, [b"Subject: one\n\ttwo".to_vec()]);
+        assert_eq!(headers.get_header("subject"), Some("one two"));
     }
 
     #[test]
@@ -420,7 +396,8 @@ mod tests {
         let mbox = "From a Mon Jan  1 00:00:00 2024\r\nSubject: s\r\n x\r\nStatus: O\r\n\r\n\
                     >From b\r\nbody\r\n\r\n";
         let (messages, store) = parsed(mbox);
-        assert_eq!(messages[0].get_header("subject"), Some("s x"));
+        let headers = Headers::parse(&store.read(messages[0].head).unwrap());
+        assert_eq!(headers.get_header("subject"), Some("s x"));
         let mut out = Vec::new();
         write_messages(&mut out, &store, &[&messages[0]]).unwrap();
         assert_eq!(String::from_utf8_lossy(&out), mbox);

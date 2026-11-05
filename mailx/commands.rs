@@ -250,7 +250,10 @@ fn start_reply(
         ReplyForm::Group => vec![parse_message(args, mb, vars)?],
         ReplyForm::Senders => msglist_or_current(args, mb, vars)?,
     };
-    let originals: Vec<&Message> = msg_nums.iter().filter_map(|&n| mb.get(n)).collect();
+    let originals = msg_nums
+        .iter()
+        .map(|&n| mb.headers(n))
+        .collect::<Result<Vec<_>>>()?;
     let composed = compose_reply(&originals, form, vars);
     Ok((msg_nums, composed))
 }
@@ -478,8 +481,8 @@ fn cmd_copy_author(
 ) -> Result<CommandResult> {
     let msg_nums = msglist_or_current(args, mb, vars)?;
 
-    if let Some(first_msg) = msg_nums.first().and_then(|&n| mb.get(n)) {
-        let filename = author_filename(first_msg.from())?;
+    if let Some(&first) = msg_nums.first() {
+        let filename = author_filename(mb.headers(first)?.from())?;
         let filename = expand_local_prefixes(&filename, vars);
 
         let written = mb.save_messages(&msg_nums, &filename)?;
@@ -627,7 +630,7 @@ fn cmd_file(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
     new_mb.is_system_mailbox = crate::util::same_file(&path, &crate::util::system_mailbox());
 
     *mb = new_mb;
-    crate::summary::print_page(mb, vars);
+    crate::summary::print_page(mb, vars)?;
 
     Ok(CommandResult::Continue)
 }
@@ -653,8 +656,8 @@ fn cmd_followup(
     let (msg_nums, mut composed) = start_reply(args, mb, vars, form)?;
     // Recorded in a file named after the author of the first message, by the
     // same writer as `record`, so `outfolder` applies.
-    let author = mb.get(msg_nums[0]).ok_or("No message")?.from();
-    let record_file = expand_local_prefixes(&author_filename(author)?, vars);
+    let author = mb.headers(msg_nums[0])?;
+    let record_file = expand_local_prefixes(&author_filename(author.from())?, vars);
 
     compose_body(&mut composed, Some(mb), vars, interp)?;
     send_message(&composed, vars, false)?;
@@ -666,7 +669,7 @@ fn cmd_followup(
 fn cmd_from(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult> {
     let msg_nums = msglist_or_current(args, mb, vars)?;
 
-    crate::summary::print_headers(mb, msg_nums, vars);
+    crate::summary::print_headers(mb, msg_nums, vars)?;
     Ok(CommandResult::Continue)
 }
 
@@ -678,7 +681,7 @@ fn cmd_headers(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Com
         let msg_num = parse_message(args, mb, vars)?;
         mb.set_current(crate::summary::page_start(msg_num, vars));
     }
-    crate::summary::print_page(mb, vars);
+    crate::summary::print_page(mb, vars)?;
 
     Ok(CommandResult::Continue)
 }
@@ -1050,9 +1053,9 @@ fn cmd_top(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Command
     let toplines = vars.get_number("toplines").unwrap_or(5) as usize;
 
     for num in &msg_nums {
-        if let Some(msg) = mb.get(*num) {
+        if mb.get(*num).is_some() {
             let mut out = Vec::new();
-            for line in &msg.header_lines {
+            for line in &mb.headers(*num)?.lines {
                 out.extend_from_slice(line);
                 out.push(b'\n');
             }
@@ -1208,7 +1211,7 @@ fn cmd_scroll(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comm
         mb.set_current(nums[0]);
     }
 
-    crate::summary::print_headers(mb, nums, vars);
+    crate::summary::print_headers(mb, nums, vars)?;
 
     Ok(CommandResult::Continue)
 }

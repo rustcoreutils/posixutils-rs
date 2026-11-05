@@ -92,10 +92,9 @@ fn run_headers_only(args: &Args) -> i32 {
     };
     if mb.message_count() == 0 {
         print_no_mail();
-    } else {
-        summary::print_headers(&mb, 1..=mb.message_count(), &vars);
+        return 0;
     }
-    0
+    exit_status(summary::print_headers(&mb, 1..=mb.message_count(), &vars))
 }
 
 fn run_receive_mode(args: &Args) -> i32 {
@@ -113,7 +112,9 @@ fn run_receive_mode(args: &Args) -> i32 {
         println!("mailx-rs version {}", env!("CARGO_PKG_VERSION"));
     }
     if !args.no_header_summary && vars.is_set("header") && mb.message_count() > 0 {
-        summary::print_page(&mb, &vars);
+        if let Err(e) = summary::print_page(&mb, &vars) {
+            eprintln!("mailx: {}", e);
+        }
     } else if mb.message_count() == 0 && is_tty {
         print_no_mail();
     }

@@ -87,21 +87,13 @@ impl Message {
     }
 }
 
-/// A single email message
+/// A message in a mailbox: where it lies in the store, and its state.
+///
+/// Its text stays in the store, read back as [`Headers`] or a body when a
+/// command needs it, so memory holds a fixed amount per message however
+/// large the message is.
 #[derive(Debug, Clone)]
 pub struct Message {
-    /// The full "From " line (envelope), as stored.
-    ///
-    /// The envelope line, the header lines and the body are kept as the bytes
-    /// in the mailbox file: mail need not be UTF-8, and a message must be
-    /// written back, saved and copied exactly as it arrived.
-    pub from_line: Vec<u8>,
-    /// Header fields in order, as (lowercase name, unfolded value).
-    ///
-    /// A field may appear more than once; lookups take the first.
-    pub headers: Vec<(String, String)>,
-    /// Original header lines in order, each with its folded continuations
-    pub header_lines: Vec<Vec<u8>>,
     /// Lines the message occupies in the mailbox file, from its `From ` line
     /// up to the next message's.
     pub raw_lines: usize,
@@ -131,9 +123,6 @@ pub struct Message {
 impl Message {
     pub fn new() -> Self {
         Message {
-            from_line: Vec::new(),
-            headers: Vec::new(),
-            header_lines: Vec::new(),
             raw_lines: 0,
             raw_bytes: 0,
             head: Span::default(),
@@ -147,9 +136,67 @@ impl Message {
         }
     }
 
+    /// The message's size in bytes as stored, framing and `Status:` included.
+    pub fn size(&self) -> usize {
+        self.raw_bytes
+    }
+
+    /// The lines the message occupies as stored, folded header lines included.
+    pub fn line_count(&self) -> usize {
+        self.raw_lines
+    }
+}
+
+/// A message's `From ` line and header fields, read from the store.
+///
+/// The lines are the bytes in the mailbox file: mail need not be UTF-8, and
+/// a message is shown and copied exactly as it arrived.
+#[derive(Debug, Default)]
+pub struct Headers {
+    /// The `From ` line, without its newline.
+    pub from_line: Vec<u8>,
+    /// The header lines in order, each with its folded continuations.
+    pub lines: Vec<Vec<u8>>,
+    /// The fields as (lowercase name, unfolded value); a field may appear
+    /// more than once, and lookups take the first.
+    fields: Vec<(String, String)>,
+}
+
+impl Headers {
+    /// Parse a stored head: a `From ` line, then header lines.
+    pub fn parse(head: &[u8]) -> Headers {
+        let mut lines = head
+            .split_inclusive(|&b| b == b'\n')
+            .map(|l| l.strip_suffix(b"\n").unwrap_or(l));
+        let mut headers = Headers {
+            from_line: lines.next().unwrap_or_default().to_vec(),
+            ..Headers::default()
+        };
+        for line in lines {
+            if line.starts_with(b" ") || line.starts_with(b"\t") {
+                if let Some(last) = headers.lines.last_mut() {
+                    last.push(b'\n');
+                    last.extend_from_slice(line);
+                }
+                if let Some((_, value)) = headers.fields.last_mut() {
+                    value.push(' ');
+                    value.push_str(String::from_utf8_lossy(line).trim());
+                }
+            } else if let Some(colon) = line.iter().position(|&b| b == b':') {
+                let name = String::from_utf8_lossy(&line[..colon]).to_lowercase();
+                let value = String::from_utf8_lossy(&line[colon + 1..])
+                    .trim()
+                    .to_string();
+                headers.fields.push((name, value));
+                headers.lines.push(line.to_vec());
+            }
+        }
+        headers
+    }
+
     /// The value of the first `name` field, compared without regard to case.
     pub fn get_header(&self, name: &str) -> Option<&str> {
-        self.headers
+        self.fields
             .iter()
             .find(|(field, _)| field.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.as_str())
@@ -173,16 +220,6 @@ impl Message {
     /// The `Date:` value, or empty.
     pub fn date(&self) -> &str {
         self.get_header("date").unwrap_or("")
-    }
-
-    /// The message's size in bytes as stored, framing and `Status:` included.
-    pub fn size(&self) -> usize {
-        self.raw_bytes
-    }
-
-    /// The lines the message occupies as stored, folded header lines included.
-    pub fn line_count(&self) -> usize {
-        self.raw_lines
     }
 
     /// The `From ` line as text, for parsing the sender and date out of it.

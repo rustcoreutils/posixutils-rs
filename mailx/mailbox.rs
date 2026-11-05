@@ -15,7 +15,7 @@ use std::io::{self, Read, Seek, Write};
 use crate::error::{IoContext, Result};
 use crate::lock::{commit, lock, open_locked, read_locked};
 use crate::mbox::{unquote_from_line, write_messages, CountingWriter};
-use crate::message::{Disposition, Message, ReadState};
+use crate::message::{Disposition, Headers, Message, ReadState};
 use crate::store::Store;
 use crate::variables::Variables;
 
@@ -113,6 +113,13 @@ impl Mailbox {
             .count()
     }
 
+    /// The `From ` line and header fields of message `num`, read from the
+    /// store.
+    pub fn headers(&self, num: usize) -> Result<Headers> {
+        let msg = self.get(num).ok_or("No message")?;
+        Ok(Headers::parse(&self.store.read(msg.head).context(STORE)?))
+    }
+
     /// The body of message `num`, read from the store and unquoted, each
     /// line ending with a newline.
     pub fn body(&self, num: usize) -> Result<Vec<u8>> {
@@ -135,9 +142,8 @@ impl Mailbox {
     /// `ignore` and `retain` allow -- or all of them, for the capitalized
     /// `Print`/`Type` form (spec 104756) -- an empty line, and its body.
     pub fn display(&self, num: usize, show_all_headers: bool, vars: &Variables) -> Result<Vec<u8>> {
-        let msg = self.get(num).ok_or("No message")?;
         let mut output = Vec::new();
-        for line in &msg.header_lines {
+        for line in &self.headers(num)?.lines {
             let field = line.split(|&b| b == b':').next().unwrap_or_default();
             if show_all_headers || vars.header_filter.shows(field.trim_ascii()) {
                 output.extend_from_slice(line);
@@ -151,10 +157,10 @@ impl Mailbox {
 
     /// Message `num` whole, `From ` line included, as given to an editor.
     pub fn full_text(&self, num: usize) -> Result<Vec<u8>> {
-        let msg = self.get(num).ok_or("No message")?;
-        let mut output = msg.from_line.clone();
+        let headers = self.headers(num)?;
+        let mut output = headers.from_line;
         output.push(b'\n');
-        for line in &msg.header_lines {
+        for line in &headers.lines {
             output.extend_from_slice(line);
             output.push(b'\n');
         }

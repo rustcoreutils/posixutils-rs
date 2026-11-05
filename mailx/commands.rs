@@ -19,7 +19,7 @@ use crate::error::{IoContext, Result};
 use crate::filename::{expand_local_prefixes, expand_typed_filename};
 use crate::mailbox::{Direction, Mailbox};
 use crate::message::{author_filename, Disposition, Message, ReadState};
-use crate::msglist::{current_message, msglist_or_current, parse_message, parse_msglist};
+use crate::msglist::{current_message, msglist_or_current, parse_message, parse_msglist, Want};
 use crate::script::CondStack;
 use crate::send::{compose_reply, send_message, ComposedMessage};
 use crate::variables::{parse_set_arg, split_args, Variables};
@@ -381,12 +381,12 @@ fn msglist_and_file(
             }
             Ok((current_message(mb)?, crate::util::mbox_path(vars)))
         }
-        1 => match parse_msglist(parts[0], mb, false, vars) {
+        1 => match parse_msglist(parts[0], mb, Want::Live, vars) {
             Ok(nums) if !file_required => Ok((nums, crate::util::mbox_path(vars))),
             _ => Ok((current_message(mb)?, expand_typed_filename(parts[0], vars))),
         },
         n => {
-            let nums = parse_msglist(&parts[..n - 1].join(" "), mb, false, vars)?;
+            let nums = parse_msglist(&parts[..n - 1].join(" "), mb, Want::Live, vars)?;
             Ok((nums, expand_typed_filename(parts[n - 1], vars)))
         }
     }
@@ -813,14 +813,14 @@ fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
 
         for i in 0..words.len() {
             let potential_msglist = words[..=i].join(" ");
-            if parse_msglist(&potential_msglist, mb, false, vars).is_ok() {
+            if parse_msglist(&potential_msglist, mb, Want::Live, vars).is_ok() {
                 msglist_end = i + 1;
             }
         }
 
         if msglist_end == 0 || msglist_end >= words.len() {
             // All command or all msglist
-            if let Ok(nums) = parse_msglist(args, mb, false, vars) {
+            if let Ok(nums) = parse_msglist(args, mb, Want::Live, vars) {
                 (
                     nums,
                     vars.get_nonempty("cmd")
@@ -833,7 +833,7 @@ fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
         } else {
             let msglist = words[..msglist_end].join(" ");
             let cmd = words[msglist_end..].join(" ");
-            let nums = parse_msglist(&msglist, mb, false, vars)?;
+            let nums = parse_msglist(&msglist, mb, Want::Live, vars)?;
             (nums, cmd)
         }
     };
@@ -1151,7 +1151,7 @@ fn cmd_undelete(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Co
             return Err("No deleted messages".into());
         }
     } else {
-        parse_msglist(args, mb, true, vars)?
+        parse_msglist(args, mb, Want::Deleted, vars)?
     };
 
     for num in &msg_nums {

@@ -384,8 +384,10 @@ pub fn compose_reply(original: &Message, reply_all: bool, vars: &Variables) -> C
         // Reply to all recipients.  The sender portion comes from Reply-To when
         // present, otherwise from From (spec 104911-104916: in the lowercase
         // form, From/To/Cc are used only when there is no Reply-To).
+        // Lists are split with `util::addresses`: a bare `split(',')` broke
+        // `"Smith, John" <j@x>` into two recipients, neither of them valid.
         if let Some(reply_to) = original.get_header("reply-to") {
-            for addr in reply_to.split(',') {
+            for addr in crate::util::addresses(reply_to) {
                 msg.add_to(addr);
             }
         } else {
@@ -396,11 +398,7 @@ pub fn compose_reply(original: &Message, reply_all: bool, vars: &Variables) -> C
         // and any declared alternates come out of the list (spec 104926-104928).
         let include_self = vars.get_bool("metoo");
 
-        for addr in original.to().split(',') {
-            let addr = addr.trim();
-            if addr.is_empty() {
-                continue;
-            }
+        for addr in crate::util::addresses(original.to()) {
             if !include_self && vars.is_me(addr) {
                 continue;
             }
@@ -409,11 +407,7 @@ pub fn compose_reply(original: &Message, reply_all: bool, vars: &Variables) -> C
 
         // Add Cc: recipients
         if let Some(cc) = original.get_header("cc") {
-            for addr in cc.split(',') {
-                let addr = addr.trim();
-                if addr.is_empty() {
-                    continue;
-                }
+            for addr in crate::util::addresses(cc) {
                 if !include_self && vars.is_me(addr) {
                     continue;
                 }
@@ -423,8 +417,11 @@ pub fn compose_reply(original: &Message, reply_all: bool, vars: &Variables) -> C
     } else {
         // Reply only to sender
         // Check Reply-To first
+        // Reply-To may name several addresses; each is a recipient.
         if let Some(reply_to) = original.get_header("reply-to") {
-            msg.add_to(reply_to);
+            for addr in crate::util::addresses(reply_to) {
+                msg.add_to(addr);
+            }
         } else {
             msg.add_to(original.from());
         }

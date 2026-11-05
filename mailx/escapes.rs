@@ -417,17 +417,17 @@ fn parse_edited_message(content: &str, msg: &mut ComposedMessage) -> Result<(), 
 
                 match name.as_str() {
                     "to" => {
-                        for addr in value.split(',') {
+                        for addr in crate::util::addresses(value) {
                             msg.add_to(addr);
                         }
                     }
                     "cc" => {
-                        for addr in value.split(',') {
+                        for addr in crate::util::addresses(value) {
                             msg.add_cc(addr);
                         }
                     }
                     "bcc" => {
-                        for addr in value.split(',') {
+                        for addr in crate::util::addresses(value) {
                             msg.add_bcc(addr);
                         }
                     }

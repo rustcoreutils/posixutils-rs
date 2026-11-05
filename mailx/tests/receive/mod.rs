@@ -5010,3 +5010,131 @@ fn envelope_recipient_drops_a_comment() {
         },
     );
 }
+
+/// Reply-all splits To: and Cc: only between addresses: a comma inside
+/// a quoted display name is part of the name.
+#[test]
+fn reply_all_keeps_quoted_commas() {
+    let mbox = create_temp_mbox(
+        "From a@example.com Fri Nov 29 10:00:00 2024\n\
+         From: Bob <bob@example.com>\n\
+         To: me@example.com, \"Smith, John\" <john@example.com>\n\
+         Cc: \"Doe, Ann\" <ann@example.com>\n\
+         Subject: s\n\
+         \n\
+         body\n\
+         \n",
+    );
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from("set debug\nreply 1\nbody\n.\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("USER", "me"), ("LOGNAME", "me")],
+        |_plan, output| {
+            let err = String::from_utf8_lossy(&output.stderr);
+            let envelope = err
+                .lines()
+                .find(|l| l.starts_with("Envelope:"))
+                .unwrap_or_else(|| panic!("no envelope line: {}", err));
+            assert_eq!(
+                envelope,
+                "Envelope: bob@example.com, john@example.com, ann@example.com"
+            );
+        },
+    );
+}
+
+/// A Reply-To: naming several addresses gives each as a recipient.
+#[test]
+fn reply_to_list_is_split() {
+    let mbox = create_temp_mbox(
+        "From a@example.com Fri Nov 29 10:00:00 2024\n\
+         From: Bob <bob@example.com>\n\
+         To: me@example.com\n\
+         Reply-To: \"Lists, All\" <l@example.com>, other@example.com\n\
+         Subject: s\n\
+         \n\
+         body\n\
+         \n",
+    );
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from("set debug\nReply 1\nbody\n.\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("USER", "me"), ("LOGNAME", "me")],
+        |_plan, output| {
+            let err = String::from_utf8_lossy(&output.stderr);
+            let envelope = err
+                .lines()
+                .find(|l| l.starts_with("Envelope:"))
+                .unwrap_or_else(|| panic!("no envelope line: {}", err));
+            assert_eq!(envelope, "Envelope: l@example.com, other@example.com");
+        },
+    );
+}
+
+/// Headers read back after `~e` split their lists the same way.
+#[test]
+fn edited_headers_keep_quoted_commas() {
+    let mbox = create_temp_mbox(
+        "From a@example.com Fri Nov 29 10:00:00 2024\n\
+         From: Bob <bob@example.com>\n\
+         To: me@example.com, \"Smith, John\" <john@example.com>\n\
+         Subject: s\n\
+         \n\
+         body\n\
+         \n",
+    );
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from(
+                "set debug\nset EDITOR=/bin/true\nreply 1\nbody\n~e\n.\nexit\n",
+            ),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("USER", "me"), ("LOGNAME", "me")],
+        |_plan, output| {
+            let err = String::from_utf8_lossy(&output.stderr);
+            let envelope = err
+                .lines()
+                .find(|l| l.starts_with("Envelope:"))
+                .unwrap_or_else(|| panic!("no envelope line: {}", err));
+            assert_eq!(envelope, "Envelope: bob@example.com, john@example.com");
+        },
+    );
+}

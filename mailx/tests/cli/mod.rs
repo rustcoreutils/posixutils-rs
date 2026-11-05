@@ -1204,31 +1204,38 @@ fn mailx_non_utf8_argument_is_reported() {
 }
 
 /// Run `mailx -n -H -f <mbox>` on `content`, then `mailx -n -N -f <mbox>`
-/// with `commands` on stdin, and return both outputs.
+/// with `commands` on stdin, and return both standard outputs.
 fn summary_and_commands(content: &str, commands: &str) -> (String, String) {
     let mbox = create_temp_mbox(content);
     let path = mbox.path().to_str().unwrap().to_string();
-    let run = |args: Vec<String>, stdin: &str| {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_mailx"))
-            .args(&args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                use std::io::Write as _;
-                child.stdin.take().unwrap().write_all(stdin.as_bytes())?;
-                child.wait_with_output()
-            })
-            .expect("run mailx");
-        String::from_utf8_lossy(&output.stdout).into_owned()
+    let run = |flag: &str, stdin: &str| {
+        let mut stdout = String::new();
+        run_test_with_checker(
+            TestPlan {
+                cmd: String::from("mailx"),
+                args: vec![
+                    String::from("-n"),
+                    String::from(flag),
+                    String::from("-f"),
+                    path.clone(),
+                ],
+                stdin_data: String::from(stdin),
+                expected_out: String::new(),
+                expected_err: String::new(),
+                expected_exit_code: 0,
+            },
+            |_plan, output| {
+                assert!(
+                    output.status.success(),
+                    "mailx failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            },
+        );
+        stdout
     };
-    let summary = run(
-        vec!["-n".into(), "-H".into(), "-f".into(), path.clone()],
-        "",
-    );
-    let commands = run(vec!["-n".into(), "-N".into(), "-f".into(), path], commands);
-    (summary, commands)
+    (run("-H", ""), run("-N", commands))
 }
 
 /// The header summary's line and byte counts, and `size`, describe the

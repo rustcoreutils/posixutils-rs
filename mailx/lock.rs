@@ -163,8 +163,10 @@ pub(crate) fn open_read_locked(path: &str) -> io::Result<(File, Option<DotLock>)
 /// committed.
 ///
 /// A file renamed over `path` while the lock was awaited -- another mailx
-/// prepending to the same mbox -- would leave the lock on a file no longer
-/// there, so the lock is taken again until it is on the file `path` names.
+/// prepending to the same mbox -- or `path` removed meanwhile -- another
+/// mailx quitting with it emptied -- would leave the lock on a file no
+/// longer there, so the lock is taken again until it is on the file `path`
+/// names.
 pub(crate) fn open_locked(path: &str) -> io::Result<(File, Option<DotLock>)> {
     use std::os::unix::fs::MetadataExt;
 
@@ -177,9 +179,14 @@ pub(crate) fn open_locked(path: &str) -> io::Result<(File, Option<DotLock>)> {
             .truncate(false)
             .open(path)?;
         lock(&file, true)?;
-        let (held, named) = (file.metadata()?, fs::metadata(path)?);
-        if (held.dev(), held.ino()) == (named.dev(), named.ino()) {
-            return Ok((file, dotlock));
+        let held = file.metadata()?;
+        match fs::metadata(path) {
+            Ok(named) if (held.dev(), held.ino()) == (named.dev(), named.ino()) => {
+                return Ok((file, dotlock));
+            }
+            // Removed while the lock was awaited: created afresh next time.
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
         }
     }
 }
@@ -218,6 +225,31 @@ mod tests {
         drop(holder);
 
         let locked = waiter.join().unwrap().unwrap();
+        assert_eq!(
+            locked.metadata().unwrap().ino(),
+            fs::metadata(&path).unwrap().ino()
+        );
+    }
+
+    /// A mailbox removed while a writer waits for its lock -- another mailx
+    /// quitting with it emptied -- is created afresh and locked, not
+    /// reported missing.
+    #[test]
+    fn a_lock_taken_after_a_removal_is_on_a_new_file() {
+        let dir = plib::tmp::TempDir::new().unwrap();
+        let path = dir.path().join("mbox");
+        fs::write(&path, "old\n").unwrap();
+        let holder = File::open(&path).unwrap();
+        // SAFETY: the fd is valid for the lifetime of `holder`.
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        let waiting = path.to_str().unwrap().to_string();
+        let waiter = std::thread::spawn(move || open_locked(&waiting).map(|(f, _)| f));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        fs::remove_file(&path).unwrap();
+        drop(holder);
+
+        let locked = waiter.join().unwrap().expect("lock after removal");
         assert_eq!(
             locked.metadata().unwrap().ino(),
             fs::metadata(&path).unwrap().ino()

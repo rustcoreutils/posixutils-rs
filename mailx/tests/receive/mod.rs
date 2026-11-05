@@ -2427,7 +2427,7 @@ fn new_state_and_n_selector() {
             assert!(
                 stdout
                     .lines()
-                    .any(|l| l.contains('N') && l.contains("new@example.com")),
+                    .any(|l| l.chars().nth(1) == Some('N') && l.contains("new@example.com")),
                 "new message should display state char N: {}",
                 stdout
             );
@@ -4155,8 +4155,9 @@ fn read_state_survives_a_reopen() {
                 .lines()
                 .find(|l| l.contains("first"))
                 .unwrap_or_else(|| panic!("no header row for message 1: {}", out));
+            // The state is the row's second column; the date may hold `Nov`.
             assert!(
-                !row.contains('N'),
+                row.chars().nth(1) != Some('N'),
                 "a message read in the previous session came back as new: {}",
                 row
             );
@@ -4197,8 +4198,9 @@ fn undelete_restores_the_previous_read_state() {
                 .lines()
                 .find(|l| l.contains("never read"))
                 .unwrap_or_else(|| panic!("no header row: {}", out));
+            // The state is the row's second column; the date may hold `Nov`.
             assert!(
-                row.contains('N'),
+                row.chars().nth(1) == Some('N'),
                 "undelete marked an unread message as read: {}",
                 row
             );

@@ -1281,3 +1281,35 @@ fn header_summary_counts_the_stored_message() {
         sizes
     );
 }
+
+/// The summary date comes from the `From ` line, as `Www Mmm dd hh:mm`.
+#[test]
+fn header_summary_date_from_envelope() {
+    let (summary, _) = summary_and_commands(
+        "From a@example.com Mon Jan  1 10:00:00 2024\n\
+         From: a@example.com\n\
+         Date: Tue, 2 Jan 2024 09:00:00 +0000\n\
+         Subject: s\n\
+         \n\
+         body\n",
+        "",
+    );
+    assert!(summary.contains("Mon Jan  1 10:00"), "{:?}", summary);
+}
+
+/// Without a usable `From ` line date the `Date:` header supplies it, and
+/// its day is the number before the month, never the year after it.
+#[test]
+fn header_summary_date_from_header() {
+    let (summary, _) = summary_and_commands(
+        "From a@example.com\n\
+         From: a@example.com\n\
+         Date: Mon, 29 Jan 2007 19:32:06 +0900\n\
+         Subject: s\n\
+         \n\
+         body\n",
+        "",
+    );
+    assert!(summary.contains("Mon Jan 29 19:32"), "{:?}", summary);
+    assert!(!summary.contains("Jan 2007"), "{:?}", summary);
+}

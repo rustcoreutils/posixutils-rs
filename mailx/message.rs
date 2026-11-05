@@ -224,44 +224,21 @@ impl Message {
         output
     }
 
-    /// Parse a date string and return a short date format for headers
+    /// The date for the header summary, as `Www Mmm dd hh:mm`.
+    ///
+    /// Traditional mailx takes it from the `From ` line, which records when
+    /// the message was delivered here. A missing or malformed one falls back
+    /// to the `Date:` header.
     pub fn short_date(&self) -> String {
-        let date = self.date();
-        // Try to extract month day from common date formats
-        // e.g., "Mon, 25 Nov 2024 10:30:00 +0000"
-        let parts: Vec<&str> = date.split_whitespace().collect();
-        if parts.len() >= 3 {
-            // Try to find month and day
-            for i in 0..parts.len().saturating_sub(1) {
-                let month = match parts[i].trim_end_matches(',') {
-                    "Jan" | "January" => Some("Jan"),
-                    "Feb" | "February" => Some("Feb"),
-                    "Mar" | "March" => Some("Mar"),
-                    "Apr" | "April" => Some("Apr"),
-                    "May" => Some("May"),
-                    "Jun" | "June" => Some("Jun"),
-                    "Jul" | "July" => Some("Jul"),
-                    "Aug" | "August" => Some("Aug"),
-                    "Sep" | "September" => Some("Sep"),
-                    "Oct" | "October" => Some("Oct"),
-                    "Nov" | "November" => Some("Nov"),
-                    "Dec" | "December" => Some("Dec"),
-                    _ => None,
-                };
-                if let Some(m) = month {
-                    if let Ok(day) = parts[i + 1].trim_end_matches(',').parse::<u32>() {
-                        return format!("{} {:2}", m, day);
-                    }
-                    if i > 0 {
-                        if let Ok(day) = parts[i - 1].trim_end_matches(',').parse::<u32>() {
-                            return format!("{} {:2}", m, day);
-                        }
-                    }
-                }
-            }
-        }
-        // Fallback - just return first 6 chars
-        date.chars().take(6).collect()
+        let envelope = self
+            .from_line
+            .strip_prefix("From ")
+            .map(|rest| rest.trim_start())
+            .and_then(|rest| rest.split_once(char::is_whitespace))
+            .and_then(|(_sender, date)| envelope_date(date));
+        envelope
+            .or_else(|| header_date(self.date()))
+            .unwrap_or_default()
     }
 
     /// Extract the sender's name or address for header display
@@ -290,6 +267,60 @@ impl Message {
         let addr = from.trim_start_matches('<').trim_end_matches('>');
         truncate_display(addr, 18)
     }
+}
+
+const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// A day of the month, `1` to `31`.
+fn day_of_month(s: &str) -> Option<u32> {
+    s.parse().ok().filter(|d| (1..=31).contains(d))
+}
+
+/// The `hh:mm` of an `hh:mm[:ss]` time.
+fn hours_minutes(s: &str) -> Option<&str> {
+    let hm = s.get(..5)?;
+    let b = hm.as_bytes();
+    let ok = b[2] == b':' && [0, 1, 3, 4].iter().all(|&i| b[i].is_ascii_digit());
+    ok.then_some(hm)
+}
+
+/// Format the summary date from its parts.
+fn summary_date(weekday: Option<&str>, month: &str, day: u32, time: &str) -> String {
+    match weekday {
+        Some(w) => format!("{} {} {:>2} {}", w, month, day, time),
+        None => format!("{} {:>2} {}", month, day, time),
+    }
+}
+
+/// The summary date of a `From ` line's `Www Mmm dd hh:mm:ss yyyy`.
+fn envelope_date(s: &str) -> Option<String> {
+    let mut parts = s.split_whitespace();
+    let weekday = parts.next().filter(|w| WEEKDAYS.contains(w))?;
+    let month = parts.next().filter(|m| MONTHS.contains(m))?;
+    let day = day_of_month(parts.next()?)?;
+    let time = hours_minutes(parts.next()?)?;
+    Some(summary_date(Some(weekday), month, day, time))
+}
+
+/// The summary date of an RFC 5322 `Date:` value, `[Www,] dd Mmm yyyy hh:mm`.
+///
+/// The day is the number *before* the month. Taking the one after it read
+/// the year as the day, so `29 Jan 2007` was summarized as `Jan 2007`.
+fn header_date(s: &str) -> Option<String> {
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    let (weekday, rest) = match parts.first() {
+        Some(w) if WEEKDAYS.contains(&w.trim_end_matches(',')) => {
+            (Some(w.trim_end_matches(',')), &parts[1..])
+        }
+        _ => (None, &parts[..]),
+    };
+    let day = day_of_month(rest.first()?)?;
+    let month = rest.get(1).filter(|m| MONTHS.contains(m))?;
+    let time = rest.get(3).and_then(|t| hours_minutes(t))?;
+    Some(summary_date(weekday, month, day, time))
 }
 
 /// Truncate `s` to at most `max_len` characters for header-summary display,

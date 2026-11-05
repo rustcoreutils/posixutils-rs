@@ -13,6 +13,7 @@ mod error;
 mod escapes;
 mod lock;
 mod mailbox;
+mod mbox;
 mod message;
 mod msglist;
 mod send;

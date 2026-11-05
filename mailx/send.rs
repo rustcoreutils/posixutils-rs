@@ -345,7 +345,7 @@ pub(crate) fn record_message(
         writeln!(file)?;
         writeln!(file)?;
         for line in crate::util::byte_lines(body) {
-            if crate::mailbox::needs_from_quoting(line) {
+            if crate::mbox::needs_from_quoting(line) {
                 write!(file, ">")?;
             }
             file.write_all(line)?;

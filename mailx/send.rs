@@ -414,8 +414,8 @@ mod tests {
     use super::*;
 
     /// A record entry is an mbox message: envelope, headers without `Bcc:`,
-    /// an empty line, the `From `-quoted body with each line terminated,
-    /// and the separating empty line.
+    /// an empty line, the `From `-quoted body as sent with each line
+    /// terminated, and the separating empty line.
     #[test]
     fn record_writes_an_mbox_entry() {
         let dir = plib::tmp::TempDir::new().expect("temp dir");
@@ -433,7 +433,7 @@ mod tests {
         assert!(envelope.starts_with(b"From "), "{:?}", envelope);
         assert_eq!(
             String::from_utf8_lossy(rest),
-            "\nTo: to@example.com\nSubject: Subj\n\n>From the start\n>>From quoted\nline\nlast\n\n"
+            "\nTo: to@example.com\nSubject: Subj\n\n>From the start\n>>From quoted\nline\r\nlast\n\n"
         );
     }
 }

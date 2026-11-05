@@ -190,3 +190,45 @@ fn status_continuation_does_not_corrupt_the_previous_header() {
     );
     assert_eq!(output.status.code(), Some(0), "exit status");
 }
+
+/// A mailbox stored with CRLF line endings keeps them when it is written
+/// back: messages are kept as the bytes they were stored as.
+#[test]
+fn crlf_mailbox_keeps_its_line_endings() {
+    let mbox = create_temp_mbox(
+        "From a@example.com Fri Nov 29 10:00:00 2024\r\n\
+         From: a@example.com\r\n\
+         Subject: one\r\n\
+         \r\n\
+         first body\r\n\
+         \r\n\
+         From b@example.com Fri Nov 29 11:00:00 2024\r\n\
+         From: b@example.com\r\n\
+         Subject: two\r\n\
+         \r\n\
+         second body\r\n\
+         \r\n",
+    );
+    let output = mailx(
+        &["-n", "-N", "-f", mbox.path().to_str().unwrap()],
+        "print 1\nquit\n",
+    );
+    assert!(output.status.success());
+    let after = std::fs::read(mbox.path()).unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&after),
+        "From a@example.com Fri Nov 29 10:00:00 2024\r\n\
+         From: a@example.com\r\n\
+         Subject: one\r\n\
+         Status: RO\r\n\
+         \r\n\
+         first body\r\n\
+         \r\n\
+         From b@example.com Fri Nov 29 11:00:00 2024\r\n\
+         From: b@example.com\r\n\
+         Subject: two\r\n\
+         \r\n\
+         second body\r\n\
+         \r\n"
+    );
+}

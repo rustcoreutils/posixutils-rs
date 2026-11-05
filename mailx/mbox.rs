@@ -33,14 +33,17 @@ pub(crate) fn parse(bytes: &[u8]) -> Vec<Message> {
     let mut after_blank = true;
 
     for raw in bytes.split_inclusive(|&b| b == b'\n') {
-        let line = without_terminator(raw);
+        // `stored` is the line as kept, a CR of a CRLF ending included, so
+        // the message is written back as it was stored; `line` is its text.
+        let stored = raw.strip_suffix(b"\n").unwrap_or(raw);
+        let line = stored.strip_suffix(b"\r").unwrap_or(stored);
         let in_headers = matches!(current, Some((_, Section::Headers { .. })));
         let starts_message = after_blank && !in_headers && line.starts_with(b"From ");
         after_blank = line.is_empty();
 
         if starts_message {
             messages.extend(current.take().map(|(msg, _)| finish(msg)));
-            current = Some((start(line, raw), Section::Headers { folding: false }));
+            current = Some((start(stored, raw), Section::Headers { folding: false }));
         } else if let Some((msg, section)) = current.as_mut() {
             // Every physical line up to the next `From ` line is part of the
             // message as stored, framing included; the header summary and
@@ -48,9 +51,9 @@ pub(crate) fn parse(bytes: &[u8]) -> Vec<Message> {
             msg.raw_lines += 1;
             msg.raw_bytes += raw.len();
             *section = match *section {
-                Section::Headers { folding } => header_line(msg, folding, line),
+                Section::Headers { folding } => header_line(msg, folding, stored),
                 Section::Body => {
-                    push_line(&mut msg.body, unquote_from_line(line));
+                    push_line(&mut msg.body, unquote_from_line(stored));
                     Section::Body
                 }
             };
@@ -58,14 +61,6 @@ pub(crate) fn parse(bytes: &[u8]) -> Vec<Message> {
     }
     messages.extend(current.map(|(msg, _)| finish(msg)));
     messages
-}
-
-/// `raw` without its line terminator, as `str::lines` would give it.
-fn without_terminator(raw: &[u8]) -> &[u8] {
-    match raw.strip_suffix(b"\n") {
-        Some(l) => l.strip_suffix(b"\r").unwrap_or(l),
-        None => raw,
-    }
 }
 
 /// A message begun by the envelope `line`, `raw` with its terminator.
@@ -77,9 +72,10 @@ fn start(line: &[u8], raw: &[u8]) -> Message {
     msg
 }
 
-/// Add one line of the header block, returning where the next line falls.
+/// Add one line of the header block, as stored, returning where the next
+/// line falls.
 fn header_line(msg: &mut Message, folding: bool, line: &[u8]) -> Section {
-    if line.is_empty() {
+    if line.strip_suffix(b"\r").unwrap_or(line).is_empty() {
         return Section::Body;
     }
     if line.starts_with(b" ") || line.starts_with(b"\t") {
@@ -140,6 +136,15 @@ fn status_read_state(value: &str) -> Option<ReadState> {
     }
 }
 
+/// The lines of `body` split at LF, each with any CR it was stored with.
+fn stored_lines(body: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let text = body.strip_suffix(b"\n").unwrap_or(body);
+    (!body.is_empty())
+        .then(|| text.split(|&b| b == b'\n'))
+        .into_iter()
+        .flatten()
+}
+
 fn push_line(body: &mut Vec<u8>, line: &[u8]) {
     body.extend_from_slice(line);
     body.push(b'\n');
@@ -148,8 +153,10 @@ fn push_line(body: &mut Vec<u8>, line: &[u8]) {
 /// Drop the empty line that separates a message from the next: it belongs
 /// to the mbox framing, which the writer adds back, not to the message.
 fn finish(mut msg: Message) -> Message {
-    if msg.body == b"\n" {
+    if msg.body == b"\n" || msg.body == b"\r\n" {
         msg.body.clear();
+    } else if msg.body.ends_with(b"\n\r\n") {
+        msg.body.truncate(msg.body.len() - 2);
     } else if msg.body.ends_with(b"\n\n") {
         msg.body.pop();
     }
@@ -168,6 +175,13 @@ pub(crate) fn write_messages<W: Write>(
     include_from_line: bool,
 ) -> io::Result<()> {
     for msg in messages {
+        // Stored lines keep their own CR; the lines written here take the
+        // message's line ending, CRLF when its `From ` line had one.
+        let eol: &[u8] = if msg.from_line.ends_with(b"\r") {
+            b"\r\n"
+        } else {
+            b"\n"
+        };
         if include_from_line {
             write_line(w, &msg.from_line)?;
         }
@@ -178,17 +192,18 @@ pub(crate) fn write_messages<W: Write>(
         // from the file, so a message read this session comes back as read.
         // The loader keeps it out of `header_lines` for exactly this reason.
         if let Some(status) = msg.read.status_value() {
-            writeln!(w, "Status: {}", status)?;
+            write!(w, "Status: {}", status)?;
+            w.write_all(eol)?;
         }
-        writeln!(w)?;
-        for line in crate::util::byte_lines(&msg.body) {
+        w.write_all(eol)?;
+        for line in stored_lines(&msg.body) {
             if needs_from_quoting(line) {
                 write!(w, ">")?;
             }
             write_line(w, line)?;
         }
         // The separator before the next message.
-        writeln!(w)?;
+        w.write_all(eol)?;
     }
 
     Ok(())
@@ -294,6 +309,17 @@ mod tests {
     fn a_line_that_is_not_a_field_starts_the_body() {
         let mbox = "From a Mon Jan  1 00:00:00 2024\nSubject: s\nno colon here\nmore\n";
         assert_eq!(bodies(mbox), ["no colon here\nmore\n"]);
+    }
+
+    #[test]
+    fn crlf_lines_round_trip() {
+        let mbox = "From a Mon Jan  1 00:00:00 2024\r\nSubject: s\r\n x\r\nStatus: O\r\n\r\n\
+                    >From b\r\nbody\r\n\r\n";
+        let messages = parse(mbox.as_bytes());
+        assert_eq!(messages[0].get_header("subject"), Some("s x"));
+        let mut out = Vec::new();
+        write_messages(&mut out, &[&messages[0]], true).unwrap();
+        assert_eq!(String::from_utf8_lossy(&out), mbox);
     }
 
     #[test]

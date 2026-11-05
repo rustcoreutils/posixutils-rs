@@ -216,17 +216,9 @@ pub fn handle_escape(
         'p' => {
             // Print the message, using pager if longer than crt lines
             let mut output = String::from("-------\nMessage contains:\n");
-            if !msg.to.is_empty() {
-                output.push_str(&format!("To: {}\n", msg.to.join(", ")));
-            }
-            if !msg.cc.is_empty() {
-                output.push_str(&format!("Cc: {}\n", msg.cc.join(", ")));
-            }
-            if !msg.bcc.is_empty() {
-                output.push_str(&format!("Bcc: {}\n", msg.bcc.join(", ")));
-            }
-            if !msg.subject.is_empty() {
-                output.push_str(&format!("Subject: {}\n", msg.subject));
+            for line in msg.header_lines(true) {
+                output.push_str(&line);
+                output.push('\n');
             }
             output.push('\n');
             let mut output = output.into_bytes();

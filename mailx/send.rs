@@ -48,28 +48,52 @@ impl ComposedMessage {
         push_address(&mut self.bcc, addr);
     }
 
-    /// Format the message for sending
-    pub fn format(&self) -> Vec<u8> {
-        let mut msg = String::new();
-
-        if !self.to.is_empty() {
-            msg.push_str(&format!("To: {}\n", self.to.join(", ")));
+    /// The header lines, in the order they are written.
+    ///
+    /// `Bcc:` is shown only to the user (`~p`): blind recipients are named
+    /// on the envelope, never in the message itself.
+    pub fn header_lines(&self, include_bcc: bool) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut add = |name: &str, value: &str| {
+            if !value.is_empty() {
+                lines.push(format!("{}: {}", name, value));
+            }
+        };
+        add("To", &self.to.join(", "));
+        add("Cc", &self.cc.join(", "));
+        if include_bcc {
+            add("Bcc", &self.bcc.join(", "));
         }
-        if !self.cc.is_empty() {
-            msg.push_str(&format!("Cc: {}\n", self.cc.join(", ")));
-        }
-        if !self.subject.is_empty() {
-            msg.push_str(&format!("Subject: {}\n", self.subject));
-        }
-
+        add("Subject", &self.subject);
         for (name, value) in &self.headers {
-            msg.push_str(&format!("{}: {}\n", name, value));
+            lines.push(format!("{}: {}", name, value));
         }
+        lines
+    }
 
-        msg.push('\n');
-        let mut msg = msg.into_bytes();
-        msg.extend_from_slice(&self.body);
+    /// The message as handed to the delivery agent: headers, an empty line,
+    /// and the body.
+    pub fn format(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for line in self.header_lines(false) {
+            out.extend_from_slice(line.as_bytes());
+            out.push(b'\n');
+        }
+        out.push(b'\n');
+        out.extend_from_slice(&self.body);
+        out
+    }
 
+    /// The message as a mailbox entry under the envelope line `from_line`.
+    pub fn to_message(&self, from_line: String) -> Message {
+        let mut msg = Message::new();
+        msg.from_line = from_line.into_bytes();
+        msg.header_lines = self
+            .header_lines(false)
+            .into_iter()
+            .map(String::into_bytes)
+            .collect();
+        msg.body = self.body.clone();
         msg
     }
 
@@ -298,15 +322,11 @@ pub fn send_message(
     Ok(())
 }
 
-/// Record a sent message to a file
 /// Append an outgoing message to a record file, in mbox format.
 ///
 /// `record`, and the author-named file `followup` writes, are ordinary
-/// mailboxes that get read back with `mailx -f`. They are written through the
-/// same `From `-quoting and separator rules as any other mailbox: writing the
-/// body verbatim meant a composed line beginning `From ` split the entry in two
-/// on the next read, and a missing trailing empty line ran consecutive records
-/// together.
+/// mailboxes that get read back with `mailx -f`, so they are written by the
+/// same writer, with the same locking, as any other mailbox.
 pub(crate) fn record_message(
     msg: &ComposedMessage,
     filename: &str,
@@ -323,41 +343,12 @@ pub(crate) fn record_message(
         filename.to_string()
     };
 
-    // Create "From " line
     let user = crate::user_login();
     let user = if user.is_empty() { "unknown" } else { &user };
     let date = chrono::Local::now().format("%a %b %e %H:%M:%S %Y");
+    let entry = msg.to_message(format!("From {} {}", user, date));
 
-    let mut file = crate::util::private_open()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .context(format!("Cannot open {}", path))?;
-
-    let write = || -> io::Result<()> {
-        let mut file = &file;
-        writeln!(file, "From {} {}", user, date)?;
-        let formatted = msg.format();
-        let (headers, body) = match formatted.windows(2).position(|w| w == b"\n\n") {
-            Some(at) => (&formatted[..at], &formatted[at + 2..]),
-            None => (&formatted[..], &[][..]),
-        };
-        file.write_all(headers)?;
-        writeln!(file)?;
-        writeln!(file)?;
-        for line in crate::util::byte_lines(body) {
-            if crate::mbox::needs_from_quoting(line) {
-                write!(file, ">")?;
-            }
-            file.write_all(line)?;
-            writeln!(file)?;
-        }
-        writeln!(file)?;
-        Ok(())
-    };
-    write().context(&path)?;
-    file.flush().context(&path)?;
-
+    crate::mailbox::append_messages_to_file(&path, &[&entry], true).context(&path)?;
     Ok(())
 }
 
@@ -448,6 +439,7 @@ pub fn compose_reply(original: &Message, reply_all: bool, vars: &Variables) -> C
 
     msg
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

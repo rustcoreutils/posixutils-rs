@@ -347,7 +347,7 @@ fn migrate_to_mbox(path: &str, messages: &[&Message], append: bool) -> io::Resul
 /// regular files where it means something.
 ///
 /// Returns the number of bytes appended.
-fn append_messages_to_file(
+pub(crate) fn append_messages_to_file(
     path: &str,
     messages: &[&Message],
     include_from_line: bool,

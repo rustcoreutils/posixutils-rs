@@ -540,9 +540,10 @@ fn cmd_edit(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
 
 /// Run `editor` over each message in turn, on a private temporary copy.
 ///
-/// The temporary comes from `mkstemp` (`O_EXCL`, mode 0600, honoring `$TMPDIR`)
-/// rather than a name built from the pid: `/tmp/mailx.<pid>.<n>` is predictable,
-/// world-readable, and `fs::write` follows a symlink planted there first.
+/// The copy is discarded afterwards: `edit` and `visual` do "not modify the
+/// contents of those messages in the mailbox". It is made by `mkstemp`
+/// (`O_EXCL`, mode 0600, honoring `$TMPDIR`), so its name cannot be predicted
+/// or replaced by a planted symlink.
 fn edit_messages(msg_nums: &[usize], mb: &Mailbox, editor: &str) -> Result<CommandResult> {
     for &num in msg_nums {
         if let Some(msg) = mb.get(num) {

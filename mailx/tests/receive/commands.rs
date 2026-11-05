@@ -1002,3 +1002,47 @@ fn dp_of_the_last_message_reports_the_end() {
     );
     assert_eq!(output.status.code(), Some(0), "exit status");
 }
+
+/// `edit` gives the editor a copy: POSIX says it "does not modify the
+/// contents of those messages in the mailbox".
+#[test]
+fn edit_leaves_the_message_unchanged() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mbox = copy_test_data("testdata.mbox");
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let ran = dir.path().join("ran");
+    let editor = dir.path().join("editor");
+    std::fs::write(
+        &editor,
+        format!(
+            "#!/bin/sh\nsed 's/Meeting/CHANGED/' \"$1\" > \"$1.new\" && mv \"$1.new\" \"$1\"\ntouch {}\n",
+            ran.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = mailx_env(
+        &["-n", "-N", "-f", mbox.path().to_str().unwrap()],
+        "edit 1\nprint 1\nquit\n",
+        &[("EDITOR", editor.to_str().unwrap())],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(ran.exists(), "the editor did not run");
+    assert!(
+        stdout.contains("Subject: Meeting Tomorrow") && !stdout.contains("CHANGED"),
+        "the edit reached the message: {}",
+        stdout
+    );
+    let after = std::fs::read(mbox.path()).unwrap();
+    assert!(
+        !String::from_utf8_lossy(&after).contains("CHANGED"),
+        "the edit reached the mailbox"
+    );
+    assert!(
+        String::from_utf8_lossy(&after).contains("Subject: Meeting Tomorrow"),
+        "the message is gone from the mailbox"
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
+}

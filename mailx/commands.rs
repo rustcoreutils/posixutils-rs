@@ -603,13 +603,8 @@ fn parse_command_line(line: &str) -> (&str, &str) {
 
 // ============ Command implementations ============
 
-/// Report what a `save`, `copy`, `Save`, `Copy`, or `write` wrote.
-fn report_written(mb: &Mailbox, msg_nums: &[usize], filename: &str) {
-    let total: usize = msg_nums
-        .iter()
-        .filter_map(|&n| mb.get(n))
-        .map(|m| m.size())
-        .sum();
+/// Report what a `save`, `copy`, `Save`, or `Copy` wrote.
+fn report_written(msg_nums: &[usize], filename: &str, total: u64) {
     println!(
         "\"{}\" {} messages {} bytes",
         filename,
@@ -730,13 +725,13 @@ fn cmd_copy(
 ) -> Result<CommandResult, String> {
     let (msg_nums, filename) = msglist_and_file(args, mb, vars, true)?;
 
-    mb.save_messages(&msg_nums, &filename, true)?;
+    let written = mb.save_messages(&msg_nums, &filename, true)?;
 
     if mark_saved {
         mark_messages_saved(mb, &msg_nums);
     }
 
-    report_written(mb, &msg_nums, &filename);
+    report_written(&msg_nums, &filename, written);
 
     Ok(CommandResult::Continue)
 }
@@ -759,13 +754,13 @@ fn cmd_copy_author(
         let filename = author_filename(first_msg.from())?;
         let filename = expand_author_filename(filename, vars);
 
-        mb.save_messages(&msg_nums, &filename, true)?;
+        let written = mb.save_messages(&msg_nums, &filename, true)?;
 
         if mark_saved {
             mark_messages_saved(mb, &msg_nums);
         }
 
-        report_written(mb, &msg_nums, &filename);
+        report_written(&msg_nums, &filename, written);
     }
 
     Ok(CommandResult::Continue)
@@ -1249,13 +1244,13 @@ fn cmd_save(
 ) -> Result<CommandResult, String> {
     let (msg_nums, filename) = msglist_and_file(args, mb, vars, false)?;
 
-    mb.save_messages(&msg_nums, &filename, true)?;
+    let written = mb.save_messages(&msg_nums, &filename, true)?;
 
     if mark_saved {
         mark_messages_saved(mb, &msg_nums);
     }
 
-    report_written(mb, &msg_nums, &filename);
+    report_written(&msg_nums, &filename, written);
 
     Ok(CommandResult::Continue)
 }

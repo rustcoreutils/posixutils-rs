@@ -1391,3 +1391,27 @@ fn header_summary_date_from_loose_headers() {
         );
     }
 }
+
+/// `save` reports the bytes it wrote, which differ from the message as
+/// loaded: here a `Status:` header is added and a separator supplied.
+#[test]
+fn save_reports_the_bytes_written() {
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let out = dir.path().join("saved");
+    let out_path = out.to_str().unwrap().to_string();
+    let (_, report) = summary_and_commands(
+        "From a@example.com Mon Jan 29 10:29:21 2007\n\
+         From: a@example.com\n\
+         Subject: s\n\
+         \n\
+         body",
+        &format!("print 1\nsave 1 {}\nexit\n", out_path),
+    );
+    let written = std::fs::metadata(&out).expect("saved file").len();
+    assert!(
+        report.contains(&format!("1 messages {} bytes", written)),
+        "report disagrees with the {} bytes written: {}",
+        written,
+        report
+    );
+}

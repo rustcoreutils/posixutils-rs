@@ -435,7 +435,7 @@ impl Mailbox {
         msg_nums: &[usize],
         path: &str,
         include_from_line: bool,
-    ) -> Result<(), String> {
+    ) -> Result<u64, String> {
         let messages: Vec<&Message> = msg_nums.iter().filter_map(|&n| self.get(n)).collect();
 
         let msgs: Vec<Message> = messages.iter().map(|m| (*m).clone()).collect();
@@ -608,25 +608,53 @@ fn migrate_to_mbox(path: &str, messages: &[Message], append: bool) -> io::Result
 /// none of which can be opened for reading, seeked, or synced. Those are not
 /// errors in the save; the durability the lock and the sync buy applies to the
 /// regular files where it means something.
+///
+/// Returns the number of bytes appended.
 fn append_messages_to_file(
     path: &str,
     messages: &[Message],
     include_from_line: bool,
-) -> io::Result<()> {
+) -> io::Result<u64> {
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
 
     // Best effort: flock fails on some filesystems and object types.
     // SAFETY: the fd is valid for the lifetime of `file`.
     unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
 
-    {
-        let mut w = io::BufWriter::new(&mut file);
+    let written = {
+        let mut w = CountingWriter {
+            inner: io::BufWriter::new(&mut file),
+            count: 0,
+        };
         write_messages(&mut w, messages, include_from_line)?;
         w.flush()?;
-    }
+        w.count
+    };
     file.flush()?;
     if file.metadata().is_ok_and(|m| m.is_file()) {
         file.sync_all()?;
     }
-    Ok(())
+    Ok(written)
+}
+
+/// A writer that counts the bytes passing through it.
+///
+/// What `save` writes is not the message as loaded -- `Status:` is
+/// regenerated and the separator always added -- so its size is counted on
+/// the way out rather than predicted.
+struct CountingWriter<W: Write> {
+    inner: W,
+    count: u64,
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.count += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }

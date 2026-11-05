@@ -164,11 +164,17 @@ impl Drop for SignalsHeld {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// The SIGINT flag is process-wide; tests that raise SIGINT take this
+    /// so that one cannot take the other's signal.
+    static SIGINT_TESTS: Mutex<()> = Mutex::new(());
 
     /// The installed handler records SIGINT in the flag instead of terminating,
     /// and `take_sigint` reports-and-clears it.
     #[test]
     fn sigint_sets_and_clears_flag() {
+        let _serial = SIGINT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         setup();
         // Clear any stale state, then deliver a SIGINT to this thread.
         let _ = take_sigint();
@@ -182,6 +188,7 @@ mod tests {
     /// A signal raised while held is delivered only when the guard drops.
     #[test]
     fn held_signal_waits_for_the_guard() {
+        let _serial = SIGINT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         setup();
         let _ = take_sigint();
         {

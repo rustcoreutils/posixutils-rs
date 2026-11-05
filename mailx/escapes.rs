@@ -530,12 +530,7 @@ fn insert_messages(
 }
 
 fn pipe_through_command(input: &[u8], cmd: &str, vars: &Variables) -> Result<Vec<u8>> {
-    let shell = vars.get_nonempty("SHELL").unwrap_or("/bin/sh");
-
-    let mut child = Command::new(shell)
-        .arg("-c")
-        .arg("--")
-        .arg(cmd)
+    let mut child = crate::util::shell_command(cmd, vars)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

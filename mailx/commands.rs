@@ -436,7 +436,7 @@ pub(crate) fn cmd_alternates(args: &str, vars: &mut Variables) -> Result<Command
 
 fn cmd_cd(args: &str) -> Result<CommandResult> {
     let dir = if args.is_empty() {
-        env::var("HOME").unwrap_or_else(|_| ".".to_string())
+        crate::util::home()
     } else {
         args.to_string()
     };
@@ -733,16 +733,8 @@ fn cmd_mail(
 ) -> Result<CommandResult> {
     let mut composed = ComposedMessage::new();
 
-    for addr in args.split_whitespace() {
-        // Expand aliases
-        let expanded = vars.expand_alias(addr);
-        if expanded.is_empty() {
-            composed.add_to(addr);
-        } else {
-            for a in expanded {
-                composed.add_to(&a);
-            }
-        }
+    for addr in args.split_whitespace().flat_map(|a| vars.recipients(a)) {
+        composed.add_to(&addr);
     }
 
     // `mail` prompts for the same optional headers Send Mode does; its own
@@ -843,15 +835,11 @@ fn after_words(args: &str, n: usize) -> &str {
 fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult> {
     let (msg_nums, cmd) = pipe_arguments(args, mb, vars)?;
 
-    let shell = vars.get_nonempty("SHELL").unwrap_or("/bin/sh");
     let page = vars.is_set("page");
 
     for num in &msg_nums {
         if let Some(msg) = mb.get(*num) {
-            let mut child = std::process::Command::new(shell)
-                .arg("-c")
-                .arg("--")
-                .arg(&cmd)
+            let mut child = crate::util::shell_command(&cmd, vars)
                 .stdin(std::process::Stdio::piped())
                 .spawn()
                 .map_err(|e| e.to_string())?;
@@ -1051,8 +1039,9 @@ fn cmd_shell(cmd: &str, vars: &mut Variables, interp: &mut Interp) -> Result<Com
 }
 
 fn cmd_shell_interactive(vars: &mut Variables) -> Result<CommandResult> {
-    let shell = vars.get_nonempty("SHELL").unwrap_or("/bin/sh");
-    Command::new(shell).status().map_err(|e| e.to_string())?;
+    Command::new(crate::util::shell_program(vars))
+        .status()
+        .map_err(|e| e.to_string())?;
     Ok(CommandResult::Continue)
 }
 

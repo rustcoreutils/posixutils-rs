@@ -29,7 +29,7 @@ pub fn expand_local_prefixes(name: &str, vars: &Variables) -> String {
     let name = name.trim();
 
     match name {
-        "%" => return spool_path(&crate::user_login_or_unknown()),
+        "%" => return spool_path(&crate::util::user_login_or_unknown()),
         "&" => return mbox_path(vars),
         _ => {}
     }
@@ -38,15 +38,7 @@ pub fn expand_local_prefixes(name: &str, vars: &Variables) -> String {
         return spool_path(user);
     }
     if let Some(rest) = name.strip_prefix('+') {
-        if let Some(folder) = vars.get_nonempty("folder") {
-            let folder = if folder.starts_with('/') {
-                folder.to_string()
-            } else {
-                format!("{}/{}", home(), folder)
-            };
-            return format!("{}/{}", folder, rest);
-        }
-        return name.to_string();
+        return in_folder(rest, vars).unwrap_or_else(|| name.to_string());
     }
     if name == "~" {
         return home();
@@ -94,4 +86,15 @@ fn shell_expand(name: &str, vars: &Variables) -> Option<String> {
         return None;
     }
     Some(first.to_string())
+}
+
+/// `name` in the directory `folder` names, relative to `HOME` unless it is
+/// absolute; `None` when `folder` is unset or null.
+pub fn in_folder(name: &str, vars: &Variables) -> Option<String> {
+    let folder = vars.get_nonempty("folder")?;
+    if folder.starts_with('/') {
+        Some(format!("{}/{}", folder, name))
+    } else {
+        Some(format!("{}/{}/{}", home(), folder, name))
+    }
 }

@@ -183,8 +183,19 @@ impl Variables {
         }
     }
 
-    /// Expand an alias
-    pub fn expand_alias(&self, name: &str) -> Vec<String> {
+    /// The addresses mail to `name` goes to: its alias expansion, or `name`
+    /// itself when it is not an alias.
+    pub fn recipients(&self, name: &str) -> Vec<String> {
+        let expanded = self.expand_alias(name);
+        if expanded.is_empty() {
+            vec![name.to_string()]
+        } else {
+            expanded
+        }
+    }
+
+    /// Expand an alias; empty when `name` is not one.
+    fn expand_alias(&self, name: &str) -> Vec<String> {
         let mut active = Vec::new();
         self.expand_alias_inner(name, &mut active)
     }
@@ -253,7 +264,7 @@ impl Variables {
         if self.is_alternate(addr) {
             return true;
         }
-        let login = crate::user_login();
+        let login = crate::util::user_login();
         if login.is_empty() {
             return false;
         }

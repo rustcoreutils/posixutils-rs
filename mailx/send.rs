@@ -9,7 +9,6 @@
 
 //! Send mode implementation for mailx
 
-use std::env;
 use std::io::{self, IsTerminal, Read, Write};
 use std::process::{Command, Stdio};
 
@@ -159,17 +158,8 @@ pub fn send_mode(args: &Args, vars: &mut Variables, interp: &mut Interp) -> Resu
 
     let mut msg = ComposedMessage::new();
 
-    // Add addresses from command line
-    for addr in &args.addresses {
-        // Expand aliases
-        let expanded = vars.expand_alias(addr);
-        if expanded.is_empty() {
-            msg.add_to(addr);
-        } else {
-            for a in expanded {
-                msg.add_to(&a);
-            }
-        }
+    for addr in args.addresses.iter().flat_map(|a| vars.recipients(a)) {
+        msg.add_to(&addr);
     }
 
     // A -s subject supplies the Subject header; otherwise `asksub` may prompt
@@ -332,19 +322,13 @@ pub(crate) fn record_message(
     filename: &str,
     vars: &Variables,
 ) -> Result<()> {
-    let path = if vars.is_set("outfolder") && !filename.starts_with('/') {
-        if let Some(folder) = vars.get_nonempty("folder") {
-            let folder = expand_folder(folder);
-            format!("{}/{}", folder, filename)
-        } else {
-            filename.to_string()
-        }
-    } else {
-        filename.to_string()
-    };
+    let in_folder = vars.is_set("outfolder") && !filename.starts_with('/');
+    let path = in_folder
+        .then(|| crate::filename::in_folder(filename, vars))
+        .flatten()
+        .unwrap_or_else(|| filename.to_string());
 
-    let user = crate::user_login();
-    let user = if user.is_empty() { "unknown" } else { &user };
+    let user = crate::util::user_login_or_unknown();
     let date = chrono::Local::now().format("%a %b %e %H:%M:%S %Y");
     let entry = msg.to_message(format!("From {} {}", user, date));
 
@@ -365,15 +349,6 @@ pub fn save_dead_letter(msg: &ComposedMessage, vars: &Variables) {
         let _ = file.write_all(&msg.format());
         // Informative notice -> stdout (spec STDOUT, 104412-104414).
         println!("Message saved to {}", dead_path);
-    }
-}
-
-fn expand_folder(folder: &str) -> String {
-    if folder.starts_with('/') {
-        folder.to_string()
-    } else {
-        let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        format!("{}/{}", home, folder)
     }
 }
 

@@ -7,12 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! Shared helpers: the paths mailx derives from the environment, the one way it
-//! runs a shell command, and the pager decision.
-//!
-//! Each of these existed in several copies that had drifted from one another --
-//! two ways to run `$SHELL -c`, two pagers with different failure behavior,
-//! eleven inline `$HOME` fallbacks, four ways to name the mbox.
+//! Shared helpers: the user and the paths derived from the environment,
+//! running shell commands, the pager, and address lists.
 
 use std::env;
 use std::io::{self, IsTerminal, Write};
@@ -24,6 +20,30 @@ use crate::variables::Variables;
 /// The user's home directory, falling back to the current directory.
 pub fn home() -> String {
     env::var("HOME").unwrap_or_else(|_| ".".to_string())
+}
+
+/// The login name of the user running mailx, or an empty string if unknown.
+///
+/// `USER` may be present but empty, which is not a login name; treat it the
+/// same as absent rather than letting "" stand in for the user's identity.
+pub fn user_login() -> String {
+    user_login_or("")
+}
+
+/// The login name, or `unknown` when the environment does not say.
+pub fn user_login_or_unknown() -> String {
+    user_login_or("unknown")
+}
+
+fn user_login_or(fallback: &str) -> String {
+    for var in ["USER", "LOGNAME"] {
+        if let Ok(v) = env::var(var) {
+            if !v.trim().is_empty() {
+                return v;
+            }
+        }
+    }
+    fallback.to_string()
 }
 
 /// The secondary mailbox messages are moved to when they have been read.
@@ -58,15 +78,24 @@ pub fn spool_path(user: &str) -> String {
         .unwrap_or_else(|| candidates[0].clone())
 }
 
-/// Run `cmd` through the command interpreter named by `SHELL`.
+/// The command interpreter `SHELL` names.
+pub fn shell_program(vars: &Variables) -> &str {
+    vars.get_nonempty("SHELL").unwrap_or("/bin/sh")
+}
+
+/// A command that runs `cmd` through the command interpreter.
 ///
 /// POSIX spells the invocation out: three arguments, `-c`, `--`, and the
 /// command string (spec 105043-105044, 104870-104872).
+pub fn shell_command(cmd: &str, vars: &Variables) -> Command {
+    let mut command = Command::new(shell_program(vars));
+    command.arg("-c").arg("--").arg(cmd);
+    command
+}
+
+/// Run `cmd` through the command interpreter.
 pub fn shell(cmd: &str, vars: &Variables) -> Result<std::process::ExitStatus> {
-    Command::new(vars.get_nonempty("SHELL").unwrap_or("/bin/sh"))
-        .arg("-c")
-        .arg("--")
-        .arg(cmd)
+    shell_command(cmd, vars)
         .status()
         .map_err(|e| e.to_string().into())
 }
@@ -78,10 +107,7 @@ pub fn shell_output(cmd: &str, vars: &Variables) -> Result<String> {
 
 /// As [`shell_output`], keeping the output as the bytes written.
 pub fn shell_output_bytes(cmd: &str, vars: &Variables) -> Result<Vec<u8>> {
-    let out = Command::new(vars.get_nonempty("SHELL").unwrap_or("/bin/sh"))
-        .arg("-c")
-        .arg("--")
-        .arg(cmd)
+    let out = shell_command(cmd, vars)
         .output()
         .map_err(|e| e.to_string())?;
     if !out.status.success() {
@@ -126,12 +152,7 @@ pub fn page_or_print(text: &[u8], vars: &Variables) {
     }
 
     let pager = vars.get_nonempty("PAGER").unwrap_or("more");
-    let spawned = Command::new(vars.get_nonempty("SHELL").unwrap_or("/bin/sh"))
-        .arg("-c")
-        .arg("--")
-        .arg(pager)
-        .stdin(Stdio::piped())
-        .spawn();
+    let spawned = shell_command(pager, vars).stdin(Stdio::piped()).spawn();
 
     // A pager that cannot be started must not swallow the message.
     let Ok(mut child) = spawned else {

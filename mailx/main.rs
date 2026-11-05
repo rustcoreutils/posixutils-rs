@@ -115,7 +115,11 @@ fn run_headers_only(args: &Args) -> i32 {
     };
 
     if mb.message_count() == 0 {
-        println!("{} {}", gettext("No mail for"), get_user());
+        println!(
+            "{} {}",
+            gettext("No mail for"),
+            util::user_login_or_unknown()
+        );
         return 0;
     }
 
@@ -162,7 +166,11 @@ fn run_receive_mode(args: &Args) -> i32 {
     if !args.no_header_summary && vars.is_set("header") && mb.message_count() > 0 {
         crate::summary::print_headers(&mb, None, &vars);
     } else if mb.message_count() == 0 && is_tty {
-        println!("{} {}", gettext("No mail for"), get_user());
+        println!(
+            "{} {}",
+            gettext("No mail for"),
+            util::user_login_or_unknown()
+        );
     }
 
     // Command loop
@@ -288,10 +296,7 @@ fn load_startup_files(vars: &mut Variables, interp: &mut Interp, no_init: bool) 
     }
 
     // Load user startup file
-    let mailrc = env::var("MAILRC").unwrap_or_else(|_| {
-        let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        format!("{}/.mailrc", home)
-    });
+    let mailrc = env::var("MAILRC").unwrap_or_else(|_| format!("{}/.mailrc", util::home()));
 
     if let Ok(content) = std::fs::read_to_string(&mailrc) {
         load_rc_content(&content, &mailrc, vars, interp);
@@ -311,33 +316,5 @@ fn get_system_mailbox() -> String {
     if let Ok(mail) = env::var("MAIL") {
         return mail;
     }
-    util::spool_path(&get_user())
-}
-
-fn get_user() -> String {
-    user_login_or("unknown")
-}
-
-/// The login name of the user running mailx, or an empty string if unknown.
-///
-/// `USER` may be present but empty, which is not a login name; treat it the
-/// same as absent rather than letting "" stand in for the user's identity.
-pub fn user_login() -> String {
-    user_login_or("")
-}
-
-/// The login name, or `unknown` when the environment does not say.
-pub fn user_login_or_unknown() -> String {
-    user_login_or("unknown")
-}
-
-fn user_login_or(fallback: &str) -> String {
-    for var in ["USER", "LOGNAME"] {
-        if let Ok(v) = env::var(var) {
-            if !v.trim().is_empty() {
-                return v;
-            }
-        }
-    }
-    fallback.to_string()
+    util::spool_path(&util::user_login_or_unknown())
 }

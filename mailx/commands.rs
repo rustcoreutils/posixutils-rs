@@ -611,7 +611,18 @@ fn cmd_file(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
     // like newly delivered mail and be copied through a second time.
     fs::File::open(&path).context(&path)?;
     mb.quit(vars)?;
-    let mut new_mb = Mailbox::load(&path)?;
+    let mut new_mb = match Mailbox::load(&path) {
+        Ok(new_mb) => new_mb,
+        Err(e) => {
+            // The old mailbox is written back already: go on with it as
+            // written, not as held, or quitting would act on it again.
+            let mut old = Mailbox::load(&leaving).unwrap_or_else(|_| Mailbox::new(leaving));
+            old.is_system_mailbox = mb.is_system_mailbox;
+            old.prev_path = mb.prev_path.take();
+            *mb = old;
+            return Err(e);
+        }
+    };
     new_mb.prev_path = Some(leaving);
     new_mb.is_system_mailbox = crate::util::same_file(&path, &crate::util::system_mailbox());
 

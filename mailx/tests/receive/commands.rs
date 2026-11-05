@@ -1233,3 +1233,29 @@ fn pipe_to_a_command_that_stops_reading() {
         stdout
     );
 }
+
+/// When `file` has written the old mailbox back but cannot load the new
+/// one, the session carries on with the old mailbox as written, so quitting
+/// does not move its read messages to mbox a second time.
+#[test]
+fn failed_file_switch_does_not_quit_twice() {
+    let system = copy_test_data("testdata.mbox");
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let secondary = dir.path().join("mbox");
+    let output = mailx_env(
+        &["-n", "-N"],
+        format!("print 1\nfile {}\nquit\n", dir.path().display()),
+        &[
+            ("MAIL", system.path().to_str().unwrap()),
+            ("MBOX", secondary.to_str().unwrap()),
+        ],
+    );
+    let saved = std::fs::read_to_string(&secondary).unwrap_or_default();
+    assert_eq!(
+        saved.matches("Subject: Meeting Tomorrow").count(),
+        1,
+        "message 1 should be in mbox once: {}\n{}",
+        saved,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

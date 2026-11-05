@@ -10,7 +10,6 @@
 //! Send mode implementation for mailx
 
 use std::env;
-use std::fs::{self, File};
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::{Command, Stdio};
 
@@ -328,7 +327,7 @@ pub(crate) fn record_message(
     let user = if user.is_empty() { "unknown" } else { &user };
     let date = chrono::Local::now().format("%a %b %e %H:%M:%S %Y");
 
-    let mut file = fs::OpenOptions::new()
+    let mut file = crate::util::private_open()
         .create(true)
         .append(true)
         .open(&path)
@@ -364,7 +363,12 @@ pub(crate) fn record_message(
 pub fn save_dead_letter(msg: &ComposedMessage, vars: &Variables) {
     let dead_path = crate::util::dead_letter_path(vars);
 
-    if let Ok(mut file) = File::create(&dead_path) {
+    let created = crate::util::private_open()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&dead_path);
+    if let Ok(mut file) = created {
         let _ = write!(file, "{}", msg.format());
         // Informative notice -> stdout (spec STDOUT, 104412-104414).
         println!("Message saved to {}", dead_path);

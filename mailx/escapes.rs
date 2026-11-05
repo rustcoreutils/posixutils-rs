@@ -278,7 +278,7 @@ pub fn handle_escape(
             // Write body to file: create, or append if it already exists
             // (spec 105094-105097).
             let path = expand_filename(args, vars);
-            let result = fs::OpenOptions::new()
+            let result = crate::util::private_open()
                 .create(true)
                 .append(true)
                 .open(&path)

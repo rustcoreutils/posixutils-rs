@@ -5347,3 +5347,51 @@ fn header_summary_shows_control_characters_as_question_marks() {
         },
     );
 }
+
+/// Files mailx creates to hold mail are private to the user, whatever the
+/// umask would otherwise allow.
+#[test]
+fn created_mail_files_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let saved = dir.path().join("saved");
+    let written = dir.path().join("written");
+    let mbox = copy_test_data("testdata.mbox");
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: format!(
+                "save 1 {}\nwrite 2 {}\nexit\n",
+                saved.display(),
+                written.display()
+            ),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, _output| {
+            for path in [&saved, &written] {
+                let mode = std::fs::metadata(path)
+                    .unwrap_or_else(|e| panic!("{}: {}", path.display(), e))
+                    .permissions()
+                    .mode();
+                assert_eq!(
+                    mode & 0o077,
+                    0,
+                    "{} is readable by others: {:o}",
+                    path.display(),
+                    mode
+                );
+            }
+        },
+    );
+}

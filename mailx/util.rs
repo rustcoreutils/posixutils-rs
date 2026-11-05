@@ -161,6 +161,19 @@ pub fn prompt_field(label: &str, current: &str) -> Result<Option<String>, String
     Ok((!line.is_empty()).then(|| line.to_string()))
 }
 
+/// Options for opening a file mailx may create, with a new file private
+/// to the user (mode 0600).
+///
+/// Mailboxes, saved messages, the record and dead.letter hold mail. Creating
+/// them 0666 less the umask -- 0644 under the usual one -- let every local
+/// user read them. An existing file keeps its permissions.
+pub fn private_open() -> std::fs::OpenOptions {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = std::fs::OpenOptions::new();
+    options.mode(0o600);
+    options
+}
+
 /// Split a comma-separated address list.
 ///
 /// Only a comma outside quotes, comments, and angle brackets separates two

@@ -1513,7 +1513,7 @@ fn cmd_write(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comma
     let (msg_nums, filename) = msglist_and_file(args, mb, vars, true)?;
 
     // Write without headers
-    let mut file = fs::OpenOptions::new()
+    let mut file = crate::util::private_open()
         .create(true)
         .append(true)
         .open(&filename)

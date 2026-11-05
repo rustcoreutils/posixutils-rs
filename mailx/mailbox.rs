@@ -9,7 +9,7 @@
 
 //! Mailbox handling for mailx - mbox format parsing and writing
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read, Seek, Write};
 use std::os::unix::io::AsRawFd;
 
@@ -637,7 +637,7 @@ fn read_locked(path: &str) -> io::Result<Vec<u8>> {
 
 /// Open `path` for a locked read-modify-write, creating it if absent.
 fn open_locked(path: &str) -> io::Result<File> {
-    let file = OpenOptions::new()
+    let file = crate::util::private_open()
         .read(true)
         .write(true)
         .create(true)
@@ -738,7 +738,10 @@ fn append_messages_to_file(
     messages: &[Message],
     include_from_line: bool,
 ) -> io::Result<u64> {
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut file = crate::util::private_open()
+        .create(true)
+        .append(true)
+        .open(path)?;
 
     // Best effort: locking fails on some filesystems and object types.
     let _ = lock(&file, true);

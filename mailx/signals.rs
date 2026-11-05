@@ -90,6 +90,46 @@ pub fn read_bytes_interruptible(buf: &mut Vec<u8>) -> io::Result<usize> {
     Ok(buf.len() - start)
 }
 
+/// Signals held off while a mailbox is written back, so a hangup, an
+/// interrupt or a stop cannot cut a rewrite short; any that arrive act once
+/// the guard is dropped. Traditional mailx ignores HUP, INT and QUIT for its
+/// quit; TERM and TSTP are held here too.
+pub struct SignalsHeld {
+    previous: libc::sigset_t,
+}
+
+impl SignalsHeld {
+    pub fn new() -> SignalsHeld {
+        // SAFETY: both sets are initialized by sigemptyset or by the call
+        // that fills them, and the return values are checked.
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            for sig in [
+                libc::SIGHUP,
+                libc::SIGINT,
+                libc::SIGQUIT,
+                libc::SIGTERM,
+                libc::SIGTSTP,
+            ] {
+                libc::sigaddset(&mut set, sig);
+            }
+            let mut previous: libc::sigset_t = std::mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut previous);
+            SignalsHeld { previous }
+        }
+    }
+}
+
+impl Drop for SignalsHeld {
+    fn drop(&mut self) {
+        // SAFETY: `previous` is the mask `new` saved.
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,5 +146,20 @@ mod tests {
         }
         assert!(take_sigint(), "SIGINT should set the flag");
         assert!(!take_sigint(), "flag should be cleared after being taken");
+    }
+
+    /// A signal raised while held is delivered only when the guard drops.
+    #[test]
+    fn held_signal_waits_for_the_guard() {
+        setup();
+        let _ = take_sigint();
+        {
+            let _held = SignalsHeld::new();
+            unsafe {
+                libc::raise(libc::SIGINT);
+            }
+            assert!(!take_sigint(), "SIGINT was delivered while held");
+        }
+        assert!(take_sigint(), "SIGINT was not delivered after the guard");
     }
 }

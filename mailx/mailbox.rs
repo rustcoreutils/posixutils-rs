@@ -252,6 +252,7 @@ impl Mailbox {
     /// deleted and saved ones as `hold` and `keepsave` direct, and write the
     /// rest back.
     pub fn quit(&mut self, vars: &Variables) -> Result<()> {
+        let _held = crate::signals::SignalsHeld::new();
         let hold = vars.is_set("hold");
         let keepsave = vars.is_set("keepsave");
         let keep = vars.is_set("keep");

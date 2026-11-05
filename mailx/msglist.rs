@@ -102,22 +102,23 @@ impl Selector {
         let current = mb.current().unwrap_or(0);
 
         match self {
-            Selector::Number(num) if (1..=mb.message_count()).contains(num) => Ok(vec![*num]),
-            Selector::Number(num) => Err(format!("Invalid message number: {}", num).into()),
+            Selector::Number(num) => check(mb, *num, want).map(|()| vec![*num]),
             Selector::Range(start, end) => {
-                let (start, end) = (start.resolve(mb), end.resolve(mb));
+                // Both ends are checked, as BSD mailx checks them; deleted
+                // messages between them are passed over below.
+                let start = start.resolve(mb, want)?;
+                let end = end.resolve(mb, want)?;
+                check(mb, start, want)?;
+                check(mb, end, want)?;
                 if start > end {
                     return Err("Invalid range".into());
                 }
-                // Clamp to the mailbox rather than reject: `undelete 1-$` and
-                // `undelete 1-9999` both mean "the rest of them".
-                let last = mb.message_count();
-                if start > last {
-                    return Err(format!("Invalid message number: {}", start).into());
-                }
-                Ok((start..=end.min(last)).collect())
+                Ok((start..=end).collect())
             }
-            Selector::Current => one(mb.current(), "No current message"),
+            Selector::Current => {
+                let current = mb.current().ok_or("No current message")?;
+                check_state(mb, current, want).map(|()| vec![current])
+            }
             Selector::First => one(
                 mb.find(0, Direction::Forward, positional),
                 none("No messages", "No deleted messages"),
@@ -168,13 +169,48 @@ impl Endpoint {
         }
     }
 
-    fn resolve(self, mb: &Mailbox) -> usize {
+    /// The message number this end stands for: `^` and `$` are the first
+    /// and last messages `want` can name, as the lone `^` and `$` are.
+    fn resolve(self, mb: &Mailbox, want: Want) -> Result<usize> {
+        let positional = |m: &Message| m.is_deleted() == (want == Want::Deleted);
+        let none = || -> crate::error::Error {
+            if want == Want::Deleted {
+                "No deleted messages".into()
+            } else {
+                "No messages".into()
+            }
+        };
         match self {
-            Endpoint::Number(n) => n,
-            Endpoint::First => 1,
-            Endpoint::Last => mb.message_count(),
-            Endpoint::Current => mb.current().unwrap_or(0),
+            Endpoint::Number(n) => Ok(n),
+            Endpoint::First => mb.find(0, Direction::Forward, positional).ok_or_else(none),
+            Endpoint::Last => mb
+                .find(mb.message_count() + 1, Direction::Backward, positional)
+                .ok_or_else(none),
+            Endpoint::Current => mb.current().ok_or_else(|| "No current message".into()),
         }
+    }
+}
+
+/// Whether message `num` may be named by number, as BSD mailx's check()
+/// has it: it must exist, and a deleted one is named only to `undelete`.
+pub fn check(mb: &Mailbox, num: usize, want: Want) -> Result<()> {
+    match mb.get(num) {
+        None => Err(format!("{}: Invalid message number", num).into()),
+        Some(m) if want == Want::Live && m.is_deleted() => {
+            Err(format!("{}: Inappropriate message", num).into())
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+/// Whether the message `num`, as `.`, is in the state `want` names: a
+/// deleted one only for `undelete`, and for it only a deleted one.
+fn check_state(mb: &Mailbox, num: usize, want: Want) -> Result<()> {
+    match mb.get(num) {
+        Some(m) if m.is_deleted() != (want == Want::Deleted) => {
+            Err(format!("{}: Inappropriate message", num).into())
+        }
+        _ => Ok(()),
     }
 }
 

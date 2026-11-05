@@ -409,28 +409,22 @@ fn range_endpoints_accept_the_positional_forms() {
     }
 }
 
-/// A range running past the last message is clamped, not rejected.
+/// Both ends of a range must name a message, as BSD mailx checks them: a
+/// range running past the last message is rejected, not clamped.
 #[test]
-fn undelete_range_past_the_end_is_clamped() {
+fn range_past_the_end_is_rejected() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap().to_string();
 
     let output = mailx(
         &["-n", "-N", "-f", &mbox_path],
-        "delete 1 2\nundelete 1-9999\nfrom *\nexit\n",
+        "delete 1 2\nundelete 1-9999\nfrom *\nundelete 1-$\nfrom *\nexit\n",
     );
     let err = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !err.contains("Invalid message number"),
-        "an over-long range was rejected instead of clamped: {}",
-        err
-    );
+    assert!(err.contains("9999: Invalid message number"), "{}", err);
     let out = String::from_utf8_lossy(&output.stdout).to_lowercase();
-    assert!(
-        out.contains("alice") && out.contains("bob"),
-        "undelete over a clamped range did not restore the messages: {}",
-        out
-    );
+    assert_eq!(out.matches("alice").count(), 1, "{}", out);
+    assert_eq!(out.matches("bob").count(), 1, "{}", out);
     assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
@@ -530,4 +524,63 @@ fn omitted_msglist_takes_the_next_undeleted_message() {
         "{}",
         stdout
     );
+}
+
+/// Run `script` on the five-message mailbox, returning its standard output
+/// and standard error.
+fn run_5msg(script: &str) -> (String, String) {
+    let mbox = copy_test_data("testdata-5msg.mbox");
+    let output = mailx(&["-n", "-N", "-f", mbox.path().to_str().unwrap()], script);
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// A deleted message named by number is not a message to act on, as BSD
+/// mailx's check() has it: the command is refused with "Inappropriate
+/// message", whether the number stands alone, in a list or as `.`.
+#[test]
+fn a_deleted_message_named_by_number_is_refused() {
+    for (script, refused) in [
+        ("d 3\np 3\nquit\n", "3: Inappropriate message"),
+        ("d 3\n3\nquit\n", "3: Inappropriate message"),
+        ("d 2\np 2 3\nquit\n", "2: Inappropriate message"),
+        ("d 2\np 2-4\nquit\n", "2: Inappropriate message"),
+        // `headers 4` makes current the top of its page, message 3.
+        (
+            "set screen=2\nd 3\nheaders 4\np .\nquit\n",
+            "3: Inappropriate message",
+        ),
+    ] {
+        let (out, err) = run_5msg(script);
+        assert!(err.contains(refused), "{:?}: {}", script, err);
+        assert!(!out.contains("Subject:"), "{:?} printed: {}", script, out);
+    }
+}
+
+/// A number past the last message is reported as BSD mailx reports it.
+#[test]
+fn a_number_past_the_end_is_invalid() {
+    for script in ["p 9\nquit\n", "9\nquit\n", "p 1-9\nquit\n"] {
+        let (_, err) = run_5msg(script);
+        assert!(
+            err.contains("9: Invalid message number"),
+            "{:?}: {}",
+            script,
+            err
+        );
+    }
+}
+
+/// Deleted messages strictly inside a range are passed over, and `^` and `$`
+/// stand for the first and last undeleted messages.
+#[test]
+fn a_range_passes_over_deleted_messages_inside_it() {
+    let (out, err) = run_5msg("d 1 3 5\nfrom ^-$\nfrom 2-4\nquit\n");
+    assert!(err.is_empty(), "{}", err);
+    let out = out.to_lowercase();
+    assert!(!out.contains("charlie"), "{}", out);
+    assert_eq!(out.matches("bob").count(), 2, "{}", out);
+    assert_eq!(out.matches("alice@different").count(), 2, "{}", out);
 }

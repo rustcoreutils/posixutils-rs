@@ -20,7 +20,8 @@ use crate::filename::{expand_local_prefixes, expand_typed_filename};
 use crate::mailbox::{Direction, Mailbox};
 use crate::message::{author_filename, Disposition, Message, ReadState};
 use crate::msglist::{
-    current_message, first, is_positional, msglist_or_current, parse_message, parse_msglist, Want,
+    check, current_message, first, is_positional, msglist_or_current, parse_message, parse_msglist,
+    Want,
 };
 use crate::script::CondStack;
 use crate::send::{compose_reply, send_message, ComposedMessage, ReplyForm};
@@ -348,9 +349,7 @@ pub fn execute_in(
 
 /// A bare message number: make it current and print it.
 fn cmd_goto(num: usize, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult> {
-    if mb.get(num).is_none() {
-        return Err(format!("Invalid message number: {}", num).into());
-    }
+    check(mb, num, Want::Live)?;
     mb.set_current(num);
     cmd_print("", mb, vars, false)
 }

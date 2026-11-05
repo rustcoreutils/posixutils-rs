@@ -19,7 +19,9 @@ use crate::error::{IoContext, Result};
 use crate::filename::{expand_local_prefixes, expand_typed_filename};
 use crate::mailbox::{Direction, Mailbox};
 use crate::message::{author_filename, Disposition, Message, ReadState};
-use crate::msglist::{current_message, msglist_or_current, parse_message, parse_msglist, Want};
+use crate::msglist::{
+    current_message, is_positional, msglist_or_current, parse_message, parse_msglist, Want,
+};
 use crate::script::CondStack;
 use crate::send::{compose_reply, send_message, ComposedMessage};
 use crate::variables::{parse_set_arg, split_args, Variables};
@@ -796,47 +798,50 @@ fn cmd_next(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
     cmd_print("", mb, vars, false)
 }
 
-fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult> {
-    // Parse: [msglist] command
-    let (msg_nums, cmd) = if args.is_empty() {
-        (
-            current_message(mb)?,
-            vars.get_nonempty("cmd")
-                .ok_or("No command specified")?
-                .to_string(),
-        )
-    } else {
-        // Try to find where msglist ends and command begins
-        // This is tricky - we'll try parsing progressively
-        let words: Vec<&str> = args.split_whitespace().collect();
-        let mut msglist_end = 0;
-
-        for i in 0..words.len() {
-            let potential_msglist = words[..=i].join(" ");
-            if parse_msglist(&potential_msglist, mb, Want::Live, vars).is_ok() {
-                msglist_end = i + 1;
-            }
-        }
-
-        if msglist_end == 0 || msglist_end >= words.len() {
-            // All command or all msglist
-            if let Ok(nums) = parse_msglist(args, mb, Want::Live, vars) {
-                (
-                    nums,
-                    vars.get_nonempty("cmd")
-                        .ok_or("No command specified")?
-                        .to_string(),
-                )
-            } else {
-                (current_message(mb)?, args.to_string())
-            }
-        } else {
-            let msglist = words[..msglist_end].join(" ");
-            let cmd = words[msglist_end..].join(" ");
-            let nums = parse_msglist(&msglist, mb, Want::Live, vars)?;
-            (nums, cmd)
-        }
+/// Split `pipe` arguments into the messages to pipe and the command.
+///
+/// POSIX makes the command the last argument, quoted if it holds blanks;
+/// arguments that are all message specifications pipe those messages
+/// through `cmd`. An unquoted command is accepted too, after any leading
+/// positional specifications.
+fn pipe_arguments(args: &str, mb: &Mailbox, vars: &Variables) -> Result<(Vec<usize>, String)> {
+    let words = split_args(args);
+    let Some((command, list)) = words
+        .split_last()
+        .filter(|_| !words.iter().all(|w| is_positional(w)))
+    else {
+        let cmd = vars.get_nonempty("cmd").ok_or("No command specified")?;
+        return Ok((msglist_or_current(args, mb, vars)?, cmd.to_string()));
     };
+    let listed = if list.is_empty() {
+        current_message(mb)
+    } else {
+        parse_msglist(&list.join(" "), mb, Want::Live, vars)
+    };
+    if let Ok(msgs) = listed {
+        return Ok((msgs, command.clone()));
+    }
+
+    let leading: Vec<&str> = args
+        .split_whitespace()
+        .take_while(|w| is_positional(w))
+        .collect();
+    let msgs = msglist_or_current(&leading.join(" "), mb, vars)?;
+    Ok((msgs, after_words(args, leading.len()).to_string()))
+}
+
+/// `args` after its first `n` blank-separated words.
+fn after_words(args: &str, n: usize) -> &str {
+    let mut rest = args.trim_start();
+    for _ in 0..n {
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        rest = rest[end..].trim_start();
+    }
+    rest
+}
+
+fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult> {
+    let (msg_nums, cmd) = pipe_arguments(args, mb, vars)?;
 
     let shell = vars.get_nonempty("SHELL").unwrap_or("/bin/sh");
     let page = vars.is_set("page");

@@ -907,3 +907,22 @@ fn editor_temp_file_honors_tmpdir() {
     );
     assert_eq!(output.status.code(), Some(0), "exit status");
 }
+
+/// The command `pipe` runs is its last argument, quoted to keep its blanks
+/// (spec: "the command is given as a single argument").
+#[test]
+fn pipe_takes_a_quoted_command() {
+    let mbox = copy_test_data("testdata.mbox");
+    let output = mailx(
+        &["-n", "-N", "-f", mbox.path().to_str().unwrap()],
+        "pipe 1 \"cat -n\"\nexit\n",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("     1\tFrom: Alice Smith <alice@example.com>"),
+        "message 1 should be numbered by cat -n: {}\n{}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
+}

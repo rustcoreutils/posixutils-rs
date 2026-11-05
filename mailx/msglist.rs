@@ -238,6 +238,13 @@ pub fn parse_msglist(spec: &str, mb: &Mailbox, want: Want, vars: &Variables) -> 
     nonempty(result, || "No applicable messages".to_string())
 }
 
+/// Whether `token` names messages by number, position or state rather than
+/// by searching their headers: `3`, `2-5`, `$`, `:u`, but not `/text` or an
+/// address.
+pub fn is_positional(token: &str) -> bool {
+    Selector::parse(token).is_ok_and(|s| !matches!(s, Selector::Subject(_) | Selector::Address(_)))
+}
+
 /// The current message, as the list an omitted msglist stands for.
 pub fn current_message(mb: &Mailbox) -> Result<Vec<usize>> {
     mb.current()

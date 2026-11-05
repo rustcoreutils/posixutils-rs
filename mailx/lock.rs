@@ -33,7 +33,7 @@ pub(crate) fn lock(file: &File, exclusive: bool) -> io::Result<()> {
     // SAFETY: the fd is valid for the lifetime of `file`, flock takes an fd and
     // an integer operation, and the return value is checked.
     if unsafe { libc::flock(file.as_raw_fd(), op) } != 0 {
-        return Err(io::Error::last_os_error());
+        return Err(interrupted_or(io::Error::last_os_error()));
     }
     #[cfg(target_os = "linux")]
     fcntl_lock(file, exclusive)?;
@@ -59,9 +59,19 @@ fn fcntl_lock(file: &File, exclusive: bool) -> io::Result<()> {
     // SAFETY: the fd is valid for the lifetime of `file`, `fl` is a valid
     // flock structure that outlives the call, and the return value is checked.
     if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLKW, &fl) } != 0 {
-        return Err(io::Error::last_os_error());
+        return Err(interrupted_or(io::Error::last_os_error()));
     }
     Ok(())
+}
+
+/// `e`, having ended a lock wait. An interrupt that ended it has been
+/// answered by giving up the wait, so the flag it set is cleared: left set,
+/// it would also abort the next command read.
+fn interrupted_or(e: io::Error) -> io::Error {
+    if e.kind() == io::ErrorKind::Interrupted {
+        crate::signals::take_sigint();
+    }
+    e
 }
 
 /// A `<mailbox>.lock` dotlock, removed when dropped.
@@ -85,10 +95,15 @@ impl Drop for DotLock {
 /// that died, and removed. Five minutes is the traditional figure.
 const STALE_DOTLOCK: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// How long to sleep between attempts on a dotlock another process holds.
+const DOTLOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Take the dotlock for `path`, waiting while another process holds it.
 ///
-/// Returns `None` when the lock file cannot be created at all.
-fn dotlock(path: &str) -> Option<DotLock> {
+/// Returns `None` when the lock file cannot be created at all, or when a
+/// stale one cannot be removed: either way the kernel locks stand alone.
+/// An interrupt gives up the wait with `ErrorKind::Interrupted`.
+fn dotlock(path: &str) -> io::Result<Option<DotLock>> {
     let lock_path = format!("{}.lock", path);
     loop {
         match crate::util::private_open()
@@ -96,7 +111,7 @@ fn dotlock(path: &str) -> Option<DotLock> {
             .create_new(true)
             .open(&lock_path)
         {
-            Ok(_) => return Some(DotLock { path: lock_path }),
+            Ok(_) => return Ok(Some(DotLock { path: lock_path })),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 let stale = fs::metadata(&lock_path)
                     .and_then(|m| m.modified())
@@ -104,12 +119,16 @@ fn dotlock(path: &str) -> Option<DotLock> {
                     .and_then(|t| t.elapsed().ok())
                     .is_some_and(|age| age > STALE_DOTLOCK);
                 if stale {
-                    let _ = fs::remove_file(&lock_path);
+                    if fs::remove_file(&lock_path).is_err() {
+                        return Ok(None);
+                    }
+                } else if crate::signals::take_sigint() {
+                    return Err(io::ErrorKind::Interrupted.into());
                 } else {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    std::thread::sleep(DOTLOCK_RETRY);
                 }
             }
-            Err(_) => return None,
+            Err(_) => return Ok(None),
         }
     }
 }
@@ -120,7 +139,7 @@ fn dotlock(path: &str) -> Option<DotLock> {
 /// delivery in progress is waited for rather than half read.
 pub(crate) fn open_read_locked(path: &str) -> io::Result<(File, Option<DotLock>)> {
     let file = File::open(path)?;
-    let dotlock = dotlock(path);
+    let dotlock = dotlock(path)?;
     lock(&file, false)?;
     Ok((file, dotlock))
 }
@@ -136,7 +155,7 @@ pub(crate) fn open_read_locked(path: &str) -> io::Result<(File, Option<DotLock>)
 pub(crate) fn open_locked(path: &str) -> io::Result<(File, Option<DotLock>)> {
     use std::os::unix::fs::MetadataExt;
 
-    let dotlock = dotlock(path);
+    let dotlock = dotlock(path)?;
     loop {
         let file = crate::util::private_open()
             .read(true)
@@ -190,5 +209,101 @@ mod tests {
             locked.metadata().unwrap().ino(),
             fs::metadata(&path).unwrap().ino()
         );
+    }
+
+    /// What `dotlock` returns for `path`, or `None` if it is still waiting
+    /// after a few seconds.
+    fn dotlock_within_seconds(path: &std::path::Path) -> Option<io::Result<bool>> {
+        let path = path.to_str().unwrap().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(dotlock(&path).map(|lock| lock.is_some()));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5)).ok()
+    }
+
+    /// A stale dotlock that cannot be removed, as in a spool directory the
+    /// user cannot write to, is passed over rather than retried forever.
+    #[test]
+    fn an_unremovable_stale_dotlock_is_passed_over() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root can remove the lock whatever the mode
+        }
+        let dir = plib::tmp::TempDir::new().unwrap();
+        let path = dir.path().join("spool");
+        fs::write(&path, "").unwrap();
+        let lock = File::create(dir.path().join("spool.lock")).unwrap();
+        let old = std::time::SystemTime::now() - 2 * STALE_DOTLOCK;
+        lock.set_modified(old).unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = dotlock_within_seconds(&path);
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            matches!(result, Some(Ok(false))),
+            "stale lock not passed over: {:?}",
+            result
+        );
+    }
+
+    /// An interrupt ends a wait on a live dotlock, and is answered there.
+    #[test]
+    fn an_interrupt_ends_a_dotlock_wait() {
+        let _serial = crate::signals::SIGINT_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::signals::setup();
+        let dir = plib::tmp::TempDir::new().unwrap();
+        let path = dir.path().join("spool");
+        fs::write(&path, "").unwrap();
+        File::create(dir.path().join("spool.lock")).unwrap();
+
+        // SAFETY: the handler `setup` installed only sets a flag.
+        unsafe {
+            libc::raise(libc::SIGINT);
+        }
+        let result = dotlock_within_seconds(&path);
+        assert!(
+            matches!(&result, Some(Err(e)) if e.kind() == io::ErrorKind::Interrupted),
+            "wait not interrupted: {:?}",
+            result
+        );
+        assert!(!crate::signals::take_sigint(), "interrupt left pending");
+    }
+
+    /// An interrupt that ends a kernel lock wait is answered there, so it
+    /// does not abort the command read next.
+    #[test]
+    fn an_interrupted_lock_wait_clears_the_interrupt() {
+        use std::os::unix::thread::JoinHandleExt;
+
+        let _serial = crate::signals::SIGINT_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::signals::setup();
+        let _ = crate::signals::take_sigint();
+        let dir = plib::tmp::TempDir::new().unwrap();
+        let path = dir.path().join("spool");
+        fs::write(&path, "").unwrap();
+        let holder = File::open(&path).unwrap();
+        // SAFETY: the fd is valid for the lifetime of `holder`.
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        let waiting = path.clone();
+        let waiter = std::thread::spawn(move || lock(&File::open(&waiting).unwrap(), false));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        // SAFETY: the thread is still running, blocked in flock.
+        unsafe {
+            libc::pthread_kill(waiter.as_pthread_t(), libc::SIGINT);
+        }
+        let result = waiter.join().unwrap();
+        assert_eq!(
+            result.map_err(|e| e.kind()),
+            Err(io::ErrorKind::Interrupted)
+        );
+        assert!(!crate::signals::take_sigint(), "interrupt left pending");
     }
 }

@@ -161,14 +161,14 @@ impl Drop for SignalsHeld {
     }
 }
 
+/// The SIGINT flag is process-wide; tests that raise SIGINT, or that read
+/// the flag, take this so that one cannot take the other's signal.
+#[cfg(test)]
+pub(crate) static SIGINT_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// The SIGINT flag is process-wide; tests that raise SIGINT take this
-    /// so that one cannot take the other's signal.
-    static SIGINT_TESTS: Mutex<()> = Mutex::new(());
 
     /// The installed handler records SIGINT in the flag instead of terminating,
     /// and `take_sigint` reports-and-clears it.

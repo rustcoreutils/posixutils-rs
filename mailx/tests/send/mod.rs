@@ -12,9 +12,7 @@
 //! delivery infrastructure. Tests use debug mode via MAILRC environment
 //! variable or expect controlled failures when sendmail is unavailable.
 
-use plib::testing::{run_test_with_checker, run_test_with_checker_and_env, TestPlan};
-
-use crate::common::create_temp_mailrc;
+use crate::common::{create_temp_mailrc, mailx, mailx_env};
 
 /// Test basic send mode with single recipient
 /// Verifies:
@@ -24,134 +22,92 @@ use crate::common::create_temp_mailrc;
 /// - Proper error when sendmail is not available
 #[test]
 fn send_basic() {
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-s"),
-                String::from("Test Subject"),
-                String::from("recipient@example.com"),
-            ],
-            stdin_data: String::from("This is a test message.\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-
-            // In CI environments without sendmail, we expect an error
-            // In environments with sendmail, it should succeed
-            // Both are valid outcomes for this test
-            if !output.status.success() {
-                assert!(
-                    stderr.contains("Cannot find sendmail")
-                        || stderr.contains("sendmail")
-                        || stderr.contains("Failed"),
-                    "Expected sendmail error, got: {}",
-                    stderr
-                );
-            }
-            // If it succeeded, sendmail was available and message was sent
-        },
+    let output = mailx(
+        &["-n", "-s", "Test Subject", "recipient@example.com"],
+        "This is a test message.\n",
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // In CI environments without sendmail, we expect an error
+    // In environments with sendmail, it should succeed
+    // Both are valid outcomes for this test
+    if !output.status.success() {
+        assert!(
+            stderr.contains("Cannot find sendmail")
+                || stderr.contains("sendmail")
+                || stderr.contains("Failed"),
+            "Expected sendmail error, got: {}",
+            stderr
+        );
+    }
+    // If it succeeded, sendmail was available and message was sent
 }
 
 /// Test send mode with subject containing spaces
 /// Verifies proper handling of multi-word subjects
 #[test]
 fn send_subject_with_spaces() {
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-s"),
-                String::from("This is a longer test subject"),
-                String::from("user@example.com"),
-            ],
-            stdin_data: String::from("Message body.\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Accept either success or sendmail not found
-            if !output.status.success() {
-                assert!(
-                    stderr.contains("Cannot find sendmail") || stderr.contains("sendmail"),
-                    "Unexpected error: {}",
-                    stderr
-                );
-            }
-        },
+    let output = mailx(
+        &[
+            "-n",
+            "-s",
+            "This is a longer test subject",
+            "user@example.com",
+        ],
+        "Message body.\n",
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Accept either success or sendmail not found
+    if !output.status.success() {
+        assert!(
+            stderr.contains("Cannot find sendmail"),
+            "Unexpected error: {}",
+            stderr
+        );
+    }
 }
 
 /// Test send mode with multiple recipients
 /// Verifies that multiple recipients are properly processed
 #[test]
 fn send_multiple_recipients() {
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-s"),
-                String::from("Multi-recipient Test"),
-                String::from("user1@example.com"),
-                String::from("user2@example.com"),
-            ],
-            stdin_data: String::from("Message to multiple recipients.\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Accept either success or sendmail not found
-            if !output.status.success() {
-                assert!(
-                    stderr.contains("Cannot find sendmail") || stderr.contains("sendmail"),
-                    "Unexpected error: {}",
-                    stderr
-                );
-            }
-        },
+    let output = mailx(
+        &[
+            "-n",
+            "-s",
+            "Multi-recipient Test",
+            "user1@example.com",
+            "user2@example.com",
+        ],
+        "Message to multiple recipients.\n",
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Accept either success or sendmail not found
+    if !output.status.success() {
+        assert!(
+            stderr.contains("Cannot find sendmail"),
+            "Unexpected error: {}",
+            stderr
+        );
+    }
 }
 
 /// Test send mode with multiline message body
 /// Verifies that stdin is properly read until EOF
 #[test]
 fn send_multiline_body() {
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-s"),
-                String::from("Multiline Test"),
-                String::from("recipient@example.com"),
-            ],
-            stdin_data: String::from("Line 1\nLine 2\nLine 3\n\nParagraph 2\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !output.status.success() {
-                assert!(
-                    stderr.contains("Cannot find sendmail") || stderr.contains("sendmail"),
-                    "Unexpected error: {}",
-                    stderr
-                );
-            }
-        },
+    let output = mailx(
+        &["-n", "-s", "Multiline Test", "recipient@example.com"],
+        "Line 1\nLine 2\nLine 3\n\nParagraph 2\n",
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        assert!(
+            stderr.contains("Cannot find sendmail"),
+            "Unexpected error: {}",
+            stderr
+        );
+    }
 }
 
 /// Test send mode with debug variable set via MAILRC environment variable
@@ -166,44 +122,32 @@ fn send_debug_mode_via_mailrc() {
     let mailrc = create_temp_mailrc("set debug\n");
     let mailrc_path = mailrc.path().to_str().unwrap();
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-s"),
-                String::from("Debug Test Subject"),
-                String::from("debug-recipient@example.com"),
-            ],
-            stdin_data: String::from("This message should not be sent.\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
+    let output = mailx_env(
+        &["-s", "Debug Test Subject", "debug-recipient@example.com"],
+        "This message should not be sent.\n",
         &[("MAILRC", mailrc_path)],
-        |_plan, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
 
-            // In debug mode, mailx prints diagnostics to stderr
-            assert!(
-                stderr.contains("Debug mode"),
-                "Should show debug mode message: {}",
-                stderr
-            );
-            assert!(
-                stderr.contains("debug-recipient@example.com") || stderr.contains("To:"),
-                "Should show recipient in debug output: {}",
-                stderr
-            );
-            assert!(
-                stderr.contains("Debug Test Subject") || stderr.contains("Subject:"),
-                "Should show subject in debug output: {}",
-                stderr
-            );
-            assert!(
-                output.status.success(),
-                "Debug mode should exit successfully"
-            );
-        },
+    // In debug mode, mailx prints diagnostics to stderr
+    assert!(
+        stderr.contains("Debug mode"),
+        "Should show debug mode message: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("debug-recipient@example.com") && stderr.contains("To:"),
+        "Should show recipient in debug output: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("Debug Test Subject") && stderr.contains("Subject:"),
+        "Should show subject in debug output: {}",
+        stderr
+    );
+    assert!(
+        output.status.success(),
+        "Debug mode should exit successfully"
     );
 
     // Keep mailrc file alive until test completes
@@ -217,31 +161,19 @@ fn send_mailrc_multiple_vars() {
     let mailrc = create_temp_mailrc("set debug\nset quiet\n");
     let mailrc_path = mailrc.path().to_str().unwrap();
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-s"),
-                String::from("Multi-var Test"),
-                String::from("user@example.com"),
-            ],
-            stdin_data: String::from("Test body.\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
+    let output = mailx_env(
+        &["-s", "Multi-var Test", "user@example.com"],
+        "Test body.\n",
         &[("MAILRC", mailrc_path)],
-        |_plan, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Debug mode should be active
-            assert!(
-                stderr.contains("Debug mode"),
-                "Should be in debug mode: {}",
-                stderr
-            );
-            assert!(output.status.success());
-        },
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Debug mode should be active
+    assert!(
+        stderr.contains("Debug mode"),
+        "Should be in debug mode: {}",
+        stderr
+    );
+    assert!(output.status.success());
 
     drop(mailrc);
 }
@@ -254,37 +186,25 @@ fn send_alias_expansion() {
     let mailrc = create_temp_mailrc("set debug\nalias team user1@example.com user2@example.com\n");
     let mailrc_path = mailrc.path().to_str().unwrap();
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-s"),
-                String::from("Team Message"),
-                String::from("team"),
-            ],
-            stdin_data: String::from("Message for the team.\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
+    let output = mailx_env(
+        &["-s", "Team Message", "team"],
+        "Message for the team.\n",
         &[("MAILRC", mailrc_path)],
-        |_plan, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Debug mode should show the expanded aliases
-            assert!(
-                stderr.contains("Debug mode"),
-                "Should be in debug mode: {}",
-                stderr
-            );
-            // The alias should have been expanded to individual addresses
-            assert!(
-                stderr.contains("user1@example.com") || stderr.contains("user2@example.com"),
-                "Alias should be expanded: {}",
-                stderr
-            );
-            assert!(output.status.success());
-        },
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Debug mode should show the expanded aliases
+    assert!(
+        stderr.contains("Debug mode"),
+        "Should be in debug mode: {}",
+        stderr
+    );
+    // The alias should have been expanded to individual addresses
+    assert!(
+        stderr.contains("user1@example.com") && stderr.contains("user2@example.com"),
+        "Alias should be expanded: {}",
+        stderr
+    );
+    assert!(output.status.success());
 
     drop(mailrc);
 }
@@ -295,36 +215,24 @@ fn send_empty_message() {
     let mailrc = create_temp_mailrc("set debug\n");
     let mailrc_path = mailrc.path().to_str().unwrap();
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-s"),
-                String::from("Empty Test"),
-                String::from("recipient@example.com"),
-            ],
-            stdin_data: String::new(),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
+    let output = mailx_env(
+        &["-s", "Empty Test", "recipient@example.com"],
+        "",
         &[("MAILRC", mailrc_path)],
-        |_plan, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                stderr.contains("Debug mode"),
-                "Should be in debug mode: {}",
-                stderr
-            );
-            // Body should be 0 bytes
-            assert!(
-                stderr.contains("Body: 0 bytes"),
-                "Should show empty body: {}",
-                stderr
-            );
-            assert!(output.status.success());
-        },
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Debug mode"),
+        "Should be in debug mode: {}",
+        stderr
+    );
+    // Body should be 0 bytes
+    assert!(
+        stderr.contains("Body: 0 bytes"),
+        "Should show empty body: {}",
+        stderr
+    );
+    assert!(output.status.success());
 
     drop(mailrc);
 }
@@ -335,35 +243,27 @@ fn send_special_subject() {
     let mailrc = create_temp_mailrc("set debug\n");
     let mailrc_path = mailrc.path().to_str().unwrap();
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-s"),
-                String::from("Re: [URGENT] Meeting @2pm - Updated!"),
-                String::from("user@example.com"),
-            ],
-            stdin_data: String::from("Meeting details.\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
+    let output = mailx_env(
+        &[
+            "-s",
+            "Re: [URGENT] Meeting @2pm - Updated!",
+            "user@example.com",
+        ],
+        "Meeting details.\n",
         &[("MAILRC", mailrc_path)],
-        |_plan, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                stderr.contains("Debug mode"),
-                "Should be in debug mode: {}",
-                stderr
-            );
-            assert!(
-                stderr.contains("[URGENT]") || stderr.contains("Updated"),
-                "Subject should be preserved: {}",
-                stderr
-            );
-            assert!(output.status.success());
-        },
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Debug mode"),
+        "Should be in debug mode: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("[URGENT]") && stderr.contains("Updated"),
+        "Subject should be preserved: {}",
+        stderr
+    );
+    assert!(output.status.success());
 
     drop(mailrc);
 }
@@ -376,31 +276,19 @@ fn send_with_dot_variable() {
     let mailrc = create_temp_mailrc("set debug\nset dot\n");
     let mailrc_path = mailrc.path().to_str().unwrap();
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-s"),
-                String::from("Dot Test"),
-                String::from("recipient@example.com"),
-            ],
-            stdin_data: String::from("Line 1\n.\nLine 2 (should be included in non-TTY)\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
+    let output = mailx_env(
+        &["-s", "Dot Test", "recipient@example.com"],
+        "Line 1\n.\nLine 2 (should be included in non-TTY)\n",
         &[("MAILRC", mailrc_path)],
-        |_plan, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                stderr.contains("Debug mode"),
-                "Should be in debug mode: {}",
-                stderr
-            );
-            // In non-interactive mode, the dot is included in the body
-            assert!(output.status.success());
-        },
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Debug mode"),
+        "Should be in debug mode: {}",
+        stderr
+    );
+    // In non-interactive mode, the dot is included in the body
+    assert!(output.status.success());
 
     drop(mailrc);
 }
@@ -411,30 +299,18 @@ fn send_sign_variable() {
     let mailrc = create_temp_mailrc("set debug\nset sign=\"Best regards,\\nTest User\"\n");
     let mailrc_path = mailrc.path().to_str().unwrap();
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-s"),
-                String::from("Sign Test"),
-                String::from("user@example.com"),
-            ],
-            stdin_data: String::from("Hello.\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
+    let output = mailx_env(
+        &["-s", "Sign Test", "user@example.com"],
+        "Hello.\n",
         &[("MAILRC", mailrc_path)],
-        |_plan, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                stderr.contains("Debug mode"),
-                "Should be in debug mode: {}",
-                stderr
-            );
-            assert!(output.status.success());
-        },
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Debug mode"),
+        "Should be in debug mode: {}",
+        stderr
+    );
+    assert!(output.status.success());
 
     drop(mailrc);
 }
@@ -445,30 +321,18 @@ fn send_custom_escape_char() {
     let mailrc = create_temp_mailrc("set debug\nset escape=#\n");
     let mailrc_path = mailrc.path().to_str().unwrap();
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-s"),
-                String::from("Escape Test"),
-                String::from("user@example.com"),
-            ],
-            stdin_data: String::from("Message body.\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
+    let output = mailx_env(
+        &["-s", "Escape Test", "user@example.com"],
+        "Message body.\n",
         &[("MAILRC", mailrc_path)],
-        |_plan, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                stderr.contains("Debug mode"),
-                "Should be in debug mode: {}",
-                stderr
-            );
-            assert!(output.status.success());
-        },
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Debug mode"),
+        "Should be in debug mode: {}",
+        stderr
+    );
+    assert!(output.status.success());
 
     drop(mailrc);
 }
@@ -479,31 +343,201 @@ fn send_sendwait_variable() {
     let mailrc = create_temp_mailrc("set debug\nset sendwait\n");
     let mailrc_path = mailrc.path().to_str().unwrap();
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-s"),
-                String::from("Sendwait Test"),
-                String::from("user@example.com"),
-            ],
-            stdin_data: String::from("Test message.\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
+    let output = mailx_env(
+        &["-s", "Sendwait Test", "user@example.com"],
+        "Test message.\n",
         &[("MAILRC", mailrc_path)],
-        |_plan, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // In debug mode, sendwait doesn't matter
-            assert!(
-                stderr.contains("Debug mode"),
-                "Should be in debug mode: {}",
-                stderr
-            );
-            assert!(output.status.success());
-        },
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // In debug mode, sendwait doesn't matter
+    assert!(
+        stderr.contains("Debug mode"),
+        "Should be in debug mode: {}",
+        stderr
+    );
+    assert!(output.status.success());
 
     drop(mailrc);
+}
+
+/// A line break in a `-s` subject or an address operand cannot add header
+/// fields.
+///
+/// Both are copied into the header block. A script passing an untrusted
+/// subject could end the Subject line, add its own `Bcc:`, or end the header
+/// block and, in a `record` file, begin a forged mbox message.
+#[test]
+fn send_operands_cannot_inject_header_lines() {
+    let mailrc = create_temp_mailrc("set debug\n");
+    let mailrc_path = mailrc.path().to_str().unwrap();
+
+    let output = mailx_env(
+        &[
+            "-s",
+            "hello\r\nBcc: injected@evil.example\n\nFrom forged@evil",
+            "victim@example.com\nCc: cc-injected@evil.example",
+        ],
+        "body\n",
+        &[("MAILRC", mailrc_path)],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Subject: hello  Bcc: injected@evil.example  From forged@evil\n"),
+        "subject was not kept on one line: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("To: victim@example.com Cc: cc-injected@evil.example\n"),
+        "address was not kept on one line: {}",
+        stderr
+    );
+    for line in stderr.lines() {
+        assert!(
+            !line.starts_with("Bcc: ") && !line.starts_with("Cc: ") && !line.starts_with("From "),
+            "an operand began a header line: {}",
+            stderr
+        );
+    }
+    assert!(output.status.success());
+
+    drop(mailrc);
+}
+
+/// A body on standard input that is not UTF-8 is sent, not refused.
+#[test]
+fn send_mode_accepts_eight_bit_body() {
+    let mailrc = create_temp_mailrc("set debug\n");
+    let body: &[u8] = b"caf\xe9 \xff\n";
+    let output = mailx_env(
+        &["-s", "s", "to@example.com"],
+        body,
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "8-bit body refused: {}", stderr);
+    assert!(
+        stderr.contains(&format!("Body: {} bytes", body.len())),
+        "body not kept whole: {}",
+        stderr
+    );
+}
+
+/// A stub delivery agent in its own directory: a shell script running
+/// `body`, which may use `$out` for a file beside it.
+fn stub_sendmail(body: &str) -> (plib::tmp::TempDir, String, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let out = dir.path().join("out");
+    let script = dir.path().join("sendmail");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\nout='{}'\n{}\n", out.display(), body),
+    )
+    .expect("write stub");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let script = script.to_str().unwrap().to_string();
+    (dir, script, out)
+}
+
+/// The `sendmail` variable names the delivery agent, as in BSD mailx; it is
+/// handed the recipients as operands and the message on standard input.
+#[test]
+fn send_uses_sendmail_variable() {
+    let (_dir, script, out) = stub_sendmail(r#"{ echo "args: $*"; cat; } > "$out""#);
+    let mailrc = create_temp_mailrc(&format!("set sendwait\nset sendmail={}\n", script));
+    let output = mailx_env(
+        &["-n", "-s", "Hi", "rcpt@example.com"],
+        "body line\n",
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+    );
+    assert!(output.status.success(), "mailx failed: {:?}", output);
+    let delivered = std::fs::read_to_string(&out).expect("stub was not run");
+    assert!(
+        delivered.starts_with("args: -oi -- rcpt@example.com\n"),
+        "{}",
+        delivered
+    );
+    assert!(delivered.contains("Subject: Hi\n"), "{}", delivered);
+    assert!(delivered.ends_with("\nbody line\n"), "{}", delivered);
+}
+
+/// A delivery agent that exits without reading the message is a failed
+/// delivery, reported as one: the write into its closed pipe does not kill
+/// mailx with SIGPIPE.
+#[test]
+fn send_reports_sendmail_that_exits_unread() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let (_dir, script, _) = stub_sendmail("echo 'no such user' >&2; exit 1");
+    let mailrc = create_temp_mailrc(&format!("set sendmail={}\n", script));
+    let body = "x".repeat(1023) + "\n";
+    let output = mailx_env(
+        &["-n", "-s", "Big", "rcpt@example.com"],
+        body.repeat(1024),
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+    );
+    assert_eq!(output.status.signal(), None, "{:?}", output);
+    assert_eq!(output.status.code(), Some(1), "{:?}", output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no such user\n"), "{}", stderr);
+    assert!(stderr.contains("sendmail failed"), "{}", stderr);
+}
+
+/// sendmail writes to mailx's own standard error, as under BSD mailx, so
+/// what it says reaches the user whether or not mailx waits for it.
+#[test]
+fn sendmail_diagnostics_reach_the_user() {
+    let (_dir, script, _) = stub_sendmail("cat >/dev/null; echo 'queued for retry' >&2");
+    let mailrc = create_temp_mailrc(&format!("set sendmail={}\n", script));
+    let output = mailx_env(
+        &["-n", "-s", "Hi", "rcpt@example.com"],
+        "body\n",
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("queued for retry"), "{:?}", output);
+}
+
+/// A sendmail with much to say is not left blocked writing it to a pipe
+/// nobody reads, and killed when mailx exits, before it has delivered.
+#[test]
+fn talkative_sendmail_still_delivers() {
+    let (_dir, script, out) =
+        stub_sendmail(r#"head -c 200000 /dev/zero >&2; cat > "$out.tmp"; mv "$out.tmp" "$out""#);
+    let mailrc = create_temp_mailrc(&format!("set sendmail={}\n", script));
+    let output = mailx_env(
+        &["-n", "-s", "Hi", "rcpt@example.com"],
+        "body line\n",
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+    );
+    assert!(output.status.success(), "{:?}", output.status);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !out.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let delivered = std::fs::read_to_string(&out).expect("the message was not delivered");
+    assert!(delivered.ends_with("\nbody line\n"), "{}", delivered);
+}
+
+/// A sendmail mailx does not wait for is still reaped when it ends, so a
+/// session that sends many messages does not fill with zombies.
+#[cfg(target_os = "linux")]
+#[test]
+fn sendmail_not_waited_for_is_reaped() {
+    let (_dir, script, _) = stub_sendmail("cat >/dev/null");
+    let mailrc = create_temp_mailrc(&format!("set sendmail={}\n", script));
+    let mbox = crate::common::copy_test_data("testdata.mbox");
+    let output = mailx_env(
+        &["-N", "-f", mbox.path().to_str().unwrap()],
+        "mail a@example.com\n~.\nmail b@example.com\n~.\n\
+         !sleep 1; ps -o stat= --ppid $PPID | grep -c Z\nexit\n",
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\n0\n") || stdout.starts_with("0\n"),
+        "{:?}",
+        output
+    );
 }

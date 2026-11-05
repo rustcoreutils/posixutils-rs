@@ -9,13 +9,13 @@
 
 //! Send mode implementation for mailx
 
-use std::env;
-use std::fs::{self, File};
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::process::{Command, Stdio};
 
 use crate::args::Args;
-use crate::message::Message;
+use crate::commands::Interp;
+use crate::error::{IoContext, Result};
+use crate::message::Headers;
 use crate::variables::Variables;
 
 /// A message being composed
@@ -25,7 +25,8 @@ pub struct ComposedMessage {
     pub cc: Vec<String>,
     pub bcc: Vec<String>,
     pub subject: String,
-    pub body: String,
+    /// The body as entered or read, which need not be UTF-8.
+    pub body: Vec<u8>,
     pub headers: Vec<(String, String)>,
 }
 
@@ -35,51 +36,54 @@ impl ComposedMessage {
     }
 
     pub fn add_to(&mut self, addr: &str) {
-        let addr = addr.trim();
-        if !addr.is_empty() && !self.to.contains(&addr.to_string()) {
-            self.to.push(addr.to_string());
-        }
+        push_address(&mut self.to, addr);
     }
 
     pub fn add_cc(&mut self, addr: &str) {
-        let addr = addr.trim();
-        if !addr.is_empty() && !self.cc.contains(&addr.to_string()) {
-            self.cc.push(addr.to_string());
-        }
+        push_address(&mut self.cc, addr);
     }
 
     pub fn add_bcc(&mut self, addr: &str) {
-        let addr = addr.trim();
-        if !addr.is_empty() && !self.bcc.contains(&addr.to_string()) {
-            self.bcc.push(addr.to_string());
-        }
+        push_address(&mut self.bcc, addr);
     }
 
-    /// Format the message for sending
-    pub fn format(&self) -> String {
-        let mut msg = String::new();
-
-        if !self.to.is_empty() {
-            msg.push_str(&format!("To: {}\n", self.to.join(", ")));
+    /// The header lines, in the order they are written.
+    ///
+    /// `Bcc:` is shown only to the user (`~p`): blind recipients are named
+    /// on the envelope, never in the message itself.
+    pub fn header_lines(&self, include_bcc: bool) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut add = |name: &str, value: &str| {
+            if !value.is_empty() {
+                lines.push(format!("{}: {}", name, value));
+            }
+        };
+        add("To", &self.to.join(", "));
+        add("Cc", &self.cc.join(", "));
+        if include_bcc {
+            add("Bcc", &self.bcc.join(", "));
         }
-        if !self.cc.is_empty() {
-            msg.push_str(&format!("Cc: {}\n", self.cc.join(", ")));
-        }
-        if !self.subject.is_empty() {
-            msg.push_str(&format!("Subject: {}\n", self.subject));
-        }
-
+        add("Subject", &self.subject);
         for (name, value) in &self.headers {
-            msg.push_str(&format!("{}: {}\n", name, value));
+            lines.push(format!("{}: {}", name, value));
         }
-
-        msg.push('\n');
-        msg.push_str(&self.body);
-
-        msg
+        lines
     }
 
-    /// Get all recipients
+    /// The message as handed to the delivery agent: headers, an empty line,
+    /// and the body.
+    pub fn format(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for line in self.header_lines(false) {
+            out.extend_from_slice(line.as_bytes());
+            out.push(b'\n');
+        }
+        out.push(b'\n');
+        out.extend_from_slice(&self.body);
+        out
+    }
+
+    /// Every recipient: To, Cc and Bcc.
     pub fn all_recipients(&self) -> Vec<&str> {
         let mut recipients: Vec<&str> = self.to.iter().map(|s| s.as_str()).collect();
         recipients.extend(self.cc.iter().map(|s| s.as_str()));
@@ -88,25 +92,44 @@ impl ComposedMessage {
     }
 }
 
+/// Add `addr` to a recipient list unless it is empty or already there.
+///
+/// An address becomes a header line, so a line break in it is folded to a
+/// space: see [`single_line`].
+pub(crate) fn push_address(list: &mut Vec<String>, addr: &str) {
+    let addr = single_line(addr.trim());
+    if !addr.is_empty() && !list.contains(&addr) {
+        list.push(addr);
+    }
+}
+
+/// `s` with every CR and LF replaced by a space.
+///
+/// A header field value is one line. Subjects and addresses given as
+/// command-line operands are copied into the header block verbatim, so a
+/// script passing `-s "$subject"` from an untrusted source let a line break in
+/// it add arbitrary header fields, end the header block early, or -- in the
+/// `record` file -- start a forged mbox message with a `From ` line.
+fn single_line(s: &str) -> String {
+    s.replace(['\r', '\n'], " ")
+}
+
 /// Prompt for the header fields the `asksub`, `askcc`, and `askbcc` variables
 /// request (spec 104582-104583, and the askcc/askbcc entries).
-pub(crate) fn prompt_optional_headers(
-    msg: &mut ComposedMessage,
-    vars: &Variables,
-) -> Result<(), String> {
-    if msg.subject.is_empty() && vars.get_bool("asksub") {
+pub(crate) fn prompt_optional_headers(msg: &mut ComposedMessage, vars: &Variables) -> Result<()> {
+    if msg.subject.is_empty() && vars.is_set("asksub") {
         if let Some(v) = crate::util::prompt_field("Subject", "")? {
             msg.subject = v;
         }
     }
-    if vars.get_bool("askcc") {
+    if vars.is_set("askcc") {
         if let Some(v) = crate::util::prompt_field("Cc", "")? {
             for addr in crate::util::addresses(&v) {
                 msg.add_cc(addr);
             }
         }
     }
-    if vars.get_bool("askbcc") {
+    if vars.is_set("askbcc") {
         if let Some(v) = crate::util::prompt_field("Bcc", "")? {
             for addr in crate::util::addresses(&v) {
                 msg.add_bcc(addr);
@@ -117,233 +140,235 @@ pub(crate) fn prompt_optional_headers(
 }
 
 /// Run send mode
-pub fn send_mode(args: &Args, vars: &mut Variables) -> Result<(), String> {
+pub fn send_mode(args: &Args, vars: &mut Variables, interp: &mut Interp) -> Result<()> {
     let is_tty = io::stdin().is_terminal();
 
     let mut msg = ComposedMessage::new();
 
-    // Add addresses from command line
-    for addr in &args.addresses {
-        // Expand aliases
-        let expanded = vars.expand_alias(addr);
-        if expanded.is_empty() {
-            msg.add_to(addr);
-        } else {
-            for a in expanded {
-                msg.add_to(&a);
-            }
-        }
+    for addr in args.addresses.iter().flat_map(|a| vars.recipients(a)) {
+        msg.add_to(&addr);
     }
 
     // A -s subject supplies the Subject header; otherwise `asksub` may prompt
     // for it. `askcc`/`askbcc` are asked either way.
     if let Some(ref subject) = args.subject {
-        msg.subject = subject.clone();
+        msg.subject = single_line(subject);
     }
     if is_tty {
         prompt_optional_headers(&mut msg, vars)?;
     }
 
-    // Read message body
     let stdin = io::stdin();
 
     if is_tty {
-        crate::commands::compose_body(&mut msg, None, vars)?;
+        crate::compose::compose_body(&mut msg, None, vars, interp)?;
     } else {
-        // Non-interactive - just read stdin
-        for line in stdin.lock().lines() {
-            let line = line.map_err(|e| e.to_string())?;
-            msg.body.push_str(&line);
-            msg.body.push('\n');
+        // Not a terminal: the body is all of standard input, as bytes, since
+        // mail need not be UTF-8.
+        let mut input = Vec::new();
+        stdin
+            .lock()
+            .read_to_end(&mut input)
+            .map_err(|e| e.to_string())?;
+        for line in crate::util::byte_lines(&input) {
+            msg.body.extend_from_slice(line);
+            msg.body.push(b'\n');
         }
     }
 
     // -E: discard a message with an empty body without sending it.
-    if args.discard_empty && msg.body.trim().is_empty() {
+    if args.discard_empty && msg.body.trim_ascii().is_empty() {
         return Ok(());
     }
 
-    // Send the message
     send_message(&msg, vars, args.record_to_recipient)?;
 
     Ok(())
 }
 
-/// Send a composed message
+/// Send a composed message, then record it as `-F` or `record` asks.
 pub fn send_message(
     msg: &ComposedMessage,
     vars: &Variables,
     record_to_recipient: bool,
-) -> Result<(), String> {
-    let recipients = msg.all_recipients();
-    if recipients.is_empty() {
-        return Err("No recipients".to_string());
+) -> Result<()> {
+    if msg.all_recipients().is_empty() {
+        return Err("No recipients".into());
     }
-
-    // Debug mode - don't actually send, just print diagnostics
-    if vars.get_bool("debug") {
-        eprintln!("--- Debug mode: message not sent ---");
-        // The envelope is what the delivery software is handed; the headers are
-        // what the recipients see. Blind recipients appear in the first and not
-        // the second, so the two are reported separately.
-        eprintln!(
-            "Envelope: {}",
-            msg.all_recipients()
-                .into_iter()
-                .map(crate::message::extract_address)
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        eprintln!("To: {}", msg.to.join(", "));
-        if !msg.cc.is_empty() {
-            eprintln!("Cc: {}", msg.cc.join(", "));
-        }
-        if !msg.bcc.is_empty() {
-            eprintln!("Bcc(envelope only): {}", msg.bcc.join(", "));
-        }
-        eprintln!("Subject: {}", msg.subject);
-        eprintln!("Body: {} bytes", msg.body.len());
-        eprintln!("---");
+    if vars.is_set("debug") {
+        report_unsent(msg);
         return Ok(());
     }
 
-    // Try to use sendmail
-    let sendmail_paths = [
-        "/usr/sbin/sendmail",
-        "/usr/lib/sendmail",
-        "/usr/bin/sendmail",
-    ];
+    deliver(msg, vars)?;
 
-    let sendmail = sendmail_paths
-        .iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .ok_or("Cannot find sendmail")?;
+    if record_to_recipient {
+        if let Some(first_to) = msg.to.first() {
+            let filename = crate::message::author_filename(first_to)?;
+            record_message(msg, &filename, vars)?;
+        }
+    } else if let Some(record_file) = vars.get_nonempty("record") {
+        record_message(msg, record_file, vars)?;
+    }
+    Ok(())
+}
 
-    // Name the recipients on the command line rather than asking sendmail to
-    // read them from the headers with `-t`. `format()` deliberately emits no
-    // `Bcc:` header, so under `-t` the blind recipients were simply never
-    // delivered to; naming them here also means a blind address cannot leak
-    // into the delivered message however the mail system is configured.
-    // Envelope operands are bare addresses. `compose_reply` fills the recipient
-    // lists from header values, so they carry display names -- and a display
-    // name containing a comma or a quote is not something to hand an MTA as a
-    // recipient.
-    let recipients: Vec<&str> = msg
+/// `debug`: report on standard error what would have been sent.
+///
+/// The envelope is what the delivery software is handed; the headers are
+/// what the recipients see. Blind recipients appear in the first and not the
+/// second, so the two are reported separately.
+fn report_unsent(msg: &ComposedMessage) {
+    eprintln!("--- Debug mode: message not sent ---");
+    eprintln!(
+        "Envelope: {}",
+        msg.all_recipients()
+            .into_iter()
+            .map(crate::message::extract_address)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    eprintln!("To: {}", msg.to.join(", "));
+    if !msg.cc.is_empty() {
+        eprintln!("Cc: {}", msg.cc.join(", "));
+    }
+    if !msg.bcc.is_empty() {
+        eprintln!("Bcc(envelope only): {}", msg.bcc.join(", "));
+    }
+    eprintln!("Subject: {}", msg.subject);
+    eprintln!("Body: {} bytes", msg.body.len());
+    eprintln!("---");
+}
+
+const SENDMAIL_PATHS: [&str; 3] = [
+    "/usr/sbin/sendmail",
+    "/usr/lib/sendmail",
+    "/usr/bin/sendmail",
+];
+
+/// Hand the message to sendmail, waiting for it when `sendwait` is set.
+///
+/// The recipients are named on sendmail's command line rather than read from
+/// the headers with `-t`: the message carries no `Bcc:` header, so under `-t`
+/// blind recipients would get nothing, and naming them keeps a blind address
+/// out of the delivered message however the mail system is set up.
+/// They are bare addresses, since a display name holding a comma or a quote
+/// is not something to hand an MTA as a recipient.
+///
+/// The `sendmail` variable names the program, as in BSD mailx; unset, the
+/// usual places are searched.
+fn deliver(msg: &ComposedMessage, vars: &Variables) -> Result<()> {
+    let sendmail = match vars.get_nonempty("sendmail") {
+        Some(program) => program,
+        None => SENDMAIL_PATHS
+            .iter()
+            .copied()
+            .find(|p| std::path::Path::new(p).exists())
+            .ok_or("Cannot find sendmail")?,
+    };
+
+    let recipients: Vec<String> = msg
         .all_recipients()
         .into_iter()
         .map(crate::message::extract_address)
         .filter(|a| !a.is_empty())
         .collect();
     if recipients.is_empty() {
-        return Err("No recipients specified".to_string());
+        return Err("No recipients specified".into());
     }
 
-    let mut cmd = Command::new(sendmail);
-    cmd.arg("-oi") // Don't treat . as end of message
+    let mut child = Command::new(sendmail)
+        .arg("-oi") // a line of "." does not end the message
         .arg("--")
         .args(&recipients)
+        // Its output goes where mailx's does, as under BSD mailx: what it
+        // has to say reaches the user, and it cannot block on a pipe
+        // nobody reads.
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-
-    let mut child = cmd
         .spawn()
-        .map_err(|e| format!("Failed to run sendmail: {}", plib::diag::io_error_text(&e)))?;
+        .context("Failed to run sendmail")?;
 
-    {
-        let stdin = child.stdin.as_mut().ok_or("Failed to open stdin")?;
-        stdin
-            .write_all(msg.format().as_bytes())
-            .map_err(|e| format!("Failed to write message: {}", plib::diag::io_error_text(&e)))?;
-    }
-
-    // Wait for sendmail if sendwait is set
-    if vars.get_bool("sendwait") {
-        let output = child.wait_with_output().map_err(|e| {
-            format!(
-                "Failed to wait for sendmail: {}",
-                plib::diag::io_error_text(&e)
-            )
-        })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("sendmail failed: {}", stderr));
+    // A sendmail that exits before reading all of the message -- it failed,
+    // or rejected a recipient -- closes the pipe: that is its failure to
+    // report, not a reason for mailx to die of SIGPIPE.
+    let written = {
+        let _sigpipe = plib::io::SigPipeIgnored::new();
+        let mut stdin = child.stdin.take().ok_or("Failed to open stdin")?;
+        stdin.write_all(&msg.format())
+    };
+    match written {
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+            let status = child.wait().context("Failed to wait for sendmail")?;
+            if status.success() {
+                return Err("sendmail exited without reading the message".into());
+            }
+            return Err(format!("sendmail failed: {}", status).into());
         }
-    }
-
-    // Record the message if requested
-    if record_to_recipient {
-        if let Some(first_to) = msg.to.first() {
-            let filename = crate::message::author_filename(first_to)?;
-            record_message(msg, filename, vars)?;
+        Err(e) => {
+            let _ = child.wait();
+            return Err(e).context("Failed to write message");
         }
-    } else if let Some(record_file) = vars.get("record") {
-        record_message(msg, record_file, vars)?;
+        Ok(()) => {}
     }
 
+    if vars.is_set("sendwait") {
+        let status = child.wait().context("Failed to wait for sendmail")?;
+        if !status.success() {
+            return Err(format!("sendmail failed: {}", status).into());
+        }
+    } else {
+        reap_in_background(child);
+    }
     Ok(())
 }
 
-/// Record a sent message to a file
+/// Wait for `child` on a thread of its own, so it is reaped when it ends
+/// rather than left a zombie, as BSD mailx reaps the sendmail it does not
+/// wait for.
+///
+/// The thread is started with every signal blocked, and keeps them so: a
+/// signal sent to mailx must go to the thread reading commands, where an
+/// interrupt is noticed, not to this one.
+fn reap_in_background(mut child: std::process::Child) {
+    // SAFETY: the set is filled by sigfillset before use, and the mask it
+    // replaces is restored before returning.
+    unsafe {
+        let mut all: libc::sigset_t = std::mem::zeroed();
+        libc::sigfillset(&mut all);
+        let mut previous: libc::sigset_t = std::mem::zeroed();
+        libc::pthread_sigmask(libc::SIG_SETMASK, &all, &mut previous);
+        let _ = std::thread::Builder::new()
+            .name("reap-sendmail".into())
+            .spawn(move || {
+                let _ = child.wait();
+            });
+        libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+    }
+}
+
 /// Append an outgoing message to a record file, in mbox format.
 ///
 /// `record`, and the author-named file `followup` writes, are ordinary
-/// mailboxes that get read back with `mailx -f`. They are written through the
-/// same `From `-quoting and separator rules as any other mailbox: writing the
-/// body verbatim meant a composed line beginning `From ` split the entry in two
-/// on the next read, and a missing trailing empty line ran consecutive records
-/// together.
+/// mailboxes that get read back with `mailx -f`, so they are written by the
+/// same writer, with the same locking, as any other mailbox.
 pub(crate) fn record_message(
     msg: &ComposedMessage,
     filename: &str,
     vars: &Variables,
-) -> Result<(), String> {
-    let path = if vars.get_bool("outfolder") && !filename.starts_with('/') {
-        if let Some(folder) = vars.get("folder") {
-            let folder = expand_folder(folder);
-            format!("{}/{}", folder, filename)
-        } else {
-            filename.to_string()
-        }
-    } else {
-        filename.to_string()
-    };
+) -> Result<()> {
+    let in_folder = vars.is_set("outfolder") && !filename.starts_with('/');
+    let path = in_folder
+        .then(|| crate::filename::in_folder(filename, vars))
+        .flatten()
+        .unwrap_or_else(|| filename.to_string());
 
-    // Create "From " line
-    let user = crate::user_login();
-    let user = if user.is_empty() { "unknown" } else { &user };
+    let user = crate::util::user_login_or_unknown();
     let date = chrono::Local::now().format("%a %b %e %H:%M:%S %Y");
-
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|e| format!("Cannot open {}: {}", path, plib::diag::io_error_text(&e)))?;
-
-    let write = || -> io::Result<()> {
-        let mut file = &file;
-        writeln!(file, "From {} {}", user, date)?;
-        let formatted = msg.format();
-        let (headers, body) = match formatted.split_once("\n\n") {
-            Some((h, b)) => (h, b),
-            None => (formatted.as_str(), ""),
-        };
-        writeln!(file, "{}", headers)?;
-        writeln!(file)?;
-        for line in body.lines() {
-            if crate::mailbox::needs_from_quoting(line) {
-                write!(file, ">")?;
-            }
-            writeln!(file, "{}", line)?;
-        }
-        writeln!(file)?;
-        Ok(())
-    };
-    write().map_err(|e| format!("{}: {}", path, plib::diag::io_error_text(&e)))?;
-    file.flush()
-        .map_err(|e| format!("{}: {}", path, plib::diag::io_error_text(&e)))?;
-
+    let from_line = format!("From {} {}", user, date);
+    crate::mailbox::append_to_file(&path, |w| {
+        crate::mbox::write_composed(w, &from_line, &msg.header_lines(false), &msg.body)
+    })
+    .context(&path)?;
     Ok(())
 }
 
@@ -351,84 +376,95 @@ pub(crate) fn record_message(
 pub fn save_dead_letter(msg: &ComposedMessage, vars: &Variables) {
     let dead_path = crate::util::dead_letter_path(vars);
 
-    if let Ok(mut file) = File::create(&dead_path) {
-        let _ = write!(file, "{}", msg.format());
+    let created = crate::util::private_open()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&dead_path);
+    if let Ok(mut file) = created {
+        let _ = file.write_all(&msg.format());
         // Informative notice -> stdout (spec STDOUT, 104412-104414).
         println!("Message saved to {}", dead_path);
     }
 }
 
-fn expand_folder(folder: &str) -> String {
-    if folder.starts_with('/') {
-        folder.to_string()
+/// Who a reply is addressed to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyForm {
+    /// The lowercase `reply` form: the sender of one message and its other
+    /// recipients.
+    Group,
+    /// The capitalized `Reply` form: the sender of each message listed.
+    Senders,
+}
+
+/// A reply to `originals`, addressed as `form` says, its subject that of
+/// the first with `Re: ` before it unless it already begins so.
+pub fn compose_reply(originals: &[Headers], form: ReplyForm, vars: &Variables) -> ComposedMessage {
+    let mut msg = ComposedMessage::new();
+    let Some(first) = originals.first() else {
+        return msg;
+    };
+    let subject = first.subject();
+    msg.subject = if subject.to_lowercase().starts_with("re:") {
+        subject.to_string()
     } else {
-        let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        format!("{}/{}", home, folder)
+        format!("Re: {}", subject)
+    };
+
+    for original in originals {
+        add_sender(&mut msg, original);
+    }
+    if form == ReplyForm::Group {
+        // Whether To and Cc join a Reply-To is implementation-defined
+        // (spec 104911-104916); here they do. Unless `metoo` is set, the
+        // user's own login and alternates come out (spec 104926-104928).
+        let include = |addr: &str| vars.is_set("metoo") || !vars.is_me(addr);
+        for addr in crate::util::addresses(first.to()).filter(|a| include(a)) {
+            msg.add_to(addr);
+        }
+        let cc = first.get_header("cc").unwrap_or("");
+        for addr in crate::util::addresses(cc).filter(|a| include(a)) {
+            msg.add_cc(addr);
+        }
+    }
+    msg
+}
+
+/// Address `msg` to the sender of `original`: its Reply-To addresses, or
+/// without one its From.
+fn add_sender(msg: &mut ComposedMessage, original: &Headers) {
+    match original.get_header("reply-to") {
+        Some(reply_to) => crate::util::addresses(reply_to).for_each(|a| msg.add_to(a)),
+        None => msg.add_to(original.from()),
     }
 }
 
-/// Compose a reply message
-pub fn compose_reply(original: &Message, reply_all: bool, vars: &Variables) -> ComposedMessage {
-    let mut msg = ComposedMessage::new();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // Set subject
-    let original_subject = original.subject();
-    if original_subject.to_lowercase().starts_with("re:") {
-        msg.subject = original_subject.to_string();
-    } else {
-        msg.subject = format!("Re: {}", original_subject);
+    /// A record entry is an mbox message: envelope, headers without `Bcc:`,
+    /// an empty line, the `From `-quoted body as sent with each line
+    /// terminated, and the separating empty line.
+    #[test]
+    fn record_writes_an_mbox_entry() {
+        let dir = plib::tmp::TempDir::new().expect("temp dir");
+        let path = dir.path().join("record");
+        let mut msg = ComposedMessage::new();
+        msg.add_to("to@example.com");
+        msg.add_bcc("hidden@example.com");
+        msg.subject = "Subj".to_string();
+        msg.body = b"From the start\n>From quoted\nline\r\nlast".to_vec();
+
+        record_message(&msg, path.to_str().unwrap(), &Variables::new()).expect("record");
+
+        let written = std::fs::read(&path).expect("read record");
+        let (envelope, rest) = written.split_at(written.iter().position(|&b| b == b'\n').unwrap());
+        assert!(envelope.starts_with(b"From "), "{:?}", envelope);
+        assert_eq!(
+            String::from_utf8_lossy(rest),
+            "\nTo: to@example.com\nSubject: Subj\n\n>From the start\n>>From quoted\nline\r\nlast\n\n"
+        );
     }
-
-    // Add recipients
-    if reply_all {
-        // Reply to all recipients.  The sender portion comes from Reply-To when
-        // present, otherwise from From (spec 104911-104916: in the lowercase
-        // form, From/To/Cc are used only when there is no Reply-To).
-        if let Some(reply_to) = original.get_header("reply-to") {
-            for addr in reply_to.split(',') {
-                msg.add_to(addr);
-            }
-        } else {
-            msg.add_to(original.from());
-        }
-
-        // Add all To: recipients.  Unless metoo is set, the user's own login
-        // and any declared alternates come out of the list (spec 104926-104928).
-        let include_self = vars.get_bool("metoo");
-
-        for addr in original.to().split(',') {
-            let addr = addr.trim();
-            if addr.is_empty() {
-                continue;
-            }
-            if !include_self && vars.is_me(addr) {
-                continue;
-            }
-            msg.add_to(addr);
-        }
-
-        // Add Cc: recipients
-        if let Some(cc) = original.get_header("cc") {
-            for addr in cc.split(',') {
-                let addr = addr.trim();
-                if addr.is_empty() {
-                    continue;
-                }
-                if !include_self && vars.is_me(addr) {
-                    continue;
-                }
-                msg.add_cc(addr);
-            }
-        }
-    } else {
-        // Reply only to sender
-        // Check Reply-To first
-        if let Some(reply_to) = original.get_header("reply-to") {
-            msg.add_to(reply_to);
-        } else {
-            msg.add_to(original.from());
-        }
-    }
-
-    msg
 }

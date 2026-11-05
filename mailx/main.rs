@@ -9,12 +9,21 @@
 
 mod args;
 mod commands;
+mod compose;
+mod error;
 mod escapes;
+mod filename;
+mod lock;
 mod mailbox;
+mod mbox;
 mod message;
 mod msglist;
+mod recovery;
+mod script;
 mod send;
 mod signals;
+mod store;
+mod summary;
 mod util;
 mod variables;
 
@@ -25,9 +34,8 @@ use std::process;
 use gettextrs::gettext;
 
 use args::{Args, Mode};
-use commands::execute_command;
+use commands::{execute_command, CommandResult, Interp};
 use mailbox::Mailbox;
-use send::send_mode;
 use variables::Variables;
 
 fn main() {
@@ -35,10 +43,6 @@ fn main() {
     // for diagnostics); diagnostics are routed through gettext for
     // translatability. See the project locale-init convention.
     plib::diag::init_locale("mailx");
-
-    // Install the SIGINT handler so an interrupt aborts the current command or
-    // message instead of terminating mailx (ASYNCHRONOUS EVENTS).
-    signals::setup();
 
     let args = match Args::parse(
         plib::optarg::args_utf8("mailx")
@@ -53,131 +57,117 @@ fn main() {
         }
     };
 
+    // Catch SIGINT and SIGHUP, so an interrupt aborts the current command or
+    // message and a hangup saves one being composed (ASYNCHRONOUS EVENTS) --
+    // except in Send Mode reading from something other than a terminal,
+    // which takes the standard action for all signals.
+    if args.mode != Mode::Send || io::stdin().is_terminal() {
+        signals::setup();
+    }
+
     let exit_code = match args.mode {
         Mode::Send => run_send_mode(&args),
         Mode::CheckMail => run_check_mail(&args),
         Mode::HeadersOnly => run_headers_only(&args),
         Mode::Receive => run_receive_mode(&args),
     };
-
     process::exit(exit_code);
 }
 
 fn run_send_mode(args: &Args) -> i32 {
-    let mut vars = Variables::new();
-    init_variables(&mut vars, args);
-
-    // -n suppresses only the system start-up file; the user MAILRC is always read.
-    load_startup_files(&mut vars, RcMode::Send, args.no_init);
-
-    if let Err(e) = send_mode(args, &mut vars) {
-        eprintln!("mailx: {}", e);
-        return 1;
-    }
-    0
+    let (mut vars, mut interp) = start_up(args, true);
+    exit_status(send::send_mode(args, &mut vars, &mut interp))
 }
 
 fn run_check_mail(args: &Args) -> i32 {
-    let mailbox_path = args.file.clone().unwrap_or_else(get_system_mailbox);
-    match Mailbox::load(&mailbox_path) {
+    match Mailbox::load(&named_or_system_mailbox(args)) {
         Ok(mb) if mb.message_count() > 0 => 0,
-        Ok(_) => 1,
-        Err(_) => 1,
+        _ => 1,
     }
 }
 
 fn run_headers_only(args: &Args) -> i32 {
-    let mut vars = Variables::new();
-    init_variables(&mut vars, args);
-
-    // -n suppresses only the system start-up file; the user MAILRC is always read.
-    load_startup_files(&mut vars, RcMode::Receive, args.no_init);
-
-    let mailbox_path = args.file.clone().unwrap_or_else(get_system_mailbox);
-    let mb = match Mailbox::load(&mailbox_path) {
+    let (vars, _) = start_up(args, false);
+    let mb = match open_mailbox(args, &vars) {
         Ok(mb) => mb,
         Err(e) => {
-            eprintln!("mailx: {}: {}", mailbox_path, plib::diag::io_error_text(&e));
+            eprintln!("mailx: {}", e);
+            return 1;
+        }
+    };
+    if mb.message_count() == 0 {
+        print_no_mail();
+        return 0;
+    }
+    exit_status(summary::print_headers(&mb, 1..=mb.message_count(), &vars))
+}
+
+fn run_receive_mode(args: &Args) -> i32 {
+    let (mut vars, mut interp) = start_up(args, false);
+    let mut mb = match open_mailbox(args, &vars) {
+        Ok(mb) => mb,
+        Err(e) => {
+            eprintln!("mailx: {}", e);
             return 1;
         }
     };
 
-    if mb.message_count() == 0 {
-        println!("{} {}", gettext("No mail for"), get_user());
-        return 0;
-    }
-
-    mb.print_headers(None, &vars);
-    0
-}
-
-fn run_receive_mode(args: &Args) -> i32 {
-    let mut vars = Variables::new();
-    init_variables(&mut vars, args);
-
-    // -n suppresses only the system start-up file; the user MAILRC is always read.
-    load_startup_files(&mut vars, RcMode::Receive, args.no_init);
-
-    let mailbox_path = if args.read_mbox {
-        args.file.clone().unwrap_or_else(|| util::mbox_path(&vars))
-    } else {
-        args.file.clone().unwrap_or_else(get_system_mailbox)
-    };
-
-    let mut mb = match Mailbox::load(&mailbox_path) {
-        Ok(mb) => mb,
-        Err(e) => {
-            if args.file.is_some() || !args.read_mbox {
-                eprintln!("mailx: {}: {}", mailbox_path, plib::diag::io_error_text(&e));
-                return 1;
-            }
-            // For mbox, create empty if doesn't exist
-            Mailbox::new(mailbox_path.clone())
-        }
-    };
-
-    mb.set_is_system_mailbox(args.file.is_none() && !args.read_mbox);
-
     let is_tty = io::stdin().is_terminal();
-
-    // Print version unless quiet
-    if !vars.get_bool("quiet") && is_tty {
+    if !vars.is_set("quiet") && is_tty {
         println!("mailx-rs version {}", env!("CARGO_PKG_VERSION"));
     }
-
-    // Print headers unless -N is specified
-    if !args.no_header_summary && vars.get_bool("header") && mb.message_count() > 0 {
-        mb.print_headers(None, &vars);
+    if !args.no_header_summary && vars.is_set("header") && mb.message_count() > 0 {
+        if let Err(e) = summary::print_page(&mb, &vars) {
+            eprintln!("mailx: {}", e);
+        }
     } else if mb.message_count() == 0 && is_tty {
-        println!("{} {}", gettext("No mail for"), get_user());
+        print_no_mail();
     }
 
-    // Command loop
-    let mut stdout = io::stdout();
+    command_loop(&mut mb, &mut vars, &mut interp, is_tty)
+}
 
+/// Read and run commands until `quit`, `exit` or end of input.
+fn command_loop(mb: &mut Mailbox, vars: &mut Variables, interp: &mut Interp, is_tty: bool) -> i32 {
+    let mut ignored_eofs = 0;
     loop {
-        // Print prompt
+        // `autoinc` takes in new mail before each prompt, as in BSD mailx;
+        // the locks are taken only when the mailbox has grown.
+        if vars.is_set("autoinc") && mb.changed_size() {
+            match mb.incorporate() {
+                Ok(0) => {}
+                Ok(_) => println!("New mail has arrived."),
+                Err(e) => eprintln!("mailx: {}", e),
+            }
+        }
         if is_tty {
             if let Some(prompt) = vars.get("prompt") {
                 print!("{}", prompt);
-                let _ = stdout.flush();
+                let _ = io::stdout().flush();
             }
         }
 
-        // Read command
-        let mut line = String::new();
-        match signals::read_line_interruptible(&mut line) {
-            Ok(0) => {
-                // EOF - quit
-                return quit_mailbox(&mut mb, &vars);
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                // SIGINT in command mode: abort the partial command, re-prompt.
-                signals::take_sigint();
+        let line = match read_command() {
+            Ok(Command::Line(line)) => line,
+            // SIGINT in command mode aborts the partial command and re-prompts.
+            Ok(Command::Interrupted) => {
                 println!();
                 continue;
             }
+            // On a terminal `ignoreeof` asks for `quit` instead, a limited
+            // number of times.
+            Ok(Command::Eof)
+                if is_tty
+                    && vars.is_set("ignoreeof")
+                    && ignored_eofs < compose::MAX_IGNORED_EOFS =>
+            {
+                ignored_eofs += 1;
+                println!("Use \"quit\" to quit.");
+                continue;
+            }
+            Ok(Command::Eof) => return exit_status(mb.quit(vars)),
+            // A hangup ends the session with nothing written back.
+            Ok(Command::Hangup) => return 1,
             Err(e) => {
                 eprintln!(
                     "mailx: {}: {}",
@@ -186,71 +176,99 @@ fn run_receive_mode(args: &Args) -> i32 {
                 );
                 return 1;
             }
-        }
-
-        // A SIGINT may have arrived between reads; abort this command too.
-        if signals::take_sigint() {
-            println!();
-            continue;
-        }
-
-        let line = line.trim();
+        };
+        ignored_eofs = 0;
         if line.is_empty() {
             continue;
         }
 
-        // Execute command
-        match execute_command(line, &mut mb, &mut vars) {
-            Ok(commands::CommandResult::Continue) => {}
-            Ok(commands::CommandResult::Quit) => {
-                return quit_mailbox(&mut mb, &vars);
-            }
-            Ok(commands::CommandResult::Exit) => {
-                return 0;
-            }
-            Err(e) => {
-                eprintln!("{}", e);
-            }
+        match execute_command(&line, mb, vars, interp) {
+            Ok(CommandResult::Continue) => {}
+            Ok(CommandResult::Quit) => return exit_status(mb.quit(vars)),
+            Ok(CommandResult::Exit) => return 0,
+            Err(error::Error::Hangup) => return 1,
+            Err(e) => eprintln!("{}", e),
         }
     }
 }
 
-fn quit_mailbox(mb: &mut Mailbox, vars: &Variables) -> i32 {
-    if let Err(e) = mb.quit(vars) {
-        eprintln!("mailx: {}", e);
-        return 1;
-    }
-    0
+/// One line of command-mode input.
+enum Command {
+    Line(String),
+    Interrupted,
+    Hangup,
+    Eof,
 }
 
-fn init_variables(vars: &mut Variables, args: &Args) {
-    // Import environment variables
-    if let Ok(val) = env::var("DEAD") {
-        vars.set("DEAD", &val);
+fn read_command() -> io::Result<Command> {
+    if signals::hangup() {
+        return Ok(Command::Hangup);
     }
-    if let Ok(val) = env::var("EDITOR") {
-        vars.set("EDITOR", &val);
+    let mut line = String::new();
+    match signals::read_line_interruptible(&mut line) {
+        Ok(0) => return Ok(Command::Eof),
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::Interrupted && signals::hangup() => {
+            return Ok(Command::Hangup);
+        }
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+            signals::take_sigint();
+            return Ok(Command::Interrupted);
+        }
+        Err(e) => return Err(e),
     }
-    if let Ok(val) = env::var("MBOX") {
-        vars.set("MBOX", &val);
+    // A signal may have arrived between reads; it acts on this command too.
+    if signals::hangup() {
+        return Ok(Command::Hangup);
     }
-    if let Ok(val) = env::var("LISTER") {
-        vars.set("LISTER", &val);
+    if signals::take_sigint() {
+        return Ok(Command::Interrupted);
     }
-    if let Ok(val) = env::var("PAGER") {
-        vars.set("PAGER", &val);
+    Ok(Command::Line(line.trim().to_string()))
+}
+
+/// The exit status for the outcome of a mode, its error reported.
+fn exit_status(result: error::Result<()>) -> i32 {
+    match result {
+        Ok(()) => 0,
+        Err(error::Error::Hangup) => 1,
+        Err(e) => {
+            eprintln!("mailx: {}", e);
+            1
+        }
     }
-    if let Ok(val) = env::var("SHELL") {
-        vars.set("SHELL", &val);
+}
+
+fn print_no_mail() {
+    println!(
+        "{} {}",
+        gettext("No mail for"),
+        util::user_login_or_unknown()
+    );
+}
+
+/// Variables and interpreter state after the Start-Up steps: defaults,
+/// imported environment variables, options, then the start-up files.
+fn start_up(args: &Args, send_mode: bool) -> (Variables, Interp) {
+    recovery::report_leftovers();
+    let mut vars = Variables::new();
+    for name in [
+        "DEAD", "EDITOR", "MBOX", "LISTER", "PAGER", "SHELL", "VISUAL",
+    ] {
+        if let Ok(value) = env::var(name) {
+            vars.set(name, &value);
+        }
     }
-    if let Ok(val) = env::var("VISUAL") {
-        vars.set("VISUAL", &val);
+    if args.ignore_interrupts {
+        vars.enable("ignore");
     }
 
-    // Set ignore variable from -i option
-    if args.ignore_interrupts {
-        vars.set_bool("ignore", true);
-    }
+    let mut interp = Interp {
+        send_mode,
+        ..Interp::default()
+    };
+    load_startup_files(&mut vars, &mut interp, args.no_init);
+    (vars, interp)
 }
 
 /// System startup file locations (checked in order)
@@ -261,80 +279,55 @@ const SYSTEM_MAILRC_PATHS: &[&str] = &[
     "/usr/lib/mailx/mailx.rc",
 ];
 
-fn load_startup_files(vars: &mut Variables, mode: RcMode, no_init: bool) {
-    // Load system startup file first (POSIX requirement), unless -n was given.
-    // Per the Start-Up steps, -n attaches only to the system start-up file;
-    // the user's MAILRC is always processed.
+/// Run the system start-up file, unless `-n`, then the user's `MAILRC`.
+///
+/// `-n` attaches only to the system file; the user's is always read.
+fn load_startup_files(vars: &mut Variables, interp: &mut Interp, no_init: bool) {
     if !no_init {
-        for path in SYSTEM_MAILRC_PATHS {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                load_rc_content(&content, path, vars, mode);
-                break; // Only load the first one found
-            }
+        if let Some((path, content)) = SYSTEM_MAILRC_PATHS
+            .iter()
+            .find_map(|p| std::fs::read_to_string(p).ok().map(|c| (p, c)))
+        {
+            run_startup_file(&content, path, vars, interp);
         }
     }
 
-    // Load user startup file
-    let mailrc = env::var("MAILRC").unwrap_or_else(|_| {
-        let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        format!("{}/.mailrc", home)
-    });
-
+    let mailrc = env::var("MAILRC").unwrap_or_else(|_| format!("{}/.mailrc", util::home()));
     if let Ok(content) = std::fs::read_to_string(&mailrc) {
-        load_rc_content(&content, &mailrc, vars, mode);
+        run_startup_file(&content, &mailrc, vars, interp);
     }
 }
 
-/// Mode for conditional execution in startup files
-#[derive(Clone, Copy, PartialEq)]
-enum RcMode {
-    Send,
-    Receive,
-}
-
-fn load_rc_content(content: &str, path: &str, vars: &mut Variables, mode: RcMode) {
-    // `if s` / `if r` ask which mode mailx is running in; the interpreter reads
-    // it from here rather than from a parameter only this path could supply.
-    vars.send_mode = mode == RcMode::Send;
+fn run_startup_file(content: &str, path: &str, vars: &mut Variables, interp: &mut Interp) {
     // Start-up files have no message store. Commands that need one are excluded
     // by their context mask, so this scratch mailbox is never read from.
     let mut scratch = Mailbox::new(String::new());
-    commands::run_script(content, path, &mut scratch, vars);
+    script::run_script(content, path, &mut scratch, vars, interp);
 }
 
-fn get_system_mailbox() -> String {
-    // MAIL names the mailbox outright when it is set (a widely relied-on
-    // extension); otherwise the spool is searched.
-    if let Ok(mail) = env::var("MAIL") {
-        return mail;
+/// The mailbox to read: the `-u` user's system mailbox, the `-f` file, mbox
+/// for a bare `-f`, or the user's own system mailbox.
+fn open_mailbox(args: &Args, vars: &Variables) -> error::Result<Mailbox> {
+    if args.file.is_none() && args.user.is_none() && args.read_mbox {
+        // mbox need not exist yet.
+        let path = util::mbox_path(vars);
+        return Ok(Mailbox::load(&path).unwrap_or_else(|_| Mailbox::new(path)));
     }
-    util::spool_path(&get_user())
+    let mut mb = Mailbox::load(&named_or_system_mailbox(args))?;
+    mb.is_system_mailbox = args.file.is_none() && args.user.is_none();
+    Ok(mb)
 }
 
-fn get_user() -> String {
-    user_login_or("unknown")
-}
-
-/// The login name of the user running mailx, or an empty string if unknown.
-///
-/// `USER` may be present but empty, which is not a login name; treat it the
-/// same as absent rather than letting "" stand in for the user's identity.
-pub fn user_login() -> String {
-    user_login_or("")
-}
-
-/// The login name, or `unknown` when the environment does not say.
-pub fn user_login_or_unknown() -> String {
-    user_login_or("unknown")
-}
-
-fn user_login_or(fallback: &str) -> String {
-    for var in ["USER", "LOGNAME"] {
-        if let Ok(v) = env::var(var) {
-            if !v.trim().is_empty() {
-                return v;
-            }
-        }
+/// The `-u` user's system mailbox, else the `-f` file, else the user's own
+/// system mailbox.
+fn named_or_system_mailbox(args: &Args) -> String {
+    if let Some(user) = &args.user {
+        // Read access is governed by the file's permissions, which provide
+        // the "appropriate privileges" check -u requires.
+        return util::spool_path(user);
     }
-    fallback.to_string()
+    if let Some(file) = &args.file {
+        return file.clone();
+    }
+    util::system_mailbox()
 }

@@ -7,7 +7,7 @@ and platforms.  This file holds only rules for the agent.
 
 ## Git
 
-Ask before any `git add` or `git commit`. Never amend a commit; make a new one.
+Never amend a commit; make a new one.
 
 Before committing, re-read `git diff HEAD` in full, and get
 `cargo clippy --all-targets` to zero warnings, fixing pre-existing ones too.

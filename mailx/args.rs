@@ -9,15 +9,16 @@
 
 //! Command line argument parsing for mailx
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Mode {
     Send,
     CheckMail,
     HeadersOnly,
+    #[default]
     Receive,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Args {
     pub mode: Mode,
     pub subject: Option<String>,
@@ -35,132 +36,80 @@ pub struct Args {
 
 impl Args {
     pub fn parse(args: Vec<String>) -> Result<Self, String> {
-        let mut result = Args {
-            mode: Mode::Receive,
-            subject: None,
-            addresses: Vec::new(),
-            file: None,
-            read_mbox: false,
-            record_to_recipient: false,
-            no_header_summary: false,
-            ignore_interrupts: false,
-            no_init: false,
-            user: None,
-            discard_empty: false,
-        };
-
-        let mut i = 0;
+        let mut result = Args::default();
         let mut check_mail = false;
         let mut headers_only = false;
         let mut end_of_opts = false;
 
+        let mut i = 0;
         while i < args.len() {
             let arg = &args[i];
 
             if arg == "--" && !end_of_opts {
                 // Explicit end-of-options terminator (XBD 12.2).
                 end_of_opts = true;
-                i += 1;
-                continue;
-            }
-
-            if !end_of_opts && arg.starts_with('-') && arg.len() > 1 {
-                let mut chars = arg[1..].chars().peekable();
-
-                while let Some(c) = chars.next() {
+            } else if !end_of_opts && arg.starts_with('-') && arg.len() > 1 {
+                for (pos, c) in arg[1..].char_indices() {
+                    let rest = &arg[1 + pos + c.len_utf8()..];
                     match c {
-                        'e' => {
-                            check_mail = true;
-                        }
-                        'E' => {
-                            result.discard_empty = true;
-                        }
-                        'f' => {
-                            // `file` is an operand (XBD 12.2), not an
-                            // option-argument: consumed as a trailing operand
-                            // in Receive Mode below, not glued to -f here.
-                            result.read_mbox = true;
-                        }
-                        'F' => {
-                            result.record_to_recipient = true;
-                        }
-                        'H' => {
-                            headers_only = true;
-                        }
-                        'i' => {
-                            result.ignore_interrupts = true;
-                        }
-                        'n' => {
-                            result.no_init = true;
-                        }
-                        'N' => {
-                            result.no_header_summary = true;
-                        }
+                        'e' => check_mail = true,
+                        'E' => result.discard_empty = true,
+                        // `file` is an operand (XBD 12.2), not an
+                        // option-argument: it is taken from the operands below.
+                        'f' => result.read_mbox = true,
+                        'F' => result.record_to_recipient = true,
+                        'H' => headers_only = true,
+                        'i' => result.ignore_interrupts = true,
+                        'n' => result.no_init = true,
+                        'N' => result.no_header_summary = true,
                         's' => {
-                            // Subject - get the value
-                            let rest: String = chars.collect();
-                            if !rest.is_empty() {
-                                result.subject = Some(rest);
-                            } else if i + 1 < args.len() {
-                                i += 1;
-                                result.subject = Some(args[i].clone());
-                            } else {
-                                return Err("option requires an argument -- s".to_string());
-                            }
+                            result.subject = Some(option_argument(rest, &args, &mut i, c)?);
                             break;
                         }
                         'u' => {
-                            // User mailbox
-                            let rest: String = chars.collect();
-                            if !rest.is_empty() {
-                                result.user = Some(rest);
-                            } else if i + 1 < args.len() {
-                                i += 1;
-                                result.user = Some(args[i].clone());
-                            } else {
-                                return Err("option requires an argument -- u".to_string());
-                            }
+                            result.user = Some(option_argument(rest, &args, &mut i, c)?);
                             break;
                         }
-                        _ => {
-                            return Err(format!("illegal option -- {}", c));
-                        }
+                        _ => return Err(format!("illegal option -- {}", c)),
                     }
                 }
             } else if result.read_mbox && result.file.is_none() {
-                // With -f, the first non-option operand is the mailbox file to
-                // read (Receive Mode), not a recipient address.
+                // With -f, the first operand is the mailbox file to read
+                // (Receive Mode), not a recipient address.
                 result.file = Some(arg.clone());
             } else {
-                // Non-option argument - must be an address (Send Mode).
                 result.addresses.push(arg.clone());
             }
-
             i += 1;
         }
 
-        // Determine mode
-        if check_mail {
-            result.mode = Mode::CheckMail;
+        result.mode = if check_mail {
+            Mode::CheckMail
         } else if headers_only {
-            result.mode = Mode::HeadersOnly;
-        } else if result.read_mbox {
-            // -f always selects Receive Mode, reading the named (or default) box.
-            result.mode = Mode::Receive;
-        } else if !result.addresses.is_empty() {
-            result.mode = Mode::Send;
+            Mode::HeadersOnly
+        } else if !result.read_mbox && !result.addresses.is_empty() {
+            Mode::Send
         } else {
-            result.mode = Mode::Receive;
-        }
-
-        // If -u was specified, read that user's system mailbox. Search the
-        // usual spool locations (as get_system_mailbox does), defaulting to
-        // /var/mail. Read access is governed by the file's permissions, which
-        // provide the "appropriate privileges" check (spec 104287-104289).
-        if let Some(ref user) = result.user {
-            result.file = Some(crate::util::spool_path(user));
-        }
-
+            // -f always selects Receive Mode, reading the named (or default) box.
+            Mode::Receive
+        };
         Ok(result)
     }
+}
+
+/// The argument of option `opt`: the rest of its cluster (`-sSubject`), or
+/// else the next argument (`-s Subject`), which `i` is advanced past.
+fn option_argument(
+    rest: &str,
+    args: &[String],
+    i: &mut usize,
+    opt: char,
+) -> Result<String, String> {
+    if !rest.is_empty() {
+        return Ok(rest.to_string());
+    }
+    *i += 1;
+    args.get(*i)
+        .cloned()
+        .ok_or_else(|| format!("option requires an argument -- {}", opt))
 }

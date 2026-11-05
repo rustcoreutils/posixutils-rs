@@ -1,0 +1,586 @@
+//
+// Copyright (c) 2025-2026 Jeff Garzik
+//
+// This file is part of the posixutils-rs project covered under
+// the MIT License.  For the full license text, please see the LICENSE
+// file in the root directory of this project.
+// SPDX-License-Identifier: MIT
+//
+
+//! Message list syntax.
+
+use crate::common::{copy_test_data, create_temp_mbox, mailx};
+
+// -----------------------------------------------------------------------------
+// Range syntax: n-m
+// -----------------------------------------------------------------------------
+
+/// Test message range 1-3
+#[test]
+fn msglist_range() {
+    let mbox = copy_test_data("testdata-5msg.mbox");
+    let mbox_path = mbox.path().to_str().unwrap();
+
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "from 1-3\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    // Should show messages 1, 2, 3
+    assert!(
+        stdout.contains("alice") && stdout.contains("bob") && stdout.contains("charlie"),
+        "Range 1-3 should show first three messages: {}",
+        stdout
+    );
+    // Should NOT show messages 4, 5
+    assert!(
+        !stdout.contains("dave"),
+        "Range 1-3 should not show message 5: {}",
+        stdout
+    );
+    assert!(output.status.success());
+}
+
+/// Test message range 3-5
+#[test]
+fn msglist_range_end() {
+    let mbox = copy_test_data("testdata-5msg.mbox");
+    let mbox_path = mbox.path().to_str().unwrap();
+
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "from 3-5\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    // Should show messages 3, 4, 5
+    assert!(
+        stdout.contains("charlie") && stdout.contains("dave"),
+        "Range 3-5 should show last messages: {}",
+        stdout
+    );
+    assert!(output.status.success());
+}
+
+// -----------------------------------------------------------------------------
+// Special symbols: . ^ $ * + -
+// -----------------------------------------------------------------------------
+
+/// Test . (current message)
+#[test]
+fn msglist_dot_current() {
+    let mbox = copy_test_data("testdata-5msg.mbox");
+    let mbox_path = mbox.path().to_str().unwrap();
+
+    // Print message 3 to set current, then use . to reference it
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "3\nfrom .\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // After viewing 3, . should refer to message 3
+    assert!(
+        stdout.contains("charlie") && stdout.contains("Urgent"),
+        ". should reference current message: {}",
+        stdout
+    );
+    assert!(output.status.success());
+}
+
+/// Test ^ (first message)
+#[test]
+fn msglist_caret_first() {
+    let mbox = copy_test_data("testdata-5msg.mbox");
+    let mbox_path = mbox.path().to_str().unwrap();
+
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "from ^\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout_lower = stdout.to_lowercase();
+    // ^ should show first message (alice, Meeting Tomorrow)
+    assert!(
+        stdout_lower.contains("alice") && stdout_lower.contains("meeting tomorrow"),
+        "^ should show first message: {}",
+        stdout
+    );
+    assert!(output.status.success());
+}
+
+/// Test $ (last message)
+#[test]
+fn msglist_dollar_last() {
+    let mbox = copy_test_data("testdata-5msg.mbox");
+    let mbox_path = mbox.path().to_str().unwrap();
+
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "from $\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout_lower = stdout.to_lowercase();
+    // $ should show last message (dave, Final Report)
+    assert!(
+        stdout_lower.contains("dave") && stdout_lower.contains("final report"),
+        "$ should show last message: {}",
+        stdout
+    );
+    assert!(output.status.success());
+}
+
+/// Test * (all messages)
+#[test]
+fn msglist_star_all() {
+    let mbox = copy_test_data("testdata-5msg.mbox");
+    let mbox_path = mbox.path().to_str().unwrap();
+
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "from *\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // * should show all 5 messages
+    assert!(
+        stdout.contains("1")
+            && stdout.contains("2")
+            && stdout.contains("3")
+            && stdout.contains("4")
+            && stdout.contains("5"),
+        "* should show all messages: {}",
+        stdout
+    );
+    assert!(output.status.success());
+}
+
+/// Test + (next message)
+#[test]
+fn msglist_plus_next() {
+    let mbox = copy_test_data("testdata-5msg.mbox");
+    let mbox_path = mbox.path().to_str().unwrap();
+
+    // Start at msg 2, then + should go to msg 3
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "2\nfrom +\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // After msg 2, + should show msg 3 (charlie)
+    assert!(
+        stdout.contains("charlie") && stdout.contains("Urgent"),
+        "+ should show next message: {}",
+        stdout
+    );
+    assert!(output.status.success());
+}
+
+/// Test - (previous message)
+#[test]
+fn msglist_minus_prev() {
+    let mbox = copy_test_data("testdata-5msg.mbox");
+    let mbox_path = mbox.path().to_str().unwrap();
+
+    // Start at msg 3, then - should go to msg 2
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "3\nfrom -\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // After msg 3, - should show msg 2 (bob)
+    assert!(
+        stdout.contains("bob") && stdout.contains("Project"),
+        "- should show previous message: {}",
+        stdout
+    );
+    assert!(output.status.success());
+}
+
+// -----------------------------------------------------------------------------
+// Subject search: /pattern
+// -----------------------------------------------------------------------------
+
+/// Test /pattern searches subjects
+#[test]
+fn msglist_subject_search() {
+    let mbox = copy_test_data("testdata-5msg.mbox");
+    let mbox_path = mbox.path().to_str().unwrap();
+
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "from /Meeting\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // /Meeting should find messages 1 and 4 (both have "Meeting" in subject)
+    assert!(
+        stdout.contains("Meeting Tomorrow") && stdout.contains("Another Meeting"),
+        "/Meeting should find Meeting messages: {}",
+        stdout
+    );
+    assert!(output.status.success());
+}
+
+/// Test /pattern is case-insensitive
+#[test]
+fn msglist_subject_search_case() {
+    let mbox = copy_test_data("testdata-5msg.mbox");
+    let mbox_path = mbox.path().to_str().unwrap();
+
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "from /urgent\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // /urgent (lowercase) should find "Urgent Request"
+    assert!(
+        stdout.contains("Urgent") && stdout.contains("charlie"),
+        "/urgent should match case-insensitively: {}",
+        stdout
+    );
+    assert!(output.status.success());
+}
+
+// -----------------------------------------------------------------------------
+// Message type: :n :o :r :u :d
+// -----------------------------------------------------------------------------
+
+/// Test :d (deleted messages) - for undelete
+#[test]
+fn msglist_type_deleted() {
+    let mbox = copy_test_data("testdata-5msg.mbox");
+    let mbox_path = mbox.path().to_str().unwrap();
+
+    // Delete messages 1 and 3, then undelete :d (all deleted)
+    let output = mailx(
+        &["-n", "-N", "-f", mbox_path],
+        "delete 1 3\nundelete :d\nfrom *\nexit\n",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    // After undelete :d, all messages should be visible
+    assert!(
+        stdout.contains("alice") && stdout.contains("charlie"),
+        ":d should select deleted messages for undelete: {}",
+        stdout
+    );
+    assert!(output.status.success());
+}
+
+// -----------------------------------------------------------------------------
+// Address matching
+// -----------------------------------------------------------------------------
+
+/// Test address matching (sender name)
+#[test]
+fn msglist_address_match() {
+    let mbox = copy_test_data("testdata-5msg.mbox");
+    let mbox_path = mbox.path().to_str().unwrap();
+
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "from bob\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Should find bob's message
+    assert!(
+        stdout.contains("bob") && stdout.contains("Project"),
+        "Address match should find bob: {}",
+        stdout
+    );
+    assert!(output.status.success());
+}
+
+/// Test address matching with full email
+#[test]
+fn msglist_address_full_email() {
+    let mbox = copy_test_data("testdata-5msg.mbox");
+    let mbox_path = mbox.path().to_str().unwrap();
+
+    let output = mailx(
+        &["-n", "-N", "-f", mbox_path],
+        "from alice@example.com\nquit\n",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Should find only alice@example.com (not alice@different.org)
+    assert!(
+        stdout.contains("Meeting Tomorrow"),
+        "Full email should find exact match: {}",
+        stdout
+    );
+    assert!(output.status.success());
+}
+
+/// Test allnet variable - match by login only
+#[test]
+fn msglist_allnet_login_match() {
+    let mbox = copy_test_data("testdata-5msg.mbox");
+    let mbox_path = mbox.path().to_str().unwrap();
+
+    // With allnet, "alice" should match both alice@example.com and alice@different.org
+    let output = mailx(
+        &["-n", "-N", "-f", mbox_path],
+        "set allnet\nfrom alice\nquit\n",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Should find both alice messages (1 and 4)
+    assert!(
+        (stdout.contains("Meeting Tomorrow") && stdout.contains("alice@example.com"))
+            && (stdout.contains("Another Meeting") && stdout.contains("alice@different.org")),
+        "allnet should match both alice addresses: {}",
+        stdout
+    );
+    assert!(output.status.success());
+}
+
+// -----------------------------------------------------------------------------
+// Multiple specs combined
+// -----------------------------------------------------------------------------
+
+/// Test multiple message specs separated by space
+#[test]
+fn msglist_multiple_specs() {
+    let mbox = copy_test_data("testdata-5msg.mbox");
+    let mbox_path = mbox.path().to_str().unwrap();
+
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "from 1 3 5\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    // Should show messages 1, 3, 5
+    assert!(
+        stdout.contains("alice") && stdout.contains("charlie") && stdout.contains("dave"),
+        "Multiple specs should show selected messages: {}",
+        stdout
+    );
+    assert!(output.status.success());
+}
+
+/// Test range combined with numbers
+#[test]
+fn msglist_range_and_number() {
+    let mbox = copy_test_data("testdata-5msg.mbox");
+    let mbox_path = mbox.path().to_str().unwrap();
+
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "from 1-2 5\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    // Should show messages 1, 2, 5 but not 3, 4
+    assert!(
+        stdout.contains("alice") && stdout.contains("bob") && stdout.contains("dave"),
+        "Range + number should show correct messages: {}",
+        stdout
+    );
+    assert!(output.status.success());
+}
+
+/// A hyphen inside an address is not a message range (spec 104533).
+#[test]
+fn hyphenated_address_is_not_a_range() {
+    let mbox = create_temp_mbox(
+        "From alpha@example.com Fri Nov 29 10:00:00 2024\n\
+         From: alpha@example.com\n\
+         Subject: first message\n\
+         \n\
+         body one\n\
+         \n\
+         From beta@example.org Fri Nov 29 11:00:00 2024\n\
+         From: beta@example.org\n\
+         Subject: second message\n\
+         \n\
+         body two\n\
+         \n\
+         From alpha-zeta@example.net Fri Nov 29 12:00:00 2024\n\
+         From: alpha-zeta@example.net\n\
+         Subject: third message\n\
+         \n\
+         body three\n\
+         \n",
+    );
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    let output = mailx(&["-n", "-N", "-f", &mbox_path], "from alpha-zeta\nexit\n");
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        out.contains("third message"),
+        "the hyphenated address did not match its own message: {}",
+        out
+    );
+    assert!(
+        !out.contains("first message") && !out.contains("second message"),
+        "`alpha-zeta` was parsed as the range alpha..zeta: {}",
+        out
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
+}
+
+/// `^`, `$`, and `.` are message numbers, so they may end a range (spec 104533).
+#[test]
+fn range_endpoints_accept_the_positional_forms() {
+    let mbox = create_temp_mbox(
+        "From a@example.com Fri Nov 29 10:00:00 2024\n\
+         From: a@example.com\n\
+         Subject: first\n\
+         \n\
+         one\n\
+         \n\
+         From c@example.org Fri Nov 29 11:00:00 2024\n\
+         From: c@example.org\n\
+         Subject: second\n\
+         \n\
+         two\n\
+         \n",
+    );
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    for spec in ["1-$", "^-$", "1-2"] {
+        let output = mailx(
+            &["-n", "-N", "-f", &mbox_path],
+            format!("from {}\nexit\n", spec),
+        );
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            out.contains("first") && out.contains("second"),
+            "`from {}` did not select the whole range: {}",
+            spec,
+            out
+        );
+        assert_eq!(output.status.code(), Some(0), "exit status");
+    }
+}
+
+/// Both ends of a range must name a message, as BSD mailx checks them: a
+/// range running past the last message is rejected, not clamped.
+#[test]
+fn range_past_the_end_is_rejected() {
+    let mbox = copy_test_data("testdata.mbox");
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    let output = mailx(
+        &["-n", "-N", "-f", &mbox_path],
+        "delete 1 2\nundelete 1-9999\nfrom *\nundelete 1-$\nfrom *\nexit\n",
+    );
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("9999: Invalid message number"), "{}", err);
+    let out = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    assert_eq!(out.matches("alice").count(), 1, "{}", out);
+    assert_eq!(out.matches("bob").count(), 1, "{}", out);
+    assert_eq!(output.status.code(), Some(0), "exit status");
+}
+
+/// With no messages there is no current message, so a command whose
+/// message list defaults to it reports that rather than doing nothing.
+#[test]
+fn default_msglist_without_a_current_message_is_diagnosed() {
+    let mbox = create_temp_mbox("");
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let saved = dir.path().join("saved");
+    let output = mailx(
+        &["-n", "-N", "-f", mbox.path().to_str().unwrap()],
+        format!("print\nsave {}\nexit\n", saved.display()),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("No applicable messages").count(),
+        2,
+        "print and save should each report no message: {}",
+        stderr
+    );
+    assert!(!saved.exists(), "save created a file with nothing in it");
+    assert_eq!(output.status.code(), Some(0), "exit status");
+}
+
+/// `$` skips deleted messages as `^` does, and for `undelete` names the last
+/// deleted message.
+#[test]
+fn dollar_is_the_last_visible_message() {
+    let mbox = copy_test_data("testdata.mbox");
+    let output = mailx(
+        &["-n", "-N", "-f", mbox.path().to_str().unwrap()],
+        "delete 3\nprint $\ndelete 1\nundelete $\nfrom *\nexit\n",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Subject: Project Update"),
+        "p $ should print 2: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("charlie@example.net ") && !stdout.contains("alice@example.com "),
+        "undelete $ should restore message 3, the last deleted, and leave 1: {}",
+        stdout
+    );
+}
+
+// -----------------------------------------------------------------------------
+// An omitted msglist
+// -----------------------------------------------------------------------------
+
+/// With every message deleted, a command given no msglist has none to act
+/// on: it does not print, nor save -- and so undelete -- the deleted current
+/// message.
+#[test]
+fn omitted_msglist_skips_a_deleted_current_message() {
+    let mbox = copy_test_data("testdata-5msg.mbox");
+    let mbox_path = mbox.path().to_str().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
+    let saved = dir.path().join("saved");
+
+    let output = mailx(
+        &["-n", "-N", "-f", mbox_path],
+        format!("d *\np\ns {}\nquit\n", saved.display()),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stdout.contains("Subject:"),
+        "printed a deleted message: {}",
+        stdout
+    );
+    assert_eq!(
+        stderr.matches("No applicable messages").count(),
+        2,
+        "{}",
+        stderr
+    );
+    assert!(!saved.exists(), "saved a deleted message");
+}
+
+/// A deleted current message stands, for a command given no msglist, for
+/// the next undeleted one after it, as BSD mailx's `first()` has it.
+#[test]
+fn omitted_msglist_takes_the_next_undeleted_message() {
+    let mbox = copy_test_data("testdata-5msg.mbox");
+    let mbox_path = mbox.path().to_str().unwrap();
+
+    // `headers 4` makes current the top of its page, message 3.
+    let output = mailx(
+        &["-n", "-N", "-f", mbox_path],
+        "set screen=2\nd 3\nheaders 4\np\nquit\n",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Subject: Another Meeting") && !stdout.contains("Subject: Urgent"),
+        "{}",
+        stdout
+    );
+}
+
+/// Run `script` on the five-message mailbox, returning its standard output
+/// and standard error.
+fn run_5msg(script: &str) -> (String, String) {
+    let mbox = copy_test_data("testdata-5msg.mbox");
+    let output = mailx(&["-n", "-N", "-f", mbox.path().to_str().unwrap()], script);
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// A deleted message named by number is not a message to act on, as BSD
+/// mailx's check() has it: the command is refused with "Inappropriate
+/// message", whether the number stands alone, in a list or as `.`.
+#[test]
+fn a_deleted_message_named_by_number_is_refused() {
+    for (script, refused) in [
+        ("d 3\np 3\nquit\n", "3: Inappropriate message"),
+        ("d 3\n3\nquit\n", "3: Inappropriate message"),
+        ("d 2\np 2 3\nquit\n", "2: Inappropriate message"),
+        ("d 2\np 2-4\nquit\n", "2: Inappropriate message"),
+        // `headers 4` makes current the top of its page, message 3.
+        (
+            "set screen=2\nd 3\nheaders 4\np .\nquit\n",
+            "3: Inappropriate message",
+        ),
+    ] {
+        let (out, err) = run_5msg(script);
+        assert!(err.contains(refused), "{:?}: {}", script, err);
+        assert!(!out.contains("Subject:"), "{:?} printed: {}", script, out);
+    }
+}
+
+/// A number past the last message is reported as BSD mailx reports it.
+#[test]
+fn a_number_past_the_end_is_invalid() {
+    for script in ["p 9\nquit\n", "9\nquit\n", "p 1-9\nquit\n"] {
+        let (_, err) = run_5msg(script);
+        assert!(
+            err.contains("9: Invalid message number"),
+            "{:?}: {}",
+            script,
+            err
+        );
+    }
+}
+
+/// Deleted messages strictly inside a range are passed over, and `^` and `$`
+/// stand for the first and last undeleted messages.
+#[test]
+fn a_range_passes_over_deleted_messages_inside_it() {
+    let (out, err) = run_5msg("d 1 3 5\nfrom ^-$\nfrom 2-4\nquit\n");
+    assert!(err.is_empty(), "{}", err);
+    let out = out.to_lowercase();
+    assert!(!out.contains("charlie"), "{}", out);
+    assert_eq!(out.matches("bob").count(), 2, "{}", out);
+    assert_eq!(out.matches("alice@different").count(), 2, "{}", out);
+}

@@ -68,30 +68,26 @@ pub fn read_line_interruptible(buf: &mut String) -> io::Result<usize> {
 ///
 /// A message body need not be UTF-8; this is the reader input mode uses.
 pub fn read_bytes_interruptible(buf: &mut Vec<u8>) -> io::Result<usize> {
-    let stdin = io::stdin();
-    let mut handle = stdin.lock();
-    let mut bytes: Vec<u8> = Vec::new();
+    let start = buf.len();
+    let mut stdin = io::stdin().lock();
     let mut byte = [0u8; 1];
-
     loop {
-        match handle.read(&mut byte) {
-            Ok(0) => break, // EOF
+        match stdin.read(&mut byte) {
+            Ok(0) => break,
             Ok(_) => {
-                bytes.push(byte[0]);
+                buf.push(byte[0]);
                 if byte[0] == b'\n' {
                     break;
                 }
             }
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {
-                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            // An interrupted line is discarded, not half kept.
+            Err(e) => {
+                buf.truncate(start);
+                return Err(e);
             }
-            Err(e) => return Err(e),
         }
     }
-
-    let n = bytes.len();
-    buf.extend_from_slice(&bytes);
-    Ok(n)
+    Ok(buf.len() - start)
 }
 
 #[cfg(test)]

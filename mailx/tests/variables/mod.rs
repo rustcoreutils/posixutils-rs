@@ -1233,3 +1233,111 @@ fn var_multiple_send_vars() {
         },
     );
 }
+
+/// A `set` value may contain blanks when quoted (spec 104965, 104694-104699).
+#[test]
+fn set_value_may_contain_blanks() {
+    let mbox = copy_test_data("testdata-single.mbox");
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from("set indentprefix=\"> \"\nset\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let out = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                out.contains("indentprefix=\"> \""),
+                "a quoted set value lost its trailing blank: {}",
+                out
+            );
+            assert!(
+                !out.lines().any(|l| l.trim() == "\""),
+                "the set tokenizer produced a junk variable named `\"`: {}",
+                out
+            );
+        },
+    );
+}
+
+/// `set noX` unsets `X`, and must not strip `no` from an unrelated name.
+#[test]
+fn set_no_prefix_only_strips_a_known_boolean() {
+    let mbox = copy_test_data("testdata-single.mbox");
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from("set notify\nset\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let out = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                out.lines().any(|l| l.trim() == "notify"),
+                "`set notify` was read as `set no tify`: {}",
+                out
+            );
+        },
+    );
+}
+
+/// `set noX` clears X for any variable that is set, not just a known boolean.
+#[test]
+fn set_no_prefix_clears_valued_and_user_variables() {
+    let mbox = copy_test_data("testdata-single.mbox");
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from(
+                "set crt=1\nset nocrt\nset myvar=1\nset nomyvar\nset notify\nset\nexit\n",
+            ),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let out = String::from_utf8_lossy(&output.stdout);
+            for gone in ["crt=", "myvar=", "nocrt", "nomyvar"] {
+                assert!(
+                    !out.contains(gone),
+                    "`set no...` left `{}` behind: {}",
+                    gone,
+                    out
+                );
+            }
+            assert!(
+                out.lines().any(|l| l.trim() == "notify"),
+                "`set notify` was read as `set no tify`: {}",
+                out
+            );
+        },
+    );
+}

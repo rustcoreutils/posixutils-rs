@@ -451,3 +451,43 @@ fn failed_editor_is_reported_and_changes_nothing() {
         stderr
     );
 }
+
+/// The escape character typed twice puts one in the message, the rest of
+/// the line as typed, blanks and all, as BSD mailx does.
+#[test]
+fn doubled_escape_keeps_the_line_as_typed() {
+    let mbox = copy_test_data("testdata.mbox");
+    let mailrc = create_temp_mailrc("set debug\n");
+
+    let output = mailx_env(
+        &["-N", "-f", mbox.path().to_str().unwrap()],
+        "mail recipient@example.com\n~~  indented  \n~p\n~.\nquit\n",
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\n~  indented  \n"), "{:?}", stdout);
+    assert_eq!(output.status.code(), Some(0), "exit status");
+}
+
+/// With another escape character, typing it twice puts that character in
+/// the message -- and does not run the rest of the line as a shell command,
+/// as taking it for `~!` would.
+#[test]
+fn doubled_custom_escape_inserts_that_character() {
+    let mbox = copy_test_data("testdata.mbox");
+    let mailrc = create_temp_mailrc("set debug\nset escape=!\n");
+
+    let output = mailx_env(
+        &["-N", "-f", mbox.path().to_str().unwrap()],
+        "mail recipient@example.com\n!!echo SHELL_RAN\n!p\n!.\nquit\n",
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\n!echo SHELL_RAN\n"), "{:?}", stdout);
+    assert!(
+        !stdout.contains("\nSHELL_RAN\n"),
+        "ran a shell: {:?}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
+}

@@ -105,6 +105,10 @@ pub(crate) fn compose_body(
 
         interrupt_count = 0;
 
+        if let Some(text) = doubled_escape(&line, escape_char) {
+            composed.body.extend_from_slice(text);
+            continue;
+        }
         if let Some(escape) = escape_text(&line, escape_char) {
             if perform_escape(&escape, composed, vars, interp, mb)? {
                 break;
@@ -131,6 +135,15 @@ fn escape_text(line: &[u8], escape_char: Option<char>) -> Option<String> {
     let ec = escape_char?.encode_utf8(&mut buf).as_bytes();
     (line.starts_with(ec) && line.len() > ec.len())
         .then(|| String::from_utf8_lossy(&line[ec.len()..]).into_owned())
+}
+
+/// The text a line beginning with the escape character twice puts in the
+/// message: the line without the first of them, as typed. `None` for any
+/// other line, or when escapes are disabled.
+fn doubled_escape(line: &[u8], escape_char: Option<char>) -> Option<&[u8]> {
+    let mut buf = [0u8; 4];
+    let ec = escape_char?.encode_utf8(&mut buf).as_bytes();
+    line.strip_prefix(ec).filter(|rest| rest.starts_with(ec))
 }
 
 /// Perform a command escape, returning whether it ended the message.

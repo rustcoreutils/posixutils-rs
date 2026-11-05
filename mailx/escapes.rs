@@ -95,11 +95,6 @@ pub fn handle_escape(
                 }
             }
         }
-        '~' => {
-            msg.body.push(b'~');
-            msg.body.extend_from_slice(args.as_bytes());
-            msg.body.push(b'\n');
-        }
         _ => return Err(format!("Unknown escape: ~{}", cmd_char).into()),
     }
     Ok(Escape::Continue)

@@ -281,9 +281,10 @@ fn deliver(msg: &ComposedMessage, vars: &Variables) -> Result<()> {
         .arg("-oi") // a line of "." does not end the message
         .arg("--")
         .args(&recipients)
+        // Its output goes where mailx's does, as under BSD mailx: what it
+        // has to say reaches the user, and it cannot block on a pipe
+        // nobody reads.
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
         .spawn()
         .context("Failed to run sendmail")?;
 
@@ -297,13 +298,11 @@ fn deliver(msg: &ComposedMessage, vars: &Variables) -> Result<()> {
     };
     match written {
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
-            let output = child
-                .wait_with_output()
-                .context("Failed to wait for sendmail")?;
-            if output.status.success() {
+            let status = child.wait().context("Failed to wait for sendmail")?;
+            if status.success() {
                 return Err("sendmail exited without reading the message".into());
             }
-            return Err(sendmail_failure(&output).into());
+            return Err(format!("sendmail failed: {}", status).into());
         }
         Err(e) => {
             let _ = child.wait();
@@ -313,24 +312,37 @@ fn deliver(msg: &ComposedMessage, vars: &Variables) -> Result<()> {
     }
 
     if vars.is_set("sendwait") {
-        let output = child
-            .wait_with_output()
-            .context("Failed to wait for sendmail")?;
-        if !output.status.success() {
-            return Err(sendmail_failure(&output).into());
+        let status = child.wait().context("Failed to wait for sendmail")?;
+        if !status.success() {
+            return Err(format!("sendmail failed: {}", status).into());
         }
+    } else {
+        reap_in_background(child);
     }
     Ok(())
 }
 
-/// How sendmail failed: what it said, or else how it exited.
-fn sendmail_failure(output: &std::process::Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stderr = stderr.trim_end();
-    if stderr.is_empty() {
-        format!("sendmail failed: {}", output.status)
-    } else {
-        format!("sendmail failed: {}", stderr)
+/// Wait for `child` on a thread of its own, so it is reaped when it ends
+/// rather than left a zombie, as BSD mailx reaps the sendmail it does not
+/// wait for.
+///
+/// The thread is started with every signal blocked, and keeps them so: a
+/// signal sent to mailx must go to the thread reading commands, where an
+/// interrupt is noticed, not to this one.
+fn reap_in_background(mut child: std::process::Child) {
+    // SAFETY: the set is filled by sigfillset before use, and the mask it
+    // replaces is restored before returning.
+    unsafe {
+        let mut all: libc::sigset_t = std::mem::zeroed();
+        libc::sigfillset(&mut all);
+        let mut previous: libc::sigset_t = std::mem::zeroed();
+        libc::pthread_sigmask(libc::SIG_SETMASK, &all, &mut previous);
+        let _ = std::thread::Builder::new()
+            .name("reap-sendmail".into())
+            .spawn(move || {
+                let _ = child.wait();
+            });
+        libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
     }
 }
 

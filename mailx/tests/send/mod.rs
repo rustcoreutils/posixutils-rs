@@ -480,9 +480,64 @@ fn send_reports_sendmail_that_exits_unread() {
     assert_eq!(output.status.signal(), None, "{:?}", output);
     assert_eq!(output.status.code(), Some(1), "{:?}", output);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no such user\n"), "{}", stderr);
+    assert!(stderr.contains("sendmail failed"), "{}", stderr);
+}
+
+/// sendmail writes to mailx's own standard error, as under BSD mailx, so
+/// what it says reaches the user whether or not mailx waits for it.
+#[test]
+fn sendmail_diagnostics_reach_the_user() {
+    let (_dir, script, _) = stub_sendmail("cat >/dev/null; echo 'queued for retry' >&2");
+    let mailrc = create_temp_mailrc(&format!("set sendmail={}\n", script));
+    let output = mailx_env(
+        &["-n", "-s", "Hi", "rcpt@example.com"],
+        "body\n",
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("queued for retry"), "{:?}", output);
+}
+
+/// A sendmail with much to say is not left blocked writing it to a pipe
+/// nobody reads, and killed when mailx exits, before it has delivered.
+#[test]
+fn talkative_sendmail_still_delivers() {
+    let (_dir, script, out) =
+        stub_sendmail(r#"head -c 200000 /dev/zero >&2; cat > "$out.tmp"; mv "$out.tmp" "$out""#);
+    let mailrc = create_temp_mailrc(&format!("set sendmail={}\n", script));
+    let output = mailx_env(
+        &["-n", "-s", "Hi", "rcpt@example.com"],
+        "body line\n",
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+    );
+    assert!(output.status.success(), "{:?}", output.status);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !out.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let delivered = std::fs::read_to_string(&out).expect("the message was not delivered");
+    assert!(delivered.ends_with("\nbody line\n"), "{}", delivered);
+}
+
+/// A sendmail mailx does not wait for is still reaped when it ends, so a
+/// session that sends many messages does not fill with zombies.
+#[cfg(target_os = "linux")]
+#[test]
+fn sendmail_not_waited_for_is_reaped() {
+    let (_dir, script, _) = stub_sendmail("cat >/dev/null");
+    let mailrc = create_temp_mailrc(&format!("set sendmail={}\n", script));
+    let mbox = crate::common::copy_test_data("testdata.mbox");
+    let output = mailx_env(
+        &["-N", "-f", mbox.path().to_str().unwrap()],
+        "mail a@example.com\n~.\nmail b@example.com\n~.\n\
+         !sleep 1; ps -o stat= --ppid $PPID | grep -c Z\nexit\n",
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stderr.contains("sendmail failed: no such user"),
-        "{}",
-        stderr
+        stdout.contains("\n0\n") || stdout.starts_with("0\n"),
+        "{:?}",
+        output
     );
 }

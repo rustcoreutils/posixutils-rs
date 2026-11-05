@@ -422,3 +422,32 @@ fn ignoreeof_does_not_loop_on_piped_input() {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+/// An editor that fails is reported, and `~e` leaves the message as it was
+/// rather than taking back whatever the editor left in the file.
+#[test]
+fn failed_editor_is_reported_and_changes_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mbox = copy_test_data("testdata.mbox");
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let editor = dir.path().join("editor");
+    std::fs::write(&editor, "#!/bin/sh\necho clobbered > \"$1\"\nexit 3\n").unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mailrc = create_temp_mailrc("set debug\n");
+    let output = mailx_env(
+        &["-N", "-f", mbox.path().to_str().unwrap()],
+        "mail to@example.com\noriginal line\n~e\n~.\nquit\n",
+        &[
+            ("MAILRC", mailrc.path().to_str().unwrap()),
+            ("EDITOR", editor.to_str().unwrap()),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("exit status: 3"), "{}", stderr);
+    assert!(
+        stderr.contains("Body: 14 bytes"),
+        "the message changed: {}",
+        stderr
+    );
+}

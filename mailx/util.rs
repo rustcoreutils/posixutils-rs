@@ -114,15 +114,19 @@ pub fn shell_command(cmd: &str, vars: &Variables) -> Command {
 ///
 /// As in BSD and Heirloom mailx, the value is split into words, quotes
 /// honored (`emacs -nw` is a program and an argument), and run directly:
-/// no shell expands it.
+/// no shell expands it. An editor that does not exit successfully is an
+/// error, so its file is not taken back.
 pub fn edit(editor: &str, file: &std::path::Path) -> Result<()> {
     let words = crate::variables::split_args(editor);
     let (program, args) = words.split_first().ok_or("No editor")?;
-    Command::new(program)
+    let status = Command::new(program)
         .args(args)
         .arg(file)
         .status()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{}: {}", program, plib::diag::io_error_text(&e)))?;
+    if !status.success() {
+        return Err(format!("{}: {}", program, status).into());
+    }
     Ok(())
 }
 

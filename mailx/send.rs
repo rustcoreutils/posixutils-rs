@@ -14,6 +14,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::process::{Command, Stdio};
 
 use crate::args::Args;
+use crate::commands::Interp;
 use crate::error::{IoContext, Result};
 use crate::message::Message;
 use crate::variables::Variables;
@@ -129,7 +130,7 @@ pub(crate) fn prompt_optional_headers(msg: &mut ComposedMessage, vars: &Variable
 }
 
 /// Run send mode
-pub fn send_mode(args: &Args, vars: &mut Variables) -> Result<()> {
+pub fn send_mode(args: &Args, vars: &mut Variables, interp: &mut Interp) -> Result<()> {
     let is_tty = io::stdin().is_terminal();
 
     let mut msg = ComposedMessage::new();
@@ -160,7 +161,7 @@ pub fn send_mode(args: &Args, vars: &mut Variables) -> Result<()> {
     let stdin = io::stdin();
 
     if is_tty {
-        crate::compose::compose_body(&mut msg, None, vars)?;
+        crate::compose::compose_body(&mut msg, None, vars, interp)?;
     } else {
         // Non-interactive - just read stdin, as bytes: mail need not be UTF-8,
         // and reading it as text refused any body that was not.

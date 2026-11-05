@@ -12,8 +12,6 @@
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
-use crate::script::CondStack;
-
 /// Mailx internal variables
 #[derive(Debug)]
 pub struct Variables {
@@ -29,16 +27,6 @@ pub struct Variables {
     pub ignored_headers: Vec<String>,
     /// Retained header fields
     pub retained_headers: Vec<String>,
-    /// Last shell command (for ! expansion with bang variable)
-    pub last_shell_cmd: Option<String>,
-    /// The `if`/`else`/`endif` blocks the interpreter is inside.
-    pub cond: CondStack,
-    /// Whether mailx was invoked in Send Mode.
-    ///
-    /// This is what `if s` and `if r` in a start-up file ask about. Receive
-    /// Mode is the only mode with a command loop, so the same rule serves both
-    /// the start-up files and the interactive interpreter.
-    pub send_mode: bool,
 }
 
 impl Variables {
@@ -50,9 +38,6 @@ impl Variables {
             alternates: Vec::new(),
             ignored_headers: Vec::new(),
             retained_headers: Vec::new(),
-            last_shell_cmd: None,
-            cond: CondStack::default(),
-            send_mode: false,
         };
 
         // Set defaults per POSIX

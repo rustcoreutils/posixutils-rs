@@ -11,6 +11,7 @@
 
 use std::io;
 
+use crate::commands::Interp;
 use crate::error::{Error, Result};
 use crate::escapes::handle_escape;
 use crate::mailbox::Mailbox;
@@ -54,6 +55,7 @@ pub(crate) fn compose_body(
     composed: &mut ComposedMessage,
     mb: Option<&Mailbox>,
     vars: &mut Variables,
+    interp: &mut Interp,
 ) -> Result<()> {
     let escape_char = vars.escape_char();
     let mut interrupt_count = 0;
@@ -100,7 +102,7 @@ pub(crate) fn compose_body(
         if let Some(escape) = escape {
             // A tilde-escape error is diagnosed but does not abort the message
             // (spec 105114-105119).
-            let result = match handle_escape(&escape, composed, vars, mb) {
+            let result = match handle_escape(&escape, composed, vars, interp, mb) {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("{}", e);

@@ -13,6 +13,7 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::process::{Command, Stdio};
 
+use crate::commands::{Context, Interp};
 use crate::error::{Error, IoContext, Result};
 use crate::filename::expand_local_prefixes;
 use crate::mailbox::Mailbox;
@@ -69,6 +70,7 @@ pub fn handle_escape(
     line: &str,
     msg: &mut ComposedMessage,
     vars: &mut Variables,
+    interp: &mut Interp,
     mb: Option<&Mailbox>,
 ) -> Result<EscapeResult> {
     if line.is_empty() {
@@ -91,7 +93,7 @@ pub fn handle_escape(
             // Shell escape with bang expansion
             let cmd = if vars.get_bool("bang") {
                 // Expand ! to previous command
-                crate::util::expand_bang(args, vars.last_shell_cmd.as_deref())
+                crate::util::expand_bang(args, interp.last_shell_cmd.as_deref())
             } else {
                 args.to_string()
             };
@@ -99,7 +101,7 @@ pub fn handle_escape(
             crate::util::shell(&cmd, vars)?;
 
             // Store for future bang expansion
-            vars.last_shell_cmd = Some(cmd);
+            interp.last_shell_cmd = Some(cmd);
 
             println!("!");
             Ok(EscapeResult::continue_input())
@@ -113,7 +115,7 @@ pub fn handle_escape(
             // Execute mailx command
             // In input mode, only a subset of commands are valid
             if !args.is_empty() {
-                if let Err(e) = execute_input_mode_command(args, vars) {
+                if let Err(e) = execute_input_mode_command(args, vars, interp) {
                     eprintln!("{}", e);
                 }
             }
@@ -598,10 +600,9 @@ fn pipe_through_command(input: &[u8], cmd: &str, vars: &Variables) -> Result<Vec
 /// command's context mask -- this used to be a third hand-written dispatcher
 /// with its own copy of the argument parser and its own `!` handling that,
 /// unlike the other two, did no bang expansion.
-fn execute_input_mode_command(line: &str, vars: &mut Variables) -> Result<()> {
+fn execute_input_mode_command(line: &str, vars: &mut Variables, interp: &mut Interp) -> Result<()> {
     // Input mode has no message store; commands needing one are excluded by
     // their context mask, so this scratch mailbox is never read from.
     let mut scratch = Mailbox::new(String::new());
-    crate::commands::execute_in(line, &mut scratch, vars, crate::commands::Context::Input)
-        .map(|_| ())
+    crate::commands::execute_in(line, &mut scratch, vars, interp, Context::Input).map(|_| ())
 }

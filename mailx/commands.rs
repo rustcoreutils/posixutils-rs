@@ -20,6 +20,7 @@ use crate::filename::{expand_local_prefixes, expand_typed_filename};
 use crate::mailbox::Mailbox;
 use crate::message::{author_filename, Disposition, ReadState};
 use crate::msglist::{msglist_or_current, parse_message, parse_msglist};
+use crate::script::CondStack;
 use crate::send::{compose_reply, send_message, ComposedMessage};
 use crate::variables::{parse_set_arg, split_args, Variables};
 
@@ -74,7 +75,18 @@ const ANY: u8 = CMD | RC | INPUT;
 /// Legal in command mode and start-up files, but not from input mode.
 const CMD_RC: u8 = CMD | RC;
 
-type Handler = fn(&str, &mut Mailbox, &mut Variables) -> Result<CommandResult>;
+/// Interpreter state that outlives a single command line.
+#[derive(Debug, Default)]
+pub struct Interp {
+    /// The `if`/`else`/`endif` blocks being executed.
+    pub cond: CondStack,
+    /// Whether mailx is in Send Mode, which `if s` and `if r` test.
+    pub send_mode: bool,
+    /// The last `!` or `~!` command, for `bang` expansion.
+    pub last_shell_cmd: Option<String>,
+}
+
+type Handler = fn(&str, &mut Mailbox, &mut Variables, &mut Interp) -> Result<CommandResult>;
 
 /// One command: its full name, the shortest accepted abbreviation, where it is
 /// legal, and what runs it.
@@ -87,6 +99,15 @@ struct Cmd {
     /// Contexts this command may be used in.
     ctx: u8,
     run: Handler,
+}
+
+const fn cmd(name: &'static str, min: usize, ctx: u8, run: Handler) -> Cmd {
+    Cmd {
+        name,
+        min,
+        ctx,
+        run,
+    }
 }
 
 /// Every command, with the abbreviation rule POSIX states for it.
@@ -102,338 +123,82 @@ struct Cmd {
 /// `followup`, and `Followup`. Note that lowercase `copy` and `save` are
 /// *legal* there; only the capitalized forms are not.
 const COMMANDS: &[Cmd] = &[
-    Cmd {
-        name: "alias",
-        min: 1,
-        ctx: ANY,
-        run: |a, _, v| cmd_alias(a, v),
-    },
-    Cmd {
-        name: "group",
-        min: 1,
-        ctx: ANY,
-        run: |a, _, v| cmd_alias(a, v),
-    },
-    Cmd {
-        name: "alternates",
-        min: 3,
-        ctx: ANY,
-        run: |a, _, v| cmd_alternates(a, v),
-    },
-    Cmd {
-        name: "echo",
-        min: 2,
-        ctx: ANY,
-        run: |a, _, _| {
-            println!("{}", a);
-            Ok(CommandResult::Continue)
-        },
-    },
-    Cmd {
-        name: "set",
-        min: 2,
-        ctx: ANY,
-        run: |a, _, v| cmd_set(a, v),
-    },
-    Cmd {
-        name: "unset",
-        min: 3,
-        ctx: ANY,
-        run: |a, _, v| cmd_unset(a, v),
-    },
-    Cmd {
-        name: "cd",
-        min: 2,
-        ctx: CMD_RC,
-        run: |a, _, _| cmd_cd(a),
-    },
-    Cmd {
-        name: "chdir",
-        min: 2,
-        ctx: CMD_RC,
-        run: |a, _, _| cmd_cd(a),
-    },
-    Cmd {
-        name: "copy",
-        min: 1,
-        ctx: CMD_RC,
-        run: |a, m, v| cmd_copy(a, m, v, false),
-    },
-    Cmd {
-        name: "Copy",
-        min: 1,
-        ctx: CMD,
-        run: |a, m, v| cmd_copy_author(a, m, v, false),
-    },
-    Cmd {
-        name: "delete",
-        min: 1,
-        ctx: CMD_RC,
-        run: cmd_delete,
-    },
-    Cmd {
-        name: "discard",
-        min: 2,
-        ctx: CMD_RC,
-        run: |a, _, v| cmd_discard(a, v),
-    },
-    Cmd {
-        name: "ignore",
-        min: 2,
-        ctx: CMD_RC,
-        run: |a, _, v| cmd_discard(a, v),
-    },
-    Cmd {
-        name: "dp",
-        min: 2,
-        ctx: CMD_RC,
-        run: cmd_dp,
-    },
-    Cmd {
-        name: "dt",
-        min: 2,
-        ctx: CMD_RC,
-        run: cmd_dp,
-    },
-    Cmd {
-        name: "edit",
-        min: 1,
-        ctx: CMD,
-        run: cmd_edit,
-    },
-    Cmd {
-        name: "exit",
-        min: 2,
-        ctx: CMD_RC,
-        run: |_, _, _| Ok(CommandResult::Exit),
-    },
-    Cmd {
-        name: "xit",
-        min: 1,
-        ctx: CMD_RC,
-        run: |_, _, _| Ok(CommandResult::Exit),
-    },
-    Cmd {
-        name: "file",
-        min: 2,
-        ctx: CMD_RC,
-        run: cmd_file,
-    },
-    Cmd {
-        name: "folder",
-        min: 4,
-        ctx: CMD_RC,
-        run: cmd_file,
-    },
-    Cmd {
-        name: "folders",
-        min: 7,
-        ctx: CMD_RC,
-        run: |_, _, v| cmd_folders(v),
-    },
-    Cmd {
-        name: "followup",
-        min: 2,
-        ctx: CMD,
-        run: |a, m, v| cmd_followup(a, m, v, false),
-    },
-    Cmd {
-        name: "Followup",
-        min: 2,
-        ctx: CMD,
-        run: |a, m, v| cmd_followup(a, m, v, true),
-    },
-    Cmd {
-        name: "from",
-        min: 1,
-        ctx: CMD_RC,
-        run: cmd_from,
-    },
-    Cmd {
-        name: "headers",
-        min: 1,
-        ctx: CMD_RC,
-        run: cmd_headers,
-    },
-    Cmd {
-        name: "help",
-        min: 3,
-        ctx: CMD_RC,
-        run: |_, _, _| cmd_help(),
-    },
-    Cmd {
-        name: "hold",
-        min: 2,
-        ctx: CMD,
-        run: cmd_hold,
-    },
-    Cmd {
-        name: "preserve",
-        min: 3,
-        ctx: CMD,
-        run: cmd_hold,
-    },
-    Cmd {
-        name: "list",
-        min: 1,
-        ctx: CMD_RC,
-        run: |_, _, _| cmd_list(),
-    },
-    Cmd {
-        name: "mail",
-        min: 1,
-        ctx: CMD,
-        run: cmd_mail,
-    },
-    Cmd {
-        name: "mbox",
-        min: 2,
-        ctx: CMD_RC,
-        run: cmd_mbox,
-    },
-    Cmd {
-        name: "next",
-        min: 1,
-        ctx: CMD_RC,
-        run: cmd_next,
-    },
-    Cmd {
-        name: "pipe",
-        min: 2,
-        ctx: CMD_RC,
-        run: cmd_pipe,
-    },
-    Cmd {
-        name: "print",
-        min: 1,
-        ctx: CMD_RC,
-        run: |a, m, v| cmd_print(a, m, v, false),
-    },
-    Cmd {
-        name: "Print",
-        min: 1,
-        ctx: CMD_RC,
-        run: |a, m, v| cmd_print(a, m, v, true),
-    },
-    Cmd {
-        name: "type",
-        min: 1,
-        ctx: CMD_RC,
-        run: |a, m, v| cmd_print(a, m, v, false),
-    },
-    Cmd {
-        name: "Type",
-        min: 1,
-        ctx: CMD_RC,
-        run: |a, m, v| cmd_print(a, m, v, true),
-    },
-    Cmd {
-        name: "quit",
-        min: 1,
-        ctx: CMD_RC,
-        run: |_, _, _| Ok(CommandResult::Quit),
-    },
-    Cmd {
-        name: "reply",
-        min: 1,
-        ctx: CMD,
-        run: |a, m, v| cmd_reply_flipr(a, m, v, true),
-    },
-    Cmd {
-        name: "respond",
-        min: 3,
-        ctx: CMD,
-        run: |a, m, v| cmd_reply_flipr(a, m, v, true),
-    },
-    Cmd {
-        name: "Reply",
-        min: 1,
-        ctx: CMD,
-        run: |a, m, v| cmd_reply_flipr(a, m, v, false),
-    },
-    Cmd {
-        name: "Respond",
-        min: 3,
-        ctx: CMD,
-        run: |a, m, v| cmd_reply_flipr(a, m, v, false),
-    },
-    Cmd {
-        name: "retain",
-        min: 3,
-        ctx: CMD_RC,
-        run: |a, _, v| cmd_retain(a, v),
-    },
-    Cmd {
-        name: "save",
-        min: 1,
-        ctx: CMD_RC,
-        run: |a, m, v| cmd_save(a, m, v, true),
-    },
-    Cmd {
-        name: "Save",
-        min: 1,
-        ctx: CMD,
-        run: |a, m, v| cmd_copy_author(a, m, v, true),
-    },
-    Cmd {
-        name: "shell",
-        min: 2,
-        ctx: CMD,
-        run: |_, _, v| cmd_shell_interactive(v),
-    },
-    Cmd {
-        name: "size",
-        min: 2,
-        ctx: CMD_RC,
-        run: cmd_size,
-    },
-    Cmd {
-        name: "source",
-        min: 2,
-        ctx: CMD_RC,
-        run: cmd_source,
-    },
-    Cmd {
-        name: "top",
-        min: 2,
-        ctx: CMD_RC,
-        run: cmd_top,
-    },
-    Cmd {
-        name: "touch",
-        min: 3,
-        ctx: CMD_RC,
-        run: cmd_touch,
-    },
-    Cmd {
-        name: "unalias",
-        min: 3,
-        ctx: CMD_RC,
-        run: |a, _, v| cmd_unalias(a, v),
-    },
-    Cmd {
-        name: "undelete",
-        min: 1,
-        ctx: CMD_RC,
-        run: cmd_undelete,
-    },
-    Cmd {
-        name: "visual",
-        min: 1,
-        ctx: CMD,
-        run: cmd_visual,
-    },
-    Cmd {
-        name: "write",
-        min: 1,
-        ctx: CMD_RC,
-        run: cmd_write,
-    },
+    cmd("alias", 1, ANY, |a, _, v, _| cmd_alias(a, v)),
+    cmd("group", 1, ANY, |a, _, v, _| cmd_alias(a, v)),
+    cmd("alternates", 3, ANY, |a, _, v, _| cmd_alternates(a, v)),
+    cmd("echo", 2, ANY, |a, _, _, _| {
+        println!("{}", a);
+        Ok(CommandResult::Continue)
+    }),
+    cmd("set", 2, ANY, |a, _, v, _| cmd_set(a, v)),
+    cmd("unset", 3, ANY, |a, _, v, _| cmd_unset(a, v)),
+    cmd("cd", 2, CMD_RC, |a, _, _, _| cmd_cd(a)),
+    cmd("chdir", 2, CMD_RC, |a, _, _, _| cmd_cd(a)),
+    cmd("copy", 1, CMD_RC, |a, m, v, _| cmd_copy(a, m, v, false)),
+    cmd("Copy", 1, CMD, |a, m, v, _| cmd_copy_author(a, m, v, false)),
+    cmd("delete", 1, CMD_RC, |a, m, v, _| cmd_delete(a, m, v)),
+    cmd("discard", 2, CMD_RC, |a, _, v, _| cmd_discard(a, v)),
+    cmd("ignore", 2, CMD_RC, |a, _, v, _| cmd_discard(a, v)),
+    cmd("dp", 2, CMD_RC, |a, m, v, _| cmd_dp(a, m, v)),
+    cmd("dt", 2, CMD_RC, |a, m, v, _| cmd_dp(a, m, v)),
+    cmd("edit", 1, CMD, |a, m, v, _| cmd_edit(a, m, v)),
+    cmd("exit", 2, CMD_RC, |_, _, _, _| Ok(CommandResult::Exit)),
+    cmd("xit", 1, CMD_RC, |_, _, _, _| Ok(CommandResult::Exit)),
+    cmd("file", 2, CMD_RC, |a, m, v, _| cmd_file(a, m, v)),
+    cmd("folder", 4, CMD_RC, |a, m, v, _| cmd_file(a, m, v)),
+    cmd("folders", 7, CMD_RC, |_, _, v, _| cmd_folders(v)),
+    cmd("followup", 2, CMD, |a, m, v, i| {
+        cmd_followup(a, m, v, i, false)
+    }),
+    cmd("Followup", 2, CMD, |a, m, v, i| {
+        cmd_followup(a, m, v, i, true)
+    }),
+    cmd("from", 1, CMD_RC, |a, m, v, _| cmd_from(a, m, v)),
+    cmd("headers", 1, CMD_RC, |a, m, v, _| cmd_headers(a, m, v)),
+    cmd("help", 3, CMD_RC, |_, _, _, _| cmd_help()),
+    cmd("hold", 2, CMD, |a, m, v, _| cmd_hold(a, m, v)),
+    cmd("preserve", 3, CMD, |a, m, v, _| cmd_hold(a, m, v)),
+    cmd("list", 1, CMD_RC, |_, _, _, _| cmd_list()),
+    cmd("mail", 1, CMD, cmd_mail),
+    cmd("mbox", 2, CMD_RC, |a, m, v, _| cmd_mbox(a, m, v)),
+    cmd("next", 1, CMD_RC, |a, m, v, _| cmd_next(a, m, v)),
+    cmd("pipe", 2, CMD_RC, |a, m, v, _| cmd_pipe(a, m, v)),
+    cmd("print", 1, CMD_RC, |a, m, v, _| cmd_print(a, m, v, false)),
+    cmd("Print", 1, CMD_RC, |a, m, v, _| cmd_print(a, m, v, true)),
+    cmd("type", 1, CMD_RC, |a, m, v, _| cmd_print(a, m, v, false)),
+    cmd("Type", 1, CMD_RC, |a, m, v, _| cmd_print(a, m, v, true)),
+    cmd("quit", 1, CMD_RC, |_, _, _, _| Ok(CommandResult::Quit)),
+    cmd("reply", 1, CMD, |a, m, v, i| {
+        cmd_reply_flipr(a, m, v, i, true)
+    }),
+    cmd("respond", 3, CMD, |a, m, v, i| {
+        cmd_reply_flipr(a, m, v, i, true)
+    }),
+    cmd("Reply", 1, CMD, |a, m, v, i| {
+        cmd_reply_flipr(a, m, v, i, false)
+    }),
+    cmd("Respond", 3, CMD, |a, m, v, i| {
+        cmd_reply_flipr(a, m, v, i, false)
+    }),
+    cmd("retain", 3, CMD_RC, |a, _, v, _| cmd_retain(a, v)),
+    cmd("save", 1, CMD_RC, |a, m, v, _| cmd_save(a, m, v, true)),
+    cmd("Save", 1, CMD, |a, m, v, _| cmd_copy_author(a, m, v, true)),
+    cmd("shell", 2, CMD, |_, _, v, _| cmd_shell_interactive(v)),
+    cmd("size", 2, CMD_RC, |a, m, v, _| cmd_size(a, m, v)),
+    cmd("source", 2, CMD_RC, cmd_source),
+    cmd("top", 2, CMD_RC, |a, m, v, _| cmd_top(a, m, v)),
+    cmd("touch", 3, CMD_RC, |a, m, v, _| cmd_touch(a, m, v)),
+    cmd("unalias", 3, CMD_RC, |a, _, v, _| cmd_unalias(a, v)),
+    cmd("undelete", 1, CMD_RC, |a, m, v, _| cmd_undelete(a, m, v)),
+    cmd("visual", 1, CMD, |a, m, v, _| cmd_visual(a, m, v)),
+    cmd("write", 1, CMD_RC, |a, m, v, _| cmd_write(a, m, v)),
 ];
 
 /// Commands spelled with punctuation rather than a name.
-const PUNCTUATION: &[(&str, u8, Handler)] =
-    &[("?", CMD_RC, |_, _, _| cmd_help()), ("|", CMD_RC, cmd_pipe)];
+const PUNCTUATION: &[Cmd] = &[
+    cmd("?", 1, CMD_RC, |_, _, _, _| cmd_help()),
+    cmd("|", 1, CMD_RC, |a, m, v, _| cmd_pipe(a, m, v)),
+];
 
 /// Find the command `word` names, if any.
 ///
@@ -456,10 +221,11 @@ fn cmd_reply_flipr(
     args: &str,
     mb: &mut Mailbox,
     vars: &mut Variables,
+    interp: &mut Interp,
     lowercase_form: bool,
 ) -> Result<CommandResult> {
     let reply_to_all = lowercase_form != vars.get_bool("flipr");
-    cmd_reply(args, mb, vars, reply_to_all)
+    cmd_reply(args, mb, vars, interp, reply_to_all)
 }
 
 /// Execute a command in Receive Mode
@@ -467,8 +233,9 @@ pub fn execute_command(
     line: &str,
     mb: &mut Mailbox,
     vars: &mut Variables,
+    interp: &mut Interp,
 ) -> Result<CommandResult> {
-    execute_in(line, mb, vars, Context::Command)
+    execute_in(line, mb, vars, interp, Context::Command)
 }
 
 /// Execute one command line in `ctx`.
@@ -481,6 +248,7 @@ pub fn execute_in(
     line: &str,
     mb: &mut Mailbox,
     vars: &mut Variables,
+    interp: &mut Interp,
     ctx: Context,
 ) -> Result<CommandResult> {
     let line = line.trim();
@@ -494,10 +262,10 @@ pub fn execute_in(
     // Conditionals are handled before the context check, so an `if` guarding a
     // command that is illegal here still suppresses it rather than diagnosing
     // it.
-    if let Some(result) = crate::script::conditional(cmd, args, vars) {
+    if let Some(result) = crate::script::conditional(cmd, args, interp) {
         return result.map(|_| CommandResult::Continue);
     }
-    if !vars.cond.active() {
+    if !interp.cond.active() {
         return Ok(CommandResult::Continue);
     }
 
@@ -506,7 +274,7 @@ pub fn execute_in(
         if ctx == Context::Startup {
             return Err("!: command not valid in a start-up file".into());
         }
-        return cmd_shell(rest, vars);
+        return cmd_shell(rest, vars, interp);
     }
 
     // Current message number.
@@ -515,11 +283,11 @@ pub fn execute_in(
         return Ok(CommandResult::Continue);
     }
 
-    if let Some((_, bits, run)) = PUNCTUATION.iter().find(|(name, _, _)| *name == cmd) {
-        if bits & ctx.bit() == 0 {
+    if let Some(punct) = PUNCTUATION.iter().find(|c| c.name == cmd) {
+        if punct.ctx & ctx.bit() == 0 {
             return Err(format!("{}: {}", cmd, ctx.where_invalid()).into());
         }
-        return run(args, mb, vars);
+        return (punct.run)(args, mb, vars, interp);
     }
 
     // Scrolling: `z`, `z+`, `z-`.
@@ -533,7 +301,7 @@ pub fn execute_in(
     }
 
     if let Some(found) = lookup(cmd, ctx) {
-        return (found?.run)(args, mb, vars);
+        return (found?.run)(args, mb, vars, interp);
     }
 
     // A bare message number selects and prints that message.
@@ -876,6 +644,7 @@ fn cmd_followup(
     args: &str,
     mb: &mut Mailbox,
     vars: &mut Variables,
+    interp: &mut Interp,
     reply_to_all: bool,
 ) -> Result<CommandResult> {
     let msg_num = if args.is_empty() {
@@ -892,7 +661,7 @@ fn cmd_followup(
     let record_file = expand_local_prefixes(&record_file, vars);
 
     // Enter input mode
-    compose_body(&mut composed, Some(mb), vars)?;
+    compose_body(&mut composed, Some(mb), vars, interp)?;
 
     // Send and record
     send_message(&composed, vars, false)?;
@@ -940,7 +709,7 @@ fn cmd_headers(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Com
 /// `Print`, `Type`, `Reply`, and `Followup`, none of which could run.
 fn command_names() -> Vec<&'static str> {
     let mut names: Vec<&'static str> = COMMANDS.iter().map(|c| c.name).collect();
-    names.extend(PUNCTUATION.iter().map(|(n, _, _)| *n));
+    names.extend(PUNCTUATION.iter().map(|c| c.name));
     names.push("z");
     names
 }
@@ -976,7 +745,12 @@ fn cmd_list() -> Result<CommandResult> {
     Ok(CommandResult::Continue)
 }
 
-fn cmd_mail(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult> {
+fn cmd_mail(
+    args: &str,
+    mb: &mut Mailbox,
+    vars: &mut Variables,
+    interp: &mut Interp,
+) -> Result<CommandResult> {
     let mut composed = ComposedMessage::new();
 
     for addr in args.split_whitespace() {
@@ -998,7 +772,7 @@ fn cmd_mail(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
         crate::send::prompt_optional_headers(&mut composed, vars)?;
     }
 
-    compose_body(&mut composed, Some(mb), vars)?;
+    compose_body(&mut composed, Some(mb), vars, interp)?;
     send_message(&composed, vars, false)?;
 
     Ok(CommandResult::Continue)
@@ -1148,6 +922,7 @@ fn cmd_reply(
     args: &str,
     mb: &mut Mailbox,
     vars: &mut Variables,
+    interp: &mut Interp,
     reply_to_all: bool,
 ) -> Result<CommandResult> {
     let msg_nums = msglist_or_current(args, mb, vars)?;
@@ -1156,7 +931,7 @@ fn cmd_reply(
         let original = mb.get(num).ok_or("No message")?;
         let mut composed = compose_reply(original, reply_to_all, vars);
 
-        compose_body(&mut composed, Some(mb), vars)?;
+        compose_body(&mut composed, Some(mb), vars, interp)?;
         send_message(&composed, vars, false)?;
     }
 
@@ -1280,18 +1055,16 @@ const BOOLEAN_VARIABLES: &[&str] = &[
     "verbose",
 ];
 
-fn cmd_shell(cmd: &str, vars: &mut Variables) -> Result<CommandResult> {
-    // Expand ! to previous command if bang is set
+fn cmd_shell(cmd: &str, vars: &mut Variables, interp: &mut Interp) -> Result<CommandResult> {
     let cmd = if vars.get_bool("bang") {
-        crate::util::expand_bang(cmd, vars.last_shell_cmd.as_deref())
+        crate::util::expand_bang(cmd, interp.last_shell_cmd.as_deref())
     } else {
         cmd.to_string()
     };
 
     crate::util::shell(&cmd, vars)?;
 
-    // Save as last command
-    vars.last_shell_cmd = Some(cmd);
+    interp.last_shell_cmd = Some(cmd);
 
     println!("!");
     Ok(CommandResult::Continue)
@@ -1321,10 +1094,15 @@ fn cmd_size(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
 /// `if`/`else`/`endif` work. `source` used to call the start-up dispatcher
 /// directly, which recognized those words and did nothing with them -- a
 /// conditional in a sourced file was silently ignored.
-fn cmd_source(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult> {
+fn cmd_source(
+    args: &str,
+    mb: &mut Mailbox,
+    vars: &mut Variables,
+    interp: &mut Interp,
+) -> Result<CommandResult> {
     let path = expand_typed_filename(args.trim(), vars);
     let content = fs::read_to_string(&path).context(&path)?;
-    crate::script::run_script(&content, &path, mb, vars);
+    crate::script::run_script(&content, &path, mb, vars, interp);
     Ok(CommandResult::Continue)
 }
 
@@ -1498,3 +1276,31 @@ fn cmd_scroll(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comm
 }
 
 // ============ Helper functions ============
+
+#[cfg(test)]
+mod tests {
+    use super::COMMANDS;
+
+    /// `lookup` takes the first command that accepts a word, so no word may
+    /// be accepted by two of them: the table order must not matter.
+    #[test]
+    fn no_word_names_two_commands() {
+        for (i, a) in COMMANDS.iter().enumerate() {
+            for b in &COMMANDS[i + 1..] {
+                let common = a
+                    .name
+                    .bytes()
+                    .zip(b.name.bytes())
+                    .take_while(|(x, y)| x == y)
+                    .count();
+                assert!(
+                    common < a.min.max(b.min),
+                    "`{}` and `{}` both accept `{}`",
+                    a.name,
+                    b.name,
+                    &a.name[..common]
+                );
+            }
+        }
+    }
+}

@@ -9,7 +9,7 @@
 
 //! Command scripts: start-up files, `source`, and `if`/`else`/`endif`.
 
-use crate::commands::{execute_in, Context};
+use crate::commands::{execute_in, Context, Interp};
 use crate::error::Result;
 use crate::mailbox::Mailbox;
 use crate::variables::Variables;
@@ -66,23 +66,23 @@ impl CondStack {
 ///
 /// `if s` holds while mailx is in Send Mode, `if r` in Receive Mode; the
 /// command loop is Receive Mode by definition.
-pub fn conditional(cmd: &str, args: &str, vars: &mut Variables) -> Option<Result<()>> {
+pub fn conditional(cmd: &str, args: &str, interp: &mut Interp) -> Option<Result<()>> {
     let is = |name: &str, min: usize| {
         cmd.len() >= min && name.len() >= cmd.len() && name.starts_with(cmd)
     };
 
     if is("if", 1) {
         let runs = match args.trim() {
-            "r" => !vars.send_mode,
-            "s" => vars.send_mode,
+            "r" => !interp.send_mode,
+            "s" => interp.send_mode,
             _ => false,
         };
-        vars.cond.push_if(runs);
+        interp.cond.push_if(runs);
         Some(Ok(()))
     } else if is("else", 2) {
-        Some(vars.cond.enter_else())
+        Some(interp.cond.enter_else())
     } else if is("endif", 2) {
-        Some(vars.cond.endif())
+        Some(interp.cond.endif())
     } else {
         None
     }
@@ -93,15 +93,21 @@ pub fn conditional(cmd: &str, args: &str, vars: &mut Variables) -> Option<Result
 /// Errors are reported and the script continues. An unterminated `if` is
 /// diagnosed at the end and its blocks closed, so a malformed file cannot
 /// leave the rest of the session suppressed.
-pub fn run_script(content: &str, path: &str, mb: &mut Mailbox, vars: &mut Variables) {
-    let depth = vars.cond.open.len();
+pub fn run_script(
+    content: &str,
+    path: &str,
+    mb: &mut Mailbox,
+    vars: &mut Variables,
+    interp: &mut Interp,
+) {
+    let depth = interp.cond.open.len();
     for line in content.lines() {
-        if let Err(e) = execute_in(line, mb, vars, Context::Startup) {
+        if let Err(e) = execute_in(line, mb, vars, interp, Context::Startup) {
             eprintln!("mailx: {}: {}", path, e);
         }
     }
-    if vars.cond.open.len() > depth {
+    if interp.cond.open.len() > depth {
         eprintln!("mailx: {}: missing endif", path);
-        vars.cond.open.truncate(depth);
+        interp.cond.open.truncate(depth);
     }
 }

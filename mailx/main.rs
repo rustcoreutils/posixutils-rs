@@ -32,7 +32,7 @@ use std::process;
 use gettextrs::gettext;
 
 use args::{Args, Mode};
-use commands::execute_command;
+use commands::{execute_command, Interp};
 use mailbox::Mailbox;
 use send::send_mode;
 use variables::Variables;
@@ -74,10 +74,14 @@ fn run_send_mode(args: &Args) -> i32 {
     let mut vars = Variables::new();
     init_variables(&mut vars, args);
 
+    let mut interp = Interp {
+        send_mode: true,
+        ..Interp::default()
+    };
     // -n suppresses only the system start-up file; the user MAILRC is always read.
-    load_startup_files(&mut vars, RcMode::Send, args.no_init);
+    load_startup_files(&mut vars, &mut interp, args.no_init);
 
-    if let Err(e) = send_mode(args, &mut vars) {
+    if let Err(e) = send_mode(args, &mut vars, &mut interp) {
         eprintln!("mailx: {}", e);
         return 1;
     }
@@ -97,8 +101,9 @@ fn run_headers_only(args: &Args) -> i32 {
     let mut vars = Variables::new();
     init_variables(&mut vars, args);
 
+    let mut interp = Interp::default();
     // -n suppresses only the system start-up file; the user MAILRC is always read.
-    load_startup_files(&mut vars, RcMode::Receive, args.no_init);
+    load_startup_files(&mut vars, &mut interp, args.no_init);
 
     let mailbox_path = args.file.clone().unwrap_or_else(get_system_mailbox);
     let mb = match Mailbox::load(&mailbox_path) {
@@ -122,8 +127,9 @@ fn run_receive_mode(args: &Args) -> i32 {
     let mut vars = Variables::new();
     init_variables(&mut vars, args);
 
+    let mut interp = Interp::default();
     // -n suppresses only the system start-up file; the user MAILRC is always read.
-    load_startup_files(&mut vars, RcMode::Receive, args.no_init);
+    load_startup_files(&mut vars, &mut interp, args.no_init);
 
     let mailbox_path = if args.read_mbox {
         args.file.clone().unwrap_or_else(|| util::mbox_path(&vars))
@@ -207,7 +213,7 @@ fn run_receive_mode(args: &Args) -> i32 {
         }
 
         // Execute command
-        match execute_command(line, &mut mb, &mut vars) {
+        match execute_command(line, &mut mb, &mut vars, &mut interp) {
             Ok(commands::CommandResult::Continue) => {}
             Ok(commands::CommandResult::Quit) => {
                 return quit_mailbox(&mut mb, &vars);
@@ -268,14 +274,14 @@ const SYSTEM_MAILRC_PATHS: &[&str] = &[
     "/usr/lib/mailx/mailx.rc",
 ];
 
-fn load_startup_files(vars: &mut Variables, mode: RcMode, no_init: bool) {
+fn load_startup_files(vars: &mut Variables, interp: &mut Interp, no_init: bool) {
     // Load system startup file first (POSIX requirement), unless -n was given.
     // Per the Start-Up steps, -n attaches only to the system start-up file;
     // the user's MAILRC is always processed.
     if !no_init {
         for path in SYSTEM_MAILRC_PATHS {
             if let Ok(content) = std::fs::read_to_string(path) {
-                load_rc_content(&content, path, vars, mode);
+                load_rc_content(&content, path, vars, interp);
                 break; // Only load the first one found
             }
         }
@@ -288,25 +294,15 @@ fn load_startup_files(vars: &mut Variables, mode: RcMode, no_init: bool) {
     });
 
     if let Ok(content) = std::fs::read_to_string(&mailrc) {
-        load_rc_content(&content, &mailrc, vars, mode);
+        load_rc_content(&content, &mailrc, vars, interp);
     }
 }
 
-/// Mode for conditional execution in startup files
-#[derive(Clone, Copy, PartialEq)]
-enum RcMode {
-    Send,
-    Receive,
-}
-
-fn load_rc_content(content: &str, path: &str, vars: &mut Variables, mode: RcMode) {
-    // `if s` / `if r` ask which mode mailx is running in; the interpreter reads
-    // it from here rather than from a parameter only this path could supply.
-    vars.send_mode = mode == RcMode::Send;
+fn load_rc_content(content: &str, path: &str, vars: &mut Variables, interp: &mut Interp) {
     // Start-up files have no message store. Commands that need one are excluded
     // by their context mask, so this scratch mailbox is never read from.
     let mut scratch = Mailbox::new(String::new());
-    script::run_script(content, path, &mut scratch, vars);
+    script::run_script(content, path, &mut scratch, vars, interp);
 }
 
 fn get_system_mailbox() -> String {

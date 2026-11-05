@@ -497,10 +497,12 @@ fn inc_and_autoinc_take_in_new_mail() {
     assert!(stdout.contains("late@example.com"), "{}", stdout);
 }
 
-/// Bytes that reached the mailbox mid-message -- not at a `From ` line --
-/// are not taken in by `inc`, and quit copies them back untouched.
+/// Text that is not a message, past what was read, does not keep `inc`
+/// from the mail after it: as BSD mailx's setptr() does, it is passed over,
+/// as text before the first message is when a mailbox is read, and the
+/// messages after it are taken in.
 #[test]
-fn inc_leaves_bytes_off_a_message_boundary_for_quit() {
+fn inc_passes_over_text_before_new_mail() {
     let extra = create_temp_mbox(
         "rest of a half-written message\n\nFrom late@example.com Fri Nov 29 15:00:00 2024\nSubject: late\n\nlate body\n\n",
     );
@@ -509,16 +511,17 @@ fn inc_leaves_bytes_off_a_message_boundary_for_quit() {
     let output = mailx(
         &["-n", "-N", "-f", path],
         format!(
-            "!cat {} >> {}\ninc\ndelete 1\nquit\n",
+            "!cat {} >> {}\ninc\nfrom $\ndelete 1\nquit\n",
             extra.path().display(),
             path
         ),
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("No new mail.\n"), "{}", stdout);
+    assert!(!stdout.contains("No new mail."), "{}", stdout);
+    assert!(stdout.contains("late@example.com"), "{}", stdout);
     let after = std::fs::read_to_string(mbox.path()).unwrap();
     assert!(
-        after.contains("rest of a half-written message\n"),
+        !after.contains("rest of a half-written message"),
         "{}",
         after
     );

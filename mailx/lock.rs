@@ -13,6 +13,8 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::unix::io::AsRawFd;
 
+use crate::signals::{SignalsHeld, LOCK_SIGNALS};
+
 /// Take a blocking lock on `file`, exclusive or shared.
 ///
 /// Mailbox files are shared with the local delivery agent, so every write path
@@ -81,8 +83,12 @@ fn interrupted_or(e: io::Error) -> io::Error {
 /// locks. Creating it needs write access to the mailbox's directory; where
 /// that is lacking, as in a spool directory writable only by group mail, the
 /// dotlock is skipped and the kernel locks stand alone.
+///
+/// The signals whose default action would end mailx with the lock file left
+/// behind are held for as long as it exists, and act once it is removed.
 pub(crate) struct DotLock {
     path: String,
+    _held: SignalsHeld,
 }
 
 impl Drop for DotLock {
@@ -102,33 +108,40 @@ const DOTLOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(100)
 ///
 /// Returns `None` when the lock file cannot be created at all, or when a
 /// stale one cannot be removed: either way the kernel locks stand alone.
-/// An interrupt gives up the wait with `ErrorKind::Interrupted`.
+/// An interrupt gives up the wait with `ErrorKind::Interrupted`; while
+/// signals are held, as they are through `quit`, none arrives.
 fn dotlock(path: &str) -> io::Result<Option<DotLock>> {
     let lock_path = format!("{}.lock", path);
     loop {
+        // Held from before the file exists, so it is never left behind.
+        let held = SignalsHeld::new(&LOCK_SIGNALS);
         match crate::util::private_open()
             .write(true)
             .create_new(true)
             .open(&lock_path)
         {
-            Ok(_) => return Ok(Some(DotLock { path: lock_path })),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                let stale = fs::metadata(&lock_path)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.elapsed().ok())
-                    .is_some_and(|age| age > STALE_DOTLOCK);
-                if stale {
-                    if fs::remove_file(&lock_path).is_err() {
-                        return Ok(None);
-                    }
-                } else if crate::signals::take_sigint() {
-                    return Err(io::ErrorKind::Interrupted.into());
-                } else {
-                    std::thread::sleep(DOTLOCK_RETRY);
-                }
+            Ok(_) => {
+                return Ok(Some(DotLock {
+                    path: lock_path,
+                    _held: held,
+                }))
             }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => drop(held),
             Err(_) => return Ok(None),
+        }
+        let stale = fs::metadata(&lock_path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > STALE_DOTLOCK);
+        if stale {
+            if fs::remove_file(&lock_path).is_err() {
+                return Ok(None);
+            }
+        } else if crate::signals::take_sigint() {
+            return Err(io::ErrorKind::Interrupted.into());
+        } else {
+            std::thread::sleep(DOTLOCK_RETRY);
         }
     }
 }
@@ -305,5 +318,32 @@ mod tests {
             Err(io::ErrorKind::Interrupted)
         );
         assert!(!crate::signals::take_sigint(), "interrupt left pending");
+    }
+
+    /// A signal whose default action would end mailx is held while it owns
+    /// a dotlock, and acts only once the lock file is gone.
+    #[test]
+    fn signals_wait_for_a_dotlock_to_go() {
+        let dir = plib::tmp::TempDir::new().unwrap();
+        let path = dir.path().join("spool");
+        let watch =
+            crate::signals::PathWatch::new(libc::SIGTSTP, &format!("{}.lock", path.display()));
+        let lock = dotlock(path.to_str().unwrap()).unwrap().expect("dotlock");
+        // SAFETY: raise sends the signal to this thread; the handler only
+        // records what it finds.
+        unsafe {
+            libc::raise(libc::SIGTSTP);
+        }
+        assert_eq!(
+            watch.seen(),
+            None,
+            "the signal acted while the lock was held"
+        );
+        drop(lock);
+        assert_eq!(
+            watch.seen(),
+            Some(false),
+            "the signal did not wait for the lock to go"
+        );
     }
 }

@@ -121,28 +121,30 @@ pub fn read_bytes_interruptible(buf: &mut Vec<u8>) -> io::Result<usize> {
     Ok(buf.len() - start)
 }
 
-/// Signals held off while a locked mailbox is written back, so a hangup,
-/// an interrupt or a stop cannot cut a rewrite short; any that arrive act
-/// once the guard is dropped. Traditional mailx ignores HUP, INT and QUIT for its
-/// quit; TERM and TSTP are held here too.
+/// Signals held off while the guard lives; any that arrive act once it is
+/// dropped.
 pub struct SignalsHeld {
     previous: libc::sigset_t,
 }
 
+/// What traditional mailx ignores for its quit, so that a hangup or an
+/// interrupt does not cut a writeback short, nor throw the session's work
+/// away while it waits for a lock.
+pub const QUIT_SIGNALS: [libc::c_int; 3] = [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT];
+
+/// The signals whose default action would stop or end mailx while it holds
+/// a lock, leaving others to wait on it -- and, for a dotlock, to find it
+/// still there after mailx is gone.
+pub const LOCK_SIGNALS: [libc::c_int; 3] = [libc::SIGQUIT, libc::SIGTERM, libc::SIGTSTP];
+
 impl SignalsHeld {
-    pub fn new() -> SignalsHeld {
+    pub fn new(signals: &[libc::c_int]) -> SignalsHeld {
         // SAFETY: both sets are initialized by sigemptyset or by the call
         // that fills them, and the return values are checked.
         unsafe {
             let mut set: libc::sigset_t = std::mem::zeroed();
             libc::sigemptyset(&mut set);
-            for sig in [
-                libc::SIGHUP,
-                libc::SIGINT,
-                libc::SIGQUIT,
-                libc::SIGTERM,
-                libc::SIGTSTP,
-            ] {
+            for &sig in signals {
                 libc::sigaddset(&mut set, sig);
             }
             let mut previous: libc::sigset_t = std::mem::zeroed();
@@ -165,6 +167,74 @@ impl Drop for SignalsHeld {
 /// the flag, take this so that one cannot take the other's signal.
 #[cfg(test)]
 pub(crate) static SIGINT_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// For tests: a handler for one signal that records whether a path exists
+/// when the signal is delivered, so a test can tell what a held signal
+/// would have found had it acted.
+#[cfg(test)]
+pub(crate) struct PathWatch {
+    signal: libc::c_int,
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+mod path_watch {
+    use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
+
+    /// The path looked for, a C string leaked for the life of the process.
+    pub(super) static WATCHED: AtomicPtr<libc::c_char> = AtomicPtr::new(std::ptr::null_mut());
+    /// -1 before delivery; then 1 if the path existed, 0 if not.
+    pub(super) static SEEN: AtomicI32 = AtomicI32::new(-1);
+    pub(super) static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(super) extern "C" fn record(_: libc::c_int) {
+        // SAFETY: access is async-signal-safe and WATCHED is a C string.
+        let exists = unsafe { libc::access(WATCHED.load(Ordering::SeqCst), libc::F_OK) } == 0;
+        SEEN.store(exists as i32, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+impl PathWatch {
+    pub(crate) fn new(signal: libc::c_int, path: &str) -> PathWatch {
+        use std::sync::atomic::Ordering;
+        let serial = path_watch::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let path = std::ffi::CString::new(path).unwrap();
+        path_watch::WATCHED.store(path.into_raw(), Ordering::SeqCst);
+        path_watch::SEEN.store(-1, Ordering::SeqCst);
+        // SAFETY: the handler only calls access and stores to an atomic,
+        // and the sigaction struct is fully initialized.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = path_watch::record as *const () as libc::sighandler_t;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(signal, &sa, std::ptr::null_mut());
+        }
+        PathWatch {
+            signal,
+            _serial: serial,
+        }
+    }
+
+    /// Whether the path existed when the signal was delivered; `None` if it
+    /// has not been.
+    pub(crate) fn seen(&self) -> Option<bool> {
+        match path_watch::SEEN.load(std::sync::atomic::Ordering::SeqCst) {
+            -1 => None,
+            n => Some(n == 1),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for PathWatch {
+    fn drop(&mut self) {
+        // SAFETY: restoring the default action for a signal is always valid.
+        unsafe {
+            libc::signal(self.signal, libc::SIG_DFL);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -192,7 +262,7 @@ mod tests {
         setup();
         let _ = take_sigint();
         {
-            let _held = SignalsHeld::new();
+            let _held = SignalsHeld::new(&QUIT_SIGNALS);
             unsafe {
                 libc::raise(libc::SIGINT);
             }

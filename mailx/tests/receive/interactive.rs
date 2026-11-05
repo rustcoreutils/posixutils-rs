@@ -252,9 +252,9 @@ fn inherited_ignored_hangup_stays_ignored() {
     );
 }
 
-/// While quit waits for another process's lock on the mailbox, signals are
-/// not yet held off: a termination request ends mailx, with the mailbox
-/// left as it was.
+/// While quit waits for another process's dotlock, owning no lock itself, a
+/// termination request still ends mailx -- BSD mailx's quit ignores only
+/// HUP, INT and QUIT -- with the mailbox left as it was.
 #[test]
 fn quit_waiting_for_a_lock_can_be_terminated() {
     use std::os::unix::process::ExitStatusExt;

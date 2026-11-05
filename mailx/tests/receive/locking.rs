@@ -100,6 +100,70 @@ fn mailbox_honors_fcntl_lock_of_delivery_agent() {
     );
 }
 
+/// An interrupt while `quit` waits for a delivery agent's lock does not cut
+/// the quit short, as BSD mailx ignores interrupts for its quit: the session's
+/// work is written back once the lock is free, not thrown away.
+#[cfg(target_os = "linux")]
+#[test]
+fn interrupt_during_quit_lock_wait_is_held() {
+    use std::os::unix::io::AsRawFd;
+    use std::process::{Command, Stdio};
+
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let mbox = dir.path().join("spool");
+    std::fs::write(
+        &mbox,
+        "From a@b Mon Jan  1 00:00:00 2024\nFrom: a@b\nSubject: one\n\nfirst\n\n\
+         From c@d Mon Jan  1 00:00:00 2024\nFrom: c@d\nSubject: two\n\nsecond\n\n",
+    )
+    .expect("write mbox");
+
+    let mut child = Command::new(plib::testing::get_binary_path("mailx"))
+        .args(["-n", "-N", "-f", mbox.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mailx");
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin.write_all(b"d 1\n").expect("write d");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    // Play the delivery agent once mailx has read the mailbox.
+    let agent = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&mbox)
+        .expect("open spool");
+    let set_lock = |kind: libc::c_int| {
+        // SAFETY: an all-zero flock is valid; start 0, length 0 is the whole file.
+        let mut fl: libc::flock = unsafe { std::mem::zeroed() };
+        fl.l_type = kind as libc::c_short;
+        fl.l_whence = libc::SEEK_SET as libc::c_short;
+        // SAFETY: the fd is open and `fl` outlives the call.
+        let rc = unsafe { libc::fcntl(agent.as_raw_fd(), libc::F_SETLK, &fl) };
+        assert_eq!(rc, 0, "fcntl lock: {}", std::io::Error::last_os_error());
+    };
+    set_lock(libc::F_WRLCK);
+
+    stdin.write_all(b"quit\n").expect("write quit");
+    drop(stdin);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    // SAFETY: kill takes a pid and a signal number; the child is ours.
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    set_lock(libc::F_UNLCK);
+
+    let output = child.wait_with_output().expect("wait for mailx");
+    drop(agent);
+    let after = std::fs::read_to_string(&mbox).expect("read spool");
+    assert!(output.status.success(), "quit failed: {:?}", output);
+    assert!(!after.contains("first"), "deleted message kept: {}", after);
+    assert!(after.contains("second"), "mail was lost: {}", after);
+}
+
 /// Files mailx creates to hold mail are private to the user, whatever the
 /// umask would otherwise allow.
 #[test]

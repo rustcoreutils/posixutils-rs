@@ -18,7 +18,8 @@
 //! - then the mailbox is rewritten in place, keeping its inode, through a
 //!   synced recovery file (see `recovery`), with any mail delivered during
 //!   the session copied through after the kept messages;
-//! - signals that could cut this short are held off while it runs.
+//! - signals that could cut this short are held off while it runs, lock
+//!   waits included.
 
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, Write};
@@ -27,7 +28,7 @@ use crate::error::{IoContext, Result};
 use crate::lock::{commit, lock, open_locked, open_read_locked};
 use crate::mbox::{unquote_from_line, write_messages, CountingWriter};
 use crate::message::{Disposition, Headers, Message, ReadState};
-use crate::signals::SignalsHeld;
+use crate::signals::{SignalsHeld, LOCK_SIGNALS, QUIT_SIGNALS};
 use crate::store::Store;
 use crate::variables::Variables;
 
@@ -306,6 +307,13 @@ impl Mailbox {
     /// deleted and saved ones as `hold` and `keepsave` direct, and write the
     /// rest back.
     pub fn quit(&mut self, vars: &Variables) -> Result<()> {
+        // As BSD mailx ignores HUP, INT and QUIT for its quit, they are held
+        // through all of it, lock waits included: an interrupt does not
+        // throw the session's work away. They act once this guard drops,
+        // after every lock quit took is released. A termination request
+        // ends a wait for another process's lock, but is held from the
+        // moment mailx owns one (see `DotLock` and `rewrite_mailbox`).
+        let _held = SignalsHeld::new(&QUIT_SIGNALS);
         let hold = vars.is_set("hold");
         let keepsave = vars.is_set("keepsave");
         let keep = vars.is_set("keep");
@@ -397,8 +405,8 @@ fn rewrite_mailbox(
 ) -> io::Result<&'static str> {
     let (mut file, _dotlock) = open_locked(path)?;
     // Held only once the locks are taken: waiting for another process's
-    // lock can be long, and must stay interruptible.
-    let _held = SignalsHeld::new();
+    // lock can be long, and must stay open to a termination request.
+    let _held = SignalsHeld::new(&LOCK_SIGNALS);
 
     // Bytes past the extent we parsed are mail that arrived while mailx was
     // running. They are copied through verbatim -- reparsing them would be
@@ -439,9 +447,8 @@ fn migrate_to_mbox(
     append: bool,
 ) -> io::Result<()> {
     let (mut file, _dotlock) = open_locked(path)?;
-    // Held only once the locks are taken: waiting for another process's
-    // lock can be long, and must stay interruptible.
-    let _held = SignalsHeld::new();
+    // As in `rewrite_mailbox`.
+    let _held = SignalsHeld::new(&LOCK_SIGNALS);
     if append {
         file.seek(io::SeekFrom::End(0))?;
         let mut w = io::BufWriter::new(&mut file);
@@ -551,4 +558,56 @@ pub(crate) fn append_to_file(
         file.sync_all()?;
     }
     Ok(written)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::signals::PathWatch;
+    use std::os::unix::io::AsRawFd;
+
+    /// A signal that arrives while `quit` waits for a lock is held until
+    /// the quit is done, its dotlock removed: acting earlier, a SIGTERM
+    /// would end mailx and leave the lock behind for others to wait on.
+    #[test]
+    fn signals_during_quit_wait_for_its_dotlock_to_go() {
+        use std::os::unix::thread::JoinHandleExt;
+
+        let dir = plib::tmp::TempDir::new().unwrap();
+        let path = dir.path().join("folder");
+        fs::write(
+            &path,
+            "From a@b Mon Jan  1 00:00:00 2024\nSubject: one\n\nfirst\n\n\
+             From c@d Mon Jan  1 00:00:00 2024\nSubject: two\n\nsecond\n\n",
+        )
+        .unwrap();
+        let watch = PathWatch::new(libc::SIGQUIT, &format!("{}.lock", path.display()));
+
+        let mut mb = Mailbox::load(path.to_str().unwrap()).unwrap();
+        mb.messages[0].disposition = Disposition::Deleted;
+        let holder = File::open(&path).unwrap();
+        // SAFETY: the fd is valid for the lifetime of `holder`.
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        let quitter = std::thread::spawn(move || mb.quit(&Variables::new()));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        // SAFETY: the thread is still running, waiting for the lock.
+        unsafe {
+            libc::pthread_kill(quitter.as_pthread_t(), libc::SIGQUIT);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        // SAFETY: as above. Unlocked, not closed: closing a descriptor for
+        // the file would drop the quitting thread's fcntl lock.
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_UN) }, 0);
+        let result = quitter.join().unwrap();
+        drop(holder);
+
+        assert!(result.is_ok(), "quit failed: {:?}", result.err());
+        assert_eq!(
+            watch.seen(),
+            Some(false),
+            "the signal acted while the dotlock was held"
+        );
+        assert!(!fs::read_to_string(&path).unwrap().contains("first"));
+    }
 }

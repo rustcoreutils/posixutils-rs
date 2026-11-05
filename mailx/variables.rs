@@ -275,9 +275,8 @@ pub fn parse_set_arg(arg: &str) -> (&str, Option<&str>) {
     if let Some(eq_pos) = arg.find('=') {
         let name = &arg[..eq_pos];
         let value = &arg[eq_pos + 1..];
-        // Strip one balanced pair of surrounding quotes, not every quote at
-        // each end independently: `trim_matches` mangled `x=""quoted""` and
-        // `x='a"` alike.
+        // Exactly one balanced pair of surrounding quotes is removed:
+        // `x=""quoted""` keeps its inner pair and `x='a"` is left as it is.
         let value = strip_one_quote_pair(value);
         (name, Some(value))
     } else {
@@ -368,10 +367,8 @@ fn terminfo_rows(term: &str) -> Option<u16> {
 
 /// The default screenful, given a window size and a terminal type.
 ///
-/// Split out from `screen_lines` so the rule can be asserted directly: a test
-/// with no controlling terminal cannot otherwise say what the fallback did.
-/// Window size first, then the terminfo entry for `TERM`, then 20 -- which is
-/// what this was unconditionally before.
+/// Window size first, then the terminfo entry for `TERM`, then 20. Kept apart
+/// from `screen_lines` so a test without a terminal can assert the rule.
 ///
 /// One row is held back for the command prompt, so a 24-row terminal lists 23
 /// summaries rather than scrolling the first one away as it prompts.

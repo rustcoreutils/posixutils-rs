@@ -263,8 +263,8 @@ const SENDMAIL_PATHS: [&str; 3] = [
 ///
 /// The recipients are named on sendmail's command line rather than read from
 /// the headers with `-t`: the message carries no `Bcc:` header, so under `-t`
-/// blind recipients were never delivered to, and naming them keeps a blind
-/// address out of the delivered message however the mail system is set up.
+/// blind recipients would get nothing, and naming them keeps a blind address
+/// out of the delivered message however the mail system is set up.
 /// They are bare addresses, since a display name holding a comma or a quote
 /// is not something to hand an MTA as a recipient.
 fn deliver(msg: &ComposedMessage, vars: &Variables) -> Result<()> {

@@ -20,10 +20,10 @@ use std::os::unix::io::AsRawFd;
 ///
 /// Delivery agents do not agree on one kind of lock. On Linux `flock` and
 /// `fcntl` locks are independent of each other, and the common agents --
-/// Postfix `local`, Exim, procmail, mutt -- take the `fcntl` kind, so a mailx
-/// holding only `flock` truncated and rewrote the spool while a delivery was
-/// appending to it, losing that mail. Both kinds are taken there. Elsewhere
-/// the two are one mechanism, and taking both would conflict with ourselves.
+/// Postfix `local`, Exim, procmail, mutt -- take the `fcntl` kind, so holding
+/// only `flock` would let a rewrite race a delivery and lose its mail. Both
+/// kinds are taken there. Elsewhere the two are one mechanism, and taking
+/// both would conflict with ourselves.
 pub(crate) fn lock(file: &File, exclusive: bool) -> io::Result<()> {
     let op = if exclusive {
         libc::LOCK_EX

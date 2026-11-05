@@ -378,12 +378,9 @@ fn pipe_through_command(input: &[u8], cmd: &str, vars: &Variables) -> Result<Vec
         .spawn()
         .context("Failed to execute command")?;
 
-    // Feed the body from a separate thread. Writing it all before reading the
-    // filter's output deadlocked as soon as that output exceeded one pipe
-    // buffer: the child blocked writing to a full stdout while we blocked
-    // writing to a full stdin.
-    // Held until after the join below, for the `~| head` case the match on
-    // `writer.join()` already anticipates.
+    // The body is fed from a thread: written before the output is read, it
+    // would deadlock once the output filled a pipe buffer. SIGPIPE is held
+    // off until the join, for a filter that stops reading (`~| head`).
     let _sigpipe = plib::io::SigPipeIgnored::new();
 
     let mut stdin = child.stdin.take().ok_or("Failed to open stdin")?;

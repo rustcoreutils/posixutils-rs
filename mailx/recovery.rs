@@ -44,11 +44,14 @@ fn directories() -> Vec<PathBuf> {
 /// Replace the contents of `file`, the mailbox at `path`, opened and locked
 /// for writing, with what `write` produces, through a recovery file in the
 /// first of `dirs` that can take one.
+///
+/// `write` is handed `file` as well, still holding its old contents, so the
+/// parts of them that are kept can be read straight from it.
 pub(crate) fn rewrite_in_place(
     path: &str,
     file: &mut File,
     dirs: &[PathBuf],
-    write: impl FnOnce(&mut dyn Write) -> io::Result<()>,
+    write: impl FnOnce(&File, &mut dyn Write) -> io::Result<()>,
 ) -> io::Result<()> {
     let mut recovery = create(path, dirs)?;
     // Held while the file is in use, so a report run meanwhile passes over
@@ -56,7 +59,7 @@ pub(crate) fn rewrite_in_place(
     lock(recovery.as_file(), libc::LOCK_EX)?;
     {
         let mut w = io::BufWriter::new(recovery.as_file_mut());
-        write(&mut w)?;
+        write(file, &mut w)?;
         w.flush()?;
     }
     recovery.as_file().sync_all()?;
@@ -82,7 +85,7 @@ pub(crate) fn rewrite_in_place(
 pub(crate) fn rewrite(
     path: &str,
     file: &mut File,
-    write: impl FnOnce(&mut dyn Write) -> io::Result<()>,
+    write: impl FnOnce(&File, &mut dyn Write) -> io::Result<()>,
 ) -> io::Result<()> {
     rewrite_in_place(path, file, &directories(), write)
 }
@@ -189,7 +192,7 @@ mod tests {
             .write(true)
             .open(&path)
             .unwrap();
-        rewrite_in_place(&path, &mut file, &[recover.path().into()], |w| {
+        rewrite_in_place(&path, &mut file, &[recover.path().into()], |_, w| {
             w.write_all(b"new\n")
         })
         .unwrap();
@@ -204,7 +207,7 @@ mod tests {
         let path = mailbox(dir.path(), "old contents\n");
         // Open for reading only, so truncating the mailbox fails.
         let mut file = File::open(&path).unwrap();
-        let err = rewrite_in_place(&path, &mut file, &[recover.path().into()], |w| {
+        let err = rewrite_in_place(&path, &mut file, &[recover.path().into()], |_, w| {
             w.write_all(b"new\n")
         })
         .unwrap_err();
@@ -231,9 +234,12 @@ mod tests {
             .open(&path)
             .unwrap();
         let missing = dir.path().join("no-such-dir");
-        rewrite_in_place(&path, &mut file, &[missing, recover.path().into()], |w| {
-            w.write_all(b"new\n")
-        })
+        rewrite_in_place(
+            &path,
+            &mut file,
+            &[missing, recover.path().into()],
+            |_, w| w.write_all(b"new\n"),
+        )
         .unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
     }

@@ -420,12 +420,6 @@ fn rewrite_mailbox(
     // running. They are copied through verbatim -- reparsing them would be
     // wrong, since they were never presented to the user as messages.
     let tail_len = file.metadata()?.len().saturating_sub(loaded_len);
-    let mut tail = plib::tmp::tempfile()?;
-    if tail_len > 0 {
-        file.seek(io::SeekFrom::Start(loaded_len))?;
-        io::copy(&mut (&file).take(tail_len), &mut tail)?;
-        tail.rewind()?;
-    }
 
     if messages.is_empty() && tail_len == 0 && !keep {
         // An emptied mailbox is removed unless `keep` is set, in which case it
@@ -434,9 +428,10 @@ fn rewrite_mailbox(
         return Ok("removed");
     }
 
-    crate::recovery::rewrite(path, &mut file, |w| {
+    crate::recovery::rewrite(path, &mut file, |mut old, w| {
         write_messages(w, store, messages)?;
-        io::copy(&mut tail, w)?;
+        old.seek(io::SeekFrom::Start(loaded_len))?;
+        io::copy(&mut old.take(tail_len), w)?;
         Ok(())
     })?;
     Ok("complete")
@@ -537,12 +532,9 @@ fn prepend_in_place(
     store: &Store,
     messages: &[&Message],
 ) -> io::Result<()> {
-    let mut old = plib::tmp::tempfile()?;
-    file.rewind()?;
-    io::copy(&mut file, &mut old)?;
-    old.rewind()?;
-    crate::recovery::rewrite(path, &mut file, |w| {
+    crate::recovery::rewrite(path, &mut file, |mut old, w| {
         write_messages(w, store, messages)?;
+        old.rewind()?;
         io::copy(&mut old, w)?;
         Ok(())
     })

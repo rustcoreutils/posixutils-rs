@@ -74,9 +74,9 @@ pub fn handle_escape(
         't' => address_words(args).into_iter().for_each(|a| msg.add_to(a)),
         's' => msg.subject = args.to_string(),
         'h' => prompt_headers(msg)?,
-        'd' => read_dead_letter(msg, vars),
+        'd' => read_dead_letter(msg, vars)?,
         'r' | '<' => read_into_body(msg, args, vars)?,
-        'w' => write_body(msg, args, vars),
+        'w' => write_body(msg, args, vars)?,
         'e' => edit_message(msg, vars.get_nonempty("EDITOR").unwrap_or("ed"))?,
         'v' => edit_message(msg, vars.get_nonempty("VISUAL").unwrap_or("vi"))?,
         'p' => print_draft(msg, vars),
@@ -100,7 +100,7 @@ pub fn handle_escape(
             msg.body.extend_from_slice(args.as_bytes());
             msg.body.push(b'\n');
         }
-        _ => println!("Unknown escape: ~{}", cmd_char),
+        _ => return Err(format!("Unknown escape: ~{}", cmd_char).into()),
     }
     Ok(Escape::Continue)
 }
@@ -137,14 +137,12 @@ fn insert_signature(msg: &mut ComposedMessage, vars: &Variables, name: &str) {
 }
 
 /// `~d`: append the dead-letter file.
-fn read_dead_letter(msg: &mut ComposedMessage, vars: &Variables) {
-    let dead_path = crate::util::dead_letter_path(vars);
-    if let Ok(content) = fs::read(&dead_path) {
-        msg.body.extend_from_slice(&content);
-        println!("\"{}\" {} bytes", dead_path, content.len());
-    } else {
-        println!("{}: No such file", dead_path);
-    }
+fn read_dead_letter(msg: &mut ComposedMessage, vars: &Variables) -> Result<()> {
+    let path = crate::util::dead_letter_path(vars);
+    let content = fs::read(&path).context(&path)?;
+    msg.body.extend_from_slice(&content);
+    println!("\"{}\" {} bytes", path, content.len());
+    Ok(())
 }
 
 /// `~r`/`~<`: append a file, or with a leading `!` a command's output.
@@ -156,28 +154,23 @@ fn read_into_body(msg: &mut ComposedMessage, args: &str, vars: &Variables) -> Re
         return Ok(());
     }
     let path = expand_local_prefixes(args, vars);
-    match fs::read(&path) {
-        Ok(content) => {
-            msg.body.extend_from_slice(&content);
-            println!("\"{}\" {} bytes", path, content.len());
-        }
-        Err(e) => println!("{}: {}", path, plib::diag::io_error_text(&e)),
-    }
+    let content = fs::read(&path).context(&path)?;
+    msg.body.extend_from_slice(&content);
+    println!("\"{}\" {} bytes", path, content.len());
     Ok(())
 }
 
 /// `~w`: write the body to a file, created or appended to (spec 105094-105097).
-fn write_body(msg: &ComposedMessage, args: &str, vars: &Variables) {
+fn write_body(msg: &ComposedMessage, args: &str, vars: &Variables) -> Result<()> {
     let path = expand_local_prefixes(args, vars);
-    let result = crate::util::private_open()
+    crate::util::private_open()
         .create(true)
         .append(true)
         .open(&path)
-        .and_then(|mut f| f.write_all(&msg.body));
-    match result {
-        Ok(_) => println!("\"{}\" {} bytes", path, msg.body.len()),
-        Err(e) => println!("{}: {}", path, plib::diag::io_error_text(&e)),
-    }
+        .and_then(|mut f| f.write_all(&msg.body))
+        .context(&path)?;
+    println!("\"{}\" {} bytes", path, msg.body.len());
+    Ok(())
 }
 
 /// `~p`: write the message being composed, paginated by `crt`.

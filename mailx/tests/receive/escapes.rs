@@ -349,3 +349,42 @@ fn mail_command_splits_recipients_by_address() {
         stderr
     );
 }
+
+/// An error in a command escape is diagnosed on standard error, and the
+/// message is still sent (spec CONSEQUENCES OF ERRORS).
+#[test]
+fn escape_errors_go_to_standard_error() {
+    let mbox = copy_test_data("testdata.mbox");
+    let mailrc = create_temp_mailrc("set debug\n");
+    let output = mailx_env(
+        &["-N", "-f", mbox.path().to_str().unwrap()],
+        "mail to@example.com\n~r /nonexistent/file\n~w /nonexistent/dir/out\n~j\nbody\n~.\nquit\n",
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for diagnostic in [
+        "/nonexistent/file:",
+        "/nonexistent/dir/out:",
+        "Unknown escape: ~j",
+    ] {
+        assert!(
+            stderr.contains(diagnostic),
+            "{} on stderr: {}",
+            diagnostic,
+            stderr
+        );
+        assert!(
+            !stdout.contains(diagnostic),
+            "{} on stdout: {}",
+            diagnostic,
+            stdout
+        );
+    }
+    assert!(
+        stderr.contains("Debug mode"),
+        "the message was not sent: {}",
+        stderr
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
+}

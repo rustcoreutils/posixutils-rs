@@ -51,6 +51,9 @@ pub(crate) fn rewrite_in_place(
     write: impl FnOnce(&mut dyn Write) -> io::Result<()>,
 ) -> io::Result<()> {
     let mut recovery = create(path, dirs)?;
+    // Held while the file is in use, so a report run meanwhile passes over
+    // it; released when it is closed, so one left behind can be taken.
+    lock(recovery.as_file(), libc::LOCK_EX)?;
     {
         let mut w = io::BufWriter::new(recovery.as_file_mut());
         write(&mut w)?;
@@ -114,6 +117,30 @@ fn fill(file: &mut File, contents: &mut File) -> io::Result<()> {
     file.sync_all()
 }
 
+/// `flock` `file` with `op`.
+fn lock(file: &File, op: libc::c_int) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the fd is valid for the lifetime of `file`.
+    if unsafe { libc::flock(file.as_raw_fd(), op) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Whether `path` is a recovery file of this user's that a rewrite left
+/// behind: owned by the user, and not locked by a rewrite still running.
+fn left_behind(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    // SAFETY: getuid cannot fail.
+    let mine = file
+        .metadata()
+        .is_ok_and(|m| m.uid() == unsafe { libc::getuid() });
+    mine && lock(&file, libc::LOCK_EX | libc::LOCK_NB).is_ok()
+}
+
 /// Report on standard error any recovery file a rewrite left behind.
 pub(crate) fn report_leftovers() {
     for dir in directories() {
@@ -121,7 +148,8 @@ pub(crate) fn report_leftovers() {
             continue;
         };
         for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy().starts_with(PREFIX) {
+            if entry.file_name().to_string_lossy().starts_with(PREFIX) && left_behind(&entry.path())
+            {
                 eprintln!(
                     "mailx: {}: holds the new contents of a mailbox whose rewrite was \
                      interrupted; recover them by hand",

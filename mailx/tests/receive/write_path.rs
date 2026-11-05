@@ -524,3 +524,24 @@ fn inc_leaves_bytes_off_a_message_boundary_for_quit() {
     );
     assert_eq!(after.matches("Subject: late\n").count(), 1, "{}", after);
 }
+
+/// A recovery file another mailx is still writing -- it holds the file's
+/// lock -- is not reported as left behind.
+#[test]
+fn recovery_file_in_use_is_not_reported() {
+    use std::os::fd::AsRawFd;
+
+    let mbox = copy_test_data("testdata.mbox");
+    let home = plib::tmp::TempDir::new().expect("temp dir");
+    let busy = home.path().join("mailx-recover.spool.Busy01");
+    let file = std::fs::File::create(&busy).unwrap();
+    // SAFETY: the fd is valid for the lifetime of `file`.
+    assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let output = mailx_env(
+        &["-n", "-H", "-f", mbox.path().to_str().unwrap()],
+        "",
+        &[("HOME", home.path().to_str().unwrap())],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("mailx-recover"), "{}", stderr);
+}

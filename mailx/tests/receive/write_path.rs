@@ -496,3 +496,31 @@ fn inc_and_autoinc_take_in_new_mail() {
     assert!(stdout.contains("New mail has arrived.\n"), "{}", stdout);
     assert!(stdout.contains("late@example.com"), "{}", stdout);
 }
+
+/// Bytes that reached the mailbox mid-message -- not at a `From ` line --
+/// are not taken in by `inc`, and quit copies them back untouched.
+#[test]
+fn inc_leaves_bytes_off_a_message_boundary_for_quit() {
+    let extra = create_temp_mbox(
+        "rest of a half-written message\n\nFrom late@example.com Fri Nov 29 15:00:00 2024\nSubject: late\n\nlate body\n\n",
+    );
+    let mbox = copy_test_data("testdata.mbox");
+    let path = mbox.path().to_str().unwrap();
+    let output = mailx(
+        &["-n", "-N", "-f", path],
+        format!(
+            "!cat {} >> {}\ninc\ndelete 1\nquit\n",
+            extra.path().display(),
+            path
+        ),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("No new mail.\n"), "{}", stdout);
+    let after = std::fs::read_to_string(mbox.path()).unwrap();
+    assert!(
+        after.contains("rest of a half-written message\n"),
+        "{}",
+        after
+    );
+    assert_eq!(after.matches("Subject: late\n").count(), 1, "{}", after);
+}

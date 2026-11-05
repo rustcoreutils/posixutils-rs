@@ -130,7 +130,10 @@ impl Mailbox {
     ///
     /// The new bytes are parsed into the store under the same locks as the
     /// first read, and `loaded_len` moves past them, so quit neither loses
-    /// nor duplicates them.
+    /// nor duplicates them. Bytes that do not begin at a `From ` line -- the
+    /// rest of a message caught half written, or a mailbox rewritten by
+    /// another program -- are not messages to parse; they are left where
+    /// they are, for quit to copy back untouched.
     pub fn incorporate(&mut self) -> Result<usize> {
         let (file, _dotlock) = open_read_locked(&self.path).context(&self.path)?;
         let len = file.metadata().context(&self.path)?.len();
@@ -140,7 +143,13 @@ impl Mailbox {
         let mut file = &file;
         file.seek(io::SeekFrom::Start(self.loaded_len))
             .context(&self.path)?;
-        let input = io::BufReader::new(file.take(len - self.loaded_len));
+        let mut input = io::BufReader::new(file.take(len - self.loaded_len));
+        if !io::BufRead::fill_buf(&mut input)
+            .context(&self.path)?
+            .starts_with(b"From ")
+        {
+            return Ok(0);
+        }
         let (messages, consumed) =
             crate::mbox::parse(input, &mut self.store).context(&self.path)?;
         self.loaded_len += consumed;

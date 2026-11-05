@@ -13,7 +13,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Seek, Write};
 
 use crate::error::{IoContext, Result};
-use crate::lock::{commit, lock, open_locked, read_locked};
+use crate::lock::{commit, lock, open_locked, open_read_locked};
 use crate::mbox::{unquote_from_line, write_messages, CountingWriter};
 use crate::message::{Disposition, Headers, Message, ReadState};
 use crate::store::Store;
@@ -79,16 +79,17 @@ impl Mailbox {
 
     /// Load a mailbox from a file
     pub fn load(path: &str) -> Result<Self> {
-        // Read in one go, under a shared lock, so the length recorded is
-        // exactly the extent parsed and a delivery in progress is waited for
-        // rather than half read; otherwise `loaded_len` could disagree with the
-        // messages in hand and the tail be written back twice. Mail need not
-        // be UTF-8, so it is parsed as bytes.
-        let bytes = read_locked(path).context(path)?;
+        // Read to the end under the locks, so the length recorded is exactly
+        // the extent parsed: otherwise `loaded_len` could disagree with the
+        // messages in hand and the tail be written back twice. The text goes
+        // to the store as it is read; mail need not be UTF-8, so it is
+        // parsed as bytes.
+        let (file, _dotlock) = open_read_locked(path).context(path)?;
         let mut mailbox = Mailbox::new(path.to_string());
-        mailbox.loaded_len = bytes.len() as u64;
-
-        mailbox.messages = crate::mbox::parse(&bytes, &mut mailbox.store).context(path)?;
+        let input = io::BufReader::with_capacity(64 * 1024, &file);
+        let (messages, len) = crate::mbox::parse(input, &mut mailbox.store).context(path)?;
+        mailbox.messages = messages;
+        mailbox.loaded_len = len;
 
         // The first new message, else the first unread one, else the first.
         let first = |state| mailbox.messages.iter().position(|m| m.read == state);
@@ -313,13 +314,15 @@ fn rewrite_mailbox(
     // Bytes past the extent we parsed are mail that arrived while mailx was
     // running. They are copied through verbatim -- reparsing them would be
     // wrong, since they were never presented to the user as messages.
-    let mut tail = Vec::new();
-    if file.metadata()?.len() > loaded_len {
+    let tail_len = file.metadata()?.len().saturating_sub(loaded_len);
+    let mut tail = plib::tmp::tempfile()?;
+    if tail_len > 0 {
         file.seek(io::SeekFrom::Start(loaded_len))?;
-        file.read_to_end(&mut tail)?;
+        io::copy(&mut (&file).take(tail_len), &mut tail)?;
+        tail.rewind()?;
     }
 
-    if messages.is_empty() && tail.is_empty() && !keep {
+    if messages.is_empty() && tail_len == 0 && !keep {
         // An emptied mailbox is removed unless `keep` is set, in which case it
         // is truncated to zero length instead (spec 104636-104637).
         drop(file);
@@ -331,7 +334,7 @@ fn rewrite_mailbox(
     {
         let mut w = io::BufWriter::new(&mut file);
         write_messages(&mut w, store, messages)?;
-        w.write_all(&tail)?;
+        io::copy(&mut tail, &mut w)?;
         w.flush()?;
     }
     commit(file)

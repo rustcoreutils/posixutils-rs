@@ -10,7 +10,7 @@
 //! Locking a mailbox against the local delivery agent.
 
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::unix::io::AsRawFd;
 
 /// Take a blocking lock on `file`, exclusive or shared.
@@ -114,14 +114,15 @@ fn dotlock(path: &str) -> Option<DotLock> {
     }
 }
 
-/// Read all of `path` under its dotlock and a shared lock.
-pub(crate) fn read_locked(path: &str) -> io::Result<Vec<u8>> {
-    let mut file = File::open(path)?;
-    let _dotlock = dotlock(path);
+/// Open `path` to read under its dotlock and a shared lock.
+///
+/// Both are held while the file and the dotlock returned are, so a
+/// delivery in progress is waited for rather than half read.
+pub(crate) fn open_read_locked(path: &str) -> io::Result<(File, Option<DotLock>)> {
+    let file = File::open(path)?;
+    let dotlock = dotlock(path);
     lock(&file, false)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok(bytes)
+    Ok((file, dotlock))
 }
 
 /// Open `path` for a locked read-modify-write, creating it if absent.

@@ -39,14 +39,28 @@ struct Parsing {
 /// The store keeps a message's `From ` line and header lines as stored,
 /// without `Status:`, followed by its body as stored, `From `-quoting and
 /// all; the empty line ending the header block is framing, not kept.
-pub(crate) fn parse(bytes: &[u8], store: &mut Store) -> io::Result<Vec<Message>> {
+///
+/// Returns the messages and the number of bytes read.
+pub(crate) fn parse(
+    mut input: impl io::BufRead,
+    store: &mut Store,
+) -> io::Result<(Vec<Message>, u64)> {
     let mut messages = Vec::new();
     let mut current: Option<Parsing> = None;
     // A `From ` line begins a message only at the start of the file or after
     // an empty line (spec 104427-104428); anywhere else it is message text.
     let mut after_blank = true;
+    let mut consumed = 0;
+    let mut buf = Vec::new();
 
-    for raw in bytes.split_inclusive(|&b| b == b'\n') {
+    loop {
+        buf.clear();
+        let n = input.read_until(b'\n', &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        consumed += n as u64;
+        let raw = buf.as_slice();
         // `stored` is the line as kept, a CR of a CRLF ending included, so
         // the message is written back as it was stored; `line` is its text.
         let stored = raw.strip_suffix(b"\n").unwrap_or(raw);
@@ -87,7 +101,7 @@ pub(crate) fn parse(bytes: &[u8], store: &mut Store) -> io::Result<Vec<Message>>
     }
     messages.extend(current.map(finish));
     store.flush()?;
-    Ok(messages)
+    Ok((messages, consumed))
 }
 
 /// Copy one line of the current message into the store, where it belongs.
@@ -333,7 +347,8 @@ mod tests {
 
     fn parsed(mbox: &str) -> (Vec<Message>, Store) {
         let mut store = Store::default();
-        let messages = parse(mbox.as_bytes(), &mut store).unwrap();
+        let (messages, len) = parse(mbox.as_bytes(), &mut store).unwrap();
+        assert_eq!(len, mbox.len() as u64);
         (messages, store)
     }
 

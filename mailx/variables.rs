@@ -231,7 +231,8 @@ impl Variables {
     /// match `edward@example.com` -- and made an empty `$USER` match every
     /// address there is, so a reply-all silently addressed no one.
     pub fn is_me(&self, addr: &str) -> bool {
-        let addr = crate::message::extract_address(addr).trim();
+        let addr = crate::message::extract_address(addr);
+        let addr = addr.as_str();
         if addr.is_empty() {
             return false;
         }

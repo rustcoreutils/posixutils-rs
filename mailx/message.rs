@@ -244,7 +244,7 @@ impl Message {
     /// The sender for the header summary: the `From:` address, or failing
     /// that the `From ` line's, as traditional mailx shows it.
     pub fn short_from(&self) -> String {
-        match self.get_header("from").map(bare_address) {
+        match self.get_header("from").map(extract_address) {
             Some(addr) if !addr.is_empty() => addr,
             _ => self
                 .from_line
@@ -254,32 +254,6 @@ impl Message {
                 .to_string(),
         }
     }
-}
-
-/// An address with its display name and any `(comment)` removed:
-/// `Name <a@b>` and `a@b (Name)` are both `a@b`.
-///
-/// An unclosed `<`, as in `Name <a@b`, still introduces the address;
-/// passing such a value through whole showed the display name instead.
-pub fn bare_address(s: &str) -> String {
-    if let Some(start) = s.find('<') {
-        if let Some(len) = s[start + 1..].find('>') {
-            return s[start + 1..start + 1 + len].trim().to_string();
-        }
-        // Unclosed: the address is what follows the `<`.
-        return s[start + 1..].trim().to_string();
-    }
-    let mut out = String::new();
-    let mut depth = 0usize;
-    for c in s.chars() {
-        match c {
-            '(' => depth += 1,
-            ')' if depth > 0 => depth -= 1,
-            _ if depth == 0 => out.push(c),
-            _ => {}
-        }
-    }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -373,28 +347,64 @@ pub(crate) fn truncate_display(s: &str, max_len: usize) -> String {
     }
 }
 
-/// Extract email address from a string like "Name <email>" or just "email"
+/// The bare address of one mailbox written in a header: `Name <a@b>`,
+/// `"Smith, J" <a@b>` and `a@b (Name)` are all `a@b`.
 ///
-/// The closing bracket is searched for *after* the opening one. Searching from
-/// the start of the string inverted the range for any display name containing a
-/// `>` ahead of the `<`, e.g. `Bob >_< Smith <bob@example.com>`.
-pub fn extract_address(s: &str) -> &str {
-    if let Some(start) = s.find('<') {
-        if let Some(end) = s[start + 1..].find('>') {
-            return &s[start + 1..start + 1 + end];
+/// Follows the RFC 5322 syntax far enough to tell the address from its
+/// decoration: a quoted string or a `(comment)` may contain `<`, `>`, or a
+/// comma without meaning anything, and the angle address is the last `<...>`.
+/// An unclosed `<`, as in `Name <a@b`, still introduces the address. With no
+/// angle address, the text outside comments is the address.
+pub fn extract_address(s: &str) -> String {
+    let mut plain = String::new();
+    let mut angle: Option<String> = None;
+    let mut in_quote = false;
+    let mut depth = 0usize;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if let Some(a) = angle.as_mut() {
+            match c {
+                // Anything after the angle address is not part of it.
+                '>' => return a.trim().to_string(),
+                // A later `<` starts the angle address afresh.
+                '<' => a.clear(),
+                _ => a.push(c),
+            }
+            continue;
+        }
+        match c {
+            '\\' if in_quote || depth > 0 => {
+                let escaped = chars.next();
+                if in_quote {
+                    plain.push(c);
+                    plain.extend(escaped);
+                }
+            }
+            '"' if depth == 0 => {
+                in_quote = !in_quote;
+                plain.push(c);
+            }
+            _ if in_quote => plain.push(c),
+            '(' => depth += 1,
+            ')' if depth > 0 => depth -= 1,
+            _ if depth > 0 => {}
+            '<' => angle = Some(String::new()),
+            _ => plain.push(c),
         }
     }
-    s.trim()
+    if let Some(a) = angle {
+        return a.trim().to_string();
+    }
+    plain.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Extract login name from an email address
-pub fn extract_login(addr: &str) -> &str {
-    let addr = extract_address(addr);
+pub fn extract_login(addr: &str) -> String {
+    let mut addr = extract_address(addr);
     if let Some(at) = addr.find('@') {
-        &addr[..at]
-    } else {
-        addr
+        addr.truncate(at);
     }
+    addr
 }
 
 /// The login name of a message's author, usable as a filename component.
@@ -407,8 +417,8 @@ pub fn extract_login(addr: &str) -> &str {
 /// an option -- means the header is not naming one. Rejecting beats
 /// sanitizing, since a silently rewritten name is also a file the user did
 /// not ask for.
-pub fn author_filename(from: &str) -> Result<&str, String> {
-    let login = extract_login(from).trim();
+pub fn author_filename(from: &str) -> Result<String, String> {
+    let login = extract_login(from);
     let acceptable = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+');
     if login.is_empty()
         || login.starts_with('-')

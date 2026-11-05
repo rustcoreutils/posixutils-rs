@@ -752,7 +752,7 @@ fn cmd_copy_author(
 
     if let Some(first_msg) = msg_nums.first().and_then(|&n| mb.get(n)) {
         let filename = author_filename(first_msg.from())?;
-        let filename = expand_author_filename(filename, vars);
+        let filename = expand_author_filename(&filename, vars);
 
         let written = mb.save_messages(&msg_nums, &filename, true)?;
 
@@ -931,7 +931,7 @@ fn cmd_followup(
 
     // Record to file named after first recipient
     let record_file = author_filename(original.from())?;
-    let record_file = expand_author_filename(record_file, vars);
+    let record_file = expand_author_filename(&record_file, vars);
 
     // Enter input mode
     compose_body(&mut composed, Some(mb), vars)?;

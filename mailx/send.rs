@@ -228,7 +228,7 @@ pub fn send_message(
     // lists from header values, so they carry display names -- and a display
     // name containing a comma or a quote is not something to hand an MTA as a
     // recipient.
-    let recipients: Vec<&str> = msg
+    let recipients: Vec<String> = msg
         .all_recipients()
         .into_iter()
         .map(crate::message::extract_address)
@@ -276,7 +276,7 @@ pub fn send_message(
     if record_to_recipient {
         if let Some(first_to) = msg.to.first() {
             let filename = crate::message::author_filename(first_to)?;
-            record_message(msg, filename, vars)?;
+            record_message(msg, &filename, vars)?;
         }
     } else if let Some(record_file) = vars.get("record") {
         record_message(msg, record_file, vars)?;

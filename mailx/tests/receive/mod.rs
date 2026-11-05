@@ -4970,3 +4970,43 @@ fn tilde_w_expands_the_home_prefix() {
         },
     );
 }
+
+/// A sender written `addr (Name)` reaches the envelope as the bare address.
+#[test]
+fn envelope_recipient_drops_a_comment() {
+    let mbox = create_temp_mbox(
+        "From a@example.com Fri Nov 29 10:00:00 2024\n\
+         From: bob@example.com (Bob Smith)\n\
+         To: me@example.com\n\
+         Subject: s\n\
+         \n\
+         body\n\
+         \n",
+    );
+    let mbox_path = mbox.path().to_str().unwrap().to_string();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox_path,
+            ],
+            stdin_data: String::from("set debug\nreply 1\nbody\n.\nexit\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("USER", "me"), ("LOGNAME", "me")],
+        |_plan, output| {
+            let err = String::from_utf8_lossy(&output.stderr);
+            let envelope = err
+                .lines()
+                .find(|l| l.starts_with("Envelope:"))
+                .unwrap_or_else(|| panic!("no envelope line: {}", err));
+            assert_eq!(envelope, "Envelope: bob@example.com");
+        },
+    );
+}

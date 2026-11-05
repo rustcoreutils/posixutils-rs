@@ -162,8 +162,46 @@ pub fn prompt_field(label: &str, current: &str) -> Result<Option<String>, String
 }
 
 /// Split a comma-separated address list.
+///
+/// Only a comma outside quotes, comments, and angle brackets separates two
+/// addresses: `"Smith, J" <j@example.com>` is one.
 pub fn addresses(list: &str) -> impl Iterator<Item = &str> {
-    list.split(',').map(str::trim).filter(|a| !a.is_empty())
+    let mut parts = Vec::new();
+    let (mut start, mut in_quote, mut depth, mut in_angle) = (0, false, 0usize, false);
+    let mut escaped = false;
+    for (i, c) in list.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if in_quote || depth > 0 => escaped = true,
+            '"' if depth == 0 && !in_angle => in_quote = !in_quote,
+            _ if in_quote => {}
+            '(' => depth += 1,
+            ')' if depth > 0 => depth -= 1,
+            _ if depth > 0 => {}
+            '<' => in_angle = true,
+            '>' => in_angle = false,
+            ',' if !in_angle => {
+                parts.push(&list[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&list[start..]);
+    parts.into_iter().map(str::trim).filter(|a| !a.is_empty())
+}
+
+/// The bare addresses of an address list, comma-separated:
+/// `A <a@x>, b@x (B)` is `a@x, b@x`.
+pub fn bare_addresses(list: &str) -> String {
+    addresses(list)
+        .map(crate::message::extract_address)
+        .filter(|a| !a.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Resolve the filename notations that are mailx's own, not the shell's.

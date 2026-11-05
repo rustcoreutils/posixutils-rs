@@ -311,7 +311,7 @@ impl Mailbox {
 
                 // Decide whether to show To or From
                 let address_field = if show_to && vars.is_me(msg.from()) {
-                    format!("To {}", crate::message::bare_address(msg.to()))
+                    format!("To {}", crate::util::bare_addresses(msg.to()))
                 } else {
                     msg.short_from()
                 };

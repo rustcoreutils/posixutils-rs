@@ -1433,3 +1433,41 @@ fn header_summary_sender_unclosed_angle() {
         summary
     );
 }
+
+/// A `<` inside a quoted display name or a comment is not the address.
+#[test]
+fn header_summary_sender_skips_quotes_and_comments() {
+    let (summary, _) = summary_and_commands(
+        "From x@example.com Mon Jan 29 10:29:21 2007\n\
+         From: \"Smith <dev team>\" <j@example.com>\n\
+         Subject: one\n\
+         \n\
+         body\n\
+         \n\
+         From x@example.com Mon Jan 29 10:30:00 2007\n\
+         From: k@example.com (Kim <work>)\n\
+         Subject: two\n\
+         \n\
+         body\n",
+        "",
+    );
+    let rows: Vec<&str> = summary.lines().collect();
+    assert!(rows[0].contains(" j@example.com "), "{:?}", rows[0]);
+    assert!(rows[1].contains(" k@example.com "), "{:?}", rows[1]);
+}
+
+/// With `showto`, every recipient's address is shown, however each is
+/// written; a comma inside a quoted name does not split it.
+#[test]
+fn header_summary_showto_lists_every_recipient() {
+    let (_, out) = summary_and_commands(
+        "From me@example.com Mon Jan 29 10:29:21 2007\n\
+         From: me@example.com\n\
+         To: \"Doe, A\" <a@x.org>, b@x.org (B)\n\
+         Subject: s\n\
+         \n\
+         body\n",
+        "alternates me@example.com\nset showto\nheaders\n",
+    );
+    assert!(out.contains("To a@x.org, b@x.org"), "{:?}", out);
+}

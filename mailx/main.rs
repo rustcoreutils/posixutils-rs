@@ -44,10 +44,6 @@ fn main() {
     // translatability. See the project locale-init convention.
     plib::diag::init_locale("mailx");
 
-    // Install the SIGINT handler so an interrupt aborts the current command or
-    // message instead of terminating mailx (ASYNCHRONOUS EVENTS).
-    signals::setup();
-
     let args = match Args::parse(
         plib::optarg::args_utf8("mailx")
             .into_iter()
@@ -60,6 +56,14 @@ fn main() {
             process::exit(1);
         }
     };
+
+    // Catch SIGINT and SIGHUP, so an interrupt aborts the current command or
+    // message and a hangup saves one being composed (ASYNCHRONOUS EVENTS) --
+    // except in Send Mode reading from something other than a terminal,
+    // which takes the standard action for all signals.
+    if args.mode != Mode::Send || io::stdin().is_terminal() {
+        signals::setup();
+    }
 
     let exit_code = match args.mode {
         Mode::Send => run_send_mode(&args),

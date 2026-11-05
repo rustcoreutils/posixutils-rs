@@ -94,3 +94,43 @@ fn hangup_while_composing_saves_the_message() {
     let dead = std::fs::read_to_string(home.path().join("dead.letter")).unwrap_or_default();
     assert!(dead.contains("unsent draft"), "dead.letter: {:?}", dead);
 }
+
+/// In Send Mode with standard input not a terminal, signals take their
+/// standard action: an interrupt ends mailx.
+#[test]
+fn piped_send_mode_takes_the_standard_action() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::time::{Duration, Instant};
+
+    let home = plib::tmp::TempDir::new().unwrap();
+    let rc = create_temp_mailrc("set debug\n");
+    let mut child = Command::new(plib::testing::get_binary_path("mailx"))
+        .args(["-s", "subject", "to@example.com"])
+        .env("HOME", home.path())
+        .env("MAILRC", rc.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn mailx");
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"body\n").unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    // SAFETY: kill sends a signal to the child we started.
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            panic!("mailx ignored the interrupt");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    drop(stdin);
+    assert_eq!(status.signal(), Some(libc::SIGINT), "{:?}", status);
+}

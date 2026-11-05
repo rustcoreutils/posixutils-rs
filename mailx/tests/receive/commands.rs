@@ -1143,3 +1143,26 @@ fn from_and_dash_h_are_not_cut_to_a_screen() {
         3
     );
 }
+
+/// `next n` goes to message n even if it has been read; only a bare `next`
+/// moves past the current message.
+#[test]
+fn next_with_a_message_goes_to_it() {
+    let mbox = copy_test_data("testdata.mbox");
+    let output = mailx(
+        &["-n", "-N", "-f", mbox.path().to_str().unwrap()],
+        "2\nnext 2\nexit\n",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.matches("Subject: Project Update").count(),
+        2,
+        "{}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("Subject: Re: Meeting Tomorrow"),
+        "{}",
+        stdout
+    );
+}

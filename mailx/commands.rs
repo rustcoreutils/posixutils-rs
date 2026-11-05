@@ -756,10 +756,13 @@ fn cmd_mbox(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
     Ok(CommandResult::Continue)
 }
 
+/// `next [message]`: write `message`, or without one the next message
+/// after the current one once that has been displayed.
 fn cmd_next(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult> {
     if !args.is_empty() {
         let msg_num = parse_message(args, mb, vars)?;
         mb.set_current(msg_num);
+        return cmd_print("", mb, vars, false);
     }
 
     if let (Some(current), Some(msg)) = (mb.current(), mb.current_message()) {

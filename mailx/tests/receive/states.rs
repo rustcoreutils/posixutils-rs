@@ -211,3 +211,32 @@ fn preserve_keeps_read_state() {
     );
     assert_eq!(output.status.code(), Some(0), "exit status");
 }
+
+/// The first new message is current on entry even when an unread one comes
+/// before it; an unread message is current only when none is new.
+#[test]
+fn first_new_message_is_current_before_unread_ones() {
+    let mbox = create_temp_mbox(
+        "From old@example.com Mon Jan  1 09:00:00 2024\n\
+         From: old@example.com\n\
+         Status: O\n\
+         Subject: seen before\n\
+         \n\
+         stale\n\
+         \n\
+         From new@example.com Mon Jan  1 10:00:00 2024\n\
+         From: new@example.com\n\
+         Subject: brand new\n\
+         \n\
+         fresh\n",
+    );
+    let output = mailx(&["-n", "-H", "-f", mbox.path().to_str().unwrap()], "");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let current: Vec<&str> = stdout.lines().filter(|l| l.starts_with('>')).collect();
+    assert_eq!(current.len(), 1, "one current message: {}", stdout);
+    assert!(
+        current[0].contains("new@example.com"),
+        "the new message should be current: {}",
+        stdout
+    );
+}

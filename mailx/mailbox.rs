@@ -80,9 +80,13 @@ impl Mailbox {
 
         mailbox.messages = crate::mbox::parse(&bytes);
 
-        let first_unread = mailbox.messages.iter().position(|m| m.read.is_unread());
-        let first = (!mailbox.messages.is_empty()).then_some(0);
-        mailbox.current = first_unread.or(first).map(|i| i + 1);
+        // The first new message, else the first unread one, else the first.
+        let first = |state| mailbox.messages.iter().position(|m| m.read == state);
+        let first_any = (!mailbox.messages.is_empty()).then_some(0);
+        mailbox.current = first(ReadState::New)
+            .or_else(|| first(ReadState::Unread))
+            .or(first_any)
+            .map(|i| i + 1);
 
         Ok(mailbox)
     }

@@ -297,7 +297,8 @@ impl Mailbox {
     }
 }
 
-/// Rewrite a mailbox in place, preserving anything delivered since it loaded.
+/// Rewrite a mailbox in place, preserving anything delivered since it
+/// loaded, through a recovery file (see `recovery`).
 ///
 /// The file is truncated and rewritten under an exclusive lock rather than
 /// replaced via a temporary and `rename`, so the inode survives: a delivery
@@ -330,15 +331,11 @@ fn rewrite_mailbox(
         return fs::remove_file(path);
     }
 
-    file.rewind()?;
-    file.set_len(0)?;
-    {
-        let mut w = io::BufWriter::new(&mut file);
-        write_messages(&mut w, store, messages)?;
-        io::copy(&mut tail, &mut w)?;
-        w.flush()?;
-    }
-    commit(file)
+    crate::recovery::rewrite(path, &mut file, |w| {
+        write_messages(w, store, messages)?;
+        io::copy(&mut tail, w)?;
+        Ok(())
+    })
 }
 
 /// Move read messages into the secondary mbox.
@@ -363,7 +360,7 @@ fn migrate_to_mbox(
     }
     match prepend_by_rename(path, &file, store, messages) {
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-            prepend_in_place(file, store, messages)
+            prepend_in_place(path, file, store, messages)
         }
         result => result,
     }
@@ -408,22 +405,22 @@ fn prepend_by_rename(
 }
 
 /// Prepend to mbox in place, where its directory cannot hold a temporary
-/// file: the old contents are staged in an unnamed temporary file while
-/// mbox is rewritten.
-fn prepend_in_place(mut file: File, store: &Store, messages: &[&Message]) -> io::Result<()> {
+/// file, through a recovery file.
+fn prepend_in_place(
+    path: &str,
+    mut file: File,
+    store: &Store,
+    messages: &[&Message],
+) -> io::Result<()> {
     let mut old = plib::tmp::tempfile()?;
     file.rewind()?;
     io::copy(&mut file, &mut old)?;
     old.rewind()?;
-    file.rewind()?;
-    file.set_len(0)?;
-    {
-        let mut w = io::BufWriter::new(&mut file);
-        write_messages(&mut w, store, messages)?;
-        io::copy(&mut old, &mut w)?;
-        w.flush()?;
-    }
-    commit(file)
+    crate::recovery::rewrite(path, &mut file, |w| {
+        write_messages(w, store, messages)?;
+        io::copy(&mut old, w)?;
+        Ok(())
+    })
 }
 
 /// Append messages to a file named by `save`, `copy`, or the mbox default.

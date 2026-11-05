@@ -381,3 +381,45 @@ fn prepend_to_mbox_in_an_unwritable_directory() {
     );
     assert!(saved.contains("Subject: old\n\nold body\n"), "{}", saved);
 }
+
+/// A recovery file left by an interrupted rewrite is reported at start-up,
+/// and kept.
+#[test]
+fn leftover_recovery_file_is_reported() {
+    let mbox = copy_test_data("testdata.mbox");
+    let home = plib::tmp::TempDir::new().expect("temp dir");
+    let leftover = home.path().join("mailx-recover.spool.AbC123");
+    std::fs::write(&leftover, "From a@x Mon Jan  1 00:00:00 2024\n\nbody\n\n").unwrap();
+    let output = mailx_env(
+        &["-n", "-H", "-f", mbox.path().to_str().unwrap()],
+        "",
+        &[("HOME", home.path().to_str().unwrap())],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&leftover.display().to_string()) && stderr.contains("interrupted"),
+        "{}",
+        stderr
+    );
+    assert!(leftover.exists(), "the recovery file must not be removed");
+}
+
+/// A rewrite that completes leaves no recovery file behind.
+#[test]
+fn completed_rewrite_leaves_no_recovery_file() {
+    let mbox = copy_test_data("testdata.mbox");
+    let home = plib::tmp::TempDir::new().expect("temp dir");
+    let output = mailx_env(
+        &["-n", "-N", "-f", mbox.path().to_str().unwrap()],
+        "delete 1\nquit\n",
+        &[("HOME", home.path().to_str().unwrap())],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let after = std::fs::read_to_string(mbox.path()).unwrap();
+    assert!(!after.contains("Subject: Meeting Tomorrow\n"), "{}", after);
+    assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+}

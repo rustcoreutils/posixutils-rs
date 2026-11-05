@@ -92,7 +92,7 @@ impl Store {
     }
 
     /// Copy the bytes of `span` to `w`, a buffer at a time.
-    pub fn copy_to(&self, span: Span, w: &mut impl Write) -> io::Result<()> {
+    pub fn copy_to<W: Write + ?Sized>(&self, span: Span, w: &mut W) -> io::Result<()> {
         let mut buf = vec![0; BUFFER.min(span.len as usize)];
         let mut done = 0;
         while done < span.len {

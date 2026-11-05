@@ -205,7 +205,7 @@ fn finish(p: Parsing) -> Message {
 /// regenerated `Status:`, an empty line, its body as stored -- `From `-quoted
 /// already -- and one trailing empty line, so the next `From ` line is
 /// preceded by an empty line, as the format requires.
-pub(crate) fn write_messages<W: Write>(
+pub(crate) fn write_messages<W: Write + ?Sized>(
     w: &mut W,
     store: &Store,
     messages: &[&Message],
@@ -231,7 +231,7 @@ pub(crate) fn write_messages<W: Write>(
 }
 
 /// Copy the lines of `span`, ending the last with a newline if it has none.
-fn copy_lines<W: Write>(store: &Store, span: Span, w: &mut W) -> io::Result<()> {
+fn copy_lines<W: Write + ?Sized>(store: &Store, span: Span, w: &mut W) -> io::Result<()> {
     store.copy_to(span, w)?;
     if span.len > 0
         && store.read(Span {
@@ -249,7 +249,7 @@ fn copy_lines<W: Write>(store: &Store, span: Span, w: &mut W) -> io::Result<()> 
 /// Stored bodies are quoted already, except that a `From ` line not after an
 /// empty line may be stored as it is; it is quoted on the way out so that no
 /// mbox reader takes it for a message boundary.
-fn copy_body<W: Write>(store: &Store, span: Span, w: &mut W) -> io::Result<()> {
+fn copy_body<W: Write + ?Sized>(store: &Store, span: Span, w: &mut W) -> io::Result<()> {
     let mut reader = store.reader(span);
     let mut line = Vec::new();
     loop {

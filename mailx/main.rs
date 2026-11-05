@@ -18,6 +18,7 @@ mod mailbox;
 mod mbox;
 mod message;
 mod msglist;
+mod recovery;
 mod script;
 mod send;
 mod signals;
@@ -209,6 +210,7 @@ fn print_no_mail() {
 /// Variables and interpreter state after the Start-Up steps: defaults,
 /// imported environment variables, options, then the start-up files.
 fn start_up(args: &Args, send_mode: bool) -> (Variables, Interp) {
+    recovery::report_leftovers();
     let mut vars = Variables::new();
     for name in [
         "DEAD", "EDITOR", "MBOX", "LISTER", "PAGER", "SHELL", "VISUAL",

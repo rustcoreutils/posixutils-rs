@@ -63,7 +63,10 @@ impl Mailbox {
         // Mail is not necessarily UTF-8. Reading it as a string refused the
         // whole mailbox when any message carried a raw 8-bit byte, so one
         // Latin-1 message from anyone made all of a user's mail unreadable.
-        let bytes = fs::read(path)?;
+        //
+        // The read is done under a shared lock, so a delivery in progress is
+        // waited for rather than half read.
+        let bytes = read_locked(path)?;
         let content = decode_mbox(&bytes);
         let mut mailbox = Mailbox::new(path.to_string());
         mailbox.loaded_len = bytes.len() as u64;
@@ -558,17 +561,64 @@ fn write_messages<W: Write>(
     Ok(())
 }
 
-/// Take a blocking exclusive lock on `file`.
+/// Take a blocking lock on `file`, exclusive or shared.
 ///
 /// Mailbox files are shared with the local delivery agent, so every write path
 /// that is not a plain atomic append has to serialize against it.
-fn lock_exclusive(file: &File) -> io::Result<()> {
+///
+/// Delivery agents do not agree on one kind of lock. On Linux `flock` and
+/// `fcntl` locks are independent of each other, and the common agents --
+/// Postfix `local`, Exim, procmail, mutt -- take the `fcntl` kind, so a mailx
+/// holding only `flock` truncated and rewrote the spool while a delivery was
+/// appending to it, losing that mail. Both kinds are taken there. Elsewhere
+/// the two are one mechanism, and taking both would conflict with ourselves.
+fn lock(file: &File, exclusive: bool) -> io::Result<()> {
+    let op = if exclusive {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_SH
+    };
     // SAFETY: the fd is valid for the lifetime of `file`, flock takes an fd and
     // an integer operation, and the return value is checked.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+    if unsafe { libc::flock(file.as_raw_fd(), op) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    #[cfg(target_os = "linux")]
+    fcntl_lock(file, exclusive)?;
+    Ok(())
+}
+
+/// Take a blocking POSIX record lock over the whole of `file`.
+///
+/// The lock belongs to the process and is released when any descriptor for
+/// the file is closed, so a locked mailbox must not be opened a second time
+/// while the lock is wanted.
+#[cfg(target_os = "linux")]
+fn fcntl_lock(file: &File, exclusive: bool) -> io::Result<()> {
+    // SAFETY: an all-zero flock is a valid value; the fields that matter are
+    // set below (start 0 and length 0 mean the whole file).
+    let mut fl: libc::flock = unsafe { std::mem::zeroed() };
+    fl.l_type = if exclusive {
+        libc::F_WRLCK
+    } else {
+        libc::F_RDLCK
+    } as libc::c_short;
+    fl.l_whence = libc::SEEK_SET as libc::c_short;
+    // SAFETY: the fd is valid for the lifetime of `file`, `fl` is a valid
+    // flock structure that outlives the call, and the return value is checked.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLKW, &fl) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Read all of `path` under a shared lock.
+fn read_locked(path: &str) -> io::Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    lock(&file, false)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// Open `path` for a locked read-modify-write, creating it if absent.
@@ -579,7 +629,7 @@ fn open_locked(path: &str) -> io::Result<File> {
         .create(true)
         .truncate(false)
         .open(path)?;
-    lock_exclusive(&file)?;
+    lock(&file, true)?;
     Ok(file)
 }
 
@@ -676,9 +726,8 @@ fn append_messages_to_file(
 ) -> io::Result<u64> {
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
 
-    // Best effort: flock fails on some filesystems and object types.
-    // SAFETY: the fd is valid for the lifetime of `file`.
-    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    // Best effort: locking fails on some filesystems and object types.
+    let _ = lock(&file, true);
 
     let written = {
         let mut w = CountingWriter {

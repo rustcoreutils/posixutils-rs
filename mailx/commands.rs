@@ -19,7 +19,7 @@ use crate::error::{IoContext, Result};
 use crate::filename::{expand_local_prefixes, expand_typed_filename};
 use crate::mailbox::Mailbox;
 use crate::message::{author_filename, Disposition, ReadState};
-use crate::msglist::{msglist_or_current, parse_message, parse_msglist};
+use crate::msglist::{current_message, msglist_or_current, parse_message, parse_msglist};
 use crate::script::CondStack;
 use crate::send::{compose_reply, send_message, ComposedMessage};
 use crate::variables::{parse_set_arg, split_args, Variables};
@@ -380,11 +380,11 @@ fn msglist_and_file(
             if file_required {
                 return Err("No file specified".into());
             }
-            Ok((vec![mb.current], crate::util::mbox_path(vars)))
+            Ok((current_message(mb)?, crate::util::mbox_path(vars)))
         }
         1 => match parse_msglist(parts[0], mb, false, vars) {
             Ok(nums) if !file_required => Ok((nums, crate::util::mbox_path(vars))),
-            _ => Ok((vec![mb.current], expand_typed_filename(parts[0], vars))),
+            _ => Ok((current_message(mb)?, expand_typed_filename(parts[0], vars))),
         },
         n => {
             let nums = parse_msglist(&parts[..n - 1].join(" "), mb, false, vars)?;
@@ -821,7 +821,7 @@ fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
     // Parse: [msglist] command
     let (msg_nums, cmd) = if args.is_empty() {
         (
-            vec![mb.current],
+            current_message(mb)?,
             vars.get_nonempty("cmd")
                 .ok_or("No command specified")?
                 .to_string(),
@@ -849,7 +849,7 @@ fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
                         .to_string(),
                 )
             } else {
-                (vec![mb.current], args.to_string())
+                (current_message(mb)?, args.to_string())
             }
         } else {
             let msglist = words[..msglist_end].join(" ");

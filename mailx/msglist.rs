@@ -37,12 +37,7 @@ fn parse_msglist_with_opts(
     let spec = spec.trim();
 
     if spec.is_empty() {
-        // Default to current message
-        if mb.current > 0 {
-            return Ok(vec![mb.current]);
-        } else {
-            return Err("No applicable messages".into());
-        }
+        return current_message(mb);
     }
 
     let mut result = Vec::new();
@@ -279,14 +274,20 @@ fn range_endpoint(s: &str, mb: &Mailbox) -> Option<usize> {
     }
 }
 
+/// The current message, as the list an omitted msglist stands for.
+pub fn current_message(mb: &Mailbox) -> Result<Vec<usize>> {
+    if mb.current > 0 {
+        Ok(vec![mb.current])
+    } else {
+        Err("No applicable messages".into())
+    }
+}
+
 /// The messages an optional msglist argument names, defaulting to the current
 /// one.
-///
-/// Nearly every command begins this way; the three-line form was written out
-/// sixteen times.
 pub fn msglist_or_current(args: &str, mb: &Mailbox, vars: &Variables) -> Result<Vec<usize>> {
     if args.is_empty() {
-        Ok(vec![mb.current])
+        current_message(mb)
     } else {
         parse_msglist(args, mb, false, vars)
     }

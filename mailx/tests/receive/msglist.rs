@@ -433,3 +433,25 @@ fn undelete_range_past_the_end_is_clamped() {
     );
     assert_eq!(output.status.code(), Some(0), "exit status");
 }
+
+/// With no messages there is no current message, so a command whose
+/// message list defaults to it reports that rather than doing nothing.
+#[test]
+fn default_msglist_without_a_current_message_is_diagnosed() {
+    let mbox = create_temp_mbox("");
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let saved = dir.path().join("saved");
+    let output = mailx(
+        &["-n", "-N", "-f", mbox.path().to_str().unwrap()],
+        &format!("print\nsave {}\nexit\n", saved.display()),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("No applicable messages").count(),
+        2,
+        "print and save should each report no message: {}",
+        stderr
+    );
+    assert!(!saved.exists(), "save created a file with nothing in it");
+    assert_eq!(output.status.code(), Some(0), "exit status");
+}

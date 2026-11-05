@@ -27,6 +27,7 @@ use crate::error::{IoContext, Result};
 use crate::lock::{commit, lock, open_locked, open_read_locked};
 use crate::mbox::{unquote_from_line, write_messages, CountingWriter};
 use crate::message::{Disposition, Headers, Message, ReadState};
+use crate::signals::SignalsHeld;
 use crate::store::Store;
 use crate::variables::Variables;
 
@@ -299,7 +300,6 @@ impl Mailbox {
     /// deleted and saved ones as `hold` and `keepsave` direct, and write the
     /// rest back.
     pub fn quit(&mut self, vars: &Variables) -> Result<()> {
-        let _held = crate::signals::SignalsHeld::new();
         let hold = vars.is_set("hold");
         let keepsave = vars.is_set("keepsave");
         let keep = vars.is_set("keep");
@@ -383,6 +383,9 @@ fn rewrite_mailbox(
     keep: bool,
 ) -> io::Result<&'static str> {
     let (mut file, _dotlock) = open_locked(path)?;
+    // Held only once the locks are taken: waiting for another process's
+    // lock can be long, and must stay interruptible.
+    let _held = SignalsHeld::new();
 
     // Bytes past the extent we parsed are mail that arrived while mailx was
     // running. They are copied through verbatim -- reparsing them would be
@@ -432,6 +435,9 @@ fn migrate_to_mbox(
     append: bool,
 ) -> io::Result<()> {
     let (mut file, _dotlock) = open_locked(path)?;
+    // Held only once the locks are taken: waiting for another process's
+    // lock can be long, and must stay interruptible.
+    let _held = SignalsHeld::new();
     if append {
         file.seek(io::SeekFrom::End(0))?;
         let mut w = io::BufWriter::new(&mut file);

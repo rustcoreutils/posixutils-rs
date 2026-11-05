@@ -251,3 +251,58 @@ fn inherited_ignored_hangup_stays_ignored() {
         after
     );
 }
+
+/// While quit waits for another process's lock on the mailbox, signals are
+/// not yet held off: a termination request ends mailx, with the mailbox
+/// left as it was.
+#[test]
+fn quit_waiting_for_a_lock_can_be_terminated() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::time::{Duration, Instant};
+
+    let mbox = copy_test_data("testdata.mbox");
+    let before = std::fs::read(mbox.path()).unwrap();
+    let lock = format!("{}.lock", mbox.path().display());
+    let home = plib::tmp::TempDir::new().unwrap();
+    let rc = create_temp_mailrc("");
+    let mut child = spawn(
+        mbox.path().to_str().unwrap(),
+        home.path(),
+        rc.path().to_str().unwrap(),
+    );
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"echo READY\n").unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    while !line.contains("READY") {
+        line.clear();
+        assert!(
+            stdout.read_line(&mut line).unwrap() > 0,
+            "mailx exited early"
+        );
+    }
+    // Take the dotlock, then ask mailx to quit: it waits for the lock.
+    std::fs::write(&lock, "").unwrap();
+    stdin.write_all(b"delete 1\nquit\n").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    // SAFETY: kill sends a signal to the child we started.
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            let _ = std::fs::remove_file(&lock);
+            panic!("mailx did not end while waiting for the lock");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let _ = std::fs::remove_file(&lock);
+    drop(stdin);
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "{:?}", status);
+    assert_eq!(std::fs::read(mbox.path()).unwrap(), before);
+}

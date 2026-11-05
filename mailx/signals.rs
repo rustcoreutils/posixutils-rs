@@ -121,9 +121,9 @@ pub fn read_bytes_interruptible(buf: &mut Vec<u8>) -> io::Result<usize> {
     Ok(buf.len() - start)
 }
 
-/// Signals held off while a mailbox is written back, so a hangup, an
-/// interrupt or a stop cannot cut a rewrite short; any that arrive act once
-/// the guard is dropped. Traditional mailx ignores HUP, INT and QUIT for its
+/// Signals held off while a locked mailbox is written back, so a hangup,
+/// an interrupt or a stop cannot cut a rewrite short; any that arrive act
+/// once the guard is dropped. Traditional mailx ignores HUP, INT and QUIT for its
 /// quit; TERM and TSTP are held here too.
 pub struct SignalsHeld {
     previous: libc::sigset_t,

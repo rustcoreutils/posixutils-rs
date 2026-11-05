@@ -344,8 +344,8 @@ fn rewrite_mailbox(
 /// Move read messages into the secondary mbox.
 ///
 /// `noappend`, the default, places them at the *beginning* of mbox; `append`
-/// puts them at the end (spec 104579-104580). Neither truncates: the previously
-/// saved mail is retained in both cases.
+/// puts them at the end (spec 104579-104580). Neither loses the mail already
+/// there.
 fn migrate_to_mbox(
     path: &str,
     store: &Store,
@@ -353,20 +353,74 @@ fn migrate_to_mbox(
     append: bool,
 ) -> io::Result<()> {
     let (mut file, _dotlock) = open_locked(path)?;
-
-    let mut existing = Vec::new();
-    if !append {
-        file.read_to_end(&mut existing)?;
-        file.rewind()?;
-        file.set_len(0)?;
-    } else {
+    if append {
         file.seek(io::SeekFrom::End(0))?;
+        let mut w = io::BufWriter::new(&mut file);
+        write_messages(&mut w, store, messages)?;
+        w.flush()?;
+        drop(w);
+        return commit(file);
     }
+    match prepend_by_rename(path, &file, store, messages) {
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            prepend_in_place(file, store, messages)
+        }
+        result => result,
+    }
+}
 
+/// Prepend to mbox by writing the new messages and then its old contents to
+/// a temporary file beside it, which then replaces it.
+///
+/// mbox is never truncated, so whenever mailx stops it holds either all of
+/// its old contents or all of its new ones. The replacement takes mbox's
+/// mode; mbox belongs to the user, so its owner is unchanged.
+fn prepend_by_rename(
+    path: &str,
+    old: &File,
+    store: &Store,
+    messages: &[&Message],
+) -> io::Result<()> {
+    let dir = match std::path::Path::new(path).parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => std::path::Path::new("."),
+    };
+    let mut tmp = plib::tmp::Builder::new()
+        .prefix(".mailx-mbox.")
+        .tempfile_in(dir)?;
+    tmp.as_file()
+        .set_permissions(old.metadata()?.permissions())?;
+    {
+        let mut w = io::BufWriter::new(tmp.as_file_mut());
+        write_messages(&mut w, store, messages)?;
+        let mut old = old;
+        old.rewind()?;
+        io::copy(&mut old, &mut w)?;
+        w.flush()?;
+    }
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(io::Error::from)?;
+    // The rename itself is durable once the directory is.
+    if let Ok(dir) = File::open(dir) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+/// Prepend to mbox in place, where its directory cannot hold a temporary
+/// file: the old contents are staged in an unnamed temporary file while
+/// mbox is rewritten.
+fn prepend_in_place(mut file: File, store: &Store, messages: &[&Message]) -> io::Result<()> {
+    let mut old = plib::tmp::tempfile()?;
+    file.rewind()?;
+    io::copy(&mut file, &mut old)?;
+    old.rewind()?;
+    file.rewind()?;
+    file.set_len(0)?;
     {
         let mut w = io::BufWriter::new(&mut file);
         write_messages(&mut w, store, messages)?;
-        w.write_all(&existing)?;
+        io::copy(&mut old, &mut w)?;
         w.flush()?;
     }
     commit(file)

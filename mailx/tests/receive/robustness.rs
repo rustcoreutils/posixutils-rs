@@ -142,59 +142,72 @@ fn author_derived_filename_rejects_path_traversal() {
     assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
+/// The address space mailx is allowed by [`run_limited`].
+#[cfg(target_os = "linux")]
+const LIMIT: u64 = 24 * 1024 * 1024;
+
+/// Run mailx with its address space limited to [`LIMIT`].
+#[cfg(target_os = "linux")]
+fn run_limited(args: &[&str], stdin: &str, env: &[(&str, &str)]) -> std::process::Output {
+    use std::io::Write;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let mut command = Command::new(plib::testing::get_binary_path("mailx"));
+    command
+        .args(args)
+        .envs(env.iter().copied())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: setrlimit is async-signal-safe and touches no shared state.
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: LIMIT,
+                rlim_max: LIMIT,
+            };
+            if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().expect("spawn mailx");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+/// `count` messages of about 64 KB each, the first numbered `first`.
+#[cfg(target_os = "linux")]
+fn big_mailbox(first: usize, count: usize) -> String {
+    let body = format!("{}\n", "x".repeat(79)).repeat(800);
+    let mut content = String::new();
+    for n in first..first + count {
+        content.push_str(&format!(
+            "From u{n}@x Mon Jan  1 00:00:00 2024\nFrom: u{n}@x\nSubject: s{n}\n\n{body}\n"
+        ));
+    }
+    content
+}
+
 /// A mailbox much larger than the memory mailx may use can still be listed,
 /// read and written back: messages stay in the session's private copy, not
 /// in memory.
 #[cfg(target_os = "linux")]
 #[test]
 fn mailbox_larger_than_memory_limit() {
-    use std::os::unix::process::CommandExt;
-    use std::process::{Command, Stdio};
-
-    const LIMIT: u64 = 24 * 1024 * 1024;
-    let body = format!("{}\n", "x".repeat(79)).repeat(800);
-    let mut content = String::new();
-    for n in 0..640 {
-        content.push_str(&format!(
-            "From u{n}@x Mon Jan  1 00:00:00 2024\nFrom: u{n}@x\nSubject: s{n}\n\n{body}\n"
-        ));
-    }
+    let content = big_mailbox(0, 640);
     assert!(content.len() as u64 > LIMIT * 3 / 2);
     let mbox = create_temp_mbox(&content);
 
-    let run = |args: &[&str], stdin: &str| {
-        let mut command = Command::new(plib::testing::get_binary_path("mailx"));
-        command
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        // SAFETY: setrlimit is async-signal-safe and touches no shared state.
-        unsafe {
-            command.pre_exec(|| {
-                let limit = libc::rlimit {
-                    rlim_cur: LIMIT,
-                    rlim_max: LIMIT,
-                };
-                if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let mut child = command.spawn().expect("spawn mailx");
-        use std::io::Write;
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(stdin.as_bytes())
-            .unwrap();
-        child.wait_with_output().unwrap()
-    };
-
     let path = mbox.path().to_str().unwrap();
-    let listed = run(&["-n", "-H", "-f", path], "");
+    let listed = run_limited(&["-n", "-H", "-f", path], "", &[]);
     assert!(
         listed.status.success(),
         "{}",
@@ -202,7 +215,7 @@ fn mailbox_larger_than_memory_limit() {
     );
     assert_eq!(String::from_utf8_lossy(&listed.stdout).lines().count(), 640);
 
-    let read = run(&["-n", "-N", "-f", path], "print 2\nquit\n");
+    let read = run_limited(&["-n", "-N", "-f", path], "print 2\nquit\n", &[]);
     assert!(
         read.status.success(),
         "{}",
@@ -213,5 +226,60 @@ fn mailbox_larger_than_memory_limit() {
     assert!(
         after.contains("Subject: s1\nStatus: RO\n"),
         "read state not written back"
+    );
+}
+
+/// Read mail is put ahead of an mbox much larger than the memory mailx may
+/// use, without reading that mbox into memory, and nothing of it is lost.
+#[cfg(target_os = "linux")]
+#[test]
+fn prepend_to_mbox_larger_than_memory_limit() {
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let spool = dir.path().join("spool");
+    let secondary = dir.path().join("mbox");
+    std::fs::write(&spool, big_mailbox(0, 2)).unwrap();
+    std::fs::write(&secondary, big_mailbox(100, 640)).unwrap();
+    std::fs::set_permissions(
+        &secondary,
+        std::os::unix::fs::PermissionsExt::from_mode(0o640),
+    )
+    .unwrap();
+
+    let output = run_limited(
+        &["-n", "-N"],
+        "print 1\nquit\n",
+        &[
+            ("MAIL", spool.to_str().unwrap()),
+            ("MBOX", secondary.to_str().unwrap()),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let saved = std::fs::read_to_string(&secondary).unwrap();
+    assert!(
+        saved.starts_with("From u0@x "),
+        "read mail should come first"
+    );
+    assert_eq!(
+        saved.matches("\nFrom u").count() + 1,
+        641,
+        "mbox lost messages"
+    );
+    let mode = std::os::unix::fs::PermissionsExt::mode(
+        &std::fs::metadata(&secondary).unwrap().permissions(),
+    );
+    assert_eq!(mode & 0o777, 0o640, "mbox lost its mode");
+    let names: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        names.len(),
+        2,
+        "a temporary file was left behind: {:?}",
+        names
     );
 }

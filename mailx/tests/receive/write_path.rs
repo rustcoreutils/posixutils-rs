@@ -9,7 +9,7 @@
 
 //! Writing mailboxes back: quit, migration to mbox, concurrent delivery.
 
-use crate::common::{create_temp_mbox, mailx, mailx_env};
+use crate::common::{copy_test_data, create_temp_mbox, mailx, mailx_env};
 use plib::tmp::NamedTempFile;
 
 /// Mail delivered while mailx is running must survive the rewrite at quit.
@@ -343,4 +343,41 @@ fn file_onto_the_current_mailbox_does_not_duplicate_it() {
         "reopening the current mailbox corrupted it"
     );
     assert_eq!(output.status.code(), Some(0), "exit status");
+}
+
+/// When mbox's directory cannot take a temporary file, read mail is still
+/// put ahead of mbox's old contents, in place.
+#[test]
+fn prepend_to_mbox_in_an_unwritable_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let system = copy_test_data("testdata.mbox");
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let locked = dir.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    let secondary = locked.join("mbox");
+    std::fs::write(
+        &secondary,
+        "From old@x Mon Jan  1 00:00:00 2024\nSubject: old\n\nold body\n\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let output = mailx_env(
+        &["-n", "-N"],
+        "print 1\nquit\n",
+        &[
+            ("MAIL", system.path().to_str().unwrap()),
+            ("MBOX", secondary.to_str().unwrap()),
+        ],
+    );
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let saved = std::fs::read_to_string(&secondary).unwrap();
+    assert!(
+        saved.starts_with("From alice@example.com "),
+        "{}\n{}",
+        saved,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(saved.contains("Subject: old\n\nold body\n"), "{}", saved);
 }

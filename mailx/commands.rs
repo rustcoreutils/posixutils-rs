@@ -720,7 +720,10 @@ fn cmd_mail(
 ) -> Result<CommandResult> {
     let mut composed = ComposedMessage::new();
 
-    for addr in args.split_whitespace().flat_map(|a| vars.recipients(a)) {
+    for addr in crate::util::address_words(args)
+        .into_iter()
+        .flat_map(|a| vars.recipients(a))
+    {
         composed.add_to(&addr);
     }
 

@@ -302,3 +302,50 @@ fn edited_headers_keep_quoted_commas() {
     assert_eq!(envelope, "Envelope: bob@example.com, john@example.com");
     assert_eq!(output.status.code(), Some(0), "exit status");
 }
+
+/// `~t`, `~c` and `~b` take addresses as written in a header -- a quoted
+/// display name may hold a comma or a blank -- as well as plain addresses
+/// separated by blanks.
+#[test]
+fn recipient_escapes_split_by_address() {
+    let mbox = copy_test_data("testdata.mbox");
+    let mailrc = create_temp_mailrc("set debug\n");
+    let output = mailx_env(
+        &["-N", "-f", mbox.path().to_str().unwrap()],
+        "mail first@example.com\n\
+         ~t \"Smith, J\" <j@example.com>\n\
+         ~c a@example.com b@example.com\n\
+         body\n~.\nquit\n",
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("To: first@example.com, \"Smith, J\" <j@example.com>\n"),
+        "~t should add one recipient: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("Cc: a@example.com, b@example.com\n"),
+        "~c should add two recipients: {}",
+        stderr
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
+}
+
+/// `mail` takes its recipients the same way.
+#[test]
+fn mail_command_splits_recipients_by_address() {
+    let mbox = copy_test_data("testdata.mbox");
+    let mailrc = create_temp_mailrc("set debug\n");
+    let output = mailx_env(
+        &["-N", "-f", mbox.path().to_str().unwrap()],
+        "mail \"Smith, J\" <j@example.com> b@example.com\nbody\n~.\nquit\n",
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("To: \"Smith, J\" <j@example.com>, b@example.com\n"),
+        "mail should take two recipients: {}",
+        stderr
+    );
+}

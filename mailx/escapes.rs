@@ -19,6 +19,7 @@ use crate::filename::expand_local_prefixes;
 use crate::mailbox::Mailbox;
 use crate::msglist::msglist_or_current;
 use crate::send::ComposedMessage;
+use crate::util::address_words;
 use crate::variables::Variables;
 
 /// What input mode does after a command escape.
@@ -68,9 +69,9 @@ pub fn handle_escape(
         'A' => insert_signature(msg, vars, "Sign"),
         'a' => insert_signature(msg, vars, "sign"),
         'i' => insert_variable(msg, vars, args),
-        'b' => args.split_whitespace().for_each(|a| msg.add_bcc(a)),
-        'c' => args.split_whitespace().for_each(|a| msg.add_cc(a)),
-        't' => args.split_whitespace().for_each(|a| msg.add_to(a)),
+        'b' => address_words(args).into_iter().for_each(|a| msg.add_bcc(a)),
+        'c' => address_words(args).into_iter().for_each(|a| msg.add_cc(a)),
+        't' => address_words(args).into_iter().for_each(|a| msg.add_to(a)),
         's' => msg.subject = args.to_string(),
         'h' => prompt_headers(msg)?,
         'd' => read_dead_letter(msg, vars),

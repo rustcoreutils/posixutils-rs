@@ -255,6 +255,52 @@ pub fn addresses(list: &str) -> impl Iterator<Item = &str> {
     parts.into_iter().map(str::trim).filter(|a| !a.is_empty())
 }
 
+/// Split recipients given as command arguments.
+///
+/// Commas separate addresses as in a header, and a quoted display name may
+/// hold a comma or a blank. Within a comma-separated part an angle address
+/// ends its mailbox, and plain addresses are separated by blanks:
+/// `"Smith, J" <j@x> k@x, l@x m@x` is four recipients.
+pub fn address_words(list: &str) -> Vec<&str> {
+    let mut words = Vec::new();
+    for part in addresses(list) {
+        let mut rest = part;
+        while let Some(end) = angle_address_end(rest) {
+            words.push(rest[..end].trim());
+            rest = rest[end..].trim_start();
+        }
+        if rest.contains(['"', '(']) {
+            words.push(rest);
+        } else {
+            words.extend(rest.split_whitespace());
+        }
+    }
+    words
+}
+
+/// The index just past the `>` that closes the first angle address in `s`,
+/// outside quotes and comments; a `>` with no `<` before it is text.
+fn angle_address_end(s: &str) -> Option<usize> {
+    let (mut in_quote, mut depth, mut escaped, mut in_angle) = (false, 0usize, false, false);
+    for (i, c) in s.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if in_quote || depth > 0 => escaped = true,
+            '"' if depth == 0 => in_quote = !in_quote,
+            _ if in_quote => {}
+            '(' => depth += 1,
+            ')' if depth > 0 => depth -= 1,
+            '<' => in_angle = true,
+            '>' if in_angle => return Some(i + 1),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// The bare addresses of an address list, comma-separated:
 /// `A <a@x>, b@x (B)` is `a@x, b@x`.
 pub fn bare_addresses(list: &str) -> String {
@@ -263,4 +309,22 @@ pub fn bare_addresses(list: &str) -> String {
         .filter(|a| !a.is_empty())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn address_words_splits_mailboxes() {
+        assert_eq!(
+            address_words(r#""Smith, J" <j@x> k@x, l@x m@x"#),
+            [r#""Smith, J" <j@x>"#, "k@x", "l@x", "m@x"]
+        );
+        assert_eq!(address_words("a@x (Alice A) "), ["a@x (Alice A)"]);
+        assert_eq!(
+            address_words("Bob >_< Smith <bob@x>"),
+            ["Bob >_< Smith <bob@x>"]
+        );
+    }
 }

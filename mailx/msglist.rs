@@ -10,6 +10,7 @@
 //! Message list parsing for mailx
 //! Handles the various message specification formats defined by POSIX
 
+use crate::error::Result;
 use crate::mailbox::Mailbox;
 use crate::message::{extract_login, Disposition, ReadState};
 use crate::variables::Variables;
@@ -23,7 +24,7 @@ pub fn parse_msglist(
     mb: &Mailbox,
     for_undelete: bool,
     vars: &Variables,
-) -> Result<Vec<usize>, String> {
+) -> Result<Vec<usize>> {
     parse_msglist_with_opts(spec, mb, for_undelete, vars.get_bool("allnet"))
 }
 
@@ -32,7 +33,7 @@ fn parse_msglist_with_opts(
     mb: &Mailbox,
     for_undelete: bool,
     allnet: bool,
-) -> Result<Vec<usize>, String> {
+) -> Result<Vec<usize>> {
     let spec = spec.trim();
 
     if spec.is_empty() {
@@ -40,7 +41,7 @@ fn parse_msglist_with_opts(
         if mb.current > 0 {
             return Ok(vec![mb.current]);
         } else {
-            return Err("No applicable messages".to_string());
+            return Err("No applicable messages".into());
         }
     }
 
@@ -66,7 +67,7 @@ fn parse_msglist_with_opts(
     }
 
     if result.is_empty() {
-        Err("No applicable messages".to_string())
+        Err("No applicable messages".into())
     } else {
         Ok(result)
     }
@@ -77,7 +78,7 @@ fn parse_single_spec(
     mb: &Mailbox,
     for_undelete: bool,
     allnet: bool,
-) -> Result<Vec<usize>, String> {
+) -> Result<Vec<usize>> {
     // Check for range (n-m). A range is a pair of message numbers
     // (spec 104533), so both halves must name one before the `-` is read as a
     // separator. Treating any embedded hyphen as a range turned an ordinary
@@ -89,13 +90,13 @@ fn parse_single_spec(
             (range_endpoint(start_str, mb), range_endpoint(end_str, mb))
         {
             if start > end {
-                return Err("Invalid range".to_string());
+                return Err("Invalid range".into());
             }
             // Clamp to the mailbox rather than reject: `undelete 1-$` and
             // `undelete 1-9999` both mean "the rest of them".
             let last = mb.message_count();
             if start > last {
-                return Err(format!("Invalid message number: {}", start));
+                return Err(format!("Invalid message number: {}", start).into());
             }
             return Ok((start..=end.min(last)).collect());
         }
@@ -108,7 +109,7 @@ fn parse_single_spec(
             if mb.current > 0 {
                 Ok(vec![mb.current])
             } else {
-                Err("No current message".to_string())
+                Err("No current message".into())
             }
         }
         "^" => {
@@ -118,13 +119,13 @@ fn parse_single_spec(
                     .iter()
                     .position(|m| m.disposition == Disposition::Deleted)
                     .map(|i| vec![i + 1])
-                    .ok_or_else(|| "No deleted messages".to_string())
+                    .ok_or_else(|| "No deleted messages".into())
             } else {
                 mb.messages
                     .iter()
                     .position(|m| m.disposition != Disposition::Deleted)
                     .map(|i| vec![i + 1])
-                    .ok_or_else(|| "No messages".to_string())
+                    .ok_or_else(|| "No messages".into())
             }
         }
         "$" => {
@@ -132,7 +133,7 @@ fn parse_single_spec(
             if mb.message_count() > 0 {
                 Ok(vec![mb.message_count()])
             } else {
-                Err("No messages".to_string())
+                Err("No messages".into())
             }
         }
         "*" => {
@@ -154,11 +155,11 @@ fn parse_single_spec(
             if for_undelete {
                 mb.next_deleted(mb.current)
                     .map(|n| vec![n])
-                    .ok_or_else(|| "No more deleted messages".to_string())
+                    .ok_or_else(|| "No more deleted messages".into())
             } else {
                 mb.next_undeleted(mb.current)
                     .map(|n| vec![n])
-                    .ok_or_else(|| "No more messages".to_string())
+                    .ok_or_else(|| "No more messages".into())
             }
         }
         "-" => {
@@ -166,11 +167,11 @@ fn parse_single_spec(
             if for_undelete {
                 mb.prev_deleted(mb.current)
                     .map(|n| vec![n])
-                    .ok_or_else(|| "No previous deleted messages".to_string())
+                    .ok_or_else(|| "No previous deleted messages".into())
             } else {
                 mb.prev_undeleted(mb.current)
                     .map(|n| vec![n])
-                    .ok_or_else(|| "No previous messages".to_string())
+                    .ok_or_else(|| "No previous messages".into())
             }
         }
         _ => {
@@ -190,7 +191,7 @@ fn parse_single_spec(
                     .collect();
 
                 if matches.is_empty() {
-                    Err(format!("No messages matching /{}", suffix))
+                    Err(format!("No messages matching /{}", suffix).into())
                 } else {
                     Ok(matches)
                 }
@@ -215,7 +216,7 @@ fn parse_single_spec(
                     .collect();
 
                 if matches.is_empty() {
-                    Err(format!("No messages of type :{}", type_char))
+                    Err(format!("No messages of type :{}", type_char).into())
                 } else {
                     Ok(matches)
                 }
@@ -224,7 +225,7 @@ fn parse_single_spec(
                 if num > 0 && num <= mb.message_count() {
                     Ok(vec![num])
                 } else {
-                    Err(format!("Invalid message number: {}", num))
+                    Err(format!("Invalid message number: {}", num).into())
                 }
             } else {
                 // Address match
@@ -253,7 +254,7 @@ fn parse_single_spec(
                     .collect();
 
                 if matches.is_empty() {
-                    Err(format!("No messages from {}", spec))
+                    Err(format!("No messages from {}", spec).into())
                 } else {
                     Ok(matches)
                 }
@@ -283,11 +284,7 @@ fn range_endpoint(s: &str, mb: &Mailbox) -> Option<usize> {
 ///
 /// Nearly every command begins this way; the three-line form was written out
 /// sixteen times.
-pub fn msglist_or_current(
-    args: &str,
-    mb: &Mailbox,
-    vars: &Variables,
-) -> Result<Vec<usize>, String> {
+pub fn msglist_or_current(args: &str, mb: &Mailbox, vars: &Variables) -> Result<Vec<usize>> {
     if args.is_empty() {
         Ok(vec![mb.current])
     } else {
@@ -296,9 +293,7 @@ pub fn msglist_or_current(
 }
 
 /// Parse a message list and return just the first message
-pub fn parse_message(spec: &str, mb: &Mailbox, vars: &Variables) -> Result<usize, String> {
+pub fn parse_message(spec: &str, mb: &Mailbox, vars: &Variables) -> Result<usize> {
     let list = parse_msglist(spec, mb, false, vars)?;
-    list.first()
-        .copied()
-        .ok_or_else(|| "No message".to_string())
+    list.first().copied().ok_or_else(|| "No message".into())
 }

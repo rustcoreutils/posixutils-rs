@@ -13,6 +13,7 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::process::{Command, Stdio};
 
+use crate::error::{Error, IoContext, Result};
 use crate::mailbox::Mailbox;
 use crate::msglist::msglist_or_current;
 use crate::send::ComposedMessage;
@@ -68,7 +69,7 @@ pub fn handle_escape(
     msg: &mut ComposedMessage,
     vars: &mut Variables,
     mb: Option<&Mailbox>,
-) -> Result<EscapeResult, String> {
+) -> Result<EscapeResult> {
     if line.is_empty() {
         // Just the escape char - treat as literal
         return Ok(EscapeResult::continue_input());
@@ -373,7 +374,7 @@ fn expand_filename(name: &str, vars: &Variables) -> String {
     crate::util::expand_local_prefixes(name, vars)
 }
 
-fn edit_message(msg: &mut ComposedMessage, editor: &str) -> Result<(), String> {
+fn edit_message(msg: &mut ComposedMessage, editor: &str) -> Result<()> {
     // The temporary comes from `mkstemp` (`O_EXCL`, mode 0600, honoring
     // `$TMPDIR`). The old `/tmp/mailx.<pid>` name was predictable and
     // world-readable, and writing to it followed a symlink planted in advance.
@@ -395,7 +396,7 @@ fn edit_message(msg: &mut ComposedMessage, editor: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_edited_message(content: &[u8], msg: &mut ComposedMessage) -> Result<(), String> {
+fn parse_edited_message(content: &[u8], msg: &mut ComposedMessage) -> Result<()> {
     let mut in_headers = true;
     let mut body = Vec::new();
 
@@ -456,7 +457,7 @@ fn parse_edited_message(content: &[u8], msg: &mut ComposedMessage) -> Result<(),
 /// `~h`: prompt for the Subject, To, Cc, and Bcc header fields.
 ///
 /// Only when standard input is a terminal (spec 105065).
-fn prompt_headers(msg: &mut ComposedMessage) -> Result<(), String> {
+fn prompt_headers(msg: &mut ComposedMessage) -> Result<()> {
     if !io::stdin().is_terminal() {
         return Ok(());
     }
@@ -493,7 +494,7 @@ fn forward_messages(
     mb: &Mailbox,
     vars: &Variables,
     all_headers: bool,
-) -> Result<(), String> {
+) -> Result<()> {
     let msg_nums = msglist_or_current(args, mb, vars)?;
 
     for num in msg_nums {
@@ -517,7 +518,7 @@ fn insert_messages(
     vars: &Variables,
     all_headers: bool,
     with_indent: bool,
-) -> Result<(), String> {
+) -> Result<()> {
     let msg_nums = msglist_or_current(args, mb, vars)?;
 
     let indent = if with_indent {
@@ -547,7 +548,7 @@ fn insert_messages(
     Ok(())
 }
 
-fn pipe_through_command(input: &[u8], cmd: &str, vars: &Variables) -> Result<Vec<u8>, String> {
+fn pipe_through_command(input: &[u8], cmd: &str, vars: &Variables) -> Result<Vec<u8>> {
     let shell = vars.get("SHELL").unwrap_or("/bin/sh");
 
     let mut child = Command::new(shell)
@@ -558,12 +559,7 @@ fn pipe_through_command(input: &[u8], cmd: &str, vars: &Variables) -> Result<Vec
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| {
-            format!(
-                "Failed to execute command: {}",
-                plib::diag::io_error_text(&e)
-            )
-        })?;
+        .context("Failed to execute command")?;
 
     // Feed the body from a separate thread. Writing it all before reading the
     // filter's output deadlocked as soon as that output exceeded one pipe
@@ -577,12 +573,9 @@ fn pipe_through_command(input: &[u8], cmd: &str, vars: &Variables) -> Result<Vec
     let body = input.to_vec();
     let writer = std::thread::spawn(move || stdin.write_all(&body));
 
-    let output = child.wait_with_output().map_err(|e| {
-        format!(
-            "Failed to wait for command: {}",
-            plib::diag::io_error_text(&e)
-        )
-    })?;
+    let output = child
+        .wait_with_output()
+        .context("Failed to wait for command")?;
 
     match writer.join() {
         Ok(Ok(())) => {}
@@ -590,12 +583,12 @@ fn pipe_through_command(input: &[u8], cmd: &str, vars: &Variables) -> Result<Vec
         // pipe early; that is not an error in the message.
         Ok(Err(e)) if e.kind() == io::ErrorKind::BrokenPipe => {}
         Ok(Err(e)) => {
-            return Err(format!(
-                "Failed to write to command: {}",
-                plib::diag::io_error_text(&e)
-            ))
+            return Err(Error::Io {
+                context: "Failed to write to command".into(),
+                source: e,
+            })
         }
-        Err(_) => return Err("Failed to write to command".to_string()),
+        Err(_) => return Err("Failed to write to command".into()),
     }
 
     if output.status.success() {
@@ -606,7 +599,8 @@ fn pipe_through_command(input: &[u8], cmd: &str, vars: &Variables) -> Result<Vec
             "Command failed with exit code {}: {}",
             output.status.code().unwrap_or(-1),
             stderr
-        ))
+        )
+        .into())
     }
 }
 
@@ -617,7 +611,7 @@ fn pipe_through_command(input: &[u8], cmd: &str, vars: &Variables) -> Result<Vec
 /// command's context mask -- this used to be a third hand-written dispatcher
 /// with its own copy of the argument parser and its own `!` handling that,
 /// unlike the other two, did no bang expansion.
-fn execute_input_mode_command(line: &str, vars: &mut Variables) -> Result<(), String> {
+fn execute_input_mode_command(line: &str, vars: &mut Variables) -> Result<()> {
     // Input mode has no message store; commands needing one are excluded by
     // their context mask, so this scratch mailbox is never read from.
     let mut scratch = Mailbox::new(String::new());

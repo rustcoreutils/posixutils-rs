@@ -9,6 +9,7 @@
 
 //! Message representation for mailx
 
+use crate::error::Result;
 use std::collections::HashMap;
 
 /// Message state as defined by POSIX
@@ -463,7 +464,7 @@ pub fn extract_login(addr: &str) -> String {
 /// an option -- means the header is not naming one. Rejecting beats
 /// sanitizing, since a silently rewritten name is also a file the user did
 /// not ask for.
-pub fn author_filename(from: &str) -> Result<String, String> {
+pub fn author_filename(from: &str) -> Result<String> {
     let login = extract_login(from);
     let acceptable = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+');
     if login.is_empty()
@@ -471,7 +472,7 @@ pub fn author_filename(from: &str) -> Result<String, String> {
         || login.starts_with('.')
         || !login.chars().all(acceptable)
     {
-        return Err(format!("{}: invalid author name", from));
+        return Err(format!("{}: invalid author name", from).into());
     }
     Ok(login)
 }

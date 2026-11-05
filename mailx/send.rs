@@ -14,6 +14,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::process::{Command, Stdio};
 
 use crate::args::Args;
+use crate::error::{IoContext, Result};
 use crate::message::Message;
 use crate::variables::Variables;
 
@@ -104,10 +105,7 @@ fn single_line(s: &str) -> String {
 
 /// Prompt for the header fields the `asksub`, `askcc`, and `askbcc` variables
 /// request (spec 104582-104583, and the askcc/askbcc entries).
-pub(crate) fn prompt_optional_headers(
-    msg: &mut ComposedMessage,
-    vars: &Variables,
-) -> Result<(), String> {
+pub(crate) fn prompt_optional_headers(msg: &mut ComposedMessage, vars: &Variables) -> Result<()> {
     if msg.subject.is_empty() && vars.get_bool("asksub") {
         if let Some(v) = crate::util::prompt_field("Subject", "")? {
             msg.subject = v;
@@ -131,7 +129,7 @@ pub(crate) fn prompt_optional_headers(
 }
 
 /// Run send mode
-pub fn send_mode(args: &Args, vars: &mut Variables) -> Result<(), String> {
+pub fn send_mode(args: &Args, vars: &mut Variables) -> Result<()> {
     let is_tty = io::stdin().is_terminal();
 
     let mut msg = ComposedMessage::new();
@@ -193,10 +191,10 @@ pub fn send_message(
     msg: &ComposedMessage,
     vars: &Variables,
     record_to_recipient: bool,
-) -> Result<(), String> {
+) -> Result<()> {
     let recipients = msg.all_recipients();
     if recipients.is_empty() {
-        return Err("No recipients".to_string());
+        return Err("No recipients".into());
     }
 
     // Debug mode - don't actually send, just print diagnostics
@@ -254,7 +252,7 @@ pub fn send_message(
         .filter(|a| !a.is_empty())
         .collect();
     if recipients.is_empty() {
-        return Err("No recipients specified".to_string());
+        return Err("No recipients specified".into());
     }
 
     let mut cmd = Command::new(sendmail);
@@ -265,29 +263,24 @@ pub fn send_message(
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to run sendmail: {}", plib::diag::io_error_text(&e)))?;
+    let mut child = cmd.spawn().context("Failed to run sendmail")?;
 
     {
         let stdin = child.stdin.as_mut().ok_or("Failed to open stdin")?;
         stdin
             .write_all(&msg.format())
-            .map_err(|e| format!("Failed to write message: {}", plib::diag::io_error_text(&e)))?;
+            .context("Failed to write message")?;
     }
 
     // Wait for sendmail if sendwait is set
     if vars.get_bool("sendwait") {
-        let output = child.wait_with_output().map_err(|e| {
-            format!(
-                "Failed to wait for sendmail: {}",
-                plib::diag::io_error_text(&e)
-            )
-        })?;
+        let output = child
+            .wait_with_output()
+            .context("Failed to wait for sendmail")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("sendmail failed: {}", stderr));
+            return Err(format!("sendmail failed: {}", stderr).into());
         }
     }
 
@@ -317,7 +310,7 @@ pub(crate) fn record_message(
     msg: &ComposedMessage,
     filename: &str,
     vars: &Variables,
-) -> Result<(), String> {
+) -> Result<()> {
     let path = if vars.get_bool("outfolder") && !filename.starts_with('/') {
         if let Some(folder) = vars.get("folder") {
             let folder = expand_folder(folder);
@@ -338,7 +331,7 @@ pub(crate) fn record_message(
         .create(true)
         .append(true)
         .open(&path)
-        .map_err(|e| format!("Cannot open {}: {}", path, plib::diag::io_error_text(&e)))?;
+        .context(format!("Cannot open {}", path))?;
 
     let write = || -> io::Result<()> {
         let mut file = &file;
@@ -361,9 +354,8 @@ pub(crate) fn record_message(
         writeln!(file)?;
         Ok(())
     };
-    write().map_err(|e| format!("{}: {}", path, plib::diag::io_error_text(&e)))?;
-    file.flush()
-        .map_err(|e| format!("{}: {}", path, plib::diag::io_error_text(&e)))?;
+    write().context(&path)?;
+    file.flush().context(&path)?;
 
     Ok(())
 }

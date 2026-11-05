@@ -18,6 +18,7 @@ use std::env;
 use std::io::{self, IsTerminal, Write};
 use std::process::{Command, Stdio};
 
+use crate::error::Result;
 use crate::variables::Variables;
 
 /// The user's home directory, falling back to the current directory.
@@ -61,22 +62,22 @@ pub fn spool_path(user: &str) -> String {
 ///
 /// POSIX spells the invocation out: three arguments, `-c`, `--`, and the
 /// command string (spec 105043-105044, 104870-104872).
-pub fn shell(cmd: &str, vars: &Variables) -> Result<std::process::ExitStatus, String> {
+pub fn shell(cmd: &str, vars: &Variables) -> Result<std::process::ExitStatus> {
     Command::new(vars.get("SHELL").unwrap_or("/bin/sh"))
         .arg("-c")
         .arg("--")
         .arg(cmd)
         .status()
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string().into())
 }
 
 /// Run `cmd` through `SHELL` and collect its standard output.
-pub fn shell_output(cmd: &str, vars: &Variables) -> Result<String, String> {
+pub fn shell_output(cmd: &str, vars: &Variables) -> Result<String> {
     shell_output_bytes(cmd, vars).map(|out| String::from_utf8_lossy(&out).into_owned())
 }
 
 /// As [`shell_output`], keeping the output as the bytes written.
-pub fn shell_output_bytes(cmd: &str, vars: &Variables) -> Result<Vec<u8>, String> {
+pub fn shell_output_bytes(cmd: &str, vars: &Variables) -> Result<Vec<u8>> {
     let out = Command::new(vars.get("SHELL").unwrap_or("/bin/sh"))
         .arg("-c")
         .arg("--")
@@ -84,7 +85,7 @@ pub fn shell_output_bytes(cmd: &str, vars: &Variables) -> Result<Vec<u8>, String
         .output()
         .map_err(|e| e.to_string())?;
     if !out.status.success() {
-        return Err(format!("{}: {}", cmd, String::from_utf8_lossy(&out.stderr)));
+        return Err(format!("{}: {}", cmd, String::from_utf8_lossy(&out.stderr)).into());
     }
     Ok(out.stdout)
 }
@@ -153,7 +154,7 @@ pub fn page_or_print(text: &[u8], vars: &Variables) {
 /// Returns `None` when the user accepts what is there. Seven copies of this
 /// read-a-line-and-trim block existed across three files, which is why `mail`
 /// never honored `askcc`/`askbcc` while Send Mode did.
-pub fn prompt_field(label: &str, current: &str) -> Result<Option<String>, String> {
+pub fn prompt_field(label: &str, current: &str) -> Result<Option<String>> {
     print!("{}: {}", label, current);
     io::stdout().flush().map_err(|e| e.to_string())?;
 

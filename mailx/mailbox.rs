@@ -13,6 +13,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Seek, Write};
 use std::os::unix::io::AsRawFd;
 
+use crate::error::{IoContext, Result};
 use crate::message::{truncate_display, Disposition, Message, ReadState};
 use crate::variables::Variables;
 
@@ -54,7 +55,7 @@ impl Mailbox {
     }
 
     /// Load a mailbox from a file
-    pub fn load(path: &str) -> io::Result<Self> {
+    pub fn load(path: &str) -> Result<Self> {
         // Read the file in one go rather than streaming it, so the byte length
         // we record is exactly the extent we parsed. A delivery that lands
         // mid-read would otherwise leave `loaded_len` disagreeing with the
@@ -67,7 +68,7 @@ impl Mailbox {
         //
         // The read is done under a shared lock, so a delivery in progress is
         // waited for rather than half read.
-        let bytes = read_locked(path)?;
+        let bytes = read_locked(path).context(path)?;
         let mut mailbox = Mailbox::new(path.to_string());
         mailbox.loaded_len = bytes.len() as u64;
 
@@ -362,7 +363,7 @@ impl Mailbox {
     }
 
     /// Handle quit - save read messages to mbox, delete saved, etc.
-    pub fn quit(&mut self, vars: &Variables) -> Result<(), String> {
+    pub fn quit(&mut self, vars: &Variables) -> Result<()> {
         let hold = vars.get_bool("hold");
         let keepsave = vars.get_bool("keepsave");
         let keep = vars.get_bool("keep");
@@ -417,8 +418,7 @@ impl Mailbox {
         if !mbox_messages.is_empty() {
             let mbox_path = crate::util::mbox_path(vars);
             let append = vars.get_bool("append");
-            migrate_to_mbox(&mbox_path, &mbox_messages, append)
-                .map_err(|e| format!("{}: {}", mbox_path, plib::diag::io_error_text(&e)))?;
+            migrate_to_mbox(&mbox_path, &mbox_messages, append).context(&mbox_path)?;
         }
 
         // Rewrite the current mailbox only when its set of messages actually
@@ -436,7 +436,7 @@ impl Mailbox {
         // `Status:` header the mailbox should now carry.
         if keep_messages.len() != self.messages.len() || self.state_differs_from_disk() {
             rewrite_mailbox(&self.path, &keep_messages, self.loaded_len, keep)
-                .map_err(|e| format!("{}: {}", self.path, plib::diag::io_error_text(&e)))?;
+                .context(&self.path)?;
         }
 
         Ok(())
@@ -453,12 +453,11 @@ impl Mailbox {
         msg_nums: &[usize],
         path: &str,
         include_from_line: bool,
-    ) -> Result<u64, String> {
+    ) -> Result<u64> {
         let messages: Vec<&Message> = msg_nums.iter().filter_map(|&n| self.get(n)).collect();
 
         let msgs: Vec<Message> = messages.iter().map(|m| (*m).clone()).collect();
-        append_messages_to_file(path, &msgs, include_from_line)
-            .map_err(|e| format!("{}: {}", path, plib::diag::io_error_text(&e)))
+        append_messages_to_file(path, &msgs, include_from_line).context(path)
     }
 }
 

@@ -224,7 +224,7 @@ fn cmd_reply_flipr(
     interp: &mut Interp,
     lowercase_form: bool,
 ) -> Result<CommandResult> {
-    let reply_to_all = lowercase_form != vars.get_bool("flipr");
+    let reply_to_all = lowercase_form != vars.is_set("flipr");
     cmd_reply(args, mb, vars, interp, reply_to_all)
 }
 
@@ -514,7 +514,7 @@ fn cmd_delete(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comm
     }
 
     // If autoprint is set, print the new current message
-    if vars.get_bool("autoprint")
+    if vars.is_set("autoprint")
         && mb.current > 0
         && mb
             .get(mb.current)
@@ -564,7 +564,7 @@ fn cmd_dp(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandR
 fn cmd_edit(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult> {
     let msg_nums = msglist_or_current(args, mb, vars)?;
 
-    let editor = vars.get("EDITOR").unwrap_or("ed");
+    let editor = vars.get_nonempty("EDITOR").unwrap_or("ed");
     edit_messages(&msg_nums, mb, editor)
 }
 
@@ -630,9 +630,9 @@ fn cmd_file(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
 }
 
 fn cmd_folders(vars: &mut Variables) -> Result<CommandResult> {
-    if let Some(folder) = vars.get("folder") {
+    if let Some(folder) = vars.get_nonempty("folder") {
         let folder = expand_typed_filename(folder, vars);
-        let lister = vars.get("LISTER").unwrap_or("ls");
+        let lister = vars.get_nonempty("LISTER").unwrap_or("ls");
         crate::util::shell(&format!("{} {}", lister, folder), vars)?;
     } else {
         println!("No folder variable set");
@@ -824,7 +824,9 @@ fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
     let (msg_nums, cmd) = if args.is_empty() {
         (
             vec![mb.current],
-            vars.get("cmd").ok_or("No command specified")?.to_string(),
+            vars.get_nonempty("cmd")
+                .ok_or("No command specified")?
+                .to_string(),
         )
     } else {
         // Try to find where msglist ends and command begins
@@ -844,7 +846,9 @@ fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
             if let Ok(nums) = parse_msglist(args, mb, false, vars) {
                 (
                     nums,
-                    vars.get("cmd").ok_or("No command specified")?.to_string(),
+                    vars.get_nonempty("cmd")
+                        .ok_or("No command specified")?
+                        .to_string(),
                 )
             } else {
                 (vec![mb.current], args.to_string())
@@ -857,8 +861,8 @@ fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
         }
     };
 
-    let shell = vars.get("SHELL").unwrap_or("/bin/sh");
-    let page = vars.get_bool("page");
+    let shell = vars.get_nonempty("SHELL").unwrap_or("/bin/sh");
+    let page = vars.is_set("page");
 
     for num in &msg_nums {
         if let Some(msg) = mb.get(*num) {
@@ -999,11 +1003,7 @@ pub(crate) fn cmd_set(args: &str, vars: &mut Variables) -> Result<CommandResult>
         if name == "onehop" {
             return Err("onehop is not supported; operating in noonehop mode".into());
         }
-        if let Some(val) = value {
-            vars.set(name, val);
-        } else {
-            vars.set_bool(name, true);
-        }
+        vars.set(name, value.unwrap_or(""));
     }
 
     Ok(CommandResult::Continue)
@@ -1056,7 +1056,7 @@ const BOOLEAN_VARIABLES: &[&str] = &[
 ];
 
 fn cmd_shell(cmd: &str, vars: &mut Variables, interp: &mut Interp) -> Result<CommandResult> {
-    let cmd = if vars.get_bool("bang") {
+    let cmd = if vars.is_set("bang") {
         crate::util::expand_bang(cmd, interp.last_shell_cmd.as_deref())
     } else {
         cmd.to_string()
@@ -1071,7 +1071,7 @@ fn cmd_shell(cmd: &str, vars: &mut Variables, interp: &mut Interp) -> Result<Com
 }
 
 fn cmd_shell_interactive(vars: &mut Variables) -> Result<CommandResult> {
-    let shell = vars.get("SHELL").unwrap_or("/bin/sh");
+    let shell = vars.get_nonempty("SHELL").unwrap_or("/bin/sh");
     Command::new(shell).status().map_err(|e| e.to_string())?;
     Ok(CommandResult::Continue)
 }
@@ -1193,7 +1193,7 @@ fn cmd_undelete(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Co
         mb.current = last;
     }
 
-    if vars.get_bool("autoprint") {
+    if vars.is_set("autoprint") {
         cmd_print("", mb, vars, false)?;
     }
 
@@ -1210,7 +1210,7 @@ pub(crate) fn cmd_unset(args: &str, vars: &mut Variables) -> Result<CommandResul
 fn cmd_visual(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult> {
     let msg_nums = msglist_or_current(args, mb, vars)?;
 
-    let editor = vars.get("VISUAL").unwrap_or("vi");
+    let editor = vars.get_nonempty("VISUAL").unwrap_or("vi");
     edit_messages(&msg_nums, mb, editor)?;
 
     Ok(CommandResult::Continue)

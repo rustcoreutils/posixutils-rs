@@ -38,7 +38,7 @@ pub fn expand_local_prefixes(name: &str, vars: &Variables) -> String {
         return spool_path(user);
     }
     if let Some(rest) = name.strip_prefix('+') {
-        if let Some(folder) = vars.get("folder") {
+        if let Some(folder) = vars.get_nonempty("folder") {
             let folder = if folder.starts_with('/') {
                 folder.to_string()
             } else {

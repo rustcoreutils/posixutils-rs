@@ -28,7 +28,7 @@ pub fn home() -> String {
 
 /// The secondary mailbox messages are moved to when they have been read.
 pub fn mbox_path(vars: &Variables) -> String {
-    vars.get("MBOX")
+    vars.get_nonempty("MBOX")
         .map(|s| s.to_string())
         .or_else(|| env::var("MBOX").ok())
         .unwrap_or_else(|| format!("{}/mbox", home()))
@@ -36,7 +36,7 @@ pub fn mbox_path(vars: &Variables) -> String {
 
 /// The file a partial message is saved to on interrupt or delivery error.
 pub fn dead_letter_path(vars: &Variables) -> String {
-    vars.get("DEAD")
+    vars.get_nonempty("DEAD")
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("{}/dead.letter", home()))
 }
@@ -63,7 +63,7 @@ pub fn spool_path(user: &str) -> String {
 /// POSIX spells the invocation out: three arguments, `-c`, `--`, and the
 /// command string (spec 105043-105044, 104870-104872).
 pub fn shell(cmd: &str, vars: &Variables) -> Result<std::process::ExitStatus> {
-    Command::new(vars.get("SHELL").unwrap_or("/bin/sh"))
+    Command::new(vars.get_nonempty("SHELL").unwrap_or("/bin/sh"))
         .arg("-c")
         .arg("--")
         .arg(cmd)
@@ -78,7 +78,7 @@ pub fn shell_output(cmd: &str, vars: &Variables) -> Result<String> {
 
 /// As [`shell_output`], keeping the output as the bytes written.
 pub fn shell_output_bytes(cmd: &str, vars: &Variables) -> Result<Vec<u8>> {
-    let out = Command::new(vars.get("SHELL").unwrap_or("/bin/sh"))
+    let out = Command::new(vars.get_nonempty("SHELL").unwrap_or("/bin/sh"))
         .arg("-c")
         .arg("--")
         .arg(cmd)
@@ -125,8 +125,8 @@ pub fn page_or_print(text: &[u8], vars: &Variables) {
         return;
     }
 
-    let pager = vars.get("PAGER").unwrap_or("more");
-    let spawned = Command::new(vars.get("SHELL").unwrap_or("/bin/sh"))
+    let pager = vars.get_nonempty("PAGER").unwrap_or("more");
+    let spawned = Command::new(vars.get_nonempty("SHELL").unwrap_or("/bin/sh"))
         .arg("-c")
         .arg("--")
         .arg(pager)

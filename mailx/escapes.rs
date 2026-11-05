@@ -91,7 +91,7 @@ pub fn handle_escape(
         }
         '!' => {
             // Shell escape with bang expansion
-            let cmd = if vars.get_bool("bang") {
+            let cmd = if vars.is_set("bang") {
                 // Expand ! to previous command
                 crate::util::expand_bang(args, interp.last_shell_cmd.as_deref())
             } else {
@@ -123,7 +123,7 @@ pub fn handle_escape(
         }
         'A' => {
             // Insert Sign variable
-            if let Some(sign) = vars.get("Sign") {
+            if let Some(sign) = vars.get_nonempty("Sign") {
                 let sign = expand_escapes(sign);
                 msg.body.extend_from_slice(sign.as_bytes());
                 msg.body.push(b'\n');
@@ -132,7 +132,7 @@ pub fn handle_escape(
         }
         'a' => {
             // Insert sign variable
-            if let Some(sign) = vars.get("sign") {
+            if let Some(sign) = vars.get_nonempty("sign") {
                 let sign = expand_escapes(sign);
                 msg.body.extend_from_slice(sign.as_bytes());
                 msg.body.push(b'\n');
@@ -167,7 +167,7 @@ pub fn handle_escape(
         }
         'e' => {
             // Edit with EDITOR
-            edit_message(msg, vars.get("EDITOR").unwrap_or("ed"))?;
+            edit_message(msg, vars.get_nonempty("EDITOR").unwrap_or("ed"))?;
             Ok(EscapeResult::continue_input())
         }
         'f' => {
@@ -192,7 +192,7 @@ pub fn handle_escape(
         'i' => {
             // Insert variable value
             if !args.is_empty() {
-                if let Some(value) = vars.get(args) {
+                if let Some(value) = vars.get_nonempty(args) {
                     msg.body.extend_from_slice(value.as_bytes());
                     msg.body.push(b'\n');
                 }
@@ -276,7 +276,7 @@ pub fn handle_escape(
         }
         'v' => {
             // Edit with VISUAL
-            edit_message(msg, vars.get("VISUAL").unwrap_or("vi"))?;
+            edit_message(msg, vars.get_nonempty("VISUAL").unwrap_or("vi"))?;
             Ok(EscapeResult::continue_input())
         }
         'w' => {
@@ -538,7 +538,7 @@ fn insert_messages(
 }
 
 fn pipe_through_command(input: &[u8], cmd: &str, vars: &Variables) -> Result<Vec<u8>> {
-    let shell = vars.get("SHELL").unwrap_or("/bin/sh");
+    let shell = vars.get_nonempty("SHELL").unwrap_or("/bin/sh");
 
     let mut child = Command::new(shell)
         .arg("-c")

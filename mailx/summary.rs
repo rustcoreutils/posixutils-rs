@@ -16,7 +16,7 @@ use crate::variables::Variables;
 /// Print the header summary of `msg_nums`, or of every message.
 pub fn print_headers(mb: &Mailbox, msg_nums: Option<&[usize]>, vars: &Variables) {
     let screen = vars.screen_lines().get();
-    let show_to = vars.get_bool("showto");
+    let show_to = vars.is_set("showto");
 
     let nums: Vec<usize> = msg_nums
         .map(|n| n.to_vec())

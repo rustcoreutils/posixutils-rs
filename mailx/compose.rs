@@ -29,13 +29,13 @@ fn interrupt_message(
     vars: &Variables,
     interrupt_count: &mut u32,
 ) -> bool {
-    if vars.get_bool("ignore") {
+    if vars.is_set("ignore") {
         println!("@");
         return false;
     }
     *interrupt_count += 1;
     if *interrupt_count >= 2 {
-        if vars.get_bool("save") && !composed.body.is_empty() {
+        if vars.is_set("save") && !composed.body.is_empty() {
             crate::send::save_dead_letter(composed, vars);
         }
         return true;
@@ -65,7 +65,7 @@ pub(crate) fn compose_body(
         match crate::signals::read_bytes_interruptible(&mut line) {
             Ok(0) => {
                 // EOF - if ignoreeof is set, require "." (or ~.) to end.
-                if vars.get_bool("ignoreeof") {
+                if vars.is_set("ignoreeof") {
                     println!("Use \".\" to terminate letter.");
                     continue;
                 }
@@ -113,8 +113,7 @@ pub(crate) fn compose_body(
                 if result.abort {
                     // `~q` saves the partial message, `~x` does not
                     // (spec 105081-105083, 105097).
-                    if result.save_dead_letter && vars.get_bool("save") && !composed.body.is_empty()
-                    {
+                    if result.save_dead_letter && vars.is_set("save") && !composed.body.is_empty() {
                         crate::send::save_dead_letter(composed, vars);
                     }
                     return Err(Error::Aborted);
@@ -125,7 +124,7 @@ pub(crate) fn compose_body(
         }
 
         // Check for single period (if dot is set, or ignoreeof forces it)
-        if (vars.get_bool("dot") || vars.get_bool("ignoreeof")) && line.trim_ascii() == b"." {
+        if (vars.is_set("dot") || vars.is_set("ignoreeof")) && line.trim_ascii() == b"." {
             break;
         }
 

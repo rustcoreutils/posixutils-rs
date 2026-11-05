@@ -182,9 +182,9 @@ impl Mailbox {
 
     /// Handle quit - save read messages to mbox, delete saved, etc.
     pub fn quit(&mut self, vars: &Variables) -> Result<()> {
-        let hold = vars.get_bool("hold");
-        let keepsave = vars.get_bool("keepsave");
-        let keep = vars.get_bool("keep");
+        let hold = vars.is_set("hold");
+        let keepsave = vars.is_set("keepsave");
+        let keep = vars.is_set("keep");
 
         // Collect messages for mbox
         let mut mbox_messages = Vec::new();
@@ -235,7 +235,7 @@ impl Mailbox {
         // Save to mbox if needed
         if !mbox_messages.is_empty() {
             let mbox_path = crate::util::mbox_path(vars);
-            let append = vars.get_bool("append");
+            let append = vars.is_set("append");
             migrate_to_mbox(&mbox_path, &mbox_messages, append).context(&mbox_path)?;
         }
 

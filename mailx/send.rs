@@ -107,19 +107,19 @@ fn single_line(s: &str) -> String {
 /// Prompt for the header fields the `asksub`, `askcc`, and `askbcc` variables
 /// request (spec 104582-104583, and the askcc/askbcc entries).
 pub(crate) fn prompt_optional_headers(msg: &mut ComposedMessage, vars: &Variables) -> Result<()> {
-    if msg.subject.is_empty() && vars.get_bool("asksub") {
+    if msg.subject.is_empty() && vars.is_set("asksub") {
         if let Some(v) = crate::util::prompt_field("Subject", "")? {
             msg.subject = v;
         }
     }
-    if vars.get_bool("askcc") {
+    if vars.is_set("askcc") {
         if let Some(v) = crate::util::prompt_field("Cc", "")? {
             for addr in crate::util::addresses(&v) {
                 msg.add_cc(addr);
             }
         }
     }
-    if vars.get_bool("askbcc") {
+    if vars.is_set("askbcc") {
         if let Some(v) = crate::util::prompt_field("Bcc", "")? {
             for addr in crate::util::addresses(&v) {
                 msg.add_bcc(addr);
@@ -199,7 +199,7 @@ pub fn send_message(
     }
 
     // Debug mode - don't actually send, just print diagnostics
-    if vars.get_bool("debug") {
+    if vars.is_set("debug") {
         eprintln!("--- Debug mode: message not sent ---");
         // The envelope is what the delivery software is handed; the headers are
         // what the recipients see. Blind recipients appear in the first and not
@@ -274,7 +274,7 @@ pub fn send_message(
     }
 
     // Wait for sendmail if sendwait is set
-    if vars.get_bool("sendwait") {
+    if vars.is_set("sendwait") {
         let output = child
             .wait_with_output()
             .context("Failed to wait for sendmail")?;
@@ -291,7 +291,7 @@ pub fn send_message(
             let filename = crate::message::author_filename(first_to)?;
             record_message(msg, &filename, vars)?;
         }
-    } else if let Some(record_file) = vars.get("record") {
+    } else if let Some(record_file) = vars.get_nonempty("record") {
         record_message(msg, record_file, vars)?;
     }
 
@@ -312,8 +312,8 @@ pub(crate) fn record_message(
     filename: &str,
     vars: &Variables,
 ) -> Result<()> {
-    let path = if vars.get_bool("outfolder") && !filename.starts_with('/') {
-        if let Some(folder) = vars.get("folder") {
+    let path = if vars.is_set("outfolder") && !filename.starts_with('/') {
+        if let Some(folder) = vars.get_nonempty("folder") {
             let folder = expand_folder(folder);
             format!("{}/{}", folder, filename)
         } else {
@@ -415,7 +415,7 @@ pub fn compose_reply(original: &Message, reply_all: bool, vars: &Variables) -> C
 
         // Add all To: recipients.  Unless metoo is set, the user's own login
         // and any declared alternates come out of the list (spec 104926-104928).
-        let include_self = vars.get_bool("metoo");
+        let include_self = vars.is_set("metoo");
 
         for addr in crate::util::addresses(original.to()) {
             if !include_self && vars.is_me(addr) {

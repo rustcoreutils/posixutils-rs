@@ -12,28 +12,36 @@
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
-/// Mailx internal variables
+/// The internal variables, and the alias, alternates and header lists that
+/// commands maintain beside them.
 #[derive(Debug)]
 pub struct Variables {
-    /// String/numeric variables
+    /// Every defined variable and its value. A binary variable is one whose
+    /// value nobody reads; `set name` gives it, like any variable, the null
+    /// value. Unset is absence.
     values: HashMap<String, String>,
-    /// Boolean variables (set = true, unset = false)
-    booleans: HashMap<String, bool>,
-    /// Aliases
     pub aliases: HashMap<String, Vec<String>>,
-    /// Alternate names for the user
+    /// Other addresses of the user's, from `alternates`.
     pub alternates: Vec<String>,
-    /// Ignored header fields
+    /// Header fields `discard`/`ignore` hide.
     pub ignored_headers: Vec<String>,
-    /// Retained header fields
+    /// Header fields `retain` keeps.
     pub retained_headers: Vec<String>,
+}
+
+/// The name a variable is stored under: `ask` is accepted for `asksub`.
+fn canonical(name: &str) -> &str {
+    if name == "ask" {
+        "asksub"
+    } else {
+        name
+    }
 }
 
 impl Variables {
     pub fn new() -> Self {
         let mut vars = Variables {
             values: HashMap::new(),
-            booleans: HashMap::new(),
             aliases: HashMap::new(),
             alternates: Vec::new(),
             ignored_headers: Vec::new(),
@@ -41,9 +49,9 @@ impl Variables {
         };
 
         // Set defaults per POSIX
-        vars.set_bool("asksub", true);
-        vars.set_bool("header", true);
-        vars.set_bool("save", true);
+        vars.enable("asksub");
+        vars.enable("header");
+        vars.enable("save");
         vars.set("prompt", "? ");
         vars.set("SHELL", "/bin/sh");
         vars.set("VISUAL", "vi");
@@ -53,37 +61,50 @@ impl Variables {
         vars
     }
 
-    /// Set a string/numeric variable
     pub fn set(&mut self, name: &str, value: &str) {
-        // Handle ask/asksub synonyms
-        let name = if name == "ask" { "asksub" } else { name };
-
-        self.values.insert(name.to_string(), value.to_string());
+        self.values
+            .insert(canonical(name).to_string(), value.to_string());
     }
 
-    /// Get a string variable
+    /// Define `name` with the null value, as `set name` does.
+    pub fn enable(&mut self, name: &str) {
+        self.set(name, "");
+    }
+
+    pub fn unset(&mut self, name: &str) {
+        self.values.remove(canonical(name));
+    }
+
+    /// Whether `name` is defined, whatever its value.
+    pub fn is_set(&self, name: &str) -> bool {
+        self.values.contains_key(canonical(name))
+    }
+
+    /// The value of `name`, null included.
     pub fn get(&self, name: &str) -> Option<&str> {
-        let name = if name == "ask" { "asksub" } else { name };
-        self.values.get(name).map(|s| s.as_str())
+        self.values.get(canonical(name)).map(|s| s.as_str())
     }
 
-    /// Get a numeric variable
+    /// The value of `name`, unless it is unset or null.
+    ///
+    /// For variables that name a file or a command, where a null value
+    /// names nothing.
+    pub fn get_nonempty(&self, name: &str) -> Option<&str> {
+        self.get(name).filter(|v| !v.is_empty())
+    }
+
     pub fn get_number(&self, name: &str) -> Option<i64> {
         self.get(name).and_then(|s| s.parse().ok())
     }
 
     /// Header summaries per screenful, for the `headers` and `z` commands.
     ///
-    /// The return type carries the non-zero guarantee rather than leaving each
-    /// caller to remember it: `screen` comes from the user, and every one of
-    /// the three sites that divides by it used to divide by zero on
-    /// `set screen=0`.
+    /// The return type carries the non-zero guarantee: `screen` comes from
+    /// the user, and the callers divide by it.
     ///
-    /// When the user has not set `screen`, the spec does not leave the default
-    /// to the implementation's taste: "If `screen` is not specified, a value
-    /// based on the terminal type identified by the TERM environment variable,
-    /// the window size, the baud rate, or some combination of these shall be
-    /// used" (104664-66). It was a hard-coded 20.
+    /// When `screen` is unset the spec asks for a value "based on the terminal
+    /// type identified by the TERM environment variable, the window size, the
+    /// baud rate, or some combination of these" (104664-66).
     pub fn screen_lines(&self) -> NonZeroUsize {
         self.get_number("screen")
             .and_then(|n| usize::try_from(n).ok())
@@ -91,60 +112,26 @@ impl Variables {
             .unwrap_or_else(|| screenful_from(terminal_rows(), std::env::var("TERM").ok()))
     }
 
-    /// Set a boolean variable
-    pub fn set_bool(&mut self, name: &str, value: bool) {
-        // Handle ask/asksub synonyms
-        let name = if name == "ask" { "asksub" } else { name };
-
-        self.booleans.insert(name.to_string(), value);
-    }
-
-    /// Get a boolean variable
-    pub fn get_bool(&self, name: &str) -> bool {
-        let name = if name == "ask" { "asksub" } else { name };
-        self.booleans.get(name).copied().unwrap_or(false)
-    }
-
-    /// Whether `name` currently has a value or a boolean setting.
-    pub fn is_set(&self, name: &str) -> bool {
-        let name = if name == "ask" { "asksub" } else { name };
-        self.values.contains_key(name) || self.booleans.contains_key(name)
-    }
-
-    /// Unset a variable
-    pub fn unset(&mut self, name: &str) {
-        let name = if name == "ask" { "asksub" } else { name };
-        self.values.remove(name);
-        self.booleans.remove(name);
-    }
-
-    /// Get the command-escape character for input mode.
+    /// The command-escape character for input mode.
     ///
-    /// Returns `Some('~')` by default, `Some(c)` when `escape` names a
-    /// character, and `None` when `escape` is set to null — in which case
-    /// command escaping is disabled (spec 104610-104612).
+    /// `~` by default; `None` when `escape` is null, which disables command
+    /// escapes (spec 104610-104612).
     pub fn escape_char(&self) -> Option<char> {
         match self.get("escape") {
             None => Some('~'),
-            Some(s) => s.chars().next(), // empty string => None => disabled
+            Some(s) => s.chars().next(),
         }
     }
 
-    /// Print all set variables
+    /// Write every defined variable, as `set` with no arguments does: `name`
+    /// for a null value, `name="value"` otherwise.
     pub fn print_all(&self) {
         let mut names: Vec<&String> = self.values.keys().collect();
         names.sort();
         for name in names {
-            if let Some(value) = self.values.get(name) {
-                println!("{}=\"{}\"", name, value);
-            }
-        }
-
-        let mut bools: Vec<(&String, &bool)> = self.booleans.iter().collect();
-        bools.sort_by_key(|(k, _)| *k);
-        for (name, value) in bools {
-            if *value {
-                println!("{}", name);
+            match self.values[name].as_str() {
+                "" => println!("{}", name),
+                value => println!("{}=\"{}\"", name, value),
             }
         }
     }

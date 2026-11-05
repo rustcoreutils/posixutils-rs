@@ -824,3 +824,65 @@ fn set_no_prefix_clears_valued_and_user_variables() {
     );
     assert_eq!(output.status.code(), Some(0), "exit status");
 }
+
+/// A variable has one value: `set name` after `set name=value` replaces the
+/// value with null rather than adding a second, boolean, `name`.
+#[test]
+fn a_variable_holds_one_value() {
+    let mbox = copy_test_data("testdata-single.mbox");
+    let output = mailx(
+        &["-n", "-N", "-f", mbox.path().to_str().unwrap()],
+        "set color=red\nset color\nset\nset shade\nset shade=blue\nset\nexit\n",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let listings: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.starts_with("color") || l.starts_with("shade"))
+        .collect();
+    // First listing: `color` (null). Second: `color` and `shade="blue"`.
+    assert_eq!(
+        listings,
+        ["color", "color", "shade=\"blue\""],
+        "each variable should be listed once, with its latest value: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
+}
+
+/// A variable that is tested for being set counts as set whatever value it
+/// was given: `set autoprint=yes` turns autoprint on.
+#[test]
+fn a_valued_variable_is_set() {
+    let mbox = copy_test_data("testdata.mbox");
+    let output = mailx(
+        &["-n", "-N", "-f", mbox.path().to_str().unwrap()],
+        "set autoprint=yes\ndelete 1\nexit\n",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Subject: Project Update"),
+        "autoprint=yes should print the next message after delete: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
+}
+
+/// `set escape` gives `escape` a null value, which disables command escapes
+/// just as `set escape=` does (`name` and `name=` are equivalent).
+#[test]
+fn set_escape_without_value_disables_escapes() {
+    let mbox = copy_test_data("testdata.mbox");
+    let mailrc = create_temp_mailrc("set debug\nset dot\nset escape\n");
+    let output = mailx_env(
+        &["-N", "-f", mbox.path().to_str().unwrap()],
+        "mail recipient@example.com\n~x\nbody\n.\nquit\n",
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Debug mode"),
+        "with escapes disabled ~x is text, so the message is sent: {}",
+        stderr
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
+}

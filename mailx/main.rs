@@ -154,12 +154,12 @@ fn run_receive_mode(args: &Args) -> i32 {
     let is_tty = io::stdin().is_terminal();
 
     // Print version unless quiet
-    if !vars.get_bool("quiet") && is_tty {
+    if !vars.is_set("quiet") && is_tty {
         println!("mailx-rs version {}", env!("CARGO_PKG_VERSION"));
     }
 
     // Print headers unless -N is specified
-    if !args.no_header_summary && vars.get_bool("header") && mb.message_count() > 0 {
+    if !args.no_header_summary && vars.is_set("header") && mb.message_count() > 0 {
         crate::summary::print_headers(&mb, None, &vars);
     } else if mb.message_count() == 0 && is_tty {
         println!("{} {}", gettext("No mail for"), get_user());
@@ -262,7 +262,7 @@ fn init_variables(vars: &mut Variables, args: &Args) {
 
     // Set ignore variable from -i option
     if args.ignore_interrupts {
-        vars.set_bool("ignore", true);
+        vars.enable("ignore");
     }
 }
 

@@ -25,7 +25,7 @@ pub fn parse_msglist(
     for_undelete: bool,
     vars: &Variables,
 ) -> Result<Vec<usize>> {
-    parse_msglist_with_opts(spec, mb, for_undelete, vars.get_bool("allnet"))
+    parse_msglist_with_opts(spec, mb, for_undelete, vars.is_set("allnet"))
 }
 
 fn parse_msglist_with_opts(

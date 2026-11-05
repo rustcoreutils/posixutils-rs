@@ -93,14 +93,9 @@ impl Store {
 
     /// Copy the bytes of `span` to `w`, a buffer at a time.
     pub fn copy_to<W: Write + ?Sized>(&self, span: Span, w: &mut W) -> io::Result<()> {
-        let mut buf = vec![0; BUFFER.min(span.len as usize)];
-        let mut done = 0;
-        while done < span.len {
-            let n = buf.len().min((span.len - done) as usize);
-            self.file()?
-                .read_exact_at(&mut buf[..n], span.offset + done)?;
-            w.write_all(&buf[..n])?;
-            done += n as u64;
+        let copied = io::copy(&mut self.reader(span), w)?;
+        if copied != span.len {
+            return Err(io::ErrorKind::UnexpectedEof.into());
         }
         Ok(())
     }

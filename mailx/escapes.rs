@@ -202,14 +202,14 @@ pub fn handle_escape(
         'm' => {
             // Insert messages with indent
             if let Some(mailbox) = mb {
-                insert_messages(args, msg, mailbox, vars, false, true)?;
+                insert_messages(args, msg, mailbox, vars, false)?;
             }
             Ok(EscapeResult::continue_input())
         }
         'M' => {
             // Insert messages with indent (all headers)
             if let Some(mailbox) = mb {
-                insert_messages(args, msg, mailbox, vars, true, true)?;
+                insert_messages(args, msg, mailbox, vars, true)?;
             }
             Ok(EscapeResult::continue_input())
         }
@@ -480,12 +480,8 @@ fn forward_messages(
 
     for num in msg_nums {
         if let Some(m) = mb.get(num) {
-            let content = if all_headers {
-                m.format_display(true, vars)
-            } else {
-                m.format_display(false, vars)
-            };
-            msg.body.extend_from_slice(&content);
+            msg.body
+                .extend_from_slice(&m.format_display(all_headers, vars));
         }
     }
 
@@ -498,24 +494,13 @@ fn insert_messages(
     mb: &Mailbox,
     vars: &Variables,
     all_headers: bool,
-    with_indent: bool,
 ) -> Result<()> {
     let msg_nums = msglist_or_current(args, mb, vars)?;
-
-    let indent = if with_indent {
-        vars.get("indentprefix").unwrap_or("\t")
-    } else {
-        ""
-    };
+    let indent = vars.get("indentprefix").unwrap_or("\t");
 
     for num in msg_nums {
         if let Some(m) = mb.get(num) {
-            let content = if all_headers {
-                m.format_display(true, vars)
-            } else {
-                m.format_display(false, vars)
-            };
-
+            let content = m.format_display(all_headers, vars);
             for line in crate::util::byte_lines(&content) {
                 if !line.is_empty() {
                     msg.body.extend_from_slice(indent.as_bytes());

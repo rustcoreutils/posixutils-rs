@@ -859,16 +859,12 @@ fn cmd_print(
         }
     }
 
-    // Mark as read and update current
     for num in &msg_nums {
         if let Some(m) = mb.get_mut(*num) {
-            m.read = ReadState::Read;
             m.displayed = true;
         }
     }
-    if let Some(&last) = msg_nums.last() {
-        mb.set_current(last);
-    }
+    mark_read(mb, &msg_nums);
 
     Ok(CommandResult::Continue)
 }
@@ -890,15 +886,7 @@ fn cmd_reply(
         send_message(&composed, vars, false)?;
     }
 
-    // Mark as read
-    for &num in &msg_nums {
-        if let Some(m) = mb.get_mut(num) {
-            m.read = ReadState::Read;
-        }
-    }
-    if let Some(&last) = msg_nums.last() {
-        mb.set_current(last);
-    }
+    mark_read(mb, &msg_nums);
 
     Ok(CommandResult::Continue)
 }

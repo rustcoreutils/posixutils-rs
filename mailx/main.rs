@@ -21,6 +21,7 @@ mod msglist;
 mod script;
 mod send;
 mod signals;
+mod store;
 mod summary;
 mod util;
 mod variables;

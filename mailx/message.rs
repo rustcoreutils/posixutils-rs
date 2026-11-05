@@ -10,6 +10,7 @@
 //! Message representation for mailx
 
 use crate::error::Result;
+use crate::store::Span;
 
 /// How much of a message the user has seen.
 ///
@@ -108,6 +109,14 @@ pub struct Message {
     pub raw_lines: usize,
     /// Bytes the message occupies in the mailbox file, measured the same way.
     pub raw_bytes: usize,
+    /// The `From ` line and kept header lines, as stored in the mailbox's
+    /// store.
+    pub head: Span,
+    /// The body as stored, `From `-quoting included, without the framing
+    /// line after it.
+    pub body_span: Span,
+    /// Whether the message's lines end in CRLF.
+    pub crlf: bool,
     /// How much of the message the user has seen.
     pub read: ReadState,
     /// The read state recorded in the mailbox file, by its `Status:` header.
@@ -130,6 +139,9 @@ impl Message {
             body: Vec::new(),
             raw_lines: 0,
             raw_bytes: 0,
+            head: Span::default(),
+            body_span: Span::default(),
+            crlf: false,
             read: ReadState::New,
             loaded_read: ReadState::New,
             disposition: Disposition::Keep,

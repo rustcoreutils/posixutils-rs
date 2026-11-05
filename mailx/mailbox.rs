@@ -9,13 +9,14 @@
 
 //! Mailbox handling for mailx - mbox format parsing and writing
 
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, Read, Seek, Write};
 
 use crate::error::{IoContext, Result};
 use crate::lock::{commit, lock, open_locked, read_locked};
 use crate::mbox::{write_messages, CountingWriter};
 use crate::message::{Disposition, Message, ReadState};
+use crate::store::Store;
 use crate::variables::Variables;
 
 /// What quitting does with a message.
@@ -47,6 +48,8 @@ pub struct Mailbox {
     current: Option<usize>,
     /// Whether this is the system mailbox
     pub is_system_mailbox: bool,
+    /// The private copy the messages are read from.
+    pub store: Store,
     /// Path of the previously-opened folder, for the `#` substitution.
     pub prev_path: Option<String>,
     /// Size of the mailbox file when it was read, in bytes.
@@ -65,6 +68,7 @@ impl Mailbox {
             messages: Vec::new(),
             current: None,
             is_system_mailbox: false,
+            store: Store::default(),
             prev_path: None,
             loaded_len: 0,
         }
@@ -81,7 +85,7 @@ impl Mailbox {
         let mut mailbox = Mailbox::new(path.to_string());
         mailbox.loaded_len = bytes.len() as u64;
 
-        mailbox.messages = crate::mbox::parse(&bytes);
+        mailbox.messages = crate::mbox::parse(&bytes, &mut mailbox.store).context(path)?;
 
         // The first new message, else the first unread one, else the first.
         let first = |state| mailbox.messages.iter().position(|m| m.read == state);
@@ -205,15 +209,21 @@ impl Mailbox {
         if !mbox_messages.is_empty() {
             let mbox_path = crate::util::mbox_path(vars);
             let append = vars.is_set("append");
-            migrate_to_mbox(&mbox_path, &mbox_messages, append).context(&mbox_path)?;
+            migrate_to_mbox(&mbox_path, &self.store, &mbox_messages, append).context(&mbox_path)?;
         }
 
         // Rewrite only if messages left the mailbox or a read state changed.
         // Leaving it alone otherwise keeps mail delivered meanwhile untouched
         // and does not re-timestamp a mailbox nobody changed.
         if keep_messages.len() != self.messages.len() || self.state_differs_from_disk() {
-            rewrite_mailbox(&self.path, &keep_messages, self.loaded_len, keep)
-                .context(&self.path)?;
+            rewrite_mailbox(
+                &self.path,
+                &self.store,
+                &keep_messages,
+                self.loaded_len,
+                keep,
+            )
+            .context(&self.path)?;
         }
 
         Ok(())
@@ -222,7 +232,7 @@ impl Mailbox {
     /// Append messages `msg_nums` to the mailbox `path`.
     pub fn save_messages(&self, msg_nums: &[usize], path: &str) -> Result<u64> {
         let messages: Vec<&Message> = msg_nums.iter().filter_map(|&n| self.get(n)).collect();
-        append_messages_to_file(path, &messages).context(path)
+        append_to_file(path, |w| write_messages(w, &self.store, &messages)).context(path)
     }
 }
 
@@ -234,6 +244,7 @@ impl Mailbox {
 /// referring to the same file, and the mode, owner, and group are untouched.
 fn rewrite_mailbox(
     path: &str,
+    store: &Store,
     messages: &[&Message],
     loaded_len: u64,
     keep: bool,
@@ -260,7 +271,7 @@ fn rewrite_mailbox(
     file.set_len(0)?;
     {
         let mut w = io::BufWriter::new(&mut file);
-        write_messages(&mut w, messages)?;
+        write_messages(&mut w, store, messages)?;
         w.write_all(&tail)?;
         w.flush()?;
     }
@@ -272,7 +283,12 @@ fn rewrite_mailbox(
 /// `noappend`, the default, places them at the *beginning* of mbox; `append`
 /// puts them at the end (spec 104579-104580). Neither truncates: the previously
 /// saved mail is retained in both cases.
-fn migrate_to_mbox(path: &str, messages: &[&Message], append: bool) -> io::Result<()> {
+fn migrate_to_mbox(
+    path: &str,
+    store: &Store,
+    messages: &[&Message],
+    append: bool,
+) -> io::Result<()> {
     let (mut file, _dotlock) = open_locked(path)?;
 
     let mut existing = Vec::new();
@@ -286,7 +302,7 @@ fn migrate_to_mbox(path: &str, messages: &[&Message], append: bool) -> io::Resul
 
     {
         let mut w = io::BufWriter::new(&mut file);
-        write_messages(&mut w, messages)?;
+        write_messages(&mut w, store, messages)?;
         w.write_all(&existing)?;
         w.flush()?;
     }
@@ -302,8 +318,11 @@ fn migrate_to_mbox(path: &str, messages: &[&Message], append: bool) -> io::Resul
 /// errors in the save; the durability the lock and the sync buy applies to the
 /// regular files where it means something.
 ///
-/// Returns the number of bytes appended.
-pub(crate) fn append_messages_to_file(path: &str, messages: &[&Message]) -> io::Result<u64> {
+/// `write` writes the messages; the number of bytes appended is returned.
+pub(crate) fn append_to_file(
+    path: &str,
+    write: impl FnOnce(&mut CountingWriter<io::BufWriter<&mut File>>) -> io::Result<()>,
+) -> io::Result<u64> {
     let mut file = crate::util::private_open()
         .create(true)
         .append(true)
@@ -317,7 +336,7 @@ pub(crate) fn append_messages_to_file(path: &str, messages: &[&Message]) -> io::
             inner: io::BufWriter::new(&mut file),
             count: 0,
         };
-        write_messages(&mut w, messages)?;
+        write(&mut w)?;
         w.flush()?;
         w.count
     };

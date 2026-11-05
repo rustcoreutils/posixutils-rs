@@ -83,19 +83,6 @@ impl ComposedMessage {
         out
     }
 
-    /// The message as a mailbox entry under the envelope line `from_line`.
-    pub fn to_message(&self, from_line: String) -> Message {
-        let mut msg = Message::new();
-        msg.from_line = from_line.into_bytes();
-        msg.header_lines = self
-            .header_lines(false)
-            .into_iter()
-            .map(String::into_bytes)
-            .collect();
-        msg.body = self.body.clone();
-        msg
-    }
-
     /// Every recipient: To, Cc and Bcc.
     pub fn all_recipients(&self) -> Vec<&str> {
         let mut recipients: Vec<&str> = self.to.iter().map(|s| s.as_str()).collect();
@@ -330,9 +317,11 @@ pub(crate) fn record_message(
 
     let user = crate::util::user_login_or_unknown();
     let date = chrono::Local::now().format("%a %b %e %H:%M:%S %Y");
-    let entry = msg.to_message(format!("From {} {}", user, date));
-
-    crate::mailbox::append_messages_to_file(&path, &[&entry]).context(&path)?;
+    let from_line = format!("From {} {}", user, date);
+    crate::mailbox::append_to_file(&path, |w| {
+        crate::mbox::write_composed(w, &from_line, &msg.header_lines(false), &msg.body)
+    })
+    .context(&path)?;
     Ok(())
 }
 

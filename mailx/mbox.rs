@@ -12,6 +12,7 @@
 use std::io::{self, Write};
 
 use crate::message::{Message, ReadState};
+use crate::store::{Span, Store};
 
 /// Where the parser is within the current message.
 #[derive(Debug, Clone, Copy)]
@@ -24,10 +25,23 @@ enum Section {
     Body,
 }
 
-/// Split a mailbox file into its messages.
-pub(crate) fn parse(bytes: &[u8]) -> Vec<Message> {
+/// The message being parsed.
+struct Parsing {
+    msg: Message,
+    section: Section,
+    /// The length of the last body line stored, and whether it is empty:
+    /// an empty last line is the framing before the next message.
+    last_body_line: Option<(u64, bool)>,
+}
+
+/// Split a mailbox file into its messages, copying each into `store`.
+///
+/// The store keeps a message's `From ` line and header lines as stored,
+/// without `Status:`, followed by its body as stored, `From `-quoting and
+/// all; the empty line ending the header block is framing, not kept.
+pub(crate) fn parse(bytes: &[u8], store: &mut Store) -> io::Result<Vec<Message>> {
     let mut messages = Vec::new();
-    let mut current: Option<(Message, Section)> = None;
+    let mut current: Option<Parsing> = None;
     // A `From ` line begins a message only at the start of the file or after
     // an empty line (spec 104427-104428); anywhere else it is message text.
     let mut after_blank = true;
@@ -37,36 +51,79 @@ pub(crate) fn parse(bytes: &[u8]) -> Vec<Message> {
         // the message is written back as it was stored; `line` is its text.
         let stored = raw.strip_suffix(b"\n").unwrap_or(raw);
         let line = stored.strip_suffix(b"\r").unwrap_or(stored);
-        let in_headers = matches!(current, Some((_, Section::Headers { .. })));
+        let in_headers = matches!(
+            current,
+            Some(Parsing {
+                section: Section::Headers { .. },
+                ..
+            })
+        );
         let starts_message = after_blank && !in_headers && line.starts_with(b"From ");
         after_blank = line.is_empty();
 
         if starts_message {
-            messages.extend(current.take().map(|(msg, _)| finish(msg)));
-            current = Some((start(stored, raw), Section::Headers { folding: false }));
-        } else if let Some((msg, section)) = current.as_mut() {
+            messages.extend(current.take().map(finish));
+            let mut msg = start(stored, raw);
+            msg.head = store.append(raw)?;
+            msg.body_span = msg.head.after(0);
+            current = Some(Parsing {
+                msg,
+                section: Section::Headers { folding: false },
+                last_body_line: None,
+            });
+        } else if let Some(p) = current.as_mut() {
             // Every physical line up to the next `From ` line is part of the
             // message as stored, framing included; the header summary and
             // `size` report these counts, as traditional mailx does.
-            msg.raw_lines += 1;
-            msg.raw_bytes += raw.len();
-            *section = match *section {
-                Section::Headers { folding } => header_line(msg, folding, stored),
+            p.msg.raw_lines += 1;
+            p.msg.raw_bytes += raw.len();
+            let was_headers = matches!(p.section, Section::Headers { .. });
+            p.section = match p.section {
+                Section::Headers { folding } => header_line(&mut p.msg, folding, stored),
                 Section::Body => {
-                    push_line(&mut msg.body, unquote_from_line(stored));
+                    push_line(&mut p.msg.body, unquote_from_line(stored));
                     Section::Body
                 }
             };
+            store_line(store, p, raw, line, was_headers)?;
         }
     }
-    messages.extend(current.map(|(msg, _)| finish(msg)));
-    messages
+    messages.extend(current.map(finish));
+    store.flush()?;
+    Ok(messages)
+}
+
+/// Copy one line of the current message into the store, where it belongs.
+fn store_line(
+    store: &mut Store,
+    p: &mut Parsing,
+    raw: &[u8],
+    line: &[u8],
+    was_headers: bool,
+) -> io::Result<()> {
+    match p.section {
+        // A kept header line or continuation extends the head; a dropped
+        // `Status:` and the empty line ending the block are not stored.
+        Section::Headers { folding } => {
+            if folding {
+                p.msg.head.len += store.append(raw)?.len;
+                p.msg.body_span = p.msg.head.after(0);
+            }
+        }
+        Section::Body if was_headers && line.is_empty() => {}
+        Section::Body => {
+            p.msg.body_span.len += store.append(raw)?.len;
+            p.last_body_line = Some((raw.len() as u64, line.is_empty()));
+        }
+    }
+    Ok(())
 }
 
 /// A message begun by the envelope `line`, `raw` with its terminator.
 fn start(line: &[u8], raw: &[u8]) -> Message {
     let mut msg = Message::new();
     msg.from_line = line.to_vec();
+    msg.crlf = line.ends_with(b"\r");
     msg.raw_lines = 1;
     msg.raw_bytes = raw.len();
     msg
@@ -152,7 +209,11 @@ fn push_line(body: &mut Vec<u8>, line: &[u8]) {
 
 /// Drop the empty line that separates a message from the next: it belongs
 /// to the mbox framing, which the writer adds back, not to the message.
-fn finish(mut msg: Message) -> Message {
+fn finish(p: Parsing) -> Message {
+    let mut msg = p.msg;
+    if let Some((len, true)) = p.last_body_line {
+        msg.body_span.len -= len;
+    }
     if msg.body == b"\n" || msg.body == b"\r\n" {
         msg.body.clear();
     } else if msg.body.ends_with(b"\n\r\n") {
@@ -163,44 +224,94 @@ fn finish(mut msg: Message) -> Message {
     msg
 }
 
-/// Serialize messages in mbox format (spec 104420-104436).
+/// Serialize messages from `store` in mbox format (spec 104420-104436).
 ///
-/// Each message is an envelope `From ` line, its header fields with a
-/// regenerated `Status:`, an empty line, the `From `-quoted body, and one
-/// trailing empty line -- so the next `From ` line is preceded by an empty
-/// line, as the format requires.
-pub(crate) fn write_messages<W: Write>(w: &mut W, messages: &[&Message]) -> io::Result<()> {
+/// Each message is its `From ` line and header fields as stored, a
+/// regenerated `Status:`, an empty line, its body as stored -- `From `-quoted
+/// already -- and one trailing empty line, so the next `From ` line is
+/// preceded by an empty line, as the format requires.
+pub(crate) fn write_messages<W: Write>(
+    w: &mut W,
+    store: &Store,
+    messages: &[&Message],
+) -> io::Result<()> {
     for msg in messages {
         // Stored lines keep their own CR; the lines written here take the
         // message's line ending, CRLF when its `From ` line had one.
-        let eol: &[u8] = if msg.from_line.ends_with(b"\r") {
-            b"\r\n"
-        } else {
-            b"\n"
-        };
-        write_line(w, &msg.from_line)?;
-        for header in &msg.header_lines {
-            write_line(w, header)?;
-        }
+        let eol: &[u8] = if msg.crlf { b"\r\n" } else { b"\n" };
+        copy_lines(store, msg.head, w)?;
         // `Status:` is written from the message's read state rather than echoed
         // from the file, so a message read this session comes back as read.
-        // The loader keeps it out of `header_lines` for exactly this reason.
+        // The loader keeps it out of the store for exactly this reason.
         if let Some(status) = msg.read.status_value() {
             write!(w, "Status: {}", status)?;
             w.write_all(eol)?;
         }
         w.write_all(eol)?;
-        for line in stored_lines(&msg.body) {
-            if needs_from_quoting(line) {
-                write!(w, ">")?;
-            }
-            write_line(w, line)?;
-        }
+        copy_body(store, msg.body_span, w)?;
         // The separator before the next message.
         w.write_all(eol)?;
     }
-
     Ok(())
+}
+
+/// Copy the lines of `span`, ending the last with a newline if it has none.
+fn copy_lines<W: Write>(store: &Store, span: Span, w: &mut W) -> io::Result<()> {
+    store.copy_to(span, w)?;
+    if span.len > 0
+        && store.read(Span {
+            offset: span.offset + span.len - 1,
+            len: 1,
+        })? != b"\n"
+    {
+        w.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+/// Copy a stored body, `From `-quoting any line stored unquoted.
+///
+/// Stored bodies are quoted already, except that a `From ` line not after an
+/// empty line may be stored as it is; it is quoted on the way out so that no
+/// mbox reader takes it for a message boundary.
+fn copy_body<W: Write>(store: &Store, span: Span, w: &mut W) -> io::Result<()> {
+    let mut reader = store.reader(span);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if io::BufRead::read_until(&mut reader, b'\n', &mut line)? == 0 {
+            return Ok(());
+        }
+        if line.starts_with(b"From ") {
+            w.write_all(b">")?;
+        }
+        w.write_all(&line)?;
+        if !line.ends_with(b"\n") {
+            w.write_all(b"\n")?;
+        }
+    }
+}
+
+/// Serialize a message held in memory -- one composed here, not read from
+/// a mailbox -- in mbox format, `From `-quoting its body.
+pub(crate) fn write_composed<W: Write>(
+    w: &mut W,
+    from_line: &str,
+    header_lines: &[String],
+    body: &[u8],
+) -> io::Result<()> {
+    write_line(w, from_line.as_bytes())?;
+    for header in header_lines {
+        write_line(w, header.as_bytes())?;
+    }
+    writeln!(w)?;
+    for line in stored_lines(body) {
+        if needs_from_quoting(line) {
+            write!(w, ">")?;
+        }
+        write_line(w, line)?;
+    }
+    writeln!(w)
 }
 
 /// Write `line` followed by a newline.
@@ -258,8 +369,15 @@ impl<W: Write> Write for CountingWriter<W> {
 mod tests {
     use super::*;
 
+    fn parsed(mbox: &str) -> (Vec<Message>, Store) {
+        let mut store = Store::default();
+        let messages = parse(mbox.as_bytes(), &mut store).unwrap();
+        (messages, store)
+    }
+
     fn bodies(mbox: &str) -> Vec<String> {
-        parse(mbox.as_bytes())
+        parsed(mbox)
+            .0
             .iter()
             .map(|m| String::from_utf8_lossy(&m.body).into_owned())
             .collect()
@@ -281,7 +399,8 @@ mod tests {
     #[test]
     fn status_is_dropped_with_its_continuation() {
         let mbox = "From a Mon Jan  1 00:00:00 2024\nSubject: s\nStatus: RO\n x\nTo: t\n\nb\n";
-        let msg = &parse(mbox.as_bytes())[0];
+        let (messages, _) = parsed(mbox);
+        let msg = &messages[0];
         assert_eq!(msg.read, ReadState::Read);
         assert_eq!(msg.loaded_read, ReadState::Read);
         assert_eq!(
@@ -294,7 +413,8 @@ mod tests {
     #[test]
     fn folded_field_keeps_its_lines_and_unfolds_its_value() {
         let mbox = "From a Mon Jan  1 00:00:00 2024\nSubject: one\n\ttwo\n\nb\n";
-        let msg = &parse(mbox.as_bytes())[0];
+        let (messages, _) = parsed(mbox);
+        let msg = &messages[0];
         assert_eq!(msg.header_lines, [b"Subject: one\n\ttwo".to_vec()]);
         assert_eq!(msg.get_header("subject"), Some("one two"));
     }
@@ -309,17 +429,18 @@ mod tests {
     fn crlf_lines_round_trip() {
         let mbox = "From a Mon Jan  1 00:00:00 2024\r\nSubject: s\r\n x\r\nStatus: O\r\n\r\n\
                     >From b\r\nbody\r\n\r\n";
-        let messages = parse(mbox.as_bytes());
+        let (messages, store) = parsed(mbox);
         assert_eq!(messages[0].get_header("subject"), Some("s x"));
         let mut out = Vec::new();
-        write_messages(&mut out, &[&messages[0]]).unwrap();
+        write_messages(&mut out, &store, &[&messages[0]]).unwrap();
         assert_eq!(String::from_utf8_lossy(&out), mbox);
     }
 
     #[test]
     fn counts_cover_every_stored_line() {
         let mbox = "From a Mon Jan  1 00:00:00 2024\nStatus: O\n\nbody\n\n";
-        let msg = &parse(mbox.as_bytes())[0];
+        let (messages, _) = parsed(mbox);
+        let msg = &messages[0];
         assert_eq!((msg.raw_lines, msg.raw_bytes), (5, mbox.len()));
         assert_eq!(msg.body, b"body\n");
     }

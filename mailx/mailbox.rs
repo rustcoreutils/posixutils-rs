@@ -18,6 +18,13 @@ use crate::mbox::{write_messages, CountingWriter};
 use crate::message::{Disposition, Message, ReadState};
 use crate::variables::Variables;
 
+/// Which way `Mailbox::find` searches.
+#[derive(Debug, Clone, Copy)]
+pub enum Direction {
+    Forward,
+    Backward,
+}
+
 /// A mailbox containing messages
 #[derive(Debug)]
 pub struct Mailbox {
@@ -25,12 +32,11 @@ pub struct Mailbox {
     pub path: String,
     /// Messages in the mailbox
     pub messages: Vec<Message>,
-    /// Current message index (1-based, 0 means no current message)
-    pub current: usize,
+    /// The current message's number, counted from 1; `None` while there
+    /// are no messages.
+    current: Option<usize>,
     /// Whether this is the system mailbox
     pub is_system_mailbox: bool,
-    /// Whether the mailbox has been modified
-    pub modified: bool,
     /// Path of the previously-opened folder, for the `#` substitution.
     pub prev_path: Option<String>,
     /// Size of the mailbox file when it was read, in bytes.
@@ -47,9 +53,8 @@ impl Mailbox {
         Mailbox {
             path,
             messages: Vec::new(),
-            current: 0,
+            current: None,
             is_system_mailbox: false,
-            modified: false,
             prev_path: None,
             loaded_len: 0,
         }
@@ -75,13 +80,9 @@ impl Mailbox {
 
         mailbox.messages = crate::mbox::parse(&bytes);
 
-        // Set current to first new/unread message, or first message
-        mailbox.current = mailbox
-            .messages
-            .iter()
-            .position(|m| m.read.is_unread())
-            .map(|i| i + 1)
-            .unwrap_or(if mailbox.messages.is_empty() { 0 } else { 1 });
+        let first_unread = mailbox.messages.iter().position(|m| m.read.is_unread());
+        let first = (!mailbox.messages.is_empty()).then_some(0);
+        mailbox.current = first_unread.or(first).map(|i| i + 1);
 
         Ok(mailbox)
     }
@@ -99,9 +100,20 @@ impl Mailbox {
             .count()
     }
 
-    /// Set whether this is the system mailbox
-    pub fn set_is_system_mailbox(&mut self, is_system: bool) {
-        self.is_system_mailbox = is_system;
+    /// The current message's number, if there is a current message.
+    pub fn current(&self) -> Option<usize> {
+        self.current
+    }
+
+    /// The current message, if there is one.
+    pub fn current_message(&self) -> Option<&Message> {
+        self.current.and_then(|n| self.get(n))
+    }
+
+    /// Make message `num` the current message.
+    pub fn set_current(&mut self, num: usize) {
+        debug_assert!(self.get(num).is_some(), "no message {}", num);
+        self.current = Some(num);
     }
 
     /// Get a message by number (1-based)
@@ -122,50 +134,20 @@ impl Mailbox {
         }
     }
 
-    /// Find first undeleted message after the given number
-    pub fn next_undeleted(&self, after: usize) -> Option<usize> {
-        for i in after..self.messages.len() {
-            if self.messages[i].disposition != Disposition::Deleted {
-                return Some(i + 1);
-            }
+    /// The first message after message `from` (`Forward`) or before it
+    /// (`Backward`) that satisfies `pred`. A `from` of 0 searches forward
+    /// from the first message.
+    pub fn find(
+        &self,
+        from: usize,
+        direction: Direction,
+        pred: impl Fn(&Message) -> bool,
+    ) -> Option<usize> {
+        let matches = |&n: &usize| self.get(n).is_some_and(&pred);
+        match direction {
+            Direction::Forward => (from + 1..=self.messages.len()).find(matches),
+            Direction::Backward => (1..from.min(self.messages.len() + 1)).rev().find(matches),
         }
-        None
-    }
-
-    /// Find first undeleted message before the given number
-    pub fn prev_undeleted(&self, before: usize) -> Option<usize> {
-        if before <= 1 {
-            return None;
-        }
-        for i in (0..before - 1).rev() {
-            if self.messages[i].disposition != Disposition::Deleted {
-                return Some(i + 1);
-            }
-        }
-        None
-    }
-
-    /// Find first deleted message after current for undelete
-    pub fn next_deleted(&self, after: usize) -> Option<usize> {
-        for i in after..self.messages.len() {
-            if self.messages[i].disposition == Disposition::Deleted {
-                return Some(i + 1);
-            }
-        }
-        None
-    }
-
-    /// Find first deleted message before current for undelete
-    pub fn prev_deleted(&self, before: usize) -> Option<usize> {
-        if before <= 1 {
-            return None;
-        }
-        for i in (0..before - 1).rev() {
-            if self.messages[i].disposition == Disposition::Deleted {
-                return Some(i + 1);
-            }
-        }
-        None
     }
 
     /// Whether any message's read state differs from the one it loaded with.

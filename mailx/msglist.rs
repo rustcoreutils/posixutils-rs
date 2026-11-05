@@ -11,8 +11,8 @@
 //! Handles the various message specification formats defined by POSIX
 
 use crate::error::Result;
-use crate::mailbox::Mailbox;
-use crate::message::{extract_login, Disposition, ReadState};
+use crate::mailbox::{Direction, Mailbox};
+use crate::message::{extract_login, Disposition, Message, ReadState};
 use crate::variables::Variables;
 
 /// Parse a message list specification and return matching message numbers
@@ -101,11 +101,9 @@ fn parse_single_spec(
     match spec {
         "." => {
             // Current message
-            if mb.current > 0 {
-                Ok(vec![mb.current])
-            } else {
-                Err("No current message".into())
-            }
+            mb.current()
+                .map(|n| vec![n])
+                .ok_or_else(|| "No current message".into())
         }
         "^" => {
             // First undeleted message (or first deleted for undelete)
@@ -148,25 +146,37 @@ fn parse_single_spec(
         "+" => {
             // Next undeleted message
             if for_undelete {
-                mb.next_deleted(mb.current)
-                    .map(|n| vec![n])
-                    .ok_or_else(|| "No more deleted messages".into())
+                mb.find(
+                    mb.current().unwrap_or(0),
+                    Direction::Forward,
+                    Message::is_deleted,
+                )
+                .map(|n| vec![n])
+                .ok_or_else(|| "No more deleted messages".into())
             } else {
-                mb.next_undeleted(mb.current)
-                    .map(|n| vec![n])
-                    .ok_or_else(|| "No more messages".into())
+                mb.find(mb.current().unwrap_or(0), Direction::Forward, |m| {
+                    !m.is_deleted()
+                })
+                .map(|n| vec![n])
+                .ok_or_else(|| "No more messages".into())
             }
         }
         "-" => {
             // Previous undeleted message
             if for_undelete {
-                mb.prev_deleted(mb.current)
-                    .map(|n| vec![n])
-                    .ok_or_else(|| "No previous deleted messages".into())
+                mb.find(
+                    mb.current().unwrap_or(0),
+                    Direction::Backward,
+                    Message::is_deleted,
+                )
+                .map(|n| vec![n])
+                .ok_or_else(|| "No previous deleted messages".into())
             } else {
-                mb.prev_undeleted(mb.current)
-                    .map(|n| vec![n])
-                    .ok_or_else(|| "No previous messages".into())
+                mb.find(mb.current().unwrap_or(0), Direction::Backward, |m| {
+                    !m.is_deleted()
+                })
+                .map(|n| vec![n])
+                .ok_or_else(|| "No previous messages".into())
             }
         }
         _ => {
@@ -268,7 +278,7 @@ fn range_endpoint(s: &str, mb: &Mailbox) -> Option<usize> {
     match s {
         "^" => Some(1),
         "$" => Some(mb.message_count()),
-        "." => Some(mb.current),
+        "." => Some(mb.current().unwrap_or(0)),
         _ if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) => s.parse().ok(),
         _ => None,
     }
@@ -276,11 +286,9 @@ fn range_endpoint(s: &str, mb: &Mailbox) -> Option<usize> {
 
 /// The current message, as the list an omitted msglist stands for.
 pub fn current_message(mb: &Mailbox) -> Result<Vec<usize>> {
-    if mb.current > 0 {
-        Ok(vec![mb.current])
-    } else {
-        Err("No applicable messages".into())
-    }
+    mb.current()
+        .map(|n| vec![n])
+        .ok_or_else(|| "No applicable messages".into())
 }
 
 /// The messages an optional msglist argument names, defaulting to the current

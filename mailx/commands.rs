@@ -17,8 +17,8 @@ use std::process::Command;
 use crate::compose::compose_body;
 use crate::error::{IoContext, Result};
 use crate::filename::{expand_local_prefixes, expand_typed_filename};
-use crate::mailbox::Mailbox;
-use crate::message::{author_filename, Disposition, ReadState};
+use crate::mailbox::{Direction, Mailbox};
+use crate::message::{author_filename, Disposition, Message, ReadState};
 use crate::msglist::{current_message, msglist_or_current, parse_message, parse_msglist};
 use crate::script::CondStack;
 use crate::send::{compose_reply, send_message, ComposedMessage};
@@ -279,7 +279,7 @@ pub fn execute_in(
 
     // Current message number.
     if line == "=" {
-        println!("{}", mb.current);
+        println!("{}", mb.current().unwrap_or(0));
         return Ok(CommandResult::Continue);
     }
 
@@ -310,7 +310,7 @@ pub fn execute_in(
             return Err(format!("{}: {}", cmd, ctx.where_invalid()).into());
         }
         return if num > 0 && num <= mb.message_count() {
-            mb.current = num;
+            mb.set_current(num);
             cmd_print("", mb, vars, false)
         } else {
             Err(format!("Invalid message number: {}", num).into())
@@ -348,7 +348,6 @@ fn mark_messages_saved(mb: &mut Mailbox, msg_nums: &[usize]) {
             m.disposition = Disposition::Saved;
         }
     }
-    mb.modified = true;
 }
 
 /// Mark messages read and make the last of them current.
@@ -359,7 +358,7 @@ fn mark_read(mb: &mut Mailbox, msg_nums: &[usize]) {
         }
     }
     if let Some(&last) = msg_nums.last() {
-        mb.current = last;
+        mb.set_current(last);
     }
 }
 
@@ -504,23 +503,14 @@ fn cmd_delete(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comm
         }
     }
 
-    mb.modified = true;
-
-    // Update current message
-    if let Some(next) = mb.next_undeleted(max_deleted) {
-        mb.current = next;
-    } else if let Some(prev) = mb.prev_undeleted(max_deleted) {
-        mb.current = prev;
+    let live = |m: &Message| !m.is_deleted();
+    if let Some(next) = mb.find(max_deleted, Direction::Forward, live) {
+        mb.set_current(next);
+    } else if let Some(prev) = mb.find(max_deleted, Direction::Backward, live) {
+        mb.set_current(prev);
     }
 
-    // If autoprint is set, print the new current message
-    if vars.is_set("autoprint")
-        && mb.current > 0
-        && mb
-            .get(mb.current)
-            .map(|m| m.disposition != Disposition::Deleted)
-            .unwrap_or(false)
-    {
+    if vars.is_set("autoprint") && mb.current_message().is_some_and(live) {
         cmd_print("", mb, vars, false)?;
     }
 
@@ -544,13 +534,7 @@ fn cmd_dp(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandR
     // Delete and print next
     cmd_delete(args, mb, vars)?;
 
-    // Print the new current message
-    if mb.current > 0
-        && mb
-            .get(mb.current)
-            .map(|m| m.disposition != Disposition::Deleted)
-            .unwrap_or(false)
-    {
+    if mb.current_message().is_some_and(|m| !m.is_deleted()) {
         cmd_print("", mb, vars, false)?;
     } else {
         println!("At EOF");
@@ -646,7 +630,7 @@ fn cmd_followup(
     reply_to_all: bool,
 ) -> Result<CommandResult> {
     let msg_num = if args.is_empty() {
-        mb.current
+        mb.current().ok_or("No message")?
     } else {
         parse_message(args, mb, vars)?
     };
@@ -684,15 +668,11 @@ fn cmd_from(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
 fn cmd_headers(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult> {
     if !args.is_empty() {
         let msg_num = parse_message(args, mb, vars)?;
-        mb.current = msg_num;
+        mb.set_current(msg_num);
     }
 
     let screen = vars.screen_lines().get();
-    let start = if mb.current > 0 {
-        ((mb.current - 1) / screen) * screen + 1
-    } else {
-        1
-    };
+    let start = mb.current().map_or(1, |c| (c - 1) / screen * screen + 1);
 
     let nums: Vec<usize> = (start..=mb.message_count().min(start + screen - 1)).collect();
     crate::summary::print_headers(mb, Some(&nums), vars);
@@ -799,14 +779,13 @@ fn cmd_mbox(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
 fn cmd_next(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult> {
     if !args.is_empty() {
         let msg_num = parse_message(args, mb, vars)?;
-        mb.current = msg_num;
+        mb.set_current(msg_num);
     }
 
-    if let Some(msg) = mb.get(mb.current) {
+    if let (Some(current), Some(msg)) = (mb.current(), mb.current_message()) {
         if msg.displayed {
-            // Move to next
-            if let Some(next) = mb.next_undeleted(mb.current) {
-                mb.current = next;
+            if let Some(next) = mb.find(current, Direction::Forward, |m| !m.is_deleted()) {
+                mb.set_current(next);
             } else {
                 println!("At EOF");
                 return Ok(CommandResult::Continue);
@@ -914,7 +893,7 @@ fn cmd_print(
         }
     }
     if let Some(&last) = msg_nums.last() {
-        mb.current = last;
+        mb.set_current(last);
     }
 
     Ok(CommandResult::Continue)
@@ -944,7 +923,7 @@ fn cmd_reply(
         }
     }
     if let Some(&last) = msg_nums.last() {
-        mb.current = last;
+        mb.set_current(last);
     }
 
     Ok(CommandResult::Continue)
@@ -1162,10 +1141,11 @@ fn cmd_unalias(args: &str, vars: &mut Variables) -> Result<CommandResult> {
 
 fn cmd_undelete(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult> {
     let msg_nums = if args.is_empty() {
-        // Find deleted message
-        if let Some(num) = mb.next_deleted(mb.current.saturating_sub(1)) {
+        let current = mb.current().unwrap_or(0);
+        let deleted = Message::is_deleted;
+        if let Some(num) = mb.find(current.saturating_sub(1), Direction::Forward, deleted) {
             vec![num]
-        } else if let Some(num) = mb.prev_deleted(mb.current + 1) {
+        } else if let Some(num) = mb.find(current + 1, Direction::Backward, deleted) {
             vec![num]
         } else {
             return Err("No deleted messages".into());
@@ -1186,7 +1166,7 @@ fn cmd_undelete(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Co
     }
 
     if let Some(&last) = msg_nums.last() {
-        mb.current = last;
+        mb.set_current(last);
     }
 
     if vars.is_set("autoprint") {
@@ -1246,7 +1226,7 @@ fn cmd_scroll(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comm
     let screen = vars.screen_lines().get();
     let direction = if args.starts_with('-') { -1i32 } else { 1 };
 
-    let current_page = (mb.current.saturating_sub(1)) / screen;
+    let current_page = mb.current().map_or(0, |c| (c - 1) / screen);
     let new_page = if direction > 0 {
         current_page + 1
     } else {
@@ -1263,7 +1243,7 @@ fn cmd_scroll(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comm
     let nums: Vec<usize> = (start..=end).collect();
 
     if !nums.is_empty() {
-        mb.current = nums[0];
+        mb.set_current(nums[0]);
     }
 
     crate::summary::print_headers(mb, Some(&nums), vars);

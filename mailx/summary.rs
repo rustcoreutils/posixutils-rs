@@ -24,7 +24,7 @@ pub fn print_headers(mb: &Mailbox, msg_nums: Option<&[usize]>, vars: &Variables)
 
     for &num in nums.iter().take(screen) {
         if let Some(msg) = mb.get(num) {
-            let current_marker = if num == mb.current { '>' } else { ' ' };
+            let current_marker = if Some(num) == mb.current() { '>' } else { ' ' };
             let state_char = msg.status_char();
 
             // Decide whether to show To or From

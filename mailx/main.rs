@@ -149,7 +149,7 @@ fn run_receive_mode(args: &Args) -> i32 {
         }
     };
 
-    mb.set_is_system_mailbox(args.file.is_none() && !args.read_mbox);
+    mb.is_system_mailbox = args.file.is_none() && !args.read_mbox;
 
     let is_tty = io::stdin().is_terminal();
 

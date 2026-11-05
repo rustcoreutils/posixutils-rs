@@ -75,6 +75,11 @@ impl Message {
         }
     }
 
+    /// Whether `delete` has marked the message.
+    pub fn is_deleted(&self) -> bool {
+        self.disposition == Disposition::Deleted
+    }
+
     /// Whether the message is `old`: seen before, and not new or read
     /// (spec 104540).
     pub fn is_old(&self) -> bool {

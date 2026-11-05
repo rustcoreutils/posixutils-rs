@@ -448,3 +448,31 @@ pub fn compose_reply(original: &Message, reply_all: bool, vars: &Variables) -> C
 
     msg
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A record entry is an mbox message: envelope, headers without `Bcc:`,
+    /// an empty line, the `From `-quoted body with each line terminated,
+    /// and the separating empty line.
+    #[test]
+    fn record_writes_an_mbox_entry() {
+        let dir = plib::tmp::TempDir::new().expect("temp dir");
+        let path = dir.path().join("record");
+        let mut msg = ComposedMessage::new();
+        msg.add_to("to@example.com");
+        msg.add_bcc("hidden@example.com");
+        msg.subject = "Subj".to_string();
+        msg.body = b"From the start\n>From quoted\nline\r\nlast".to_vec();
+
+        record_message(&msg, path.to_str().unwrap(), &Variables::new()).expect("record");
+
+        let written = std::fs::read(&path).expect("read record");
+        let (envelope, rest) = written.split_at(written.iter().position(|&b| b == b'\n').unwrap());
+        assert!(envelope.starts_with(b"From "), "{:?}", envelope);
+        assert_eq!(
+            String::from_utf8_lossy(rest),
+            "\nTo: to@example.com\nSubject: Subj\n\n>From the start\n>>From quoted\nline\nlast\n\n"
+        );
+    }
+}

@@ -1166,3 +1166,47 @@ fn next_with_a_message_goes_to_it() {
         stdout
     );
 }
+
+/// An `EDITOR` value may carry arguments, as `emacs -nw` does: it is run by
+/// the command interpreter, with the file to edit after them.
+#[test]
+fn editor_may_take_arguments() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mbox = copy_test_data("testdata.mbox");
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let log = dir.path().join("args");
+    let editor = dir.path().join("editor");
+    std::fs::write(
+        &editor,
+        format!("#!/bin/sh\necho \"$@\" >> {}\n", log.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let value = format!("{} --flag", editor.display());
+
+    let mbox_path = mbox.path().to_str().unwrap();
+    mailx_env(
+        &["-n", "-N", "-f", mbox_path],
+        "edit 1\nexit\n",
+        &[("EDITOR", &value)],
+    );
+    mailx_env(
+        &["-n", "-N", "-f", mbox_path],
+        "mail to@example.com\n~v\n~x\nexit\n",
+        &[("VISUAL", &value)],
+    );
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    let lines: Vec<&str> = calls.lines().collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "edit and ~v should each run the editor: {:?}",
+        calls
+    );
+    assert!(
+        lines.iter().all(|l| l.starts_with("--flag /")),
+        "the editor should get its argument, then the file: {:?}",
+        calls
+    );
+}

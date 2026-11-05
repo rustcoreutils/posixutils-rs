@@ -110,6 +110,20 @@ pub fn shell_command(cmd: &str, vars: &Variables) -> Command {
     command
 }
 
+/// Run the editor `editor` names on `file`.
+///
+/// The value is a command, which may carry arguments (`emacs -nw`), so it
+/// is run by the command interpreter with the file as `$1`, never itself
+/// expanded by the shell.
+pub fn edit(editor: &str, file: &std::path::Path, vars: &Variables) -> Result<()> {
+    shell_command(&format!("{} \"$1\"", editor), vars)
+        .arg("mailx")
+        .arg(file)
+        .status()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Run `cmd` through the command interpreter.
 pub fn shell(cmd: &str, vars: &Variables) -> Result<std::process::ExitStatus> {
     shell_command(cmd, vars)

@@ -62,6 +62,9 @@ pub(crate) fn compose_body(
     let mut ignored_eofs = 0;
 
     loop {
+        if crate::signals::hangup() {
+            return Err(hang_up(composed, vars));
+        }
         let mut line = Vec::new();
         match crate::signals::read_bytes_interruptible(&mut line) {
             Ok(0) => {
@@ -81,6 +84,9 @@ pub(crate) fn compose_body(
             }
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                if crate::signals::hangup() {
+                    return Err(hang_up(composed, vars));
+                }
                 crate::signals::take_sigint();
                 if interrupt_message(composed, vars, &mut interrupt_count) {
                     return Err(Error::Interrupted);
@@ -152,4 +158,13 @@ fn perform_escape(
             Ok(false)
         }
     }
+}
+
+/// End composition on a hangup, as BSD and Heirloom mailx do: the message
+/// is saved to the dead-letter file, when `save` allows, and mailx exits.
+fn hang_up(composed: &ComposedMessage, vars: &Variables) -> Error {
+    if vars.is_set("save") && !composed.body.is_empty() {
+        crate::send::save_dead_letter(composed, vars);
+    }
+    Error::Hangup
 }

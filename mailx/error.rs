@@ -22,6 +22,8 @@ pub enum Error {
     Aborted,
     /// Message composition abandoned by a second interrupt.
     Interrupted,
+    /// The terminal hung up: mailx ends without writing anything back.
+    Hangup,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -35,6 +37,7 @@ impl fmt::Display for Error {
             Error::Msg(msg) => f.write_str(msg),
             Error::Aborted => f.write_str("Aborted"),
             Error::Interrupted => f.write_str("Interrupt"),
+            Error::Hangup => f.write_str("Hangup"),
         }
     }
 }

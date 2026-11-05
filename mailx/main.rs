@@ -141,6 +141,8 @@ fn command_loop(mb: &mut Mailbox, vars: &mut Variables, interp: &mut Interp, is_
                 continue;
             }
             Ok(Command::Eof) => return exit_status(mb.quit(vars)),
+            // A hangup ends the session with nothing written back.
+            Ok(Command::Hangup) => return 1,
             Err(e) => {
                 eprintln!(
                     "mailx: {}: {}",
@@ -158,6 +160,7 @@ fn command_loop(mb: &mut Mailbox, vars: &mut Variables, interp: &mut Interp, is_
             Ok(CommandResult::Continue) => {}
             Ok(CommandResult::Quit) => return exit_status(mb.quit(vars)),
             Ok(CommandResult::Exit) => return 0,
+            Err(error::Error::Hangup) => return 1,
             Err(e) => eprintln!("{}", e),
         }
     }
@@ -167,21 +170,31 @@ fn command_loop(mb: &mut Mailbox, vars: &mut Variables, interp: &mut Interp, is_
 enum Command {
     Line(String),
     Interrupted,
+    Hangup,
     Eof,
 }
 
 fn read_command() -> io::Result<Command> {
+    if signals::hangup() {
+        return Ok(Command::Hangup);
+    }
     let mut line = String::new();
     match signals::read_line_interruptible(&mut line) {
         Ok(0) => return Ok(Command::Eof),
         Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::Interrupted && signals::hangup() => {
+            return Ok(Command::Hangup);
+        }
         Err(e) if e.kind() == io::ErrorKind::Interrupted => {
             signals::take_sigint();
             return Ok(Command::Interrupted);
         }
         Err(e) => return Err(e),
     }
-    // A SIGINT may have arrived between reads; it aborts this command too.
+    // A signal may have arrived between reads; it acts on this command too.
+    if signals::hangup() {
+        return Ok(Command::Hangup);
+    }
     if signals::take_sigint() {
         return Ok(Command::Interrupted);
     }
@@ -192,6 +205,7 @@ fn read_command() -> io::Result<Command> {
 fn exit_status(result: error::Result<()>) -> i32 {
     match result {
         Ok(()) => 0,
+        Err(error::Error::Hangup) => 1,
         Err(e) => {
             eprintln!("mailx: {}", e);
             1

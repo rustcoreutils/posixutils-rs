@@ -15,8 +15,12 @@
 //! `ignore`, requires a second interrupt to abort the message (writing the
 //! partial letter to the dead-letter file when `save` is set).
 //!
-//! The handler merely records that a `SIGINT` arrived; the main and composition
-//! loops poll the flag. So that a blocking read returns promptly when the user
+//! A hangup (`SIGHUP`) ends mailx as in BSD and Heirloom mailx: in command
+//! mode at once, with no writeback; while composing, after saving the
+//! message to the dead-letter file.
+//!
+//! The handlers merely record that a signal arrived; the main and composition
+//! loops poll the flags. So that a blocking read returns promptly when the user
 //! interrupts, the handler is installed with `sigaction` and `SA_RESTART`
 //! cleared, and interactive input is read one byte at a time through
 //! [`read_line_interruptible`] (whose `BufReader`-backed reads surface `EINTR`
@@ -27,21 +31,41 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Set by the `SIGINT` handler; polled (and cleared) by the input loops.
 static SIGINT_RECEIVED: AtomicBool = AtomicBool::new(false);
+/// Set by the `SIGHUP` handler; polled by the input loops.
+static SIGHUP_RECEIVED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn sigint_handler(_signum: libc::c_int) {
     SIGINT_RECEIVED.store(true, Ordering::SeqCst);
 }
 
-/// Install the `SIGINT` handler.  `SA_RESTART` is deliberately left unset so a
-/// blocking `read(2)` returns `EINTR` instead of being restarted.
+extern "C" fn sighup_handler(_signum: libc::c_int) {
+    SIGHUP_RECEIVED.store(true, Ordering::SeqCst);
+}
+
+/// Install the `SIGINT` and `SIGHUP` handlers.  `SA_RESTART` is deliberately
+/// left unset so a blocking `read(2)` returns `EINTR` instead of being
+/// restarted.
 pub fn setup() {
+    install(libc::SIGINT, sigint_handler);
+    install(libc::SIGHUP, sighup_handler);
+}
+
+fn install(signal: libc::c_int, handler: extern "C" fn(libc::c_int)) {
+    // SAFETY: the handler only stores to an atomic, which is
+    // async-signal-safe, and `sa` is fully initialized.
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = sigint_handler as *const () as libc::sighandler_t;
+        sa.sa_sigaction = handler as *const () as libc::sighandler_t;
         libc::sigemptyset(&mut sa.sa_mask);
         sa.sa_flags = 0; // no SA_RESTART => interrupted reads return EINTR
-        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+        libc::sigaction(signal, &sa, std::ptr::null_mut());
     }
+}
+
+/// Whether a `SIGHUP` has been delivered. It is not cleared: a hangup ends
+/// mailx.
+pub fn hangup() -> bool {
+    SIGHUP_RECEIVED.load(Ordering::SeqCst)
 }
 
 /// Return whether a `SIGINT` has been delivered since the last check, clearing

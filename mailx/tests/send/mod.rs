@@ -421,3 +421,43 @@ fn send_mode_accepts_eight_bit_body() {
         stderr
     );
 }
+
+/// A stub delivery agent in its own directory: a shell script running
+/// `body`, which may use `$out` for a file beside it.
+fn stub_sendmail(body: &str) -> (plib::tmp::TempDir, String, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let out = dir.path().join("out");
+    let script = dir.path().join("sendmail");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\nout='{}'\n{}\n", out.display(), body),
+    )
+    .expect("write stub");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let script = script.to_str().unwrap().to_string();
+    (dir, script, out)
+}
+
+/// The `sendmail` variable names the delivery agent, as in BSD mailx; it is
+/// handed the recipients as operands and the message on standard input.
+#[test]
+fn send_uses_sendmail_variable() {
+    let (_dir, script, out) = stub_sendmail(r#"{ echo "args: $*"; cat; } > "$out""#);
+    let mailrc = create_temp_mailrc(&format!("set sendwait\nset sendmail={}\n", script));
+    let output = mailx_env(
+        &["-n", "-s", "Hi", "rcpt@example.com"],
+        "body line\n",
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+    );
+    assert!(output.status.success(), "mailx failed: {:?}", output);
+    let delivered = std::fs::read_to_string(&out).expect("stub was not run");
+    assert!(
+        delivered.starts_with("args: -oi -- rcpt@example.com\n"),
+        "{}",
+        delivered
+    );
+    assert!(delivered.contains("Subject: Hi\n"), "{}", delivered);
+    assert!(delivered.ends_with("\nbody line\n"), "{}", delivered);
+}

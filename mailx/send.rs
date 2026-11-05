@@ -254,11 +254,18 @@ const SENDMAIL_PATHS: [&str; 3] = [
 /// out of the delivered message however the mail system is set up.
 /// They are bare addresses, since a display name holding a comma or a quote
 /// is not something to hand an MTA as a recipient.
+///
+/// The `sendmail` variable names the program, as in BSD mailx; unset, the
+/// usual places are searched.
 fn deliver(msg: &ComposedMessage, vars: &Variables) -> Result<()> {
-    let sendmail = SENDMAIL_PATHS
-        .iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .ok_or("Cannot find sendmail")?;
+    let sendmail = match vars.get_nonempty("sendmail") {
+        Some(program) => program,
+        None => SENDMAIL_PATHS
+            .iter()
+            .copied()
+            .find(|p| std::path::Path::new(p).exists())
+            .ok_or("Cannot find sendmail")?,
+    };
 
     let recipients: Vec<String> = msg
         .all_recipients()

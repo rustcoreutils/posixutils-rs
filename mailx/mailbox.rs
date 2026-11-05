@@ -267,26 +267,47 @@ impl Mailbox {
             }
         }
 
+        if self.is_system_mailbox
+            && fs::metadata(&self.path).is_ok_and(|m| m.len() > self.loaded_len)
+        {
+            println!("New mail has arrived.");
+        }
+
         if !mbox_messages.is_empty() {
             let mbox_path = crate::util::mbox_path(vars);
             let append = vars.is_set("append");
             migrate_to_mbox(&mbox_path, &self.store, &mbox_messages, append).context(&mbox_path)?;
+            println!("Saved {} in mbox", count(mbox_messages.len()));
         }
 
         // Rewrite only if messages left the mailbox or a read state changed.
         // Leaving it alone otherwise keeps mail delivered meanwhile untouched
         // and does not re-timestamp a mailbox nobody changed.
-        if keep_messages.len() != self.messages.len() || self.state_differs_from_disk() {
-            rewrite_mailbox(
-                &self.path,
-                &self.store,
-                &keep_messages,
-                self.loaded_len,
-                keep,
-            )
-            .context(&self.path)?;
-        }
+        let rewritten =
+            if keep_messages.len() != self.messages.len() || self.state_differs_from_disk() {
+                Some(
+                    rewrite_mailbox(
+                        &self.path,
+                        &self.store,
+                        &keep_messages,
+                        self.loaded_len,
+                        keep,
+                    )
+                    .context(&self.path)?,
+                )
+            } else {
+                None
+            };
 
+        // What BSD mailx reports: messages held in the system mailbox, or
+        // how a folder's rewrite ended.
+        if self.is_system_mailbox {
+            if !keep_messages.is_empty() {
+                println!("Held {} in {}", count(keep_messages.len()), self.path);
+            }
+        } else if let Some(outcome) = rewritten {
+            println!("\"{}\" {}", self.path, outcome);
+        }
         Ok(())
     }
 
@@ -304,13 +325,16 @@ impl Mailbox {
 /// replaced via a temporary and `rename`, so the inode survives: a delivery
 /// agent holding the mailbox open, or holding its own lock on it, keeps
 /// referring to the same file, and the mode, owner, and group are untouched.
+///
+/// Returns how it ended, in BSD mailx's words: `complete`, or `removed` for
+/// an emptied mailbox.
 fn rewrite_mailbox(
     path: &str,
     store: &Store,
     messages: &[&Message],
     loaded_len: u64,
     keep: bool,
-) -> io::Result<()> {
+) -> io::Result<&'static str> {
     let (mut file, _dotlock) = open_locked(path)?;
 
     // Bytes past the extent we parsed are mail that arrived while mailx was
@@ -328,14 +352,25 @@ fn rewrite_mailbox(
         // An emptied mailbox is removed unless `keep` is set, in which case it
         // is truncated to zero length instead (spec 104636-104637).
         drop(file);
-        return fs::remove_file(path);
+        fs::remove_file(path)?;
+        return Ok("removed");
     }
 
     crate::recovery::rewrite(path, &mut file, |w| {
         write_messages(w, store, messages)?;
         io::copy(&mut tail, w)?;
         Ok(())
-    })
+    })?;
+    Ok("complete")
+}
+
+/// `n` messages, in words: "1 message", "2 messages".
+fn count(n: usize) -> String {
+    if n == 1 {
+        "1 message".to_string()
+    } else {
+        format!("{} messages", n)
+    }
 }
 
 /// Move read messages into the secondary mbox.

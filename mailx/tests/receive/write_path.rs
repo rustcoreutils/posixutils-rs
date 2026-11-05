@@ -423,3 +423,39 @@ fn completed_rewrite_leaves_no_recovery_file() {
     assert!(!after.contains("Subject: Meeting Tomorrow\n"), "{}", after);
     assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
 }
+
+/// Quitting the system mailbox reports, as BSD mailx does, what moved to
+/// mbox and what was held; quitting a folder reports its rewrite.
+#[test]
+fn quit_reports_what_it_did() {
+    let system = copy_test_data("testdata.mbox");
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let secondary = dir.path().join("mbox");
+    let path = system.path().to_str().unwrap();
+    let env = [("MAIL", path), ("MBOX", secondary.to_str().unwrap())];
+
+    // Messages 1 and 2 are read: they move to mbox; unread 3 is held.
+    let output = mailx_env(&["-n", "-N"], "quit\n", &env);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Saved 2 messages in mbox\n"), "{}", stdout);
+    assert!(
+        stdout.contains(&format!("Held 1 message in {}\n", path)),
+        "{}",
+        stdout
+    );
+
+    let folder = copy_test_data("testdata.mbox");
+    let fpath = folder.path().to_str().unwrap();
+    let output = mailx(&["-n", "-N", "-f", fpath], "delete 1\nquit\n");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(&format!("\"{}\" complete\n", fpath)),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let output = mailx(&["-n", "-N", "-f", fpath], "delete *\nquit\n");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(&format!("\"{}\" removed\n", fpath)),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}

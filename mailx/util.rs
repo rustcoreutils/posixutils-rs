@@ -109,13 +109,13 @@ pub fn expand_bang(cmd: &str, previous: Option<&str>) -> String {
 ///
 /// Pagination only happens when standard output is a terminal (spec
 /// 104362-104367): a pager attached to a pipe would hang or corrupt the output.
-pub fn page_or_print(text: &str, vars: &Variables) {
+pub fn page_or_print(text: &[u8], vars: &Variables) {
     let long_enough = vars
         .get_number("crt")
-        .is_some_and(|crt| text.lines().count() > crt as usize);
+        .is_some_and(|crt| byte_lines(text).count() > crt as usize);
 
     if !long_enough || !io::stdout().is_terminal() {
-        print!("{}", text);
+        print_bytes(text);
         return;
     }
 
@@ -129,7 +129,7 @@ pub fn page_or_print(text: &str, vars: &Variables) {
 
     // A pager that cannot be started must not swallow the message.
     let Ok(mut child) = spawned else {
-        print!("{}", text);
+        print_bytes(text);
         return;
     };
 
@@ -138,7 +138,7 @@ pub fn page_or_print(text: &str, vars: &Variables) {
     let _sigpipe = plib::io::SigPipeIgnored::new();
 
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(text.as_bytes());
+        let _ = stdin.write_all(text);
     }
     let _ = child.wait();
 }
@@ -159,6 +159,27 @@ pub fn prompt_field(label: &str, current: &str) -> Result<Option<String>, String
 
     let line = line.trim();
     Ok((!line.is_empty()).then(|| line.to_string()))
+}
+
+/// The lines of `bytes` as `str::lines` would give them: split at `\n`,
+/// a trailing `\r` dropped, and no empty line after a final newline.
+pub fn byte_lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let body = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    (!bytes.is_empty())
+        .then(|| body.split(|&b| b == b'\n'))
+        .into_iter()
+        .flatten()
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
+}
+
+/// Write `bytes` to standard output as they are.
+///
+/// Message text is shown as stored, 8-bit bytes included, as traditional
+/// mailx does; the terminal's character set decides how they look.
+pub fn print_bytes(bytes: &[u8]) {
+    let mut out = io::stdout().lock();
+    let _ = out.write_all(bytes);
+    let _ = out.flush();
 }
 
 /// Options for opening a file mailx may create, with a new file private

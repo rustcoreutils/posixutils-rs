@@ -60,14 +60,14 @@ impl Mailbox {
         // mid-read would otherwise leave `loaded_len` disagreeing with the
         // messages in hand, and the tail would be written back twice.
         //
-        // Mail is not necessarily UTF-8. Reading it as a string refused the
-        // whole mailbox when any message carried a raw 8-bit byte, so one
-        // Latin-1 message from anyone made all of a user's mail unreadable.
+        // Mail is not necessarily UTF-8, so the mailbox is parsed as bytes.
+        // Reading it as a string refused the whole mailbox when any message
+        // carried a raw 8-bit byte, so one Latin-1 message from anyone made
+        // all of a user's mail unreadable.
         //
         // The read is done under a shared lock, so a delivery in progress is
         // waited for rather than half read.
         let bytes = read_locked(path)?;
-        let content = decode_mbox(&bytes);
         let mut mailbox = Mailbox::new(path.to_string());
         mailbox.loaded_len = bytes.len() as u64;
 
@@ -82,18 +82,18 @@ impl Mailbox {
         // follow an empty line.
         let mut at_message_boundary = true;
 
-        for raw in content.split_inclusive('\n') {
+        for raw in bytes.split_inclusive(|&b| b == b'\n') {
             // The same line `str::lines` would yield; `raw` keeps the
             // terminator so the message's on-disk size can be counted.
-            let line = match raw.strip_suffix('\n') {
-                Some(l) => l.strip_suffix('\r').unwrap_or(l),
+            let line = match raw.strip_suffix(b"\n") {
+                Some(l) => l.strip_suffix(b"\r").unwrap_or(l),
                 None => raw,
             };
             let boundary = at_message_boundary;
             at_message_boundary = line.is_empty();
 
             // Check for message separator (From line)
-            if line.starts_with("From ") && !in_headers && boundary {
+            if line.starts_with(b"From ") && !in_headers && boundary {
                 // Save previous message if any
                 if let Some(msg) = current_msg.take() {
                     mailbox.messages.push(msg);
@@ -102,10 +102,10 @@ impl Mailbox {
                 // Start new message.  Absent a Status: header it is `new`
                 // (spec 104491-104496); a Status: header may downgrade it below.
                 let mut msg = Message::new();
-                msg.from_line = line.to_string();
+                msg.from_line = line.to_vec();
                 msg.read = ReadState::New;
                 msg.raw_lines = 1;
-                msg.raw_bytes = encoded_len(raw);
+                msg.raw_bytes = raw.len();
                 current_msg = Some(msg);
                 in_headers = true;
                 header_continuation = false;
@@ -118,13 +118,13 @@ impl Mailbox {
                 // the separating blank line included. The header summary and
                 // `size` report these counts, as traditional mailx does.
                 msg.raw_lines += 1;
-                msg.raw_bytes += encoded_len(raw);
+                msg.raw_bytes += raw.len();
 
                 if in_headers {
                     if line.is_empty() {
                         // End of headers
                         in_headers = false;
-                    } else if line.starts_with(' ') || line.starts_with('\t') {
+                    } else if line.starts_with(b" ") || line.starts_with(b"\t") {
                         // Header continuation. Skipped entirely when the header
                         // it continues was not retained.
                         if !header_continuation {
@@ -133,18 +133,21 @@ impl Mailbox {
                         if !last_header_key.is_empty() {
                             if let Some(val) = msg.headers.get_mut(&last_header_key) {
                                 val.push(' ');
-                                val.push_str(line.trim());
+                                val.push_str(String::from_utf8_lossy(line).trim());
                             }
                         }
                         // Append to last header line
                         if let Some(last) = msg.header_lines.last_mut() {
-                            last.push('\n');
-                            last.push_str(line);
+                            last.push(b'\n');
+                            last.extend_from_slice(line);
                         }
-                    } else if let Some(colon_pos) = line.find(':') {
-                        // New header
-                        let key = line[..colon_pos].to_lowercase();
-                        let value = line[colon_pos + 1..].trim().to_string();
+                    } else if let Some(colon_pos) = line.iter().position(|&b| b == b':') {
+                        // New header. The parsed value is text, for matching
+                        // and display; the line itself is kept as stored.
+                        let key = String::from_utf8_lossy(&line[..colon_pos]).to_lowercase();
+                        let value = String::from_utf8_lossy(&line[colon_pos + 1..])
+                            .trim()
+                            .to_string();
 
                         // A Status: header records prior disposition: `R`
                         // (read) wins; `O` alone (seen but not read) is unread.
@@ -168,14 +171,14 @@ impl Mailbox {
                         }
 
                         msg.headers.insert(key.clone(), value);
-                        msg.header_lines.push(line.to_string());
+                        msg.header_lines.push(line.to_vec());
                         last_header_key = key;
                         header_continuation = true;
                     } else {
                         // Malformed header, treat as body start
                         in_headers = false;
-                        msg.body.push_str(line);
-                        msg.body.push('\n');
+                        msg.body.extend_from_slice(line);
+                        msg.body.push(b'\n');
                     }
                 } else {
                     // Body. Undo the mbox `From ` quoting: a run of `>`
@@ -183,8 +186,8 @@ impl Mailbox {
                     // `>From ` (and never adding one to `>>From `) meant a body
                     // line that genuinely read `>From x` was silently turned
                     // into `From x`.
-                    msg.body.push_str(unquote_from_line(line));
-                    msg.body.push('\n');
+                    msg.body.extend_from_slice(unquote_from_line(line));
+                    msg.body.push(b'\n');
                 }
             }
         }
@@ -201,11 +204,11 @@ impl Mailbox {
         // separator on write would then have doubled it, growing the mailbox by
         // a blank line every session.
         for msg in &mut mailbox.messages {
-            if msg.body == "\n" {
+            if msg.body == b"\n" {
                 // A message with no body at all: the one line present is the
                 // framing blank, not content.
                 msg.body.clear();
-            } else if msg.body.ends_with("\n\n") {
+            } else if msg.body.ends_with(b"\n\n") {
                 msg.body.pop();
             }
         }
@@ -466,75 +469,33 @@ fn printable(s: &str) -> String {
         .collect()
 }
 
-/// The first of the private-use characters that stand for undecodable bytes.
-///
-/// Byte `b` (always `0x80` or above: ASCII is valid UTF-8) is held as
-/// `U+F700 + b`, so the range used is `U+F780..=U+F7FF`.
-const RAW_BYTE_BASE: u32 = 0xF700;
-
-/// The byte a stand-in character represents, if it is one.
-fn raw_byte(c: char) -> Option<u8> {
-    let n = u32::from(c).checked_sub(RAW_BYTE_BASE)?;
-    u8::try_from(n).ok().filter(|b| *b >= 0x80)
-}
-
-/// Decode mailbox bytes, keeping every byte that is not valid UTF-8.
-///
-/// Each such byte becomes a private-use stand-in that [`encode_mbox`] turns
-/// back into the byte, so a message is written back, saved, or copied exactly
-/// as it arrived rather than with its 8-bit text replaced.
-fn decode_mbox(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len());
-    for chunk in bytes.utf8_chunks() {
-        out.push_str(chunk.valid());
-        for &b in chunk.invalid() {
-            out.extend(char::from_u32(RAW_BYTE_BASE + u32::from(b)));
-        }
-    }
-    out
-}
-
-/// The bytes `s` was decoded from by [`decode_mbox`].
-pub(crate) fn encode_mbox(s: &str) -> std::borrow::Cow<'_, [u8]> {
-    if !s.chars().any(|c| raw_byte(c).is_some()) {
-        return std::borrow::Cow::Borrowed(s.as_bytes());
-    }
-    let mut out = Vec::with_capacity(s.len());
-    for c in s.chars() {
-        match raw_byte(c) {
-            Some(b) => out.push(b),
-            None => out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
-        }
-    }
-    std::borrow::Cow::Owned(out)
-}
-
-/// The length in bytes of `s` as stored in the mailbox file.
-fn encoded_len(s: &str) -> usize {
-    encode_mbox(s).len()
-}
-
-/// Write `s` as stored in a mailbox file, followed by a newline.
-fn write_line<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
-    w.write_all(&encode_mbox(s))?;
+/// Write `line` followed by a newline.
+fn write_line<W: Write>(w: &mut W, line: &[u8]) -> io::Result<()> {
+    w.write_all(line)?;
     w.write_all(b"\n")
 }
 
 /// Remove one level of mbox `From ` quoting from a body line.
 ///
 /// mboxrd: `>From ` came from `From `, `>>From ` from `>From `, and so on.
-fn unquote_from_line(line: &str) -> &str {
-    let rest = line.trim_start_matches('>');
-    if rest.starts_with("From ") && rest.len() < line.len() {
+fn unquote_from_line(line: &[u8]) -> &[u8] {
+    let rest = trim_quote_marks(line);
+    if rest.starts_with(b"From ") && rest.len() < line.len() {
         &line[1..]
     } else {
         line
     }
 }
 
+/// `line` without its leading run of `>`.
+fn trim_quote_marks(line: &[u8]) -> &[u8] {
+    let n = line.iter().take_while(|&&b| b == b'>').count();
+    &line[n..]
+}
+
 /// Whether a body line needs mbox `From ` quoting on the way out.
-pub(crate) fn needs_from_quoting(line: &str) -> bool {
-    line.trim_start_matches('>').starts_with("From ")
+pub(crate) fn needs_from_quoting(line: &[u8]) -> bool {
+    trim_quote_marks(line).starts_with(b"From ")
 }
 
 /// Serialize messages in mbox format (spec 104420-104436).
@@ -562,7 +523,7 @@ fn write_messages<W: Write>(
             writeln!(w, "Status: {}", status)?;
         }
         writeln!(w)?;
-        for line in msg.body.lines() {
+        for line in crate::util::byte_lines(&msg.body) {
             if needs_from_quoting(line) {
                 write!(w, ">")?;
             }

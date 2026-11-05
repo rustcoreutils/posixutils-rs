@@ -228,7 +228,7 @@ pub fn handle_escape(
             output.push_str(&msg.body);
             output.push_str("-------\n");
 
-            crate::util::page_or_print(&output, vars);
+            crate::util::page_or_print(output.as_bytes(), vars);
             Ok(EscapeResult::continue_input())
         }
         'q' => {
@@ -500,7 +500,7 @@ fn forward_messages(
             } else {
                 m.format_display(false, vars)
             };
-            msg.body.push_str(&content);
+            msg.body.push_str(&String::from_utf8_lossy(&content));
         }
     }
 
@@ -531,7 +531,7 @@ fn insert_messages(
                 m.format_display(false, vars)
             };
 
-            for line in content.lines() {
+            for line in String::from_utf8_lossy(&content).lines() {
                 if !line.is_empty() {
                     msg.body.push_str(indent);
                 }

@@ -851,7 +851,7 @@ fn edit_messages(msg_nums: &[usize], mb: &Mailbox, editor: &str) -> Result<Comma
         if let Some(msg) = mb.get(num) {
             let mut tmp = plib::tmp::NamedTempFile::new().map_err(|e| e.to_string())?;
             tmp.as_file_mut()
-                .write_all(msg.format_full().as_bytes())
+                .write_all(&msg.format_full())
                 .map_err(|e| e.to_string())?;
             tmp.as_file_mut().flush().map_err(|e| e.to_string())?;
 
@@ -1147,9 +1147,7 @@ fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
 
             if let Some(stdin) = child.stdin.as_mut() {
                 let content = msg.format_display(false, vars);
-                stdin
-                    .write_all(content.as_bytes())
-                    .map_err(|e| e.to_string())?;
+                stdin.write_all(&content).map_err(|e| e.to_string())?;
                 if page {
                     stdin.write_all(b"\x0c").map_err(|e| e.to_string())?; // form feed
                 }
@@ -1404,18 +1402,19 @@ fn cmd_top(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Command
     for num in &msg_nums {
         if let Some(msg) = mb.get(*num) {
             // Print headers
+            let mut out = Vec::new();
             for line in &msg.header_lines {
-                println!("{}", line);
+                out.extend_from_slice(line);
+                out.push(b'\n');
             }
-            println!();
+            out.push(b'\n');
 
             // Print first toplines of body
-            for (i, line) in msg.body.lines().enumerate() {
-                if i >= toplines {
-                    break;
-                }
-                println!("{}", line);
+            for line in crate::util::byte_lines(&msg.body).take(toplines) {
+                out.extend_from_slice(line);
+                out.push(b'\n');
             }
+            crate::util::print_bytes(&out);
         }
     }
 
@@ -1522,9 +1521,8 @@ fn cmd_write(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comma
     let mut total_size = 0;
     for num in &msg_nums {
         if let Some(msg) = mb.get(*num) {
-            let body = crate::mailbox::encode_mbox(&msg.body);
-            file.write_all(&body).map_err(|e| e.to_string())?;
-            total_size += body.len();
+            file.write_all(&msg.body).map_err(|e| e.to_string())?;
+            total_size += msg.body.len();
         }
     }
 

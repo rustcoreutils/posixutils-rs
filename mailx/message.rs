@@ -80,14 +80,18 @@ impl Message {
 /// A single email message
 #[derive(Debug, Clone)]
 pub struct Message {
-    /// The full "From " line (envelope)
-    pub from_line: String,
+    /// The full "From " line (envelope), as stored.
+    ///
+    /// The envelope line, the header lines and the body are kept as the bytes
+    /// in the mailbox file: mail need not be UTF-8, and a message must be
+    /// written back, saved and copied exactly as it arrived.
+    pub from_line: Vec<u8>,
     /// Parsed headers (lowercase key -> original value)
     pub headers: HashMap<String, String>,
-    /// Original header lines in order
-    pub header_lines: Vec<String>,
+    /// Original header lines in order, each with its folded continuations
+    pub header_lines: Vec<Vec<u8>>,
     /// Message body
-    pub body: String,
+    pub body: Vec<u8>,
     /// Lines the message occupies in the mailbox file, from its `From ` line
     /// up to the next message's.
     pub raw_lines: usize,
@@ -107,10 +111,10 @@ pub struct Message {
 impl Message {
     pub fn new() -> Self {
         Message {
-            from_line: String::new(),
+            from_line: Vec::new(),
             headers: HashMap::new(),
             header_lines: Vec::new(),
-            body: String::new(),
+            body: Vec::new(),
             raw_lines: 0,
             raw_bytes: 0,
             read: ReadState::New,
@@ -171,17 +175,18 @@ impl Message {
         &self,
         show_all_headers: bool,
         vars: &crate::variables::Variables,
-    ) -> String {
+    ) -> Vec<u8> {
         let (ignored, retained): (&[String], &[String]) = if show_all_headers {
             (&[], &[])
         } else {
             (&vars.ignored_headers, &vars.retained_headers)
         };
-        let mut output = String::new();
+        let mut output = Vec::new();
 
         // Add headers
         for line in &self.header_lines {
-            let field_name = line.split(':').next().unwrap_or("").trim().to_lowercase();
+            let name = line.split(|&b| b == b':').next().unwrap_or_default();
+            let field_name = String::from_utf8_lossy(name).trim().to_lowercase();
 
             let include = if show_all_headers {
                 true
@@ -192,36 +197,41 @@ impl Message {
             };
 
             if include {
-                output.push_str(line);
-                output.push('\n');
+                output.extend_from_slice(line);
+                output.push(b'\n');
             }
         }
 
-        output.push('\n');
-        output.push_str(&self.body);
+        output.push(b'\n');
+        output.extend_from_slice(&self.body);
 
         output
     }
 
     /// Format the full message including From line
-    pub fn format_full(&self) -> String {
+    pub fn format_full(&self) -> Vec<u8> {
         let mut output = self.from_line.clone();
-        output.push('\n');
+        output.push(b'\n');
 
         for line in &self.header_lines {
-            output.push_str(line);
-            output.push('\n');
+            output.extend_from_slice(line);
+            output.push(b'\n');
         }
 
-        output.push('\n');
-        output.push_str(&self.body);
+        output.push(b'\n');
+        output.extend_from_slice(&self.body);
 
         // Ensure trailing newline
-        if !output.ends_with('\n') {
-            output.push('\n');
+        if !output.ends_with(b"\n") {
+            output.push(b'\n');
         }
 
         output
+    }
+
+    /// The `From ` line as text, for parsing the sender and date out of it.
+    pub fn envelope(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.from_line)
     }
 
     /// The date for the header summary, as `Www Mmm dd hh:mm`.
@@ -230,8 +240,8 @@ impl Message {
     /// the message was delivered here. A missing or malformed one falls back
     /// to the `Date:` header.
     pub fn short_date(&self) -> String {
-        let envelope = self
-            .from_line
+        let line = self.envelope();
+        let envelope = line
             .strip_prefix("From ")
             .map(|rest| rest.trim_start())
             .and_then(|rest| rest.split_once(char::is_whitespace))
@@ -247,7 +257,7 @@ impl Message {
         match self.get_header("from").map(extract_address) {
             Some(addr) if !addr.is_empty() => addr,
             _ => self
-                .from_line
+                .envelope()
                 .strip_prefix("From ")
                 .and_then(|rest| rest.split_whitespace().next())
                 .unwrap_or("")

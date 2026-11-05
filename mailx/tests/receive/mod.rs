@@ -5395,3 +5395,48 @@ fn created_mail_files_are_private() {
         },
     );
 }
+
+/// Messages are kept as stored bytes: a genuine private-use character comes
+/// back as itself, beside raw 8-bit bytes, and `print` shows the bytes as
+/// stored rather than a stand-in for them.
+#[test]
+fn stored_bytes_round_trip_exactly() {
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let mbox = dir.path().join("in.mbox");
+    let copied = dir.path().join("copied.mbox");
+    // U+F7E9 in UTF-8 is EF 9F A9; the stand-in scheme read it as byte E9.
+    let first: &[u8] = b"From a@b Mon Jan  1 00:00:00 2024\nFrom: a@b\nSubject: s\n\n\
+        pua \xef\x9f\xa9 raw \xe9\n\n";
+    let second: &[u8] = b"From c@d Mon Jan  1 00:00:00 2024\nFrom: c@d\nSubject: two\n\nsecond\n\n";
+    std::fs::write(&mbox, [first, second].concat()).expect("write mbox");
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox.to_str().unwrap().to_string(),
+            ],
+            stdin_data: format!("print 1\ncopy 1 {}\nd 2\nquit\n", copied.display()),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            let wanted: &[u8] = b"pua \xef\x9f\xa9 raw \xe9\n";
+            assert!(
+                output.stdout.windows(wanted.len()).any(|w| w == wanted),
+                "print did not show the stored bytes: {:?}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        },
+    );
+
+    // Printing read the message, so both copies record that in `Status:`.
+    let read: &[u8] = b"From a@b Mon Jan  1 00:00:00 2024\nFrom: a@b\nSubject: s\n\
+        Status: RO\n\npua \xef\x9f\xa9 raw \xe9\n\n";
+    assert_eq!(std::fs::read(&copied).expect("read copy"), read);
+    assert_eq!(std::fs::read(&mbox).expect("read rewrite"), read);
+}

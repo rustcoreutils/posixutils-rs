@@ -344,7 +344,7 @@ pub(crate) fn record_message(
         writeln!(file, "{}", headers)?;
         writeln!(file)?;
         for line in body.lines() {
-            if crate::mailbox::needs_from_quoting(line) {
+            if crate::mailbox::needs_from_quoting(line.as_bytes()) {
                 write!(file, ">")?;
             }
             writeln!(file, "{}", line)?;

@@ -114,6 +114,33 @@ impl Mailbox {
             .count()
     }
 
+    /// Take in mail delivered to the mailbox since it was read, returning
+    /// how many messages were added.
+    ///
+    /// The new bytes are parsed into the store under the same locks as the
+    /// first read, and `loaded_len` moves past them, so quit neither loses
+    /// nor duplicates them.
+    pub fn incorporate(&mut self) -> Result<usize> {
+        let (file, _dotlock) = open_read_locked(&self.path).context(&self.path)?;
+        let len = file.metadata().context(&self.path)?.len();
+        if len < self.loaded_len {
+            return Err(format!("{}: mailbox shrank while open", self.path).into());
+        }
+        let mut file = &file;
+        file.seek(io::SeekFrom::Start(self.loaded_len))
+            .context(&self.path)?;
+        let input = io::BufReader::new(file.take(len - self.loaded_len));
+        let (messages, consumed) =
+            crate::mbox::parse(input, &mut self.store).context(&self.path)?;
+        self.loaded_len += consumed;
+        let added = messages.len();
+        self.messages.extend(messages);
+        if self.current.is_none() && !self.messages.is_empty() {
+            self.current = Some(1);
+        }
+        Ok(added)
+    }
+
     /// The `From ` line and header fields of message `num`, read from the
     /// store.
     pub fn headers(&self, num: usize) -> Result<Headers> {

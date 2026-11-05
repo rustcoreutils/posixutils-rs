@@ -158,6 +158,7 @@ const COMMANDS: &[Cmd] = &[
     cmd("help", 3, CMD_RC, |_, _, _, _| cmd_help()),
     cmd("hold", 2, CMD, |a, m, v, _| cmd_hold(a, m, v)),
     cmd("preserve", 3, CMD, |a, m, v, _| cmd_hold(a, m, v)),
+    cmd("inc", 3, CMD, |_, m, v, _| cmd_inc(m, v)),
     cmd("list", 1, CMD_RC, |_, _, _, _| cmd_list()),
     cmd("mail", 1, CMD, cmd_mail),
     cmd("mbox", 2, CMD_RC, |a, m, v, _| cmd_mbox(a, m, v)),
@@ -714,6 +715,70 @@ fn cmd_hold(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
     }
 
     Ok(CommandResult::Continue)
+}
+
+/// `inc`: take in new mail, as BSD mailx does -- report the mailbox and
+/// make the first new message current, or say there is none.
+fn cmd_inc(mb: &mut Mailbox, vars: &Variables) -> Result<CommandResult> {
+    let before = mb.message_count();
+    if mb.incorporate()? == 0 {
+        println!("No new mail.");
+        return Ok(CommandResult::Continue);
+    }
+    // The first new message among those added, else the first unread one.
+    let added = before + 1..=mb.message_count();
+    let current = added
+        .clone()
+        .find(|&n| mb.get(n).is_some_and(|m| m.read == ReadState::New))
+        .or_else(|| {
+            added
+                .clone()
+                .find(|&n| mb.get(n).is_some_and(|m| m.read.is_unread()))
+        })
+        .unwrap_or(before + 1);
+    mb.set_current(current);
+    println!("{}", mailbox_info(mb, vars));
+    Ok(CommandResult::Continue)
+}
+
+/// BSD mailx's one-line account of a mailbox: its name, abbreviated with
+/// `+` inside `folder`, and how many messages it holds, new, unread,
+/// deleted and saved.
+fn mailbox_info(mb: &Mailbox, vars: &Variables) -> String {
+    let folder = crate::filename::in_folder("", vars);
+    let name = match folder.as_deref().and_then(|f| mb.path.strip_prefix(f)) {
+        Some(rest) => format!("+{}", rest),
+        None => mb.path.clone(),
+    };
+    let messages = &mb.messages;
+    let new = messages.iter().filter(|m| m.read == ReadState::New).count();
+    let unread = messages.iter().filter(|m| m.read.is_unread()).count();
+    let deleted = messages.iter().filter(|m| m.is_deleted()).count();
+    let saved = messages
+        .iter()
+        .filter(|m| m.disposition == Disposition::Saved)
+        .count();
+
+    let mut info = format!("\"{}\": ", name);
+    if messages.len() == 1 {
+        info.push_str("1 message");
+    } else {
+        info.push_str(&format!("{} messages", messages.len()));
+    }
+    // BSD prints the unread count, new included, when any unread is not new.
+    let unread_shown = if unread > new { unread } else { 0 };
+    let counts = [
+        (new, "new"),
+        (unread_shown, "unread"),
+        (deleted, "deleted"),
+        (saved, "saved"),
+    ];
+    for (n, word) in counts {
+        if n > 0 {
+            info.push_str(&format!(" {} {}", n, word));
+        }
+    }
+    info
 }
 
 fn cmd_list() -> Result<CommandResult> {

@@ -459,3 +459,40 @@ fn quit_reports_what_it_did() {
         String::from_utf8_lossy(&output.stdout)
     );
 }
+
+/// Mail delivered during the session is taken in by `inc`, or before a
+/// prompt with `autoinc`, and is written back once, not twice, at quit.
+#[test]
+fn inc_and_autoinc_take_in_new_mail() {
+    let extra = create_temp_mbox(
+        "From late@example.com Fri Nov 29 15:00:00 2024\nFrom: late@example.com\nSubject: late\n\nlate body\n\n",
+    );
+    let deliver = format!("!cat {} >> ", extra.path().display());
+
+    let mbox = copy_test_data("testdata.mbox");
+    let path = mbox.path().to_str().unwrap();
+    let output = mailx(
+        &["-n", "-N", "-f", path],
+        format!("inc\n{deliver}{path}\ninc\nfrom *\nquit\n"),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("No new mail.\n"), "{}", stdout);
+    assert!(
+        stdout.contains(&format!("\"{}\": 4 messages 1 new", path)),
+        "{}",
+        stdout
+    );
+    assert!(stdout.contains("late@example.com"), "{}", stdout);
+    let after = std::fs::read_to_string(mbox.path()).unwrap();
+    assert_eq!(after.matches("Subject: late\n").count(), 1, "{}", after);
+
+    let mbox = copy_test_data("testdata.mbox");
+    let path = mbox.path().to_str().unwrap();
+    let output = mailx(
+        &["-n", "-N", "-f", path],
+        format!("set autoinc\n{deliver}{path}\nfrom *\nexit\n"),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("New mail has arrived.\n"), "{}", stdout);
+    assert!(stdout.contains("late@example.com"), "{}", stdout);
+}

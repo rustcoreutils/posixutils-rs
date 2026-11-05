@@ -396,9 +396,11 @@ pub(crate) fn truncate_display(s: &str, max_len: usize) -> String {
 ///
 /// Follows the RFC 5322 syntax far enough to tell the address from its
 /// decoration: a quoted string or a `(comment)` may contain `<`, `>`, or a
-/// comma without meaning anything, and the angle address is the last `<...>`.
-/// An unclosed `<`, as in `Name <a@b`, still introduces the address. With no
-/// angle address, the text outside comments is the address.
+/// comma without meaning anything. The angle address ends at the first `>`
+/// outside them and begins at the last `<` before it, so a stray `<` in a
+/// display name (`Bob >_< Smith <bob@x>`) is passed over; anything after that
+/// `>` is ignored. An unclosed `<`, as in `Name <a@b`, still introduces the
+/// address. With no angle address, the text outside comments is the address.
 pub fn extract_address(s: &str) -> String {
     let mut plain = String::new();
     let mut angle: Option<String> = None;

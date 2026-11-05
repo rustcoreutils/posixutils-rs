@@ -1355,3 +1355,39 @@ fn header_summary_sender_is_the_address() {
         rows[2]
     );
 }
+
+/// The `Date:` fallback tolerates the layouts mail actually carries rather
+/// than leaving the date column blank.
+#[test]
+fn header_summary_date_from_loose_headers() {
+    let cases = [
+        ("Mon Nov 25 10:30:00 2024", "Mon Nov 25 10:30"),
+        ("25 Nov 2024", "Nov 25"),
+        ("Mon,25 Nov 2024 10:30 +0000", "Mon Nov 25 10:30"),
+        (
+            "Monday, 25 November 2024 10:30:00 +0000",
+            "Mon Nov 25 10:30",
+        ),
+    ];
+    for (header, want) in cases {
+        let (summary, _) = summary_and_commands(
+            &format!(
+                "From a@example.com\n\
+                 From: a@example.com\n\
+                 Date: {}\n\
+                 Subject: s\n\
+                 \n\
+                 body\n",
+                header
+            ),
+            "",
+        );
+        assert!(
+            summary.contains(want),
+            "Date: {} should summarize as {:?}: {:?}",
+            header,
+            want,
+            summary
+        );
+    }
+}

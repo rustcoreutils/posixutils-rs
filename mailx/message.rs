@@ -294,11 +294,18 @@ fn hours_minutes(s: &str) -> Option<&str> {
 }
 
 /// Format the summary date from its parts.
-fn summary_date(weekday: Option<&str>, month: &str, day: u32, time: &str) -> String {
-    match weekday {
-        Some(w) => format!("{} {} {:>2} {}", w, month, day, time),
-        None => format!("{} {:>2} {}", month, day, time),
+fn summary_date(weekday: Option<&str>, month: &str, day: u32, time: Option<&str>) -> String {
+    let mut out = String::new();
+    if let Some(w) = weekday {
+        out.push_str(w);
+        out.push(' ');
     }
+    out.push_str(&format!("{} {:>2}", month, day));
+    if let Some(t) = time {
+        out.push(' ');
+        out.push_str(t);
+    }
+    out
 }
 
 /// The summary date of a `From ` line's `Www Mmm dd hh:mm:ss yyyy`.
@@ -308,24 +315,39 @@ fn envelope_date(s: &str) -> Option<String> {
     let month = parts.next().filter(|m| MONTHS.contains(m))?;
     let day = day_of_month(parts.next()?)?;
     let time = hours_minutes(parts.next()?)?;
-    Some(summary_date(Some(weekday), month, day, time))
+    Some(summary_date(Some(weekday), month, day, Some(time)))
 }
 
-/// The summary date of an RFC 5322 `Date:` value, `[Www,] dd Mmm yyyy hh:mm`.
+/// The three-letter abbreviation `s` names from `names`, accepting the
+/// full name too (`Nov`, `November`).
+fn abbreviation(s: &str, names: &[&'static str]) -> Option<&'static str> {
+    let prefix = s.get(..3)?;
+    names
+        .iter()
+        .copied()
+        .find(|n| n.eq_ignore_ascii_case(prefix))
+}
+
+/// The summary date of a `Date:` value.
 ///
-/// The day is the number *before* the month. Taking the one after it read
-/// the year as the day, so `29 Jan 2007` was summarized as `Jan 2007`.
+/// RFC 5322 writes `[Www,] dd Mmm yyyy hh:mm`, but mail in the wild also
+/// carries `Www Mmm dd hh:mm:ss yyyy`, omits the time, or the space after the
+/// comma, so the parts are found rather than expected in place. The day is
+/// the number next to the month that can be one, preferring the one before
+/// it: taking the number after it read `29 Jan 2007` as `Jan 2007`.
 fn header_date(s: &str) -> Option<String> {
-    let parts: Vec<&str> = s.split_whitespace().collect();
-    let (weekday, rest) = match parts.first() {
-        Some(w) if WEEKDAYS.contains(&w.trim_end_matches(',')) => {
-            (Some(w.trim_end_matches(',')), &parts[1..])
-        }
-        _ => (None, &parts[..]),
-    };
-    let day = day_of_month(rest.first()?)?;
-    let month = rest.get(1).filter(|m| MONTHS.contains(m))?;
-    let time = rest.get(3).and_then(|t| hours_minutes(t))?;
+    let parts: Vec<&str> = s
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|p| !p.is_empty())
+        .collect();
+    let weekday = parts.first().and_then(|w| abbreviation(w, &WEEKDAYS));
+    let (at, month) = parts
+        .iter()
+        .enumerate()
+        .find_map(|(i, p)| abbreviation(p, &MONTHS).map(|m| (i, m)))?;
+    let before = at.checked_sub(1).and_then(|i| day_of_month(parts[i]));
+    let day = before.or_else(|| parts.get(at + 1).and_then(|p| day_of_month(p)))?;
+    let time = parts.iter().find_map(|p| hours_minutes(p));
     Some(summary_date(weekday, month, day, time))
 }
 

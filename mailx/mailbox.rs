@@ -311,7 +311,7 @@ impl Mailbox {
 
                 // Decide whether to show To or From
                 let address_field = if show_to && vars.is_me(msg.from()) {
-                    format!("To {}", truncate_display(msg.to(), 18))
+                    format!("To {}", crate::message::bare_address(msg.to()))
                 } else {
                     msg.short_from()
                 };
@@ -321,8 +321,10 @@ impl Mailbox {
                 let size = msg.size();
                 let subject = truncate_display(msg.subject(), 25);
 
+                // The traditional layout: sender cut to 20 columns, date
+                // `Www Mmm dd hh:mm`, then lines/bytes.
                 println!(
-                    "{}{}{:>4}  {:<18}  {:>6}  {:>5}/{:<5}  {}",
+                    "{}{}{:>3} {:<20.20}  {:>16.16} {:>3}/{:<5} {}",
                     current_marker, state_char, num, address_field, date, lines, size, subject
                 );
             }

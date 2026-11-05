@@ -241,32 +241,38 @@ impl Message {
             .unwrap_or_default()
     }
 
-    /// Extract the sender's name or address for header display
+    /// The sender for the header summary: the `From:` address, or failing
+    /// that the `From ` line's, as traditional mailx shows it.
     pub fn short_from(&self) -> String {
-        let from = self.from();
-        // Try to extract name from "Name <email>" format
-        if let Some(start) = from.find('<') {
-            let name = from[..start].trim().trim_matches('"');
-            if !name.is_empty() {
-                return truncate_display(name, 18);
-            }
+        match self.get_header("from").map(bare_address) {
+            Some(addr) if !addr.is_empty() => addr,
+            _ => self
+                .from_line
+                .strip_prefix("From ")
+                .and_then(|rest| rest.split_whitespace().next())
+                .unwrap_or("")
+                .to_string(),
         }
-        // Try to extract name from "(Name)" format. The closing paren is
-        // searched for *after* the opening one; searching from the start of the
-        // string inverts the range whenever `)` precedes `(`, which panicked
-        // while printing the start-up header summary.
-        if let Some(start) = from.find('(') {
-            if let Some(end) = from[start + 1..].find(')') {
-                let name = &from[start + 1..start + 1 + end];
-                if !name.is_empty() {
-                    return truncate_display(name, 18);
-                }
-            }
-        }
-        // Just use the address
-        let addr = from.trim_start_matches('<').trim_end_matches('>');
-        truncate_display(addr, 18)
     }
+}
+
+/// An address with its display name and any `(comment)` removed:
+/// `Name <a@b>` and `a@b (Name)` are both `a@b`.
+pub fn bare_address(s: &str) -> String {
+    if s.contains('<') {
+        return extract_address(s).trim().to_string();
+    }
+    let mut out = String::new();
+    let mut depth = 0usize;
+    for c in s.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' if depth > 0 => depth -= 1,
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];

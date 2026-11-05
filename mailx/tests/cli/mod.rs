@@ -1030,13 +1030,14 @@ fn opt_n_still_reads_user_mailrc() {
 /// character boundary rather than panicking on a byte slice.
 #[test]
 fn header_summary_multibyte_no_panic() {
-    // 3-byte chars in Subject (>25) and 2-byte chars in the From name (>18):
-    // a byte-offset slice at column 22/15 would fall mid-character and panic.
+    // 3-byte chars in Subject (>25) and 2-byte chars in the From address
+    // (>20): a byte-offset slice at column 22/10 would fall mid-character and
+    // panic.
     let subject: String = "あ".repeat(30);
-    let from_name: String = "Ñ".repeat(20);
+    let from_name: String = "Ñ".repeat(25);
     let body = format!(
         "From sender@example.com Mon Jan  1 10:00:00 2024\n\
-         From: {} <sender@example.com>\n\
+         From: {}@example.com\n\
          Subject: {}\n\
          \n\
          body text\n",
@@ -1312,4 +1313,45 @@ fn header_summary_date_from_header() {
     );
     assert!(summary.contains("Mon Jan 29 19:32"), "{:?}", summary);
     assert!(!summary.contains("Jan 2007"), "{:?}", summary);
+}
+
+/// The summary shows the sender's bare address, cut to 20 columns, in the
+/// traditional layout.
+#[test]
+fn header_summary_sender_is_the_address() {
+    let (summary, _) = summary_and_commands(
+        "From x@example.com Mon Jan 29 10:29:21 2007\n\
+         From: Some Name <angle@example.com>\n\
+         Subject: one\n\
+         \n\
+         body\n\
+         \n\
+         From x@example.com Mon Jan 29 10:30:00 2007\n\
+         From: paren@example.com (Some Name)\n\
+         Subject: two\n\
+         \n\
+         body\n\
+         \n\
+         From x@example.com Mon Jan 29 10:31:00 2007\n\
+         From: a.very.long.address@example.com\n\
+         Subject: three\n\
+         \n\
+         body\n",
+        "",
+    );
+    let rows: Vec<&str> = summary.lines().collect();
+    assert_eq!(
+        rows[0],
+        ">N  1 angle@example.com     Mon Jan 29 10:29   6/100   one"
+    );
+    assert!(
+        rows[1].contains(" paren@example.com ") && !rows[1].contains("Some Name"),
+        "{:?}",
+        rows[1]
+    );
+    assert!(
+        rows[2].contains(" a.very.long.address@  Mon"),
+        "{:?}",
+        rows[2]
+    );
 }

@@ -443,7 +443,7 @@ fn default_msglist_without_a_current_message_is_diagnosed() {
     let saved = dir.path().join("saved");
     let output = mailx(
         &["-n", "-N", "-f", mbox.path().to_str().unwrap()],
-        &format!("print\nsave {}\nexit\n", saved.display()),
+        format!("print\nsave {}\nexit\n", saved.display()),
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(

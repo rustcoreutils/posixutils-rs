@@ -265,3 +265,53 @@ fn reply_to_list_is_split() {
     assert_eq!(envelope, "Envelope: l@example.com, other@example.com");
     assert_eq!(output.status.code(), Some(0), "exit status");
 }
+
+/// Run `commands` against testdata.mbox with `debug` set, returning stderr,
+/// where each message mailx would have sent is reported.
+fn debug_session(commands: &str) -> String {
+    let mbox = copy_test_data("testdata.mbox");
+    let mailrc = create_temp_mailrc("set debug\n");
+    let output = mailx_env(
+        &["-N", "-f", mbox.path().to_str().unwrap()],
+        commands,
+        &[
+            ("MAILRC", mailrc.path().to_str().unwrap()),
+            ("USER", "nobody"),
+        ],
+    );
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// `Reply` and `Followup` answer the senders of every listed message in one
+/// message; `F` is enough to name `Followup`.
+#[test]
+fn capitalized_replies_go_to_every_listed_sender_at_once() {
+    for cmd in ["Reply 1 2", "Followup 1 2", "F 1 2"] {
+        let stderr = debug_session(&format!("{}\nbody\n~.\nexit\n", cmd));
+        assert_eq!(
+            stderr.matches("Debug mode").count(),
+            1,
+            "{}: {}",
+            cmd,
+            stderr
+        );
+        assert!(
+            stderr.contains("To: Alice Smith <alice@example.com>, Bob Jones <bob@example.org>\n"),
+            "{} should reply to both senders: {}",
+            cmd,
+            stderr
+        );
+    }
+}
+
+/// `followup` answers one message as `reply` does: its sender and its other
+/// recipients.
+#[test]
+fn followup_replies_to_all_recipients_of_one_message() {
+    let stderr = debug_session("followup 1\nbody\n~.\nexit\n");
+    assert!(
+        stderr.contains("To: Alice Smith <alice@example.com>, testuser@localhost\n"),
+        "followup should reply to sender and recipients: {}",
+        stderr
+    );
+}

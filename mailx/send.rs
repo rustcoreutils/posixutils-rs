@@ -352,61 +352,56 @@ pub fn save_dead_letter(msg: &ComposedMessage, vars: &Variables) {
     }
 }
 
-/// Compose a reply message
-pub fn compose_reply(original: &Message, reply_all: bool, vars: &Variables) -> ComposedMessage {
+/// Who a reply is addressed to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyForm {
+    /// The lowercase `reply` form: the sender of one message and its other
+    /// recipients.
+    Group,
+    /// The capitalized `Reply` form: the sender of each message listed.
+    Senders,
+}
+
+/// A reply to `originals`, addressed as `form` says, its subject that of
+/// the first with `Re: ` before it unless it already begins so.
+pub fn compose_reply(originals: &[&Message], form: ReplyForm, vars: &Variables) -> ComposedMessage {
     let mut msg = ComposedMessage::new();
-
-    let original_subject = original.subject();
-    if original_subject.to_lowercase().starts_with("re:") {
-        msg.subject = original_subject.to_string();
+    let Some(first) = originals.first() else {
+        return msg;
+    };
+    let subject = first.subject();
+    msg.subject = if subject.to_lowercase().starts_with("re:") {
+        subject.to_string()
     } else {
-        msg.subject = format!("Re: {}", original_subject);
+        format!("Re: {}", subject)
+    };
+
+    for original in originals {
+        add_sender(&mut msg, original);
     }
-
-    if reply_all {
-        // The sender's part is Reply-To, or From without one. Whether To and
-        // Cc join a Reply-To is implementation-defined (spec 104911-104916);
-        // here they do.
-        if let Some(reply_to) = original.get_header("reply-to") {
-            for addr in crate::util::addresses(reply_to) {
-                msg.add_to(addr);
-            }
-        } else {
-            msg.add_to(original.from());
-        }
-
-        // Unless `metoo` is set, the user's own login and alternates come out
-        // of the list (spec 104926-104928).
-        let include_self = vars.is_set("metoo");
-
-        for addr in crate::util::addresses(original.to()) {
-            if !include_self && vars.is_me(addr) {
-                continue;
-            }
+    if form == ReplyForm::Group {
+        // Whether To and Cc join a Reply-To is implementation-defined
+        // (spec 104911-104916); here they do. Unless `metoo` is set, the
+        // user's own login and alternates come out (spec 104926-104928).
+        let include = |addr: &str| vars.is_set("metoo") || !vars.is_me(addr);
+        for addr in crate::util::addresses(first.to()).filter(|a| include(a)) {
             msg.add_to(addr);
         }
-
-        if let Some(cc) = original.get_header("cc") {
-            for addr in crate::util::addresses(cc) {
-                if !include_self && vars.is_me(addr) {
-                    continue;
-                }
-                msg.add_cc(addr);
-            }
-        }
-    } else {
-        // Reply-To may name several addresses, each a recipient; without
-        // one, the sender.
-        if let Some(reply_to) = original.get_header("reply-to") {
-            for addr in crate::util::addresses(reply_to) {
-                msg.add_to(addr);
-            }
-        } else {
-            msg.add_to(original.from());
+        let cc = first.get_header("cc").unwrap_or("");
+        for addr in crate::util::addresses(cc).filter(|a| include(a)) {
+            msg.add_cc(addr);
         }
     }
-
     msg
+}
+
+/// Address `msg` to the sender of `original`: its Reply-To addresses, or
+/// without one its From.
+fn add_sender(msg: &mut ComposedMessage, original: &Message) {
+    match original.get_header("reply-to") {
+        Some(reply_to) => crate::util::addresses(reply_to).for_each(|a| msg.add_to(a)),
+        None => msg.add_to(original.from()),
+    }
 }
 
 #[cfg(test)]

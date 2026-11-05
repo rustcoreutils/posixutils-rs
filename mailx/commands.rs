@@ -23,7 +23,7 @@ use crate::msglist::{
     current_message, is_positional, msglist_or_current, parse_message, parse_msglist, Want,
 };
 use crate::script::CondStack;
-use crate::send::{compose_reply, send_message, ComposedMessage};
+use crate::send::{compose_reply, send_message, ComposedMessage, ReplyForm};
 use crate::variables::{parse_set_arg, split_args, Variables};
 
 /// Result of executing a command
@@ -148,10 +148,10 @@ const COMMANDS: &[Cmd] = &[
     cmd("folder", 4, CMD_RC, |a, m, v, _| cmd_file(a, m, v)),
     cmd("folders", 7, CMD_RC, |_, _, v, _| cmd_folders(v)),
     cmd("followup", 2, CMD, |a, m, v, i| {
-        cmd_followup(a, m, v, i, false)
+        cmd_followup(a, m, v, i, ReplyForm::Group)
     }),
-    cmd("Followup", 2, CMD, |a, m, v, i| {
-        cmd_followup(a, m, v, i, true)
+    cmd("Followup", 1, CMD, |a, m, v, i| {
+        cmd_followup(a, m, v, i, ReplyForm::Senders)
     }),
     cmd("from", 1, CMD_RC, |a, m, v, _| cmd_from(a, m, v)),
     cmd("headers", 1, CMD_RC, |a, m, v, _| cmd_headers(a, m, v)),
@@ -215,8 +215,8 @@ fn lookup(word: &str, ctx: Context) -> Option<Result<&'static Cmd>> {
     })
 }
 
-/// `reply`/`Reply` differ only in who the reply goes to, and `flipr` swaps
-/// which spelling means which (spec 104899-104902).
+/// `reply`/`Reply`, and `respond`/`Respond`: `flipr` swaps which spelling
+/// takes which form (spec 104899-104902).
 fn cmd_reply_flipr(
     args: &str,
     mb: &mut Mailbox,
@@ -224,8 +224,35 @@ fn cmd_reply_flipr(
     interp: &mut Interp,
     lowercase_form: bool,
 ) -> Result<CommandResult> {
-    let reply_to_all = lowercase_form != vars.is_set("flipr");
-    cmd_reply(args, mb, vars, interp, reply_to_all)
+    let form = if lowercase_form != vars.is_set("flipr") {
+        ReplyForm::Group
+    } else {
+        ReplyForm::Senders
+    };
+    let (msg_nums, mut composed) = start_reply(args, mb, vars, form)?;
+    compose_body(&mut composed, Some(mb), vars, interp)?;
+    send_message(&composed, vars, false)?;
+    mark_read(mb, &msg_nums);
+    Ok(CommandResult::Continue)
+}
+
+/// The messages a reply answers, and the reply addressed to them: the group
+/// form answers one message (`[message]`), the senders form every message
+/// listed (`[msglist]`).
+fn start_reply(
+    args: &str,
+    mb: &Mailbox,
+    vars: &Variables,
+    form: ReplyForm,
+) -> Result<(Vec<usize>, ComposedMessage)> {
+    let msg_nums = match form {
+        ReplyForm::Group if args.is_empty() => current_message(mb)?,
+        ReplyForm::Group => vec![parse_message(args, mb, vars)?],
+        ReplyForm::Senders => msglist_or_current(args, mb, vars)?,
+    };
+    let originals: Vec<&Message> = msg_nums.iter().filter_map(|&n| mb.get(n)).collect();
+    let composed = compose_reply(&originals, form, vars);
+    Ok((msg_nums, composed))
 }
 
 /// Execute a command in Receive Mode
@@ -608,30 +635,18 @@ fn cmd_followup(
     mb: &mut Mailbox,
     vars: &mut Variables,
     interp: &mut Interp,
-    reply_to_all: bool,
+    form: ReplyForm,
 ) -> Result<CommandResult> {
-    let msg_num = if args.is_empty() {
-        mb.current().ok_or("No message")?
-    } else {
-        parse_message(args, mb, vars)?
-    };
-
-    let original = mb.get(msg_num).ok_or("No message")?;
-    let mut composed = compose_reply(original, reply_to_all, vars);
-
-    let record_file = author_filename(original.from())?;
-    let record_file = expand_local_prefixes(&record_file, vars);
+    let (msg_nums, mut composed) = start_reply(args, mb, vars, form)?;
+    // Recorded in a file named after the author of the first message, by the
+    // same writer as `record`, so `outfolder` applies.
+    let author = mb.get(msg_nums[0]).ok_or("No message")?.from();
+    let record_file = expand_local_prefixes(&author_filename(author)?, vars);
 
     compose_body(&mut composed, Some(mb), vars, interp)?;
-
     send_message(&composed, vars, false)?;
-    // Recorded by the same writer as `record`, so `outfolder` applies.
     crate::send::record_message(&composed, &record_file, vars)?;
-
-    if let Some(m) = mb.get_mut(msg_num) {
-        m.read = ReadState::Read;
-    }
-
+    mark_read(mb, &msg_nums);
     Ok(CommandResult::Continue)
 }
 
@@ -854,28 +869,6 @@ fn cmd_print(
             m.displayed = true;
         }
     }
-    mark_read(mb, &msg_nums);
-
-    Ok(CommandResult::Continue)
-}
-
-fn cmd_reply(
-    args: &str,
-    mb: &mut Mailbox,
-    vars: &mut Variables,
-    interp: &mut Interp,
-    reply_to_all: bool,
-) -> Result<CommandResult> {
-    let msg_nums = msglist_or_current(args, mb, vars)?;
-
-    for &num in &msg_nums {
-        let original = mb.get(num).ok_or("No message")?;
-        let mut composed = compose_reply(original, reply_to_all, vars);
-
-        compose_body(&mut composed, Some(mb), vars, interp)?;
-        send_message(&composed, vars, false)?;
-    }
-
     mark_read(mb, &msg_nums);
 
     Ok(CommandResult::Continue)

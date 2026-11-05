@@ -529,14 +529,12 @@ fn cmd_delete(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comm
 
 fn cmd_discard(args: &str, vars: &mut Variables) -> Result<CommandResult> {
     if args.is_empty() {
-        for h in &vars.ignored_headers {
-            println!("{}", h);
+        for field in vars.header_filter.ignored() {
+            println!("{}", field);
         }
     } else {
-        for header in args.split_whitespace() {
-            if !vars.ignored_headers.contains(&header.to_string()) {
-                vars.ignored_headers.push(header.to_string());
-            }
+        for field in args.split_whitespace() {
+            vars.header_filter.ignore(field);
         }
     }
     Ok(CommandResult::Continue)
@@ -954,14 +952,12 @@ fn cmd_reply(
 
 fn cmd_retain(args: &str, vars: &mut Variables) -> Result<CommandResult> {
     if args.is_empty() {
-        for h in &vars.retained_headers {
-            println!("{}", h);
+        for field in vars.header_filter.retained() {
+            println!("{}", field);
         }
     } else {
-        for header in args.split_whitespace() {
-            if !vars.retained_headers.contains(&header.to_string()) {
-                vars.retained_headers.push(header.to_string());
-            }
+        for field in args.split_whitespace() {
+            vars.header_filter.retain(field);
         }
     }
     Ok(CommandResult::Continue)

@@ -166,38 +166,20 @@ impl Message {
         self.raw_lines
     }
 
-    /// Format the message for display with header filtering
     /// Render the message for display.
     ///
     /// `show_all_headers` is the capitalized `Print`/`Type` form, which
-    /// overrides `discard`/`ignore`/`retain` (spec 104756). The three callers
-    /// each repeated the same choice of header lists; the choice belongs here.
+    /// overrides `discard`/`ignore`/`retain` (spec 104756).
     pub fn format_display(
         &self,
         show_all_headers: bool,
         vars: &crate::variables::Variables,
     ) -> Vec<u8> {
-        let (ignored, retained): (&[String], &[String]) = if show_all_headers {
-            (&[], &[])
-        } else {
-            (&vars.ignored_headers, &vars.retained_headers)
-        };
         let mut output = Vec::new();
 
-        // Add headers
         for line in &self.header_lines {
-            let name = line.split(|&b| b == b':').next().unwrap_or_default();
-            let field_name = String::from_utf8_lossy(name).trim().to_lowercase();
-
-            let include = if show_all_headers {
-                true
-            } else if !retained.is_empty() {
-                retained.iter().any(|r| r.to_lowercase() == field_name)
-            } else {
-                !ignored.iter().any(|i| i.to_lowercase() == field_name)
-            };
-
-            if include {
+            let field = line.split(|&b| b == b':').next().unwrap_or_default();
+            if show_all_headers || vars.header_filter.shows(field.trim_ascii()) {
                 output.extend_from_slice(line);
                 output.push(b'\n');
             }

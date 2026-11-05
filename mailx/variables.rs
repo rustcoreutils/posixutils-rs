@@ -23,10 +23,58 @@ pub struct Variables {
     pub aliases: HashMap<String, Vec<String>>,
     /// Other addresses of the user's, from `alternates`.
     pub alternates: Vec<String>,
-    /// Header fields `discard`/`ignore` hide.
-    pub ignored_headers: Vec<String>,
-    /// Header fields `retain` keeps.
-    pub retained_headers: Vec<String>,
+    /// The header fields `discard`, `ignore` and `retain` name.
+    pub header_filter: HeaderFilter,
+}
+
+/// Which header fields a message is displayed with.
+///
+/// Field names compare without regard to case, as header field names do.
+#[derive(Debug, Default)]
+pub struct HeaderFilter {
+    ignored: Vec<String>,
+    retained: Vec<String>,
+}
+
+impl HeaderFilter {
+    /// Hide `field` (`discard`, `ignore`).
+    pub fn ignore(&mut self, field: &str) {
+        add_field(&mut self.ignored, field);
+    }
+
+    /// Show `field`, and with it only the other retained fields (`retain`).
+    pub fn retain(&mut self, field: &str) {
+        add_field(&mut self.retained, field);
+    }
+
+    pub fn ignored(&self) -> &[String] {
+        &self.ignored
+    }
+
+    pub fn retained(&self) -> &[String] {
+        &self.retained
+    }
+
+    /// Whether a header line whose field name is `field` is displayed.
+    ///
+    /// A non-empty `retain` list overrides `discard`.
+    pub fn shows(&self, field: &[u8]) -> bool {
+        let named = |list: &[String]| {
+            list.iter()
+                .any(|f| f.as_bytes().eq_ignore_ascii_case(field))
+        };
+        if self.retained.is_empty() {
+            !named(&self.ignored)
+        } else {
+            named(&self.retained)
+        }
+    }
+}
+
+fn add_field(list: &mut Vec<String>, field: &str) {
+    if !list.iter().any(|f| f.eq_ignore_ascii_case(field)) {
+        list.push(field.to_string());
+    }
 }
 
 /// The name a variable is stored under: `ask` is accepted for `asksub`.
@@ -44,8 +92,7 @@ impl Variables {
             values: HashMap::new(),
             aliases: HashMap::new(),
             alternates: Vec::new(),
-            ignored_headers: Vec::new(),
-            retained_headers: Vec::new(),
+            header_filter: HeaderFilter::default(),
         };
 
         // Set defaults per POSIX

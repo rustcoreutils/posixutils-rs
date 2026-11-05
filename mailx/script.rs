@@ -88,11 +88,12 @@ pub fn conditional(cmd: &str, args: &str, interp: &mut Interp) -> Option<Result<
     }
 }
 
-/// Run every line of `content` as a start-up script.
+/// Run the lines of `content` as a start-up script.
 ///
-/// Errors are reported and the script continues. An unterminated `if` is
-/// diagnosed at the end and its blocks closed, so a malformed file cannot
-/// leave the rest of the session suppressed.
+/// An error is reported and ends the script, the rest of the file unread --
+/// one of the two behaviors POSIX allows, and the one BSD mailx has. An
+/// unterminated `if` is diagnosed and its blocks closed, so a malformed file
+/// cannot leave the rest of the session suppressed.
 pub fn run_script(
     content: &str,
     path: &str,
@@ -104,6 +105,7 @@ pub fn run_script(
     for line in content.lines() {
         if let Err(e) = execute_in(line, mb, vars, interp, Context::Startup) {
             eprintln!("mailx: {}: {}", path, e);
+            break;
         }
     }
     if interp.cond.open.len() > depth {

@@ -10,7 +10,7 @@
 //! Start-up file handling.
 
 use super::capitalized::capitalized_fixture;
-use crate::common::{copy_test_data, create_temp_mailrc, mailx_env};
+use crate::common::{copy_test_data, create_temp_mailrc, mailx, mailx_env};
 
 /// A `Copy` command in a start-up file is diagnosed (case-folded match).
 #[test]
@@ -58,4 +58,46 @@ fn startup_rejects_only_the_capitalized_file_commands() {
         );
         assert_eq!(output.status.code(), Some(0), "exit status");
     }
+}
+
+/// An error in a start-up file ends that file, as in BSD mailx: the lines
+/// after it are not run, and the session goes on.
+#[test]
+fn startup_file_stops_at_its_first_error() {
+    let mbox = copy_test_data("testdata.mbox");
+    let mailrc = create_temp_mailrc("set before\nno_such_command\nset after\n");
+    let output = mailx_env(
+        &["-N", "-f", mbox.path().to_str().unwrap()],
+        "set\nexit\n",
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no_such_command"), "diagnostic: {}", stderr);
+    assert!(stdout.lines().any(|l| l == "before"), "{}", stdout);
+    assert!(
+        !stdout.lines().any(|l| l == "after"),
+        "the line after the error ran: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
+}
+
+/// A file read by `source` likewise stops at its first error.
+#[test]
+fn sourced_file_stops_at_its_first_error() {
+    let mbox = copy_test_data("testdata.mbox");
+    let script = create_temp_mailrc("set before\nno_such_command\nset after\n");
+    let output = mailx(
+        &["-n", "-N", "-f", mbox.path().to_str().unwrap()],
+        format!("source {}\nset\nexit\n", script.path().display()),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.lines().any(|l| l == "before"), "{}", stdout);
+    assert!(
+        !stdout.lines().any(|l| l == "after"),
+        "the line after the error ran: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }

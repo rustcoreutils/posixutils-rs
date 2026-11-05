@@ -388,3 +388,37 @@ fn escape_errors_go_to_standard_error() {
     );
     assert_eq!(output.status.code(), Some(0), "exit status");
 }
+
+/// `ignoreeof` cannot hold input open when standard input is not a terminal:
+/// end of input there never ends, so the message ends with it.
+#[test]
+fn ignoreeof_does_not_loop_on_piped_input() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let mbox = copy_test_data("testdata.mbox");
+    let mailrc = create_temp_mailrc("set debug\nset ignoreeof\n");
+    let mut child = Command::new(plib::testing::get_binary_path("mailx"))
+        .args(["-N", "-f", mbox.path().to_str().unwrap()])
+        .env("MAILRC", mailrc.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn mailx");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"mail to@example.com\nbody\n")
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            panic!("mailx kept reading past end of input");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}

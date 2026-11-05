@@ -9,7 +9,7 @@
 
 //! Input mode: reading a message body from the user, with command escapes and interrupts.
 
-use std::io;
+use std::io::{self, IsTerminal};
 
 use crate::commands::Interp;
 use crate::error::{Error, Result};
@@ -44,6 +44,9 @@ fn interrupt_message(
     false
 }
 
+/// How many end-of-input indications `ignoreeof` passes over.
+const MAX_IGNORED_EOFS: u32 = 25;
+
 /// Read a message body from standard input, handling command escapes.
 ///
 /// Shared by every entry into input mode: `mail`, `reply`, `followup`, and Send
@@ -56,13 +59,21 @@ pub(crate) fn compose_body(
 ) -> Result<()> {
     let escape_char = vars.escape_char();
     let mut interrupt_count = 0;
+    let mut ignored_eofs = 0;
 
     loop {
         let mut line = Vec::new();
         match crate::signals::read_bytes_interruptible(&mut line) {
             Ok(0) => {
-                // EOF - if ignoreeof is set, require "." (or ~.) to end.
-                if vars.is_set("ignoreeof") {
+                // `ignoreeof` asks for "." or `~.` instead. Only a terminal's
+                // end of input can be ignored: a pipe's never stops, so it ends
+                // the message, as does a terminal that keeps at it (BSD mailx
+                // gives up after 25).
+                if vars.is_set("ignoreeof")
+                    && ignored_eofs < MAX_IGNORED_EOFS
+                    && io::stdin().is_terminal()
+                {
+                    ignored_eofs += 1;
                     println!("Use \".\" to terminate letter.");
                     continue;
                 }

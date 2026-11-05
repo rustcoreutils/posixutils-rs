@@ -74,7 +74,13 @@ impl Mailbox {
         // follow an empty line.
         let mut at_message_boundary = true;
 
-        for line in content.lines() {
+        for raw in content.split_inclusive('\n') {
+            // The same line `str::lines` would yield; `raw` keeps the
+            // terminator so the message's on-disk size can be counted.
+            let line = match raw.strip_suffix('\n') {
+                Some(l) => l.strip_suffix('\r').unwrap_or(l),
+                None => raw,
+            };
             let boundary = at_message_boundary;
             at_message_boundary = line.is_empty();
 
@@ -90,6 +96,8 @@ impl Mailbox {
                 let mut msg = Message::new();
                 msg.from_line = line.to_string();
                 msg.read = ReadState::New;
+                msg.raw_lines = 1;
+                msg.raw_bytes = raw.len();
                 current_msg = Some(msg);
                 in_headers = true;
                 header_continuation = false;
@@ -97,6 +105,13 @@ impl Mailbox {
             }
 
             if let Some(ref mut msg) = current_msg {
+                // Every physical line up to the next `From ` line is part of
+                // this message as stored: folded header lines, `Status:`, and
+                // the separating blank line included. The header summary and
+                // `size` report these counts, as traditional mailx does.
+                msg.raw_lines += 1;
+                msg.raw_bytes += raw.len();
+
                 if in_headers {
                     if line.is_empty() {
                         // End of headers

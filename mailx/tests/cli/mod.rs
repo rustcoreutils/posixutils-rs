@@ -1202,3 +1202,75 @@ fn alias_backslash_prevents_expansion() {
 fn mailx_non_utf8_argument_is_reported() {
     plib::testing::assert_non_utf8_argument_rejected("mailx", &[]);
 }
+
+/// Run `mailx -n -H -f <mbox>` on `content`, then `mailx -n -N -f <mbox>`
+/// with `commands` on stdin, and return both outputs.
+fn summary_and_commands(content: &str, commands: &str) -> (String, String) {
+    let mbox = create_temp_mbox(content);
+    let path = mbox.path().to_str().unwrap().to_string();
+    let run = |args: Vec<String>, stdin: &str| {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_mailx"))
+            .args(&args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write as _;
+                child.stdin.take().unwrap().write_all(stdin.as_bytes())?;
+                child.wait_with_output()
+            })
+            .expect("run mailx");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let summary = run(
+        vec!["-n".into(), "-H".into(), "-f".into(), path.clone()],
+        "",
+    );
+    let commands = run(vec!["-n".into(), "-N".into(), "-f".into(), path], commands);
+    (summary, commands)
+}
+
+/// The header summary's line and byte counts, and `size`, describe the
+/// message as stored: folded header lines, `Status:`, and the blank line
+/// separating it from the next message all count, as in traditional mailx.
+#[test]
+fn header_summary_counts_the_stored_message() {
+    let first = "From alice@example.com Mon Jan 29 10:29:21 2007\n\
+                 Received: from a.example\n\
+                 \tby b.example\n\
+                 \tfor c.example\n\
+                 From: alice@example.com\n\
+                 Subject: folded\n\
+                 Status: O\n\
+                 \n\
+                 body line one\n\
+                 body line two\n\
+                 \n";
+    let second = "From bob@example.com Mon Jan 29 11:00:00 2007\n\
+                  From: bob@example.com\n\
+                  Subject: second\n\
+                  \n\
+                  hi\n";
+    let (summary, sizes) = summary_and_commands(&format!("{}{}", first, second), "size 1 2\n");
+
+    let want = format!("{}/{}", first.lines().count(), first.len());
+    let line = summary
+        .lines()
+        .find(|l| l.contains("folded"))
+        .unwrap_or_else(|| panic!("no summary line: {}", summary));
+    assert!(line.contains(&want), "want {} in {:?}", want, line);
+    let want2 = format!("{}/{}", second.lines().count(), second.len());
+    assert!(summary.contains(&want2), "want {} in {:?}", want2, summary);
+
+    assert!(
+        sizes.contains(&format!("1: {} bytes", first.len())),
+        "size disagrees with the summary: {}",
+        sizes
+    );
+    assert!(
+        sizes.contains(&format!("2: {} bytes", second.len())),
+        "size disagrees with the summary: {}",
+        sizes
+    );
+}

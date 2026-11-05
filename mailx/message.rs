@@ -88,6 +88,11 @@ pub struct Message {
     pub header_lines: Vec<String>,
     /// Message body
     pub body: String,
+    /// Lines the message occupies in the mailbox file, from its `From ` line
+    /// up to the next message's.
+    pub raw_lines: usize,
+    /// Bytes the message occupies in the mailbox file, measured the same way.
+    pub raw_bytes: usize,
     /// How much of the message the user has seen.
     pub read: ReadState,
     /// What should become of it when the mailbox closes.
@@ -106,6 +111,8 @@ impl Message {
             headers: HashMap::new(),
             header_lines: Vec::new(),
             body: String::new(),
+            raw_lines: 0,
+            raw_bytes: 0,
             read: ReadState::New,
             disposition: Disposition::Keep,
             displayed: false,
@@ -138,15 +145,20 @@ impl Message {
         self.get_header("date").unwrap_or("")
     }
 
-    /// Get the total size in bytes
+    /// The message's size in bytes, as stored in the mailbox file.
+    ///
+    /// Reconstructing it from the parsed parts undercounted: the separating
+    /// blank line and any `Status:` header are not kept in them.
     pub fn size(&self) -> usize {
-        let header_size: usize = self.header_lines.iter().map(|l| l.len() + 1).sum();
-        self.from_line.len() + 1 + header_size + 1 + self.body.len()
+        self.raw_bytes
     }
 
-    /// Get the number of lines
+    /// The number of lines the message occupies in the mailbox file.
+    ///
+    /// Counting parsed header entries undercounted, since each folded header
+    /// is one entry spanning several lines.
     pub fn line_count(&self) -> usize {
-        1 + self.header_lines.len() + 1 + self.body.lines().count()
+        self.raw_lines
     }
 
     /// Format the message for display with header filtering

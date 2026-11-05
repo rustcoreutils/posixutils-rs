@@ -9,11 +9,11 @@
 
 //! Fixtures and runners shared by the mailx test modules.
 
-use plib::testing::run_test_base_with_env;
-use plib::tmp::NamedTempFile;
+use plib::testing::get_binary_path;
+use plib::tmp::{NamedTempFile, TempDir};
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::Output;
+use std::process::{Command, Output, Stdio};
 
 /// Path to a static test data file in `tests/`:
 ///
@@ -63,9 +63,37 @@ pub fn mailx(args: &[&str], stdin: impl AsRef<[u8]>) -> Output {
 }
 
 /// Run mailx with `args` and extra environment variables, feeding it `stdin`.
+///
+/// mailx runs in an empty temporary directory, so a relative filename a test
+/// gets wrong lands there rather than in the source tree. As for every
+/// utility under test, the locale is C unless `env` sets one.
 pub fn mailx_env(args: &[&str], stdin: impl AsRef<[u8]>, env: &[(&str, &str)]) -> Output {
-    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-    run_test_base_with_env("mailx", &args, stdin.as_ref(), env)
+    let cwd = TempDir::new().expect("failed to create working directory");
+    let mut command = Command::new(get_binary_path("mailx"));
+    command
+        .args(args)
+        .current_dir(cwd.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if !env
+        .iter()
+        .any(|(k, _)| k.starts_with("LC_") || *k == "LANG" || *k == "LANGUAGE")
+    {
+        command.env("LC_ALL", "C");
+    }
+    command.envs(env.iter().copied());
+
+    let mut child = command.spawn().expect("failed to run mailx");
+    let mut input = child.stdin.take().expect("stdin is piped");
+    let stdin = stdin.as_ref().to_vec();
+    // Fed from a thread so a large input cannot deadlock against output.
+    let writer = std::thread::spawn(move || {
+        let _ = input.write_all(&stdin);
+    });
+    let output = child.wait_with_output().expect("failed to wait for mailx");
+    writer.join().expect("stdin writer panicked");
+    output
 }
 
 /// Run mailx and require exactly this standard output, standard error and

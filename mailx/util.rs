@@ -346,6 +346,15 @@ pub fn bare_addresses(list: &str) -> String {
         .join(", ")
 }
 
+/// `n` messages, in words: "1 message", "2 messages".
+pub fn messages(n: usize) -> String {
+    if n == 1 {
+        "1 message".to_string()
+    } else {
+        format!("{} messages", n)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -585,7 +585,11 @@ fn edit_messages(msg_nums: &[usize], mb: &Mailbox, editor: &str) -> Result<Comma
 
 fn cmd_file(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult> {
     if args.is_empty() {
-        println!("\"{}\" {} messages", mb.path, mb.undeleted_count());
+        println!(
+            "\"{}\" {}",
+            mb.path,
+            crate::util::messages(mb.undeleted_count())
+        );
         return Ok(CommandResult::Continue);
     }
 
@@ -759,12 +763,7 @@ fn mailbox_info(mb: &Mailbox, vars: &Variables) -> String {
         .filter(|m| m.disposition == Disposition::Saved)
         .count();
 
-    let mut info = format!("\"{}\": ", name);
-    if messages.len() == 1 {
-        info.push_str("1 message");
-    } else {
-        info.push_str(&format!("{} messages", messages.len()));
-    }
+    let mut info = format!("\"{}\": {}", name, crate::util::messages(messages.len()));
     // BSD prints the unread count, new included, when any unread is not new.
     let unread_shown = if unread > new { unread } else { 0 };
     let counts = [

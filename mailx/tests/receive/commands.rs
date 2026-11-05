@@ -1286,3 +1286,16 @@ fn editor_is_run_without_a_shell() {
     let args = std::fs::read_to_string(&log).unwrap_or_default();
     assert!(args.starts_with("$HOME|two words|/"), "{:?}", args);
 }
+
+/// `file` with no argument counts the messages in words: one message is
+/// "1 message".
+#[test]
+fn file_counts_one_message_in_the_singular() {
+    let mbox = copy_test_data("testdata-single.mbox");
+    let path = mbox.path().to_str().unwrap();
+    let output = mailx(&["-n", "-N", "-f", path], "file\nexit\n");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("\"{}\" 1 message\n", path)
+    );
+}

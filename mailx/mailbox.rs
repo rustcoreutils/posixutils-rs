@@ -330,7 +330,10 @@ impl Mailbox {
             let mbox_path = crate::util::mbox_path(vars);
             let append = vars.is_set("append");
             migrate_to_mbox(&mbox_path, &self.store, &mbox_messages, append).context(&mbox_path)?;
-            println!("Saved {} in mbox", count(mbox_messages.len()));
+            println!(
+                "Saved {} in mbox",
+                crate::util::messages(mbox_messages.len())
+            );
         }
 
         // Rewrite only if messages left the mailbox or a read state changed.
@@ -356,7 +359,11 @@ impl Mailbox {
         // how a folder's rewrite ended.
         if self.is_system_mailbox {
             if !keep_messages.is_empty() {
-                println!("Held {} in {}", count(keep_messages.len()), self.path);
+                println!(
+                    "Held {} in {}",
+                    crate::util::messages(keep_messages.len()),
+                    self.path
+                );
             }
         } else if let Some(outcome) = rewritten {
             println!("\"{}\" {}", self.path, outcome);
@@ -418,15 +425,6 @@ fn rewrite_mailbox(
         Ok(())
     })?;
     Ok("complete")
-}
-
-/// `n` messages, in words: "1 message", "2 messages".
-fn count(n: usize) -> String {
-    if n == 1 {
-        "1 message".to_string()
-    } else {
-        format!("{} messages", n)
-    }
 }
 
 /// Move read messages into the secondary mbox.

@@ -366,9 +366,9 @@ fn mark_read(mb: &mut Mailbox, msg_nums: &[usize]) {
 
 /// Split `[msglist] file` into its two halves.
 ///
-/// The trailing word is the filename; everything before it is the message list.
-/// With a single argument the intent is ambiguous, so a msglist that parses
-/// wins and anything else is taken as a filename.
+/// The last word is the file and the rest the message list, so a lone word is
+/// a file (`save [file]`). With no words the file is mbox, when one may be
+/// omitted.
 fn msglist_and_file(
     args: &str,
     mb: &Mailbox,
@@ -383,10 +383,7 @@ fn msglist_and_file(
             }
             Ok((current_message(mb)?, crate::util::mbox_path(vars)))
         }
-        1 => match parse_msglist(parts[0], mb, Want::Live, vars) {
-            Ok(nums) if !file_required => Ok((nums, crate::util::mbox_path(vars))),
-            _ => Ok((current_message(mb)?, expand_typed_filename(parts[0], vars))),
-        },
+        1 => Ok((current_message(mb)?, expand_typed_filename(parts[0], vars))),
         n => {
             let nums = parse_msglist(&parts[..n - 1].join(" "), mb, Want::Live, vars)?;
             Ok((nums, expand_typed_filename(parts[n - 1], vars)))

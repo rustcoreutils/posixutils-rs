@@ -936,14 +936,15 @@ fn copy_without_a_file_copies_to_mbox() {
     let secondary = dir.path().join("mbox");
     let output = mailx_env(
         &["-n", "-N", "-f", mbox.path().to_str().unwrap()],
-        "copy 2\nfrom 2\nquit\n",
+        "copy\nfrom 3\nquit\n",
         &[("MBOX", secondary.to_str().unwrap())],
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let copied = std::fs::read_to_string(&secondary).unwrap_or_default();
+    // Message 3, unread, is current on entry.
     assert!(
-        copied.contains("Subject: Project Update"),
-        "copy should write message 2 to mbox: {}\n{}",
+        copied.contains("Subject: Re: Meeting Tomorrow"),
+        "copy should write message 3 to mbox: {}\n{}",
         copied,
         String::from_utf8_lossy(&output.stderr)
     );
@@ -956,8 +957,8 @@ fn copy_without_a_file_copies_to_mbox() {
     );
     let kept = std::fs::read_to_string(mbox.path()).unwrap();
     assert!(
-        kept.contains("Subject: Project Update"),
-        "message 2 left the mailbox"
+        kept.contains("Subject: Re: Meeting Tomorrow"),
+        "message 3 left the mailbox"
     );
     assert_eq!(output.status.code(), Some(0), "exit status");
 }
@@ -1063,4 +1064,26 @@ fn headers_with_a_message_makes_its_page_top_current() {
         .filter(|l| l.parse::<usize>().is_ok())
         .collect();
     assert_eq!(numbers, ["1", "3"], "{}", stdout);
+}
+
+/// A lone `save` or `copy` argument is the file (`save [file]`), even when it
+/// could also be read as a message list naming a sender.
+#[test]
+fn lone_save_argument_is_a_file() {
+    let mbox = copy_test_data("testdata.mbox");
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let output = mailx(
+        &["-n", "-N", "-f", mbox.path().to_str().unwrap()],
+        format!("cd {}\nsave alice\ncopy 2\nexit\n", dir.path().display()),
+    );
+    for name in ["alice", "2"] {
+        let saved = std::fs::read_to_string(dir.path().join(name)).unwrap_or_default();
+        assert!(
+            saved.contains("Subject: Re: Meeting Tomorrow"),
+            "the current message should be in {}: {:?}\n{}",
+            name,
+            saved,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

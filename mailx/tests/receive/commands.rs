@@ -1087,3 +1087,28 @@ fn lone_save_argument_is_a_file() {
         );
     }
 }
+
+/// `file %` opens the system mailbox -- the one `MAIL` names -- as the
+/// system mailbox, where `hold` and `mbox` are allowed.
+#[test]
+fn file_percent_opens_the_system_mailbox() {
+    let system = copy_test_data("testdata.mbox");
+    let other = copy_test_data("testdata-single.mbox");
+    let output = mailx_env(
+        &["-n", "-N", "-f", other.path().to_str().unwrap()],
+        "file %\nhold 1\nmbox 2\nexit\n",
+        &[("MAIL", system.path().to_str().unwrap())],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("Project Update"),
+        "file % opened the wrong mailbox: {}",
+        stdout
+    );
+    assert!(
+        !stderr.contains("Allowed only in the system mailbox"),
+        "file % should open it as the system mailbox: {}",
+        stderr
+    );
+}

@@ -584,6 +584,7 @@ fn cmd_file(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
     mb.quit(vars)?;
     let mut new_mb = Mailbox::load(&path)?;
     new_mb.prev_path = Some(leaving);
+    new_mb.is_system_mailbox = crate::util::same_file(&path, &crate::util::system_mailbox());
 
     *mb = new_mb;
     crate::summary::print_headers(mb, None, vars);

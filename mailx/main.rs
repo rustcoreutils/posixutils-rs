@@ -285,7 +285,5 @@ fn named_or_system_mailbox(args: &Args) -> String {
     if let Some(file) = &args.file {
         return file.clone();
     }
-    // MAIL names the mailbox outright when it is set (a widely relied-on
-    // extension); otherwise the spool is searched.
-    env::var("MAIL").unwrap_or_else(|_| util::spool_path(&util::user_login_or_unknown()))
+    util::system_mailbox()
 }

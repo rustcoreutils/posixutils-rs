@@ -61,6 +61,23 @@ pub fn dead_letter_path(vars: &Variables) -> String {
         .unwrap_or_else(|| format!("{}/dead.letter", home()))
 }
 
+/// The user's own system mailbox.
+///
+/// `MAIL` names it outright when set (a widely relied-on extension);
+/// otherwise the spool is searched.
+pub fn system_mailbox() -> String {
+    env::var("MAIL").unwrap_or_else(|_| spool_path(&user_login_or_unknown()))
+}
+
+/// Whether `a` and `b` name the same file.
+pub fn same_file(a: &str, b: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+        _ => a == b,
+    }
+}
+
 /// The system mailbox belonging to `user`.
 ///
 /// The spool location is unspecified, so the usual three are tried in turn and

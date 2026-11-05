@@ -9,7 +9,7 @@
 
 //! Resolving the filenames commands and command escapes are given.
 
-use crate::util::{home, mbox_path, spool_path};
+use crate::util::{home, mbox_path, spool_path, system_mailbox};
 use crate::variables::Variables;
 
 /// Resolve the filename notations that are mailx's own, not the shell's.
@@ -29,7 +29,7 @@ pub fn expand_local_prefixes(name: &str, vars: &Variables) -> String {
     let name = name.trim();
 
     match name {
-        "%" => return spool_path(&crate::util::user_login_or_unknown()),
+        "%" => return system_mailbox(),
         "&" => return mbox_path(vars),
         _ => {}
     }

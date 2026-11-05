@@ -35,24 +35,15 @@ impl ComposedMessage {
     }
 
     pub fn add_to(&mut self, addr: &str) {
-        let addr = addr.trim();
-        if !addr.is_empty() && !self.to.contains(&addr.to_string()) {
-            self.to.push(addr.to_string());
-        }
+        push_address(&mut self.to, addr);
     }
 
     pub fn add_cc(&mut self, addr: &str) {
-        let addr = addr.trim();
-        if !addr.is_empty() && !self.cc.contains(&addr.to_string()) {
-            self.cc.push(addr.to_string());
-        }
+        push_address(&mut self.cc, addr);
     }
 
     pub fn add_bcc(&mut self, addr: &str) {
-        let addr = addr.trim();
-        if !addr.is_empty() && !self.bcc.contains(&addr.to_string()) {
-            self.bcc.push(addr.to_string());
-        }
+        push_address(&mut self.bcc, addr);
     }
 
     /// Format the message for sending
@@ -86,6 +77,28 @@ impl ComposedMessage {
         recipients.extend(self.bcc.iter().map(|s| s.as_str()));
         recipients
     }
+}
+
+/// Add `addr` to a recipient list unless it is empty or already there.
+///
+/// An address becomes a header line, so a line break in it is folded to a
+/// space: see [`single_line`].
+fn push_address(list: &mut Vec<String>, addr: &str) {
+    let addr = single_line(addr.trim());
+    if !addr.is_empty() && !list.contains(&addr) {
+        list.push(addr);
+    }
+}
+
+/// `s` with every CR and LF replaced by a space.
+///
+/// A header field value is one line. Subjects and addresses given as
+/// command-line operands are copied into the header block verbatim, so a
+/// script passing `-s "$subject"` from an untrusted source let a line break in
+/// it add arbitrary header fields, end the header block early, or -- in the
+/// `record` file -- start a forged mbox message with a `From ` line.
+fn single_line(s: &str) -> String {
+    s.replace(['\r', '\n'], " ")
 }
 
 /// Prompt for the header fields the `asksub`, `askcc`, and `askbcc` variables
@@ -138,7 +151,7 @@ pub fn send_mode(args: &Args, vars: &mut Variables) -> Result<(), String> {
     // A -s subject supplies the Subject header; otherwise `asksub` may prompt
     // for it. `askcc`/`askbcc` are asked either way.
     if let Some(ref subject) = args.subject {
-        msg.subject = subject.clone();
+        msg.subject = single_line(subject);
     }
     if is_tty {
         prompt_optional_headers(&mut msg, vars)?;

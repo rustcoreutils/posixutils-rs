@@ -507,3 +507,56 @@ fn send_sendwait_variable() {
 
     drop(mailrc);
 }
+
+/// A line break in a `-s` subject or an address operand cannot add header
+/// fields.
+///
+/// Both are copied into the header block. A script passing an untrusted
+/// subject could end the Subject line, add its own `Bcc:`, or end the header
+/// block and, in a `record` file, begin a forged mbox message.
+#[test]
+fn send_operands_cannot_inject_header_lines() {
+    let mailrc = create_temp_mailrc("set debug\n");
+    let mailrc_path = mailrc.path().to_str().unwrap();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-s"),
+                String::from("hello\r\nBcc: injected@evil.example\n\nFrom forged@evil"),
+                String::from("victim@example.com\nCc: cc-injected@evil.example"),
+            ],
+            stdin_data: String::from("body\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc_path)],
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("Subject: hello  Bcc: injected@evil.example  From forged@evil\n"),
+                "subject was not kept on one line: {}",
+                stderr
+            );
+            assert!(
+                stderr.contains("To: victim@example.com Cc: cc-injected@evil.example\n"),
+                "address was not kept on one line: {}",
+                stderr
+            );
+            for line in stderr.lines() {
+                assert!(
+                    !line.starts_with("Bcc: ")
+                        && !line.starts_with("Cc: ")
+                        && !line.starts_with("From "),
+                    "an operand began a header line: {}",
+                    stderr
+                );
+            }
+            assert!(output.status.success());
+        },
+    );
+
+    drop(mailrc);
+}

@@ -19,7 +19,6 @@ pub(crate) fn parse(bytes: &[u8]) -> Vec<Message> {
     let mut current_msg: Option<Message> = None;
     let mut in_headers = false;
     let mut header_continuation = false;
-    let mut last_header_key = String::new();
     // A `From ` line only begins a message at the start of the file or
     // after an empty line (spec 104427-104428). Splitting on every body
     // line that happened to start with `From ` tore messages in half --
@@ -75,11 +74,9 @@ pub(crate) fn parse(bytes: &[u8]) -> Vec<Message> {
                     if !header_continuation {
                         continue;
                     }
-                    if !last_header_key.is_empty() {
-                        if let Some(val) = msg.headers.get_mut(&last_header_key) {
-                            val.push(' ');
-                            val.push_str(String::from_utf8_lossy(line).trim());
-                        }
+                    if let Some((_, val)) = msg.headers.last_mut() {
+                        val.push(' ');
+                        val.push_str(String::from_utf8_lossy(line).trim());
                     }
                     // Append to last header line
                     if let Some(last) = msg.header_lines.last_mut() {
@@ -110,14 +107,12 @@ pub(crate) fn parse(bytes: &[u8]) -> Vec<Message> {
                         // Its continuation lines go with it -- leaving the
                         // previous header current would append them to
                         // whatever came before `Status:`.
-                        last_header_key.clear();
                         header_continuation = false;
                         continue;
                     }
 
-                    msg.headers.insert(key.clone(), value);
+                    msg.headers.push((key, value));
                     msg.header_lines.push(line.to_vec());
-                    last_header_key = key;
                     header_continuation = true;
                 } else {
                     // Malformed header, treat as body start

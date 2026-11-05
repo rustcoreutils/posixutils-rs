@@ -1027,3 +1027,23 @@ fn header_summary_date_tokens_are_whole() {
         assert_eq!(date.trim(), want, "Date: {}: {:?}", header, row);
     }
 }
+
+/// A field that appears twice is read from its first occurrence, as other
+/// mail readers do; the second must not silently replace it.
+#[test]
+fn repeated_header_field_uses_the_first() {
+    let (summary, _) = summary_and_commands(
+        "From a@example.com Fri Nov 29 10:00:00 2024\n\
+         From: a@example.com\n\
+         Subject: first subject\n\
+         Subject: second subject\n\
+         \n\
+         body\n",
+        "exit\n",
+    );
+    assert!(
+        summary.contains("first subject") && !summary.contains("second subject"),
+        "the summary should show the first Subject: {}",
+        summary
+    );
+}

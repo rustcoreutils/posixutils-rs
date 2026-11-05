@@ -10,7 +10,6 @@
 //! Message representation for mailx
 
 use crate::error::Result;
-use std::collections::HashMap;
 
 /// Message state as defined by POSIX
 /// How much of a message the user has seen.
@@ -92,8 +91,10 @@ pub struct Message {
     /// in the mailbox file: mail need not be UTF-8, and a message must be
     /// written back, saved and copied exactly as it arrived.
     pub from_line: Vec<u8>,
-    /// Parsed headers (lowercase key -> original value)
-    pub headers: HashMap<String, String>,
+    /// Header fields in order, as (lowercase name, unfolded value).
+    ///
+    /// A field may appear more than once; lookups take the first.
+    pub headers: Vec<(String, String)>,
     /// Original header lines in order, each with its folded continuations
     pub header_lines: Vec<Vec<u8>>,
     /// Message body
@@ -120,7 +121,7 @@ impl Message {
     pub fn new() -> Self {
         Message {
             from_line: Vec::new(),
-            headers: HashMap::new(),
+            headers: Vec::new(),
             header_lines: Vec::new(),
             body: Vec::new(),
             raw_lines: 0,
@@ -133,9 +134,12 @@ impl Message {
         }
     }
 
-    /// Get a header value (case-insensitive)
+    /// The value of the first `name` field, compared without regard to case.
     pub fn get_header(&self, name: &str) -> Option<&str> {
-        self.headers.get(&name.to_lowercase()).map(|s| s.as_str())
+        self.headers
+            .iter()
+            .find(|(field, _)| field.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
     }
 
     /// Get the From: header address

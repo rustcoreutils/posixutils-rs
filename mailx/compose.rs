@@ -13,7 +13,7 @@ use std::io;
 
 use crate::commands::Interp;
 use crate::error::{Error, Result};
-use crate::escapes::handle_escape;
+use crate::escapes::{handle_escape, Escape};
 use crate::mailbox::Mailbox;
 use crate::send::ComposedMessage;
 use crate::variables::Variables;
@@ -102,25 +102,22 @@ pub(crate) fn compose_body(
         if let Some(escape) = escape {
             // A tilde-escape error is diagnosed but does not abort the message
             // (spec 105114-105119).
-            let result = match handle_escape(&escape, composed, vars, interp, mb) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("{}", e);
-                    continue;
-                }
-            };
-            if result.done {
-                if result.abort {
-                    // `~q` saves the partial message, `~x` does not
-                    // (spec 105081-105083, 105097).
-                    if result.save_dead_letter && vars.is_set("save") && !composed.body.is_empty() {
+            match handle_escape(&escape, composed, vars, interp, mb) {
+                Ok(Escape::Continue) => continue,
+                Ok(Escape::Finish) => break,
+                // `~q` saves the partial message, `~x` does not
+                // (spec 105081-105083, 105097).
+                Ok(Escape::Abort { save_dead_letter }) => {
+                    if save_dead_letter && vars.is_set("save") && !composed.body.is_empty() {
                         crate::send::save_dead_letter(composed, vars);
                     }
                     return Err(Error::Aborted);
                 }
-                break;
+                Err(e) => {
+                    eprintln!("{}", e);
+                    continue;
+                }
             }
-            continue;
         }
 
         // Check for single period (if dot is set, or ignoreeof forces it)

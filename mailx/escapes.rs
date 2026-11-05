@@ -21,302 +21,175 @@ use crate::msglist::msglist_or_current;
 use crate::send::ComposedMessage;
 use crate::variables::Variables;
 
-/// Result of handling an escape
-pub struct EscapeResult {
-    pub done: bool,
-    pub abort: bool,
-    /// Whether to save to dead letter on abort (true for ~q, false for ~x)
-    pub save_dead_letter: bool,
+/// What input mode does after a command escape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Escape {
+    /// Go on reading the message.
+    Continue,
+    /// End the message, to be sent (`~.`).
+    Finish,
+    /// Abandon the message (`~q`, `~x`), saving it to dead.letter or not.
+    Abort { save_dead_letter: bool },
 }
 
-impl EscapeResult {
-    pub fn continue_input() -> Self {
-        EscapeResult {
-            done: false,
-            abort: false,
-            save_dead_letter: false,
-        }
-    }
-
-    pub fn finish() -> Self {
-        EscapeResult {
-            done: true,
-            abort: false,
-            save_dead_letter: false,
-        }
-    }
-
-    /// Abort and save to dead letter (~q behavior)
-    pub fn abort_with_save() -> Self {
-        EscapeResult {
-            done: true,
-            abort: true,
-            save_dead_letter: true,
-        }
-    }
-
-    /// Abort without saving (~x behavior)
-    pub fn abort_without_save() -> Self {
-        EscapeResult {
-            done: true,
-            abort: true,
-            save_dead_letter: false,
-        }
-    }
-}
-
-/// Handle an escape command
+/// Perform the command escape `line`, the text after the escape character.
 pub fn handle_escape(
     line: &str,
     msg: &mut ComposedMessage,
     vars: &mut Variables,
     interp: &mut Interp,
     mb: Option<&Mailbox>,
-) -> Result<EscapeResult> {
-    if line.is_empty() {
-        // Just the escape char - treat as literal
-        return Ok(EscapeResult::continue_input());
-    }
-
-    let cmd_char = line.chars().next().unwrap();
-    // Slice past the command character by its UTF-8 length. Slicing at byte 1
-    // split a multibyte character (`~élan`) and panicked -- the callers already
-    // take care to advance by `len_utf8` past the escape character itself.
+) -> Result<Escape> {
+    let Some(cmd_char) = line.chars().next() else {
+        return Ok(Escape::Continue);
+    };
     let args = line[cmd_char.len_utf8()..].trim();
 
     match cmd_char {
-        '.' => {
-            // End message input
-            Ok(EscapeResult::finish())
-        }
-        '!' => {
-            // Shell escape with bang expansion
-            let cmd = if vars.is_set("bang") {
-                // Expand ! to previous command
-                crate::util::expand_bang(args, interp.last_shell_cmd.as_deref())
-            } else {
-                args.to_string()
-            };
-
-            crate::util::shell(&cmd, vars)?;
-
-            // Store for future bang expansion
-            interp.last_shell_cmd = Some(cmd);
-
-            println!("!");
-            Ok(EscapeResult::continue_input())
-        }
-        '?' => {
-            // Help
-            print_escape_help();
-            Ok(EscapeResult::continue_input())
-        }
-        ':' | '_' => {
-            // Execute mailx command
-            // In input mode, only a subset of commands are valid
-            if !args.is_empty() {
-                if let Err(e) = execute_input_mode_command(args, vars, interp) {
-                    eprintln!("{}", e);
-                }
-            }
-            Ok(EscapeResult::continue_input())
-        }
-        'A' => {
-            // Insert Sign variable
-            if let Some(sign) = vars.get_nonempty("Sign") {
-                let sign = expand_escapes(sign);
-                msg.body.extend_from_slice(sign.as_bytes());
-                msg.body.push(b'\n');
-            }
-            Ok(EscapeResult::continue_input())
-        }
-        'a' => {
-            // Insert sign variable
-            if let Some(sign) = vars.get_nonempty("sign") {
-                let sign = expand_escapes(sign);
-                msg.body.extend_from_slice(sign.as_bytes());
-                msg.body.push(b'\n');
-            }
-            Ok(EscapeResult::continue_input())
-        }
-        'b' => {
-            // Add Bcc recipients
-            for addr in args.split_whitespace() {
-                msg.add_bcc(addr);
-            }
-            Ok(EscapeResult::continue_input())
-        }
-        'c' => {
-            // Add Cc recipients
-            for addr in args.split_whitespace() {
-                msg.add_cc(addr);
-            }
-            Ok(EscapeResult::continue_input())
-        }
-        'd' => {
-            // Read dead letter file
-            let dead_path = crate::util::dead_letter_path(vars);
-
-            if let Ok(content) = fs::read(&dead_path) {
-                msg.body.extend_from_slice(&content);
-                println!("\"{}\" {} bytes", dead_path, content.len());
-            } else {
-                println!("{}: No such file", dead_path);
-            }
-            Ok(EscapeResult::continue_input())
-        }
-        'e' => {
-            // Edit with EDITOR
-            edit_message(msg, vars.get_nonempty("EDITOR").unwrap_or("ed"))?;
-            Ok(EscapeResult::continue_input())
-        }
-        'f' => {
-            // Forward messages (without modification)
-            if let Some(mailbox) = mb {
-                forward_messages(args, msg, mailbox, vars, false)?;
-            }
-            Ok(EscapeResult::continue_input())
-        }
-        'F' => {
-            // Forward messages (all headers)
-            if let Some(mailbox) = mb {
-                forward_messages(args, msg, mailbox, vars, true)?;
-            }
-            Ok(EscapeResult::continue_input())
-        }
-        'h' => {
-            // Prompt for headers
-            prompt_headers(msg)?;
-            Ok(EscapeResult::continue_input())
-        }
-        'i' => {
-            // Insert variable value
-            if !args.is_empty() {
-                if let Some(value) = vars.get_nonempty(args) {
-                    msg.body.extend_from_slice(value.as_bytes());
-                    msg.body.push(b'\n');
-                }
-            }
-            Ok(EscapeResult::continue_input())
-        }
-        'm' => {
-            // Insert messages with indent
-            if let Some(mailbox) = mb {
-                insert_messages(args, msg, mailbox, vars, false)?;
-            }
-            Ok(EscapeResult::continue_input())
-        }
-        'M' => {
-            // Insert messages with indent (all headers)
-            if let Some(mailbox) = mb {
-                insert_messages(args, msg, mailbox, vars, true)?;
-            }
-            Ok(EscapeResult::continue_input())
-        }
-        'p' => {
-            // Print the message, using pager if longer than crt lines
-            let mut output = String::from("-------\nMessage contains:\n");
-            for line in msg.header_lines(true) {
-                output.push_str(&line);
-                output.push('\n');
-            }
-            output.push('\n');
-            let mut output = output.into_bytes();
-            output.extend_from_slice(&msg.body);
-            output.extend_from_slice(b"-------\n");
-
-            crate::util::page_or_print(&output, vars);
-            Ok(EscapeResult::continue_input())
-        }
+        '.' => return Ok(Escape::Finish),
         'q' => {
-            // Quit, save to dead letter
-            Ok(EscapeResult::abort_with_save())
-        }
-        'r' | '<' => {
-            // Read file or command output
-            if let Some(cmd) = args.strip_prefix('!') {
-                // Read command output
-                let output = crate::util::shell_output_bytes(cmd, vars)?;
-                msg.body.extend_from_slice(&output);
-                println!("{} bytes", output.len());
-            } else {
-                // Read file
-                let path = expand_local_prefixes(args, vars);
-                match fs::read(&path) {
-                    Ok(content) => {
-                        msg.body.extend_from_slice(&content);
-                        println!("\"{}\" {} bytes", path, content.len());
-                    }
-                    Err(e) => {
-                        println!("{}: {}", path, plib::diag::io_error_text(&e));
-                    }
-                }
-            }
-            Ok(EscapeResult::continue_input())
-        }
-        's' => {
-            // Set subject
-            msg.subject = args.to_string();
-            Ok(EscapeResult::continue_input())
-        }
-        't' => {
-            // Add To recipients
-            for addr in args.split_whitespace() {
-                msg.add_to(addr);
-            }
-            Ok(EscapeResult::continue_input())
-        }
-        'v' => {
-            // Edit with VISUAL
-            edit_message(msg, vars.get_nonempty("VISUAL").unwrap_or("vi"))?;
-            Ok(EscapeResult::continue_input())
-        }
-        'w' => {
-            // Write body to file: create, or append if it already exists
-            // (spec 105094-105097).
-            let path = expand_local_prefixes(args, vars);
-            let result = crate::util::private_open()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .and_then(|mut f| f.write_all(&msg.body));
-            match result {
-                Ok(_) => println!("\"{}\" {} bytes", path, msg.body.len()),
-                Err(e) => println!("{}: {}", path, plib::diag::io_error_text(&e)),
-            }
-            Ok(EscapeResult::continue_input())
+            return Ok(Escape::Abort {
+                save_dead_letter: true,
+            })
         }
         'x' => {
-            // Exit without saving
-            Ok(EscapeResult::abort_without_save())
+            return Ok(Escape::Abort {
+                save_dead_letter: false,
+            })
         }
-        '|' => {
-            // Pipe body through command
-            if !args.is_empty() {
-                match pipe_through_command(&msg.body, args, vars) {
-                    Ok(output) => {
-                        msg.body = output;
-                    }
-                    Err(e) => {
-                        eprintln!("{}", e);
-                    }
+        '!' => shell_escape(args, vars, interp)?,
+        '?' => print_escape_help(),
+        ':' | '_' if !args.is_empty() => {
+            if let Err(e) = execute_input_mode_command(args, vars, interp) {
+                eprintln!("{}", e);
+            }
+        }
+        ':' | '_' => {}
+        'A' => insert_signature(msg, vars, "Sign"),
+        'a' => insert_signature(msg, vars, "sign"),
+        'i' => insert_variable(msg, vars, args),
+        'b' => args.split_whitespace().for_each(|a| msg.add_bcc(a)),
+        'c' => args.split_whitespace().for_each(|a| msg.add_cc(a)),
+        't' => args.split_whitespace().for_each(|a| msg.add_to(a)),
+        's' => msg.subject = args.to_string(),
+        'h' => prompt_headers(msg)?,
+        'd' => read_dead_letter(msg, vars),
+        'r' | '<' => read_into_body(msg, args, vars)?,
+        'w' => write_body(msg, args, vars),
+        'e' => edit_message(msg, vars.get_nonempty("EDITOR").unwrap_or("ed"))?,
+        'v' => edit_message(msg, vars.get_nonempty("VISUAL").unwrap_or("vi"))?,
+        'p' => print_draft(msg, vars),
+        '|' if !args.is_empty() => match pipe_through_command(&msg.body, args, vars) {
+            Ok(output) => msg.body = output,
+            Err(e) => eprintln!("{}", e),
+        },
+        '|' => {}
+        'f' | 'F' | 'm' | 'M' => {
+            if let Some(mb) = mb {
+                let all_headers = cmd_char.is_ascii_uppercase();
+                if cmd_char.eq_ignore_ascii_case(&'f') {
+                    forward_messages(args, msg, mb, vars, all_headers)?;
+                } else {
+                    insert_messages(args, msg, mb, vars, all_headers)?;
                 }
             }
-            Ok(EscapeResult::continue_input())
         }
         '~' => {
-            // Literal escape character
             msg.body.push(b'~');
             msg.body.extend_from_slice(args.as_bytes());
             msg.body.push(b'\n');
-            Ok(EscapeResult::continue_input())
         }
-        _ => {
-            // Unknown escape
-            println!("Unknown escape: ~{}", cmd_char);
-            Ok(EscapeResult::continue_input())
-        }
+        _ => println!("Unknown escape: ~{}", cmd_char),
     }
+    Ok(Escape::Continue)
+}
+
+/// `~!`: run a shell command, with `bang` expansion.
+fn shell_escape(args: &str, vars: &Variables, interp: &mut Interp) -> Result<()> {
+    let cmd = if vars.is_set("bang") {
+        crate::util::expand_bang(args, interp.last_shell_cmd.as_deref())
+    } else {
+        args.to_string()
+    };
+    crate::util::shell(&cmd, vars)?;
+    interp.last_shell_cmd = Some(cmd);
+    println!("!");
+    Ok(())
+}
+
+/// `~i`: append the value of variable `name` and a newline, unless it is
+/// unset or null.
+fn insert_variable(msg: &mut ComposedMessage, vars: &Variables, name: &str) {
+    if let Some(value) = vars.get_nonempty(name) {
+        msg.body.extend_from_slice(value.as_bytes());
+        msg.body.push(b'\n');
+    }
+}
+
+/// `~a`/`~A`: as `~i sign`/`~i Sign`, with `\t` and `\n` in the value
+/// standing for a tab and a newline.
+fn insert_signature(msg: &mut ComposedMessage, vars: &Variables, name: &str) {
+    if let Some(sign) = vars.get_nonempty(name) {
+        msg.body.extend_from_slice(expand_escapes(sign).as_bytes());
+        msg.body.push(b'\n');
+    }
+}
+
+/// `~d`: append the dead-letter file.
+fn read_dead_letter(msg: &mut ComposedMessage, vars: &Variables) {
+    let dead_path = crate::util::dead_letter_path(vars);
+    if let Ok(content) = fs::read(&dead_path) {
+        msg.body.extend_from_slice(&content);
+        println!("\"{}\" {} bytes", dead_path, content.len());
+    } else {
+        println!("{}: No such file", dead_path);
+    }
+}
+
+/// `~r`/`~<`: append a file, or with a leading `!` a command's output.
+fn read_into_body(msg: &mut ComposedMessage, args: &str, vars: &Variables) -> Result<()> {
+    if let Some(cmd) = args.strip_prefix('!') {
+        let output = crate::util::shell_output_bytes(cmd, vars)?;
+        msg.body.extend_from_slice(&output);
+        println!("{} bytes", output.len());
+        return Ok(());
+    }
+    let path = expand_local_prefixes(args, vars);
+    match fs::read(&path) {
+        Ok(content) => {
+            msg.body.extend_from_slice(&content);
+            println!("\"{}\" {} bytes", path, content.len());
+        }
+        Err(e) => println!("{}: {}", path, plib::diag::io_error_text(&e)),
+    }
+    Ok(())
+}
+
+/// `~w`: write the body to a file, created or appended to (spec 105094-105097).
+fn write_body(msg: &ComposedMessage, args: &str, vars: &Variables) {
+    let path = expand_local_prefixes(args, vars);
+    let result = crate::util::private_open()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| f.write_all(&msg.body));
+    match result {
+        Ok(_) => println!("\"{}\" {} bytes", path, msg.body.len()),
+        Err(e) => println!("{}: {}", path, plib::diag::io_error_text(&e)),
+    }
+}
+
+/// `~p`: write the message being composed, paginated by `crt`.
+fn print_draft(msg: &ComposedMessage, vars: &Variables) {
+    let mut output = b"-------\nMessage contains:\n".to_vec();
+    for line in msg.header_lines(true) {
+        output.extend_from_slice(line.as_bytes());
+        output.push(b'\n');
+    }
+    output.push(b'\n');
+    output.extend_from_slice(&msg.body);
+    output.extend_from_slice(b"-------\n");
+    crate::util::page_or_print(&output, vars);
 }
 
 fn print_escape_help() {
@@ -442,30 +315,22 @@ fn prompt_headers(msg: &mut ComposedMessage) -> Result<()> {
     if !io::stdin().is_terminal() {
         return Ok(());
     }
-
     if let Some(v) = crate::util::prompt_field("Subject", &msg.subject)? {
         msg.subject = v;
     }
-    for (label, current, list) in [
-        ("To", msg.to.join(", "), 0),
-        ("Cc", msg.cc.join(", "), 1),
-        ("Bcc", msg.bcc.join(", "), 2),
-    ] {
-        if let Some(v) = crate::util::prompt_field(label, &current)? {
-            let target = match list {
-                0 => &mut msg.to,
-                1 => &mut msg.cc,
-                _ => &mut msg.bcc,
-            };
-            target.clear();
-            for addr in crate::util::addresses(&v) {
-                if !target.contains(&addr.to_string()) {
-                    target.push(addr.to_string());
-                }
-            }
+    prompt_address_list("To", &mut msg.to)?;
+    prompt_address_list("Cc", &mut msg.cc)?;
+    prompt_address_list("Bcc", &mut msg.bcc)
+}
+
+/// Prompt with the addresses in `list`; a new answer replaces them.
+fn prompt_address_list(label: &str, list: &mut Vec<String>) -> Result<()> {
+    if let Some(answer) = crate::util::prompt_field(label, &list.join(", "))? {
+        list.clear();
+        for addr in crate::util::addresses(&answer) {
+            crate::send::push_address(list, addr);
         }
     }
-
     Ok(())
 }
 

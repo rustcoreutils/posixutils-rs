@@ -109,7 +109,7 @@ impl ComposedMessage {
 ///
 /// An address becomes a header line, so a line break in it is folded to a
 /// space: see [`single_line`].
-fn push_address(list: &mut Vec<String>, addr: &str) {
+pub(crate) fn push_address(list: &mut Vec<String>, addr: &str) {
     let addr = single_line(addr.trim());
     if !addr.is_empty() && !list.contains(&addr) {
         list.push(addr);

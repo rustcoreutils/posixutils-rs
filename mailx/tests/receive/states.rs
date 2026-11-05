@@ -241,3 +241,32 @@ fn first_new_message_is_current_before_unread_ones() {
         stdout
     );
 }
+
+/// The header summary shown on entry is the page holding the current
+/// message, so the first new message is on screen.
+#[test]
+fn entry_summary_shows_the_page_with_the_current_message() {
+    let mut content = String::new();
+    for (n, status) in [(1, "Status: RO\n"), (2, "Status: RO\n"), (3, "")] {
+        content.push_str(&format!(
+            "From m{n}@example.com Mon Jan  1 0{n}:00:00 2024\n\
+             From: m{n}@example.com\n\
+             {status}Subject: message {n}\n\n\
+             body\n\n"
+        ));
+    }
+    let mbox = create_temp_mbox(&content);
+    let mailrc = crate::common::create_temp_mailrc("set screen=2\n");
+    let output = mailx_env(
+        &["-f", mbox.path().to_str().unwrap()],
+        "exit\n",
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.lines().any(|l| l.starts_with(">N  3")),
+        "the page with new message 3 should be shown: {}",
+        stdout
+    );
+    assert!(!stdout.contains("message 1"), "{}", stdout);
+}

@@ -660,11 +660,7 @@ fn cmd_headers(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Com
         mb.set_current(msg_num);
     }
 
-    let screen = vars.screen_lines().get();
-    let start = mb.current().map_or(1, |c| (c - 1) / screen * screen + 1);
-
-    let nums: Vec<usize> = (start..=mb.message_count().min(start + screen - 1)).collect();
-    crate::summary::print_headers(mb, Some(&nums), vars);
+    crate::summary::print_page(mb, vars);
 
     Ok(CommandResult::Continue)
 }

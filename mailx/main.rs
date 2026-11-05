@@ -112,7 +112,7 @@ fn run_receive_mode(args: &Args) -> i32 {
         println!("mailx-rs version {}", env!("CARGO_PKG_VERSION"));
     }
     if !args.no_header_summary && vars.is_set("header") && mb.message_count() > 0 {
-        summary::print_headers(&mb, None, &vars);
+        summary::print_page(&mb, &vars);
     } else if mb.message_count() == 0 && is_tty {
         print_no_mail();
     }

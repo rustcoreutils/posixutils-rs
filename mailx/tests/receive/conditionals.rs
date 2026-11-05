@@ -214,3 +214,24 @@ fn source_honors_conditionals() {
     );
     assert_eq!(output.status.code(), Some(0), "exit status");
 }
+
+/// A stray second `else` is diagnosed without closing its `if`: the next
+/// `endif` still closes the inner block, not the one around it.
+#[test]
+fn stray_else_leaves_its_block_open() {
+    let mbox = copy_test_data("testdata.mbox");
+    let output = mailx(
+        &["-n", "-N", "-f", mbox.path().to_str().unwrap()],
+        "if r\nif s\nelse\nelse\nendif\nset inner_after\nelse\nset outer_else\nendif\nset\nexit\n",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unexpected else"), "{}", stderr);
+    assert!(stdout.lines().any(|l| l == "inner_after"), "{}", stdout);
+    assert!(
+        !stdout.lines().any(|l| l == "outer_else"),
+        "the outer else branch ran: {}",
+        stdout
+    );
+    assert!(!stderr.contains("unexpected endif"), "{}", stderr);
+}

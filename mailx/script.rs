@@ -42,12 +42,10 @@ impl CondStack {
     }
 
     fn enter_else(&mut self) -> Result<()> {
-        match self.open.pop() {
+        match self.open.last_mut() {
             Some(b) if !b.in_else => {
-                self.open.push(Branch {
-                    runs: !b.runs,
-                    in_else: true,
-                });
+                b.runs = !b.runs;
+                b.in_else = true;
                 Ok(())
             }
             _ => Err("unexpected else".into()),

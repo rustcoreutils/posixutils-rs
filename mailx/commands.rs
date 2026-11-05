@@ -1522,9 +1522,9 @@ fn cmd_write(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comma
     let mut total_size = 0;
     for num in &msg_nums {
         if let Some(msg) = mb.get(*num) {
-            file.write_all(msg.body.as_bytes())
-                .map_err(|e| e.to_string())?;
-            total_size += msg.body.len();
+            let body = crate::mailbox::encode_mbox(&msg.body);
+            file.write_all(&body).map_err(|e| e.to_string())?;
+            total_size += body.len();
         }
     }
 

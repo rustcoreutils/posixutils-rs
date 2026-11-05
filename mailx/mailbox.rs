@@ -59,9 +59,14 @@ impl Mailbox {
         // we record is exactly the extent we parsed. A delivery that lands
         // mid-read would otherwise leave `loaded_len` disagreeing with the
         // messages in hand, and the tail would be written back twice.
-        let content = fs::read_to_string(path)?;
+        //
+        // Mail is not necessarily UTF-8. Reading it as a string refused the
+        // whole mailbox when any message carried a raw 8-bit byte, so one
+        // Latin-1 message from anyone made all of a user's mail unreadable.
+        let bytes = fs::read(path)?;
+        let content = decode_mbox(&bytes);
         let mut mailbox = Mailbox::new(path.to_string());
-        mailbox.loaded_len = content.len() as u64;
+        mailbox.loaded_len = bytes.len() as u64;
 
         let mut current_msg: Option<Message> = None;
         let mut in_headers = false;
@@ -97,7 +102,7 @@ impl Mailbox {
                 msg.from_line = line.to_string();
                 msg.read = ReadState::New;
                 msg.raw_lines = 1;
-                msg.raw_bytes = raw.len();
+                msg.raw_bytes = encoded_len(raw);
                 current_msg = Some(msg);
                 in_headers = true;
                 header_continuation = false;
@@ -110,7 +115,7 @@ impl Mailbox {
                 // the separating blank line included. The header summary and
                 // `size` report these counts, as traditional mailx does.
                 msg.raw_lines += 1;
-                msg.raw_bytes += raw.len();
+                msg.raw_bytes += encoded_len(raw);
 
                 if in_headers {
                     if line.is_empty() {
@@ -444,6 +449,60 @@ impl Mailbox {
     }
 }
 
+/// The first of the private-use characters that stand for undecodable bytes.
+///
+/// Byte `b` (always `0x80` or above: ASCII is valid UTF-8) is held as
+/// `U+F700 + b`, so the range used is `U+F780..=U+F7FF`.
+const RAW_BYTE_BASE: u32 = 0xF700;
+
+/// The byte a stand-in character represents, if it is one.
+fn raw_byte(c: char) -> Option<u8> {
+    let n = u32::from(c).checked_sub(RAW_BYTE_BASE)?;
+    u8::try_from(n).ok().filter(|b| *b >= 0x80)
+}
+
+/// Decode mailbox bytes, keeping every byte that is not valid UTF-8.
+///
+/// Each such byte becomes a private-use stand-in that [`encode_mbox`] turns
+/// back into the byte, so a message is written back, saved, or copied exactly
+/// as it arrived rather than with its 8-bit text replaced.
+fn decode_mbox(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for chunk in bytes.utf8_chunks() {
+        out.push_str(chunk.valid());
+        for &b in chunk.invalid() {
+            out.extend(char::from_u32(RAW_BYTE_BASE + u32::from(b)));
+        }
+    }
+    out
+}
+
+/// The bytes `s` was decoded from by [`decode_mbox`].
+pub(crate) fn encode_mbox(s: &str) -> std::borrow::Cow<'_, [u8]> {
+    if !s.chars().any(|c| raw_byte(c).is_some()) {
+        return std::borrow::Cow::Borrowed(s.as_bytes());
+    }
+    let mut out = Vec::with_capacity(s.len());
+    for c in s.chars() {
+        match raw_byte(c) {
+            Some(b) => out.push(b),
+            None => out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// The length in bytes of `s` as stored in the mailbox file.
+fn encoded_len(s: &str) -> usize {
+    encode_mbox(s).len()
+}
+
+/// Write `s` as stored in a mailbox file, followed by a newline.
+fn write_line<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
+    w.write_all(&encode_mbox(s))?;
+    w.write_all(b"\n")
+}
+
 /// Remove one level of mbox `From ` quoting from a body line.
 ///
 /// mboxrd: `>From ` came from `From `, `>>From ` from `>From `, and so on.
@@ -474,10 +533,10 @@ fn write_messages<W: Write>(
 ) -> io::Result<()> {
     for msg in messages {
         if include_from_line {
-            writeln!(w, "{}", msg.from_line)?;
+            write_line(w, &msg.from_line)?;
         }
         for header in &msg.header_lines {
-            writeln!(w, "{}", header)?;
+            write_line(w, header)?;
         }
         // `Status:` is written from the message's read state rather than echoed
         // from the file, so a message read this session comes back as read.
@@ -490,7 +549,7 @@ fn write_messages<W: Write>(
             if needs_from_quoting(line) {
                 write!(w, ">")?;
             }
-            writeln!(w, "{}", line)?;
+            write_line(w, line)?;
         }
         // The separator before the next message.
         writeln!(w)?;

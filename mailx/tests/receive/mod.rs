@@ -5138,3 +5138,81 @@ fn edited_headers_keep_quoted_commas() {
         },
     );
 }
+
+/// A message carrying bytes that are not UTF-8 does not make the mailbox
+/// unreadable, and those bytes survive a rewrite and a `copy`.
+///
+/// Mail is 8-bit. The mailbox used to be read as a string, so a single
+/// Latin-1 message from anyone locked its owner out of all their mail.
+#[test]
+fn eight_bit_mailbox_loads_and_round_trips() {
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let mbox = dir.path().join("in.mbox");
+    let copied = dir.path().join("copied.mbox");
+    let first: &[u8] =
+        b"From a@b Mon Jan  1 00:00:00 2024\nFrom: a@b\nSubject: caf\xe9\n\nbody \xe9\xff\n\n";
+    let second: &[u8] = b"From c@d Mon Jan  1 00:00:00 2024\nFrom: c@d\nSubject: two\n\nsecond\n\n";
+    std::fs::write(&mbox, [first, second].concat()).expect("write mbox");
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-n"),
+                String::from("-N"),
+                String::from("-f"),
+                mbox.to_str().unwrap().to_string(),
+            ],
+            stdin_data: format!("size 1\ncopy 1 {}\nd 2\nquit\n", copied.display()),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_plan, output| {
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "an 8-bit mailbox was refused: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let out = String::from_utf8_lossy(&output.stdout);
+            assert!(out.contains("1: 68 bytes"), "size miscounted: {}", out);
+            assert!(
+                out.contains("1 messages 68 bytes"),
+                "copy miscounted: {}",
+                out
+            );
+        },
+    );
+
+    let copy = std::fs::read(&copied).expect("read copy");
+    assert_eq!(copy, first, "copy did not keep the 8-bit bytes");
+    let rewritten = std::fs::read(&mbox).expect("read rewritten mailbox");
+    assert_eq!(
+        rewritten,
+        first,
+        "rewrite did not keep the 8-bit bytes: {}",
+        String::from_utf8_lossy(&rewritten)
+    );
+
+    // `write` puts out the body alone, with the same bytes.
+    let body = dir.path().join("body.txt");
+    let out = std::process::Command::new(plib::testing::get_binary_path("mailx"))
+        .args(["-n", "-N", "-f", mbox.to_str().unwrap()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            let script = format!("write 1 {}\nexit\n", body.display());
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(script.as_bytes())?;
+            child.wait_with_output()
+        })
+        .expect("run mailx");
+    assert!(out.status.success(), "write failed: {:?}", out);
+    assert_eq!(std::fs::read(&body).expect("read body"), b"body \xe9\xff\n");
+}

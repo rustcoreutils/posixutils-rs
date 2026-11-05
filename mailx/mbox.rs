@@ -7,7 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! The mbox format: parsing a mailbox file into messages, and writing them back.
+//! The mbox format: parsing a mailbox file into messages kept in a store,
+//! and writing messages back out of it.
 
 use std::io::{self, Write};
 

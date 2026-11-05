@@ -7,7 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! Message representation for mailx
+//! A message's state and place in the store, its header fields as read
+//! back from it, and address parsing.
 
 use crate::error::Result;
 use crate::store::Span;

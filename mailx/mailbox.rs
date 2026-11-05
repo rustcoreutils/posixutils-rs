@@ -7,7 +7,18 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! Mailbox handling for mailx - mbox format parsing and writing
+//! An open mailbox: its messages, and the session's work on them.
+//!
+//! Opening a mailbox reads it once, under its locks, into the session's
+//! private store (see `store`); memory holds where each message lies and
+//! its state. Quitting writes the result back without risking mail:
+//!
+//! - read messages go to mbox first, appended, or prepended through a
+//!   temporary file renamed over mbox;
+//! - then the mailbox is rewritten in place, keeping its inode, through a
+//!   synced recovery file (see `recovery`), with any mail delivered during
+//!   the session copied through after the kept messages;
+//! - signals that could cut this short are held off while it runs.
 
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, Write};

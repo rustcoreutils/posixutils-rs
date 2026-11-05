@@ -18,6 +18,7 @@ mod message;
 mod msglist;
 mod send;
 mod signals;
+mod summary;
 mod util;
 mod variables;
 
@@ -110,7 +111,7 @@ fn run_headers_only(args: &Args) -> i32 {
         return 0;
     }
 
-    mb.print_headers(None, &vars);
+    crate::summary::print_headers(&mb, None, &vars);
     0
 }
 
@@ -150,7 +151,7 @@ fn run_receive_mode(args: &Args) -> i32 {
 
     // Print headers unless -N is specified
     if !args.no_header_summary && vars.get_bool("header") && mb.message_count() > 0 {
-        mb.print_headers(None, &vars);
+        crate::summary::print_headers(&mb, None, &vars);
     } else if mb.message_count() == 0 && is_tty {
         println!("{} {}", gettext("No mail for"), get_user());
     }

@@ -897,7 +897,7 @@ fn cmd_file(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
     new_mb.prev_path = Some(leaving);
 
     *mb = new_mb;
-    mb.print_headers(None, vars);
+    crate::summary::print_headers(mb, None, vars);
 
     Ok(CommandResult::Continue)
 }
@@ -951,7 +951,7 @@ fn cmd_followup(
 fn cmd_from(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult> {
     let msg_nums = msglist_or_current(args, mb, vars)?;
 
-    mb.print_headers(Some(&msg_nums), vars);
+    crate::summary::print_headers(mb, Some(&msg_nums), vars);
     Ok(CommandResult::Continue)
 }
 
@@ -969,7 +969,7 @@ fn cmd_headers(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Com
     };
 
     let nums: Vec<usize> = (start..=mb.message_count().min(start + screen - 1)).collect();
-    mb.print_headers(Some(&nums), vars);
+    crate::summary::print_headers(mb, Some(&nums), vars);
 
     Ok(CommandResult::Continue)
 }
@@ -1552,7 +1552,7 @@ fn cmd_scroll(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comm
         mb.current = nums[0];
     }
 
-    mb.print_headers(Some(&nums), vars);
+    crate::summary::print_headers(mb, Some(&nums), vars);
 
     Ok(CommandResult::Continue)
 }

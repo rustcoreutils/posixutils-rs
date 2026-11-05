@@ -15,7 +15,7 @@ use std::io::{self, Read, Seek, Write};
 use crate::error::{IoContext, Result};
 use crate::lock::{commit, lock, open_locked, read_locked};
 use crate::mbox::{write_messages, CountingWriter};
-use crate::message::{truncate_display, Disposition, Message, ReadState};
+use crate::message::{Disposition, Message, ReadState};
 use crate::variables::Variables;
 
 /// A mailbox containing messages
@@ -168,49 +168,6 @@ impl Mailbox {
         None
     }
 
-    /// Print header summary for messages
-    pub fn print_headers(&self, msg_nums: Option<&[usize]>, vars: &Variables) {
-        let screen = vars.screen_lines().get();
-        let show_to = vars.get_bool("showto");
-
-        let nums: Vec<usize> = msg_nums
-            .map(|n| n.to_vec())
-            .unwrap_or_else(|| (1..=self.messages.len()).collect());
-
-        for &num in nums.iter().take(screen) {
-            if let Some(msg) = self.get(num) {
-                let current_marker = if num == self.current { '>' } else { ' ' };
-                let state_char = msg.status_char();
-
-                // Decide whether to show To or From
-                let address_field = if show_to && vars.is_me(msg.from()) {
-                    format!("To {}", crate::util::bare_addresses(msg.to()))
-                } else {
-                    msg.short_from()
-                };
-
-                let date = msg.short_date();
-                let lines = msg.line_count();
-                let size = msg.size();
-                // Both fields are text the sender chose, written to the
-                // terminal for every message in the mailbox without the user
-                // asking to read it. A raw escape sequence there could
-                // retitle or clear the window, or redraw the summary to hide
-                // or misrepresent messages, so control characters are shown
-                // as `?`.
-                let address_field = printable(&address_field);
-                let subject = truncate_display(&printable(msg.subject()), 25);
-
-                // The traditional layout: sender cut to 20 columns, date
-                // `Www Mmm dd hh:mm`, then lines/bytes.
-                println!(
-                    "{}{}{:>3} {:<20.20}  {:>16.16} {:>3}/{:<5} {}",
-                    current_marker, state_char, num, address_field, date, lines, size, subject
-                );
-            }
-        }
-    }
-
     /// Whether any message's read state differs from the `Status:` it loaded.
     fn state_differs_from_disk(&self) -> bool {
         self.messages.iter().any(|m| {
@@ -320,13 +277,6 @@ impl Mailbox {
         let msgs: Vec<Message> = messages.iter().map(|m| (*m).clone()).collect();
         append_messages_to_file(path, &msgs, include_from_line).context(path)
     }
-}
-
-/// `s` with each control character replaced by `?`.
-fn printable(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_control() { '?' } else { c })
-        .collect()
 }
 
 /// Rewrite a mailbox in place, preserving anything delivered since it loaded.

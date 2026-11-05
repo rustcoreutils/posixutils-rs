@@ -64,9 +64,11 @@ pub fn mailx(args: &[&str], stdin: impl AsRef<[u8]>) -> Output {
 
 /// Run mailx with `args` and extra environment variables, feeding it `stdin`.
 ///
-/// mailx runs in an empty temporary directory, so a relative filename a test
-/// gets wrong lands there rather than in the source tree. As for every
-/// utility under test, the locale is C unless `env` sets one.
+/// mailx runs in an empty temporary directory, which is also its `HOME`
+/// unless `env` sets one, so a relative filename a test gets wrong, a
+/// `dead.letter` or a `.mailrc` stays out of the source tree and the user's
+/// home. As for every utility under test, the locale is C unless `env` sets
+/// one.
 pub fn mailx_env(args: &[&str], stdin: impl AsRef<[u8]>, env: &[(&str, &str)]) -> Output {
     let cwd = TempDir::new().expect("failed to create working directory");
     let mut command = Command::new(get_binary_path("mailx"));
@@ -82,6 +84,7 @@ pub fn mailx_env(args: &[&str], stdin: impl AsRef<[u8]>, env: &[(&str, &str)]) -
     {
         command.env("LC_ALL", "C");
     }
+    command.env("HOME", cwd.path());
     command.envs(env.iter().copied());
 
     let mut child = command.spawn().expect("failed to run mailx");

@@ -77,8 +77,8 @@ pub fn handle_escape(
         'd' => read_dead_letter(msg, vars)?,
         'r' | '<' => read_into_body(msg, args, vars)?,
         'w' => write_body(msg, args, vars)?,
-        'e' => edit_message(msg, vars.get_nonempty("EDITOR").unwrap_or("ed"), vars)?,
-        'v' => edit_message(msg, vars.get_nonempty("VISUAL").unwrap_or("vi"), vars)?,
+        'e' => edit_message(msg, vars.get_nonempty("EDITOR").unwrap_or("ed"))?,
+        'v' => edit_message(msg, vars.get_nonempty("VISUAL").unwrap_or("vi"))?,
         'p' => print_draft(msg, vars),
         '|' if !args.is_empty() => match pipe_through_command(&msg.body, args, vars) {
             Ok(output) => msg.body = output,
@@ -222,7 +222,7 @@ fn expand_escapes(s: &str) -> String {
     s.replace("\\t", "\t").replace("\\n", "\n")
 }
 
-fn edit_message(msg: &mut ComposedMessage, editor: &str, vars: &Variables) -> Result<()> {
+fn edit_message(msg: &mut ComposedMessage, editor: &str) -> Result<()> {
     // The temporary comes from `mkstemp` (`O_EXCL`, mode 0600, honoring
     // `$TMPDIR`). The old `/tmp/mailx.<pid>` name was predictable and
     // world-readable, and writing to it followed a symlink planted in advance.
@@ -232,7 +232,7 @@ fn edit_message(msg: &mut ComposedMessage, editor: &str, vars: &Variables) -> Re
         .map_err(|e| e.to_string())?;
     tmp.as_file_mut().flush().map_err(|e| e.to_string())?;
 
-    crate::util::edit(editor, tmp.path(), vars)?;
+    crate::util::edit(editor, tmp.path())?;
 
     let edited = fs::read(tmp.path()).map_err(|e| e.to_string())?;
     parse_edited_message(&edited, msg)?;

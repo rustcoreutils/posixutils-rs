@@ -1259,3 +1259,30 @@ fn failed_file_switch_does_not_quit_twice() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// `EDITOR` is split into words, quotes honored, and run directly as in BSD
+/// and Heirloom mailx: no shell expands it.
+#[test]
+fn editor_is_run_without_a_shell() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mbox = copy_test_data("testdata.mbox");
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let log = dir.path().join("args");
+    let editor = dir.path().join("editor");
+    std::fs::write(
+        &editor,
+        format!("#!/bin/sh\nprintf '%s|' \"$@\" >> {}\n", log.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let value = format!("{} $HOME \"two words\"", editor.display());
+
+    mailx_env(
+        &["-n", "-N", "-f", mbox.path().to_str().unwrap()],
+        "edit 1\nexit\n",
+        &[("EDITOR", &value)],
+    );
+    let args = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(args.starts_with("$HOME|two words|/"), "{:?}", args);
+}

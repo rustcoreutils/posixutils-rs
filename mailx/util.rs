@@ -112,12 +112,14 @@ pub fn shell_command(cmd: &str, vars: &Variables) -> Command {
 
 /// Run the editor `editor` names on `file`.
 ///
-/// The value is a command, which may carry arguments (`emacs -nw`), so it
-/// is run by the command interpreter with the file as `$1`, never itself
-/// expanded by the shell.
-pub fn edit(editor: &str, file: &std::path::Path, vars: &Variables) -> Result<()> {
-    shell_command(&format!("{} \"$1\"", editor), vars)
-        .arg("mailx")
+/// As in BSD and Heirloom mailx, the value is split into words, quotes
+/// honored (`emacs -nw` is a program and an argument), and run directly:
+/// no shell expands it.
+pub fn edit(editor: &str, file: &std::path::Path) -> Result<()> {
+    let words = crate::variables::split_args(editor);
+    let (program, args) = words.split_first().ok_or("No editor")?;
+    Command::new(program)
+        .args(args)
         .arg(file)
         .status()
         .map_err(|e| e.to_string())?;

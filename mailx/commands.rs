@@ -557,7 +557,7 @@ fn cmd_edit(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
     let msg_nums = msglist_or_current(args, mb, vars)?;
 
     let editor = vars.get_nonempty("EDITOR").unwrap_or("ed");
-    edit_messages(&msg_nums, mb, editor, vars)
+    edit_messages(&msg_nums, mb, editor)
 }
 
 /// Run `editor` over each message in turn, on a private temporary copy.
@@ -566,12 +566,7 @@ fn cmd_edit(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
 /// contents of those messages in the mailbox". It is made by `mkstemp`
 /// (`O_EXCL`, mode 0600, honoring `$TMPDIR`), so its name cannot be predicted
 /// or replaced by a planted symlink.
-fn edit_messages(
-    msg_nums: &[usize],
-    mb: &Mailbox,
-    editor: &str,
-    vars: &Variables,
-) -> Result<CommandResult> {
+fn edit_messages(msg_nums: &[usize], mb: &Mailbox, editor: &str) -> Result<CommandResult> {
     for &num in msg_nums {
         if mb.get(num).is_some() {
             let mut tmp = plib::tmp::NamedTempFile::new().map_err(|e| e.to_string())?;
@@ -580,7 +575,7 @@ fn edit_messages(
                 .map_err(|e| e.to_string())?;
             tmp.as_file_mut().flush().map_err(|e| e.to_string())?;
 
-            crate::util::edit(editor, tmp.path(), vars)?;
+            crate::util::edit(editor, tmp.path())?;
         }
     }
 
@@ -1151,7 +1146,7 @@ fn cmd_visual(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comm
     let msg_nums = msglist_or_current(args, mb, vars)?;
 
     let editor = vars.get_nonempty("VISUAL").unwrap_or("vi");
-    edit_messages(&msg_nums, mb, editor, vars)?;
+    edit_messages(&msg_nums, mb, editor)?;
 
     Ok(CommandResult::Continue)
 }

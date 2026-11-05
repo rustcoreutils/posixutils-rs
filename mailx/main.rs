@@ -129,6 +129,7 @@ fn run_receive_mode(args: &Args) -> i32 {
 
 /// Read and run commands until `quit`, `exit` or end of input.
 fn command_loop(mb: &mut Mailbox, vars: &mut Variables, interp: &mut Interp, is_tty: bool) -> i32 {
+    let mut ignored_eofs = 0;
     loop {
         if is_tty {
             if let Some(prompt) = vars.get("prompt") {
@@ -144,6 +145,17 @@ fn command_loop(mb: &mut Mailbox, vars: &mut Variables, interp: &mut Interp, is_
                 println!();
                 continue;
             }
+            // On a terminal `ignoreeof` asks for `quit` instead, a limited
+            // number of times.
+            Ok(Command::Eof)
+                if is_tty
+                    && vars.is_set("ignoreeof")
+                    && ignored_eofs < compose::MAX_IGNORED_EOFS =>
+            {
+                ignored_eofs += 1;
+                println!("Use \"quit\" to quit.");
+                continue;
+            }
             Ok(Command::Eof) => return exit_status(mb.quit(vars)),
             // A hangup ends the session with nothing written back.
             Ok(Command::Hangup) => return 1,
@@ -156,6 +168,7 @@ fn command_loop(mb: &mut Mailbox, vars: &mut Variables, interp: &mut Interp, is_
                 return 1;
             }
         };
+        ignored_eofs = 0;
         if line.is_empty() {
             continue;
         }

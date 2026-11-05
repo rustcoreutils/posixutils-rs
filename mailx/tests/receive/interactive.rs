@@ -7,7 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! A hangup (SIGHUP), in command mode and while composing.
+//! Signals and terminals: hangups, interrupts in piped Send Mode, and end
+//! of input on a terminal.
 
 use crate::common::{copy_test_data, create_temp_mailrc};
 use std::io::{BufRead, BufReader, Write};
@@ -133,4 +134,66 @@ fn piped_send_mode_takes_the_standard_action() {
     };
     drop(stdin);
     assert_eq!(status.signal(), Some(libc::SIGINT), "{:?}", status);
+}
+
+/// On a terminal, `ignoreeof` makes command mode answer end of input with a
+/// reminder instead of quitting, as BSD mailx does.
+#[cfg(target_os = "linux")]
+#[test]
+fn ignoreeof_holds_command_mode_open_on_a_terminal() {
+    use std::io::Read;
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::time::{Duration, Instant};
+
+    let mbox = copy_test_data("testdata.mbox");
+    let home = plib::tmp::TempDir::new().unwrap();
+    let rc = create_temp_mailrc("set ignoreeof\n");
+    let (mut master, slave) = unsafe {
+        let (mut m, mut s) = (0, 0);
+        // SAFETY: openpty fills both descriptors or fails.
+        assert_eq!(
+            libc::openpty(
+                &mut m,
+                &mut s,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null()
+            ),
+            0
+        );
+        (std::fs::File::from_raw_fd(m), OwnedFd::from_raw_fd(s))
+    };
+    let mut child = Command::new(plib::testing::get_binary_path("mailx"))
+        .args(["-N", "-f", mbox.path().to_str().unwrap()])
+        .env("HOME", home.path())
+        .env("MAILRC", rc.path())
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave))
+        .spawn()
+        .expect("spawn mailx");
+
+    let mut seen = String::new();
+    let mut read_until = |master: &mut std::fs::File, want: &str| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut buf = [0u8; 4096];
+        while !seen.contains(want) {
+            assert!(
+                Instant::now() < deadline,
+                "never saw {:?} in {:?}",
+                want,
+                seen
+            );
+            let n = master
+                .read(&mut buf)
+                .unwrap_or_else(|e| panic!("mailx ended ({}): {:?}", e, seen));
+            seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+    };
+    read_until(&mut master, "? ");
+    master.write_all(b"\x04").unwrap(); // end of input, on a terminal
+    read_until(&mut master, "Use \"quit\" to quit.");
+    master.write_all(b"exit\n").unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "{:?}: {}", status, seen);
 }

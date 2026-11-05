@@ -15,7 +15,7 @@ mod conditionals;
 mod encoding;
 mod escapes;
 mod filenames;
-mod hangup;
+mod interactive;
 mod locking;
 mod modes;
 mod msglist;

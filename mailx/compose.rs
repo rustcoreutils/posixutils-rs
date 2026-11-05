@@ -44,8 +44,9 @@ fn interrupt_message(
     false
 }
 
-/// How many end-of-input indications `ignoreeof` passes over.
-const MAX_IGNORED_EOFS: u32 = 25;
+/// How many end-of-input indications in a row `ignoreeof` passes over, in
+/// input mode and command mode; BSD mailx gives up after 25.
+pub(crate) const MAX_IGNORED_EOFS: u32 = 25;
 
 /// Read a message body from standard input, handling command escapes.
 ///

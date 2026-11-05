@@ -477,3 +477,57 @@ fn dollar_is_the_last_visible_message() {
         stdout
     );
 }
+
+// -----------------------------------------------------------------------------
+// An omitted msglist
+// -----------------------------------------------------------------------------
+
+/// With every message deleted, a command given no msglist has none to act
+/// on: it does not print, nor save -- and so undelete -- the deleted current
+/// message.
+#[test]
+fn omitted_msglist_skips_a_deleted_current_message() {
+    let mbox = copy_test_data("testdata-5msg.mbox");
+    let mbox_path = mbox.path().to_str().unwrap();
+    let dir = plib::tmp::TempDir::new().unwrap();
+    let saved = dir.path().join("saved");
+
+    let output = mailx(
+        &["-n", "-N", "-f", mbox_path],
+        format!("d *\np\ns {}\nquit\n", saved.display()),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stdout.contains("Subject:"),
+        "printed a deleted message: {}",
+        stdout
+    );
+    assert_eq!(
+        stderr.matches("No applicable messages").count(),
+        2,
+        "{}",
+        stderr
+    );
+    assert!(!saved.exists(), "saved a deleted message");
+}
+
+/// A deleted current message stands, for a command given no msglist, for
+/// the next undeleted one after it, as BSD mailx's `first()` has it.
+#[test]
+fn omitted_msglist_takes_the_next_undeleted_message() {
+    let mbox = copy_test_data("testdata-5msg.mbox");
+    let mbox_path = mbox.path().to_str().unwrap();
+
+    // `headers 4` makes current the top of its page, message 3.
+    let output = mailx(
+        &["-n", "-N", "-f", mbox_path],
+        "set screen=2\nd 3\nheaders 4\np\nquit\n",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Subject: Another Meeting") && !stdout.contains("Subject: Urgent"),
+        "{}",
+        stdout
+    );
+}

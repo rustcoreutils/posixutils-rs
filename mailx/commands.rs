@@ -20,7 +20,7 @@ use crate::filename::{expand_local_prefixes, expand_typed_filename};
 use crate::mailbox::{Direction, Mailbox};
 use crate::message::{author_filename, Disposition, Message, ReadState};
 use crate::msglist::{
-    current_message, is_positional, msglist_or_current, parse_message, parse_msglist, Want,
+    current_message, first, is_positional, msglist_or_current, parse_message, parse_msglist, Want,
 };
 use crate::script::CondStack;
 use crate::send::{compose_reply, send_message, ComposedMessage, ReplyForm};
@@ -1164,15 +1164,7 @@ fn cmd_unalias(args: &str, vars: &mut Variables) -> Result<CommandResult> {
 
 fn cmd_undelete(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult> {
     let msg_nums = if args.is_empty() {
-        let current = mb.current().unwrap_or(0);
-        let deleted = Message::is_deleted;
-        if let Some(num) = mb.find(current.saturating_sub(1), Direction::Forward, deleted) {
-            vec![num]
-        } else if let Some(num) = mb.find(current + 1, Direction::Backward, deleted) {
-            vec![num]
-        } else {
-            return Err("No deleted messages".into());
-        }
+        vec![first(mb, Want::Deleted).ok_or("No deleted messages")?]
     } else {
         parse_msglist(args, mb, Want::Deleted, vars)?
     };

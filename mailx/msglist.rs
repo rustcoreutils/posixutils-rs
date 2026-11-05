@@ -236,7 +236,7 @@ fn is_from(msg: &Headers, addr: &str, allnet: bool) -> bool {
 pub fn parse_msglist(spec: &str, mb: &Mailbox, want: Want, vars: &Variables) -> Result<Vec<usize>> {
     let spec = spec.trim();
     if spec.is_empty() {
-        return current_message(mb);
+        return omitted(mb, want);
     }
 
     let allnet = vars.is_set("allnet");
@@ -260,11 +260,28 @@ pub fn is_positional(token: &str) -> bool {
     Selector::parse(token).is_ok_and(|s| !matches!(s, Selector::Subject(_) | Selector::Address(_)))
 }
 
-/// The current message, as the list an omitted msglist stands for.
-pub fn current_message(mb: &Mailbox) -> Result<Vec<usize>> {
-    mb.current()
+/// The message an omitted msglist stands for, as BSD mailx's `first()`
+/// finds it: the current message, or failing that the nearest after it, or
+/// failing that before it, that `want` can name -- so a deleted current
+/// message is passed over by every command but `undelete`.
+pub fn first(mb: &Mailbox, want: Want) -> Option<usize> {
+    let wanted = |m: &Message| m.is_deleted() == (want == Want::Deleted);
+    let current = mb.current().unwrap_or(0);
+    mb.find(current.saturating_sub(1), Direction::Forward, wanted)
+        .or_else(|| mb.find(current, Direction::Backward, wanted))
+}
+
+/// The list an omitted msglist stands for: see [`first`].
+fn omitted(mb: &Mailbox, want: Want) -> Result<Vec<usize>> {
+    first(mb, want)
         .map(|n| vec![n])
         .ok_or_else(|| "No applicable messages".into())
+}
+
+/// The list an omitted msglist stands for, for every command but
+/// `undelete`.
+pub fn current_message(mb: &Mailbox) -> Result<Vec<usize>> {
+    omitted(mb, Want::Live)
 }
 
 /// The messages an optional msglist argument names, defaulting to the current

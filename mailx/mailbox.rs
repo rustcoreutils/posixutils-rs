@@ -587,9 +587,60 @@ fn fcntl_lock(file: &File, exclusive: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// Read all of `path` under a shared lock.
+/// A `<mailbox>.lock` dotlock, removed when dropped.
+///
+/// Some delivery agents lock the spool only this way, by creating a lock file
+/// beside it, so traditional mailx takes the dotlock too, before its kernel
+/// locks. Creating it needs write access to the mailbox's directory; where
+/// that is lacking, as in a spool directory writable only by group mail, the
+/// dotlock is skipped and the kernel locks stand alone.
+struct DotLock {
+    path: String,
+}
+
+impl Drop for DotLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// How old a dotlock must be before it is taken as left behind by a holder
+/// that died, and removed. Five minutes is the traditional figure.
+const STALE_DOTLOCK: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Take the dotlock for `path`, waiting while another process holds it.
+///
+/// Returns `None` when the lock file cannot be created at all.
+fn dotlock(path: &str) -> Option<DotLock> {
+    let lock_path = format!("{}.lock", path);
+    loop {
+        match crate::util::private_open()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(_) => return Some(DotLock { path: lock_path }),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                let stale = fs::metadata(&lock_path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age > STALE_DOTLOCK);
+                if stale {
+                    let _ = fs::remove_file(&lock_path);
+                } else {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Read all of `path` under its dotlock and a shared lock.
 fn read_locked(path: &str) -> io::Result<Vec<u8>> {
     let mut file = File::open(path)?;
+    let _dotlock = dotlock(path);
     lock(&file, false)?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
@@ -597,7 +648,11 @@ fn read_locked(path: &str) -> io::Result<Vec<u8>> {
 }
 
 /// Open `path` for a locked read-modify-write, creating it if absent.
-fn open_locked(path: &str) -> io::Result<File> {
+///
+/// The dotlock returned with the file must be held until the file is
+/// committed.
+fn open_locked(path: &str) -> io::Result<(File, Option<DotLock>)> {
+    let dotlock = dotlock(path);
     let file = crate::util::private_open()
         .read(true)
         .write(true)
@@ -605,7 +660,7 @@ fn open_locked(path: &str) -> io::Result<File> {
         .truncate(false)
         .open(path)?;
     lock(&file, true)?;
-    Ok(file)
+    Ok((file, dotlock))
 }
 
 /// Flush and commit `file`, reporting any deferred write error.
@@ -629,7 +684,7 @@ fn rewrite_mailbox(
     loaded_len: u64,
     keep: bool,
 ) -> io::Result<()> {
-    let mut file = open_locked(path)?;
+    let (mut file, _dotlock) = open_locked(path)?;
 
     // Bytes past the extent we parsed are mail that arrived while mailx was
     // running. They are copied through verbatim -- reparsing them would be
@@ -664,7 +719,7 @@ fn rewrite_mailbox(
 /// puts them at the end (spec 104579-104580). Neither truncates: the previously
 /// saved mail is retained in both cases.
 fn migrate_to_mbox(path: &str, messages: &[Message], append: bool) -> io::Result<()> {
-    let mut file = open_locked(path)?;
+    let (mut file, _dotlock) = open_locked(path)?;
 
     let mut existing = Vec::new();
     if !append {

@@ -5480,3 +5480,113 @@ fn input_mode_keeps_eight_bit_bytes() {
         b"typed \xff\nread \xe9\n"
     );
 }
+
+/// mailx waits for a delivery agent's `<mailbox>.lock`, and takes and
+/// removes its own.
+#[test]
+fn mailbox_honors_dotlock() {
+    use std::process::{Command, Stdio};
+
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let mbox = dir.path().join("spool");
+    let lock = dir.path().join("spool.lock");
+    std::fs::write(
+        &mbox,
+        "From a@b Mon Jan  1 00:00:00 2024\nFrom: a@b\nSubject: one\n\nfirst\n\n",
+    )
+    .expect("write mbox");
+    std::fs::write(&lock, "").expect("write lock");
+
+    let mut child = Command::new(plib::testing::get_binary_path("mailx"))
+        .args(["-n", "-H", "-f", mbox.to_str().unwrap()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mailx");
+
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let finished_early = child.try_wait().expect("try_wait").is_some();
+    std::fs::remove_file(&lock).expect("release lock");
+
+    let output = child.wait_with_output().expect("wait for mailx");
+    assert!(!finished_early, "mailx did not wait for the dotlock");
+    assert!(output.status.success(), "mailx failed: {:?}", output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("one"));
+    assert!(!lock.exists(), "mailx left its dotlock behind");
+}
+
+/// A dotlock older than five minutes was left by a holder that died; it is
+/// broken rather than waited on forever.
+#[test]
+fn mailbox_breaks_stale_dotlock() {
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let mbox = dir.path().join("spool");
+    let lock = dir.path().join("spool.lock");
+    std::fs::write(
+        &mbox,
+        "From a@b Mon Jan  1 00:00:00 2024\nFrom: a@b\nSubject: one\n\nfirst\n\n",
+    )
+    .expect("write mbox");
+    let file = std::fs::File::create(&lock).expect("write lock");
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+    file.set_modified(old).expect("age lock");
+    drop(file);
+
+    let started = std::time::Instant::now();
+    let output = plib::testing::run_test_base_with_env(
+        "mailx",
+        &[
+            String::from("-n"),
+            String::from("-H"),
+            String::from("-f"),
+            mbox.to_str().unwrap().to_string(),
+        ],
+        b"",
+        &[],
+    );
+    assert!(output.status.success(), "mailx failed: {:?}", output);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "mailx waited on a stale dotlock"
+    );
+    assert!(!lock.exists(), "the stale dotlock was not removed");
+}
+
+/// Where the mailbox's directory is not writable, as a spool directory
+/// writable only by group mail, the dotlock is skipped, not waited on.
+#[test]
+fn mailbox_without_dotlock_access_still_opens() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Root can create files in any directory; the case cannot arise.
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let spool = dir.path().join("spool");
+    std::fs::create_dir(&spool).expect("mkdir");
+    let mbox = spool.join("user");
+    std::fs::write(
+        &mbox,
+        "From a@b Mon Jan  1 00:00:00 2024\nFrom: a@b\nSubject: one\n\nfirst\n\n",
+    )
+    .expect("write mbox");
+    std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+
+    let output = plib::testing::run_test_base_with_env(
+        "mailx",
+        &[
+            String::from("-n"),
+            String::from("-H"),
+            String::from("-f"),
+            mbox.to_str().unwrap().to_string(),
+        ],
+        b"",
+        &[],
+    );
+    std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    assert!(output.status.success(), "mailx failed: {:?}", output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("one"));
+}

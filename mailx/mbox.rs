@@ -79,7 +79,7 @@ pub(crate) fn parse(
         if starts_message {
             messages.extend(current.take().map(finish));
             let mut msg = start(stored, raw);
-            msg.head = store.append(raw)?;
+            msg.head = append_line(store, raw)?;
             msg.body_span = msg.head.after(0);
             current = Some(Parsing {
                 msg,
@@ -118,14 +118,15 @@ fn store_line(
         // `Status:` and the empty line ending the block are not stored.
         Section::Headers { folding } => {
             if folding {
-                p.msg.head.len += store.append(raw)?.len;
+                p.msg.head.len += append_line(store, raw)?.len;
                 p.msg.body_span = p.msg.head.after(0);
             }
         }
         Section::Body if was_headers && line.is_empty() => {}
         Section::Body => {
-            p.msg.body_span.len += store.append(raw)?.len;
-            p.last_body_line = Some((raw.len() as u64, line.is_empty()));
+            let stored = append_line(store, raw)?.len;
+            p.msg.body_span.len += stored;
+            p.last_body_line = Some((stored, line.is_empty()));
         }
     }
     Ok(())
@@ -215,7 +216,7 @@ pub(crate) fn write_messages<W: Write + ?Sized>(
         // Stored lines keep their own CR; the lines written here take the
         // message's line ending, CRLF when its `From ` line had one.
         let eol: &[u8] = if msg.crlf { b"\r\n" } else { b"\n" };
-        copy_lines(store, msg.head, w)?;
+        store.copy_to(msg.head, w)?;
         // `Status:` is written from the message's read state rather than echoed
         // from the file, so a message read this session comes back as read.
         // The loader keeps it out of the store for exactly this reason.
@@ -231,18 +232,14 @@ pub(crate) fn write_messages<W: Write + ?Sized>(
     Ok(())
 }
 
-/// Copy the lines of `span`, ending the last with a newline if it has none.
-fn copy_lines<W: Write + ?Sized>(store: &Store, span: Span, w: &mut W) -> io::Result<()> {
-    store.copy_to(span, w)?;
-    if span.len > 0
-        && store.read(Span {
-            offset: span.offset + span.len - 1,
-            len: 1,
-        })? != b"\n"
-    {
-        w.write_all(b"\n")?;
+/// Store one line, with a newline even if the file's last line had none,
+/// so every stored line can be copied out whole.
+fn append_line(store: &mut Store, raw: &[u8]) -> io::Result<Span> {
+    let mut span = store.append(raw)?;
+    if !raw.ends_with(b"\n") {
+        span.len += store.append(b"\n")?.len;
     }
-    Ok(())
+    Ok(span)
 }
 
 /// Copy a stored body, `From `-quoting any line stored unquoted.

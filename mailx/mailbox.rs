@@ -14,10 +14,13 @@ use std::io::{self, Read, Seek, Write};
 
 use crate::error::{IoContext, Result};
 use crate::lock::{commit, lock, open_locked, read_locked};
-use crate::mbox::{write_messages, CountingWriter};
+use crate::mbox::{unquote_from_line, write_messages, CountingWriter};
 use crate::message::{Disposition, Message, ReadState};
 use crate::store::Store;
 use crate::variables::Variables;
+
+/// The context for an I/O error on the store.
+const STORE: &str = "temporary mailbox copy";
 
 /// What quitting does with a message.
 enum Fate {
@@ -108,6 +111,56 @@ impl Mailbox {
             .iter()
             .filter(|m| m.disposition != Disposition::Deleted)
             .count()
+    }
+
+    /// The body of message `num`, read from the store and unquoted, each
+    /// line ending with a newline.
+    pub fn body(&self, num: usize) -> Result<Vec<u8>> {
+        let msg = self.get(num).ok_or("No message")?;
+        let mut body = Vec::with_capacity(msg.body_span.len as usize + 1);
+        let mut reader = self.store.reader(msg.body_span);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            if io::BufRead::read_until(&mut reader, b'\n', &mut line).context(STORE)? == 0 {
+                return Ok(body);
+            }
+            let text = line.strip_suffix(b"\n").unwrap_or(&line);
+            body.extend_from_slice(unquote_from_line(text));
+            body.push(b'\n');
+        }
+    }
+
+    /// Message `num` as `print` shows it: its header fields as `discard`,
+    /// `ignore` and `retain` allow -- or all of them, for the capitalized
+    /// `Print`/`Type` form (spec 104756) -- an empty line, and its body.
+    pub fn display(&self, num: usize, show_all_headers: bool, vars: &Variables) -> Result<Vec<u8>> {
+        let msg = self.get(num).ok_or("No message")?;
+        let mut output = Vec::new();
+        for line in &msg.header_lines {
+            let field = line.split(|&b| b == b':').next().unwrap_or_default();
+            if show_all_headers || vars.header_filter.shows(field.trim_ascii()) {
+                output.extend_from_slice(line);
+                output.push(b'\n');
+            }
+        }
+        output.push(b'\n');
+        output.extend_from_slice(&self.body(num)?);
+        Ok(output)
+    }
+
+    /// Message `num` whole, `From ` line included, as given to an editor.
+    pub fn full_text(&self, num: usize) -> Result<Vec<u8>> {
+        let msg = self.get(num).ok_or("No message")?;
+        let mut output = msg.from_line.clone();
+        output.push(b'\n');
+        for line in &msg.header_lines {
+            output.extend_from_slice(line);
+            output.push(b'\n');
+        }
+        output.push(b'\n');
+        output.extend_from_slice(&self.body(num)?);
+        Ok(output)
     }
 
     /// The current message's number, if there is a current message.

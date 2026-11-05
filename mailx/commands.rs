@@ -570,10 +570,10 @@ fn edit_messages(
     vars: &Variables,
 ) -> Result<CommandResult> {
     for &num in msg_nums {
-        if let Some(msg) = mb.get(num) {
+        if mb.get(num).is_some() {
             let mut tmp = plib::tmp::NamedTempFile::new().map_err(|e| e.to_string())?;
             tmp.as_file_mut()
-                .write_all(&msg.format_full())
+                .write_all(&mb.full_text(num)?)
                 .map_err(|e| e.to_string())?;
             tmp.as_file_mut().flush().map_err(|e| e.to_string())?;
 
@@ -843,12 +843,12 @@ fn cmd_pipe(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
     let _sigpipe = plib::io::SigPipeIgnored::new();
 
     for num in &msg_nums {
-        if let Some(msg) = mb.get(*num) {
+        if mb.get(*num).is_some() {
             let mut child = crate::util::shell_command(&cmd, vars)
                 .stdin(std::process::Stdio::piped())
                 .spawn()
                 .map_err(|e| e.to_string())?;
-            let mut input = msg.format_display(false, vars);
+            let mut input = mb.display(*num, false, vars)?;
             if page {
                 input.push(b'\x0c');
             }
@@ -880,8 +880,8 @@ fn cmd_print(
     let msg_nums = msglist_or_current(args, mb, vars)?;
 
     for num in &msg_nums {
-        if let Some(msg) = mb.get(*num) {
-            crate::util::page_or_print(&msg.format_display(show_all_headers, vars), vars);
+        if mb.get(*num).is_some() {
+            crate::util::page_or_print(&mb.display(*num, show_all_headers, vars)?, vars);
         }
     }
 
@@ -1058,7 +1058,7 @@ fn cmd_top(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Command
             }
             out.push(b'\n');
 
-            for line in crate::util::byte_lines(&msg.body).take(toplines) {
+            for line in crate::util::byte_lines(&mb.body(*num)?).take(toplines) {
                 out.extend_from_slice(line);
                 out.push(b'\n');
             }
@@ -1165,9 +1165,10 @@ fn cmd_write(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comma
 
     let mut total_size = 0;
     for num in &msg_nums {
-        if let Some(msg) = mb.get(*num) {
-            file.write_all(&msg.body).map_err(|e| e.to_string())?;
-            total_size += msg.body.len();
+        if mb.get(*num).is_some() {
+            let body = mb.body(*num)?;
+            file.write_all(&body).map_err(|e| e.to_string())?;
+            total_size += body.len();
         }
     }
 

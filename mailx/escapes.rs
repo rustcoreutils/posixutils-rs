@@ -335,9 +335,9 @@ fn forward_messages(
     let msg_nums = msglist_or_current(args, mb, vars)?;
 
     for num in msg_nums {
-        if let Some(m) = mb.get(num) {
+        if mb.get(num).is_some() {
             msg.body
-                .extend_from_slice(&m.format_display(all_headers, vars));
+                .extend_from_slice(&mb.display(num, all_headers, vars)?);
         }
     }
 
@@ -355,8 +355,8 @@ fn insert_messages(
     let indent = vars.get("indentprefix").unwrap_or("\t");
 
     for num in msg_nums {
-        if let Some(m) = mb.get(num) {
-            let content = m.format_display(all_headers, vars);
+        if mb.get(num).is_some() {
+            let content = mb.display(num, all_headers, vars)?;
             for line in crate::util::byte_lines(&content) {
                 if !line.is_empty() {
                     msg.body.extend_from_slice(indent.as_bytes());

@@ -102,8 +102,6 @@ pub struct Message {
     pub headers: Vec<(String, String)>,
     /// Original header lines in order, each with its folded continuations
     pub header_lines: Vec<Vec<u8>>,
-    /// Message body
-    pub body: Vec<u8>,
     /// Lines the message occupies in the mailbox file, from its `From ` line
     /// up to the next message's.
     pub raw_lines: usize,
@@ -136,7 +134,6 @@ impl Message {
             from_line: Vec::new(),
             headers: Vec::new(),
             header_lines: Vec::new(),
-            body: Vec::new(),
             raw_lines: 0,
             raw_bytes: 0,
             head: Span::default(),
@@ -186,52 +183,6 @@ impl Message {
     /// The lines the message occupies as stored, folded header lines included.
     pub fn line_count(&self) -> usize {
         self.raw_lines
-    }
-
-    /// Render the message for display.
-    ///
-    /// `show_all_headers` is the capitalized `Print`/`Type` form, which
-    /// overrides `discard`/`ignore`/`retain` (spec 104756).
-    pub fn format_display(
-        &self,
-        show_all_headers: bool,
-        vars: &crate::variables::Variables,
-    ) -> Vec<u8> {
-        let mut output = Vec::new();
-
-        for line in &self.header_lines {
-            let field = line.split(|&b| b == b':').next().unwrap_or_default();
-            if show_all_headers || vars.header_filter.shows(field.trim_ascii()) {
-                output.extend_from_slice(line);
-                output.push(b'\n');
-            }
-        }
-
-        output.push(b'\n');
-        output.extend_from_slice(&self.body);
-
-        output
-    }
-
-    /// Format the full message including From line
-    pub fn format_full(&self) -> Vec<u8> {
-        let mut output = self.from_line.clone();
-        output.push(b'\n');
-
-        for line in &self.header_lines {
-            output.extend_from_slice(line);
-            output.push(b'\n');
-        }
-
-        output.push(b'\n');
-        output.extend_from_slice(&self.body);
-
-        // Ensure trailing newline
-        if !output.ends_with(b"\n") {
-            output.push(b'\n');
-        }
-
-        output
     }
 
     /// The `From ` line as text, for parsing the sender and date out of it.

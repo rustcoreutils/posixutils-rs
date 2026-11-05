@@ -80,10 +80,7 @@ pub(crate) fn parse(bytes: &[u8], store: &mut Store) -> io::Result<Vec<Message>>
             let was_headers = matches!(p.section, Section::Headers { .. });
             p.section = match p.section {
                 Section::Headers { folding } => header_line(&mut p.msg, folding, stored),
-                Section::Body => {
-                    push_line(&mut p.msg.body, unquote_from_line(stored));
-                    Section::Body
-                }
+                Section::Body => Section::Body,
             };
             store_line(store, p, raw, line, was_headers)?;
         }
@@ -143,7 +140,6 @@ fn header_line(msg: &mut Message, folding: bool, line: &[u8]) -> Section {
     }
     let Some(colon) = line.iter().position(|&b| b == b':') else {
         // Not a header field: the body began without its empty line.
-        push_line(&mut msg.body, line);
         return Section::Body;
     };
 
@@ -202,24 +198,12 @@ fn stored_lines(body: &[u8]) -> impl Iterator<Item = &[u8]> {
         .flatten()
 }
 
-fn push_line(body: &mut Vec<u8>, line: &[u8]) {
-    body.extend_from_slice(line);
-    body.push(b'\n');
-}
-
 /// Drop the empty line that separates a message from the next: it belongs
 /// to the mbox framing, which the writer adds back, not to the message.
 fn finish(p: Parsing) -> Message {
     let mut msg = p.msg;
     if let Some((len, true)) = p.last_body_line {
         msg.body_span.len -= len;
-    }
-    if msg.body == b"\n" || msg.body == b"\r\n" {
-        msg.body.clear();
-    } else if msg.body.ends_with(b"\n\r\n") {
-        msg.body.truncate(msg.body.len() - 2);
-    } else if msg.body.ends_with(b"\n\n") {
-        msg.body.pop();
     }
     msg
 }
@@ -323,7 +307,7 @@ fn write_line<W: Write>(w: &mut W, line: &[u8]) -> io::Result<()> {
 /// Remove one level of mbox `From ` quoting from a body line.
 ///
 /// mboxrd: `>From ` came from `From `, `>>From ` from `>From `, and so on.
-fn unquote_from_line(line: &[u8]) -> &[u8] {
+pub(crate) fn unquote_from_line(line: &[u8]) -> &[u8] {
     let rest = trim_quote_marks(line);
     if rest.starts_with(b"From ") && rest.len() < line.len() {
         &line[1..]
@@ -375,11 +359,17 @@ mod tests {
         (messages, store)
     }
 
+    /// Each message's body as read back from the store and unquoted.
     fn bodies(mbox: &str) -> Vec<String> {
-        parsed(mbox)
-            .0
+        let (messages, store) = parsed(mbox);
+        messages
             .iter()
-            .map(|m| String::from_utf8_lossy(&m.body).into_owned())
+            .map(|m| {
+                let stored = store.read(m.body_span).unwrap();
+                let lines = stored.split_inclusive(|&b| b == b'\n');
+                let unquoted: Vec<&[u8]> = lines.map(unquote_from_line).collect();
+                String::from_utf8_lossy(&unquoted.concat()).into_owned()
+            })
             .collect()
     }
 
@@ -439,9 +429,9 @@ mod tests {
     #[test]
     fn counts_cover_every_stored_line() {
         let mbox = "From a Mon Jan  1 00:00:00 2024\nStatus: O\n\nbody\n\n";
-        let (messages, _) = parsed(mbox);
+        let (messages, store) = parsed(mbox);
         let msg = &messages[0];
         assert_eq!((msg.raw_lines, msg.raw_bytes), (5, mbox.len()));
-        assert_eq!(msg.body, b"body\n");
+        assert_eq!(store.read(msg.body_span).unwrap(), b"body\n");
     }
 }

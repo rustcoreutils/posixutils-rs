@@ -545,3 +545,74 @@ fn recovery_file_in_use_is_not_reported() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("mailx-recover"), "{}", stderr);
 }
+
+/// Prepend a read message to an mbox reached through `link`, made by
+/// `make_link` beside the real file, returning what each name then holds.
+fn prepend_through_link(
+    make_link: fn(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+) -> (plib::tmp::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let sys = dir.path().join("spool");
+    std::fs::write(
+        &sys,
+        "From alice@example.com Fri Nov 29 10:00:00 2024\nSubject: fresh mail\n\nbody\n\n",
+    )
+    .unwrap();
+    std::fs::create_dir(dir.path().join("data")).unwrap();
+    let real = dir.path().join("data").join("mbox");
+    std::fs::write(
+        &real,
+        "From older@example.com Fri Nov 22 09:00:00 2024\nSubject: previously saved\n\nold\n\n",
+    )
+    .unwrap();
+    let link = dir.path().join("mbox");
+    make_link(&real, &link).unwrap();
+
+    let output = mailx_env(
+        &["-n", "-N"],
+        "print 1\nquit\n",
+        &[
+            ("MAIL", sys.to_str().unwrap()),
+            ("MBOX", link.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0), "{:?}", output);
+    (dir, real, link)
+}
+
+/// The mail now at `path`: the migrated message, then the old.
+fn assert_prepended(path: &std::path::Path) {
+    let after = std::fs::read_to_string(path).unwrap();
+    let new_at = after.find("fresh mail");
+    let old_at = after.find("previously saved");
+    assert!(
+        matches!((new_at, old_at), (Some(n), Some(o)) if n < o),
+        "{}: {:?}",
+        path.display(),
+        after
+    );
+}
+
+/// An mbox that is a symbolic link stays one: the mail goes to the file it
+/// names, not into a regular file put in the link's place.
+#[test]
+fn prepend_to_mbox_keeps_a_symlink() {
+    let (_dir, real, link) =
+        prepend_through_link(|real, link| std::os::unix::fs::symlink(real, link));
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "mbox is no longer a symlink"
+    );
+    assert_prepended(&real);
+}
+
+/// An mbox with other hard links stays one file: every name sees the mail.
+#[test]
+fn prepend_to_mbox_keeps_hard_links() {
+    let (_dir, real, link) = prepend_through_link(|real, link| std::fs::hard_link(real, link));
+    assert_prepended(&link);
+    assert_prepended(&real);
+}

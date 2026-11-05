@@ -475,7 +475,14 @@ fn migrate_to_mbox(
         drop(w);
         return commit(file);
     }
-    match prepend_by_rename(path, &file, store, messages) {
+    // A file with other names is rewritten where it is, as BSD mailx always
+    // does: renaming over one name would split it from the others.
+    if std::os::unix::fs::MetadataExt::nlink(&file.metadata()?) > 1 {
+        return prepend_in_place(path, file, store, messages);
+    }
+    // Through a symbolic link, the file to replace is the one it names.
+    let target = fs::canonicalize(path)?;
+    match prepend_by_rename(&target, &file, store, messages) {
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
             prepend_in_place(path, file, store, messages)
         }
@@ -488,14 +495,15 @@ fn migrate_to_mbox(
 ///
 /// mbox is never truncated, so whenever mailx stops it holds either all of
 /// its old contents or all of its new ones. The replacement takes mbox's
-/// mode; mbox belongs to the user, so its owner is unchanged.
+/// mode; mbox belongs to the user, so its owner is unchanged. `path` names
+/// the file itself, not a link to it.
 fn prepend_by_rename(
-    path: &str,
+    path: &std::path::Path,
     old: &File,
     store: &Store,
     messages: &[&Message],
 ) -> io::Result<()> {
-    let dir = match std::path::Path::new(path).parent() {
+    let dir = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => std::path::Path::new("."),
     };

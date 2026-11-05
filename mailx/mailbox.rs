@@ -422,8 +422,7 @@ fn rewrite_mailbox(
     if messages.is_empty() && tail_len == 0 && !keep {
         // An emptied mailbox is removed unless `keep` is set, in which case it
         // is truncated to zero length instead (spec 104636-104637).
-        drop(file);
-        fs::remove_file(path)?;
+        remove_locked(path, file)?;
         return Ok("removed");
     }
 
@@ -433,6 +432,17 @@ fn rewrite_mailbox(
         Ok(())
     })?;
     Ok("complete")
+}
+
+/// Unlink the mailbox at `path`, then let go of `locks`, its locked file.
+///
+/// In that order, as BSD mailx removes the mailbox before closing it: a
+/// delivery agent waiting on the locks finds, once let in, that the file it
+/// locked is gone, and does not append mail to it just before the unlink.
+fn remove_locked<L>(path: &str, locks: L) -> io::Result<()> {
+    let removed = fs::remove_file(path);
+    drop(locks);
+    removed
 }
 
 /// Move read messages into the secondary mbox.
@@ -609,5 +619,32 @@ mod tests {
             "the signal acted while the dotlock was held"
         );
         assert!(!fs::read_to_string(&path).unwrap().contains("first"));
+    }
+
+    /// An emptied mailbox is unlinked before its locks are let go: a
+    /// delivery agent waiting on them, once let in, finds the file it locked
+    /// already gone, rather than appending to it in the moment before mailx
+    /// unlinks it and losing the mail.
+    #[test]
+    fn an_emptied_mailbox_is_unlinked_under_its_locks() {
+        /// Stands for the locked file: records, when let go, whether the
+        /// mailbox was still there.
+        struct Locks<'a>(&'a std::path::Path, &'a std::cell::Cell<Option<bool>>);
+        impl Drop for Locks<'_> {
+            fn drop(&mut self) {
+                self.1.set(Some(self.0.exists()));
+            }
+        }
+
+        let dir = plib::tmp::TempDir::new().unwrap();
+        let path = dir.path().join("folder");
+        fs::write(&path, "").unwrap();
+        let there_at_release = std::cell::Cell::new(None);
+        remove_locked(path.to_str().unwrap(), Locks(&path, &there_at_release)).unwrap();
+        assert_eq!(
+            there_at_release.get(),
+            Some(false),
+            "the mailbox was unlinked after its locks were let go"
+        );
     }
 }

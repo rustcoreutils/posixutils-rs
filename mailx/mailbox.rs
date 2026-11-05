@@ -74,6 +74,9 @@ pub struct Mailbox {
     /// rewrite at quit copies those bytes through verbatim, so a concurrent
     /// delivery is not destroyed by writing back only the messages we parsed.
     loaded_len: u64,
+    /// Size of the mailbox file when last looked at for new mail: past
+    /// `loaded_len` when bytes there were not a message to take in.
+    checked_len: u64,
 }
 
 impl Mailbox {
@@ -87,6 +90,7 @@ impl Mailbox {
             store: Store::default(),
             prev_path: None,
             loaded_len: 0,
+            checked_len: 0,
         }
     }
 
@@ -103,6 +107,7 @@ impl Mailbox {
         let (messages, len) = crate::mbox::parse(input, &mut mailbox.store).context(path)?;
         mailbox.messages = messages;
         mailbox.loaded_len = len;
+        mailbox.checked_len = len;
 
         // The first new message, else the first unread one, else the first.
         let first = |state| mailbox.messages.iter().position(|m| m.read == state);
@@ -127,10 +132,12 @@ impl Mailbox {
             .count()
     }
 
-    /// Whether the mailbox file's size has changed since it was read: a
-    /// cheap check, without locks, for whether to [`Mailbox::incorporate`].
+    /// Whether the mailbox file has grown since it was last looked at for new
+    /// mail: a cheap check, without locks, for whether to
+    /// [`Mailbox::incorporate`]. A mailbox that shrank holds no new mail, as
+    /// BSD mailx's `autoinc` has it.
     pub fn changed_size(&self) -> bool {
-        fs::metadata(&self.path).is_ok_and(|m| m.len() != self.loaded_len)
+        fs::metadata(&self.path).is_ok_and(|m| m.len() > self.checked_len)
     }
 
     /// Take in mail delivered to the mailbox since it was read, returning
@@ -148,6 +155,7 @@ impl Mailbox {
         if len < self.loaded_len {
             return Err(format!("{}: mailbox shrank while open", self.path).into());
         }
+        self.checked_len = self.checked_len.max(len);
         let mut file = &file;
         file.seek(io::SeekFrom::Start(self.loaded_len))
             .context(&self.path)?;
@@ -646,5 +654,38 @@ mod tests {
             Some(false),
             "the mailbox was unlinked after its locks were let go"
         );
+    }
+
+    const ONE_MESSAGE: &str = "From a@b Mon Jan  1 00:00:00 2024\n\nonly\n\n";
+
+    /// A mailbox that shrank under mailx is not new mail for `autoinc` to
+    /// take the locks for -- and fail on -- at every prompt.
+    #[test]
+    fn a_shrunken_mailbox_has_no_new_mail() {
+        let dir = plib::tmp::TempDir::new().unwrap();
+        let path = dir.path().join("folder");
+        fs::write(&path, ONE_MESSAGE).unwrap();
+        let mb = Mailbox::load(path.to_str().unwrap()).unwrap();
+        fs::write(&path, "").unwrap();
+        assert!(!mb.changed_size());
+    }
+
+    /// Bytes that are not a message, once looked at, are not looked at
+    /// again until more arrive.
+    #[test]
+    fn a_tail_that_is_not_mail_is_checked_once() {
+        let dir = plib::tmp::TempDir::new().unwrap();
+        let path = dir.path().join("folder");
+        fs::write(&path, ONE_MESSAGE).unwrap();
+        let mut mb = Mailbox::load(path.to_str().unwrap()).unwrap();
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"half a message\n").unwrap();
+        assert!(mb.changed_size());
+        assert_eq!(mb.incorporate().unwrap(), 0);
+        assert!(!mb.changed_size(), "the same tail is to be checked again");
+
+        file.write_all(b"\nFrom c@d Mon Jan  1 00:00:00 2024\n\nmore\n\n")
+            .unwrap();
+        assert!(mb.changed_size(), "more mail went unnoticed");
     }
 }

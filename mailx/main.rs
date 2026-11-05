@@ -132,7 +132,7 @@ fn command_loop(mb: &mut Mailbox, vars: &mut Variables, interp: &mut Interp, is_
     let mut ignored_eofs = 0;
     loop {
         // `autoinc` takes in new mail before each prompt, as in BSD mailx;
-        // the locks are taken only when the mailbox has changed.
+        // the locks are taken only when the mailbox has grown.
         if vars.is_set("autoinc") && mb.changed_size() {
             match mb.incorporate() {
                 Ok(0) => {}

@@ -926,3 +926,38 @@ fn pipe_takes_a_quoted_command() {
     );
     assert_eq!(output.status.code(), Some(0), "exit status");
 }
+
+/// `copy` with no file copies to mbox, as `save` does, but leaves the
+/// message unmarked, so quitting does not remove it from the mailbox.
+#[test]
+fn copy_without_a_file_copies_to_mbox() {
+    let mbox = copy_test_data("testdata.mbox");
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let secondary = dir.path().join("mbox");
+    let output = mailx_env(
+        &["-n", "-N", "-f", mbox.path().to_str().unwrap()],
+        "copy 2\nfrom 2\nquit\n",
+        &[("MBOX", secondary.to_str().unwrap())],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let copied = std::fs::read_to_string(&secondary).unwrap_or_default();
+    assert!(
+        copied.contains("Subject: Project Update"),
+        "copy should write message 2 to mbox: {}\n{}",
+        copied,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !stdout
+            .lines()
+            .any(|l| l.starts_with(">*") || l.starts_with(" *")),
+        "copy must not mark the message saved: {}",
+        stdout
+    );
+    let kept = std::fs::read_to_string(mbox.path()).unwrap();
+    assert!(
+        kept.contains("Subject: Project Update"),
+        "message 2 left the mailbox"
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
+}

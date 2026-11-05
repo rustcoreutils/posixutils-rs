@@ -136,7 +136,7 @@ const COMMANDS: &[Cmd] = &[
     cmd("unset", 3, ANY, |a, _, v, _| cmd_unset(a, v)),
     cmd("cd", 2, CMD_RC, |a, _, _, _| cmd_cd(a)),
     cmd("chdir", 2, CMD_RC, |a, _, _, _| cmd_cd(a)),
-    cmd("copy", 1, CMD_RC, |a, m, v, _| cmd_copy(a, m, v, false)),
+    cmd("copy", 1, CMD_RC, |a, m, v, _| cmd_save(a, m, v, false)),
     cmd("Copy", 1, CMD, |a, m, v, _| cmd_copy_author(a, m, v, false)),
     cmd("delete", 1, CMD_RC, |a, m, v, _| cmd_delete(a, m, v)),
     cmd("discard", 2, CMD_RC, |a, _, v, _| cmd_discard(a, v)),
@@ -442,25 +442,6 @@ fn cmd_cd(args: &str) -> Result<CommandResult> {
     };
 
     env::set_current_dir(&dir).context(&dir)?;
-    Ok(CommandResult::Continue)
-}
-
-fn cmd_copy(
-    args: &str,
-    mb: &mut Mailbox,
-    vars: &mut Variables,
-    mark_saved: bool,
-) -> Result<CommandResult> {
-    let (msg_nums, filename) = msglist_and_file(args, mb, vars, true)?;
-
-    let written = mb.save_messages(&msg_nums, &filename, true)?;
-
-    if mark_saved {
-        mark_messages_saved(mb, &msg_nums);
-    }
-
-    report_written(&msg_nums, &filename, written);
-
     Ok(CommandResult::Continue)
 }
 
@@ -935,6 +916,8 @@ fn cmd_retain(args: &str, vars: &mut Variables) -> Result<CommandResult> {
     Ok(CommandResult::Continue)
 }
 
+/// `save` and `copy`: append messages to a file, mbox when none is named.
+/// `copy` differs only in leaving the messages unmarked.
 fn cmd_save(
     args: &str,
     mb: &mut Mailbox,

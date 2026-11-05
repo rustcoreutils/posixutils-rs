@@ -15,7 +15,7 @@ use std::io::{self, IsTerminal, Write};
 use std::process::Command;
 
 use crate::compose::compose_body;
-use crate::error::{IoContext, Result};
+use crate::error::{Error, IoContext, Result};
 use crate::filename::{expand_local_prefixes, expand_typed_filename};
 use crate::mailbox::{Direction, Mailbox};
 use crate::message::{author_filename, Disposition, Message, ReadState};
@@ -56,12 +56,14 @@ impl Context {
         }
     }
 
-    fn where_invalid(self) -> &'static str {
-        match self {
+    /// The diagnostic for command `word`, not valid in this context.
+    fn reject(self, word: &str) -> Error {
+        let why = match self {
             Context::Command => "command not valid here",
             Context::Startup => "command not valid in a start-up file",
             Context::Input => "command not valid in input mode",
-        }
+        };
+        format!("{}: {}", word, why).into()
     }
 }
 
@@ -207,7 +209,7 @@ fn lookup(word: &str, ctx: Context) -> Option<Result<&'static Cmd>> {
         .iter()
         .find(|c| word.len() >= c.min && c.name.len() >= word.len() && c.name.starts_with(word))?;
     Some(if cmd.ctx & ctx.bit() == 0 {
-        Err(format!("{}: {}", word, ctx.where_invalid()).into())
+        Err(ctx.reject(word))
     } else {
         Ok(cmd)
     })
@@ -270,7 +272,7 @@ pub fn execute_in(
     // Shell escape. Not valid in a start-up file (spec 104557-104559).
     if let Some(rest) = line.strip_prefix('!') {
         if ctx == Context::Startup {
-            return Err("!: command not valid in a start-up file".into());
+            return Err(ctx.reject("!"));
         }
         return cmd_shell(rest, vars, interp);
     }
@@ -283,7 +285,7 @@ pub fn execute_in(
 
     if let Some(punct) = PUNCTUATION.iter().find(|c| c.name == cmd) {
         if punct.ctx & ctx.bit() == 0 {
-            return Err(format!("{}: {}", cmd, ctx.where_invalid()).into());
+            return Err(ctx.reject(cmd));
         }
         return (punct.run)(args, mb, vars, interp);
     }
@@ -292,7 +294,7 @@ pub fn execute_in(
     if let Some(direction) = cmd.strip_prefix('z') {
         if direction.is_empty() || direction == "+" || direction == "-" {
             if ctx != Context::Command {
-                return Err(format!("{}: {}", cmd, ctx.where_invalid()).into());
+                return Err(ctx.reject(cmd));
             }
             return cmd_scroll(direction, mb, vars);
         }
@@ -305,17 +307,21 @@ pub fn execute_in(
     // A bare message number selects and prints that message.
     if let Ok(num) = cmd.parse::<usize>() {
         if ctx != Context::Command {
-            return Err(format!("{}: {}", cmd, ctx.where_invalid()).into());
+            return Err(ctx.reject(cmd));
         }
-        return if num > 0 && num <= mb.message_count() {
-            mb.set_current(num);
-            cmd_print("", mb, vars, false)
-        } else {
-            Err(format!("Invalid message number: {}", num).into())
-        };
+        return cmd_goto(num, mb, vars);
     }
 
     Err(format!("Unknown command: {}", cmd).into())
+}
+
+/// A bare message number: make it current and print it.
+fn cmd_goto(num: usize, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult> {
+    if mb.get(num).is_none() {
+        return Err(format!("Invalid message number: {}", num).into());
+    }
+    mb.set_current(num);
+    cmd_print("", mb, vars, false)
 }
 
 fn parse_command_line(line: &str) -> (&str, &str) {

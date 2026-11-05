@@ -87,34 +87,11 @@ pub(crate) fn compose_body(
 
         interrupt_count = 0;
 
-        // Check for escape character (disabled when `escape` is null). The
-        // line is bytes, so the escape char is compared in its UTF-8 form; the
-        // escape command itself is text.
-        let escape = escape_char.and_then(|ec| {
-            let mut buf = [0u8; 4];
-            let ec = ec.encode_utf8(&mut buf).as_bytes();
-            (line.starts_with(ec) && line.len() > ec.len())
-                .then(|| String::from_utf8_lossy(&line[ec.len()..]).into_owned())
-        });
-        if let Some(escape) = escape {
-            // A tilde-escape error is diagnosed but does not abort the message
-            // (spec 105114-105119).
-            match handle_escape(&escape, composed, vars, interp, mb) {
-                Ok(Escape::Continue) => continue,
-                Ok(Escape::Finish) => break,
-                // `~q` saves the partial message, `~x` does not
-                // (spec 105081-105083, 105097).
-                Ok(Escape::Abort { save_dead_letter }) => {
-                    if save_dead_letter && vars.is_set("save") && !composed.body.is_empty() {
-                        crate::send::save_dead_letter(composed, vars);
-                    }
-                    return Err(Error::Aborted);
-                }
-                Err(e) => {
-                    eprintln!("{}", e);
-                    continue;
-                }
+        if let Some(escape) = escape_text(&line, escape_char) {
+            if perform_escape(&escape, composed, vars, interp, mb)? {
+                break;
             }
+            continue;
         }
 
         // Check for single period (if dot is set, or ignoreeof forces it)
@@ -126,4 +103,42 @@ pub(crate) fn compose_body(
     }
 
     Ok(())
+}
+
+/// The command escape `line` holds: the text after a leading escape
+/// character, which is compared in its UTF-8 form since the line is bytes.
+/// `None` when escapes are disabled (`escape` is null).
+fn escape_text(line: &[u8], escape_char: Option<char>) -> Option<String> {
+    let mut buf = [0u8; 4];
+    let ec = escape_char?.encode_utf8(&mut buf).as_bytes();
+    (line.starts_with(ec) && line.len() > ec.len())
+        .then(|| String::from_utf8_lossy(&line[ec.len()..]).into_owned())
+}
+
+/// Perform a command escape, returning whether it ended the message.
+///
+/// An error in an escape is diagnosed without abandoning the message (spec
+/// 105114-105119). `~q` saves the partial message and `~x` does not (spec
+/// 105081-105083, 105097); both end composition with [`Error::Aborted`].
+fn perform_escape(
+    escape: &str,
+    composed: &mut ComposedMessage,
+    vars: &mut Variables,
+    interp: &mut Interp,
+    mb: Option<&Mailbox>,
+) -> Result<bool> {
+    match handle_escape(escape, composed, vars, interp, mb) {
+        Ok(Escape::Continue) => Ok(false),
+        Ok(Escape::Finish) => Ok(true),
+        Ok(Escape::Abort { save_dead_letter }) => {
+            if save_dead_letter && vars.is_set("save") && !composed.body.is_empty() {
+                crate::send::save_dead_letter(composed, vars);
+            }
+            Err(Error::Aborted)
+        }
+        Err(e) => {
+            eprintln!("{}", e);
+            Ok(false)
+        }
+    }
 }

@@ -961,3 +961,44 @@ fn copy_without_a_file_copies_to_mbox() {
     );
     assert_eq!(output.status.code(), Some(0), "exit status");
 }
+
+/// `autoprint` has no effect on `dp`: the next message is written once.
+#[test]
+fn dp_prints_once_with_autoprint() {
+    let mbox = copy_test_data("testdata.mbox");
+    let output = mailx(
+        &["-n", "-N", "-f", mbox.path().to_str().unwrap()],
+        "set autoprint\ndp 1\nexit\n",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.matches("Subject: Project Update").count(),
+        1,
+        "dp should print message 2 exactly once: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
+}
+
+/// `dp` on the last message has no following message to write; it reports
+/// the end of the mailbox rather than writing the one before.
+#[test]
+fn dp_of_the_last_message_reports_the_end() {
+    let mbox = copy_test_data("testdata.mbox");
+    let output = mailx(
+        &["-n", "-N", "-f", mbox.path().to_str().unwrap()],
+        "dp 3\nexit\n",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("At EOF"),
+        "dp 3 should report EOF: {}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("Subject:"),
+        "dp 3 must not print another message: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
+}

@@ -477,27 +477,33 @@ fn cmd_copy_author(
 
 fn cmd_delete(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult> {
     let msg_nums = msglist_or_current(args, mb, vars)?;
+    delete_messages(mb, &msg_nums);
+    if vars.is_set("autoprint") && mb.current_message().is_some_and(|m| !m.is_deleted()) {
+        cmd_print("", mb, vars, false)?;
+    }
+    Ok(CommandResult::Continue)
+}
 
-    let max_deleted = msg_nums.iter().copied().max().unwrap_or(0);
-
-    for num in &msg_nums {
-        if let Some(m) = mb.get_mut(*num) {
+/// Mark `msg_nums` deleted and make current the first undeleted message
+/// after the last of them, or failing that the last one before it.
+///
+/// Returns whether a message followed the last one deleted.
+fn delete_messages(mb: &mut Mailbox, msg_nums: &[usize]) -> bool {
+    for &num in msg_nums {
+        if let Some(m) = mb.get_mut(num) {
             m.disposition = Disposition::Deleted;
         }
     }
-
+    let last = msg_nums.iter().copied().max().unwrap_or(0);
     let live = |m: &Message| !m.is_deleted();
-    if let Some(next) = mb.find(max_deleted, Direction::Forward, live) {
+    if let Some(next) = mb.find(last, Direction::Forward, live) {
         mb.set_current(next);
-    } else if let Some(prev) = mb.find(max_deleted, Direction::Backward, live) {
+        return true;
+    }
+    if let Some(prev) = mb.find(last, Direction::Backward, live) {
         mb.set_current(prev);
     }
-
-    if vars.is_set("autoprint") && mb.current_message().is_some_and(live) {
-        cmd_print("", mb, vars, false)?;
-    }
-
-    Ok(CommandResult::Continue)
+    false
 }
 
 fn cmd_discard(args: &str, vars: &mut Variables) -> Result<CommandResult> {
@@ -513,16 +519,15 @@ fn cmd_discard(args: &str, vars: &mut Variables) -> Result<CommandResult> {
     Ok(CommandResult::Continue)
 }
 
+/// `dp`/`dt`: delete, then write the message after the last one deleted.
+/// Unlike `delete`, it ignores `autoprint`.
 fn cmd_dp(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult> {
-    // Delete and print next
-    cmd_delete(args, mb, vars)?;
-
-    if mb.current_message().is_some_and(|m| !m.is_deleted()) {
+    let msg_nums = msglist_or_current(args, mb, vars)?;
+    if delete_messages(mb, &msg_nums) {
         cmd_print("", mb, vars, false)?;
     } else {
         println!("At EOF");
     }
-
     Ok(CommandResult::Continue)
 }
 

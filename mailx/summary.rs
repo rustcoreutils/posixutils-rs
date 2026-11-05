@@ -59,9 +59,15 @@ pub fn print_headers(mb: &Mailbox, msg_nums: Option<&[usize]>, vars: &Variables)
 /// Print the page of `screen` summaries that holds the current message.
 pub fn print_page(mb: &Mailbox, vars: &Variables) {
     let screen = vars.screen_lines().get();
-    let start = mb.current().map_or(1, |c| (c - 1) / screen * screen + 1);
+    let start = mb.current().map_or(1, |c| page_start(c, vars));
     let nums: Vec<usize> = (start..=mb.message_count().min(start + screen - 1)).collect();
     print_headers(mb, Some(&nums), vars);
+}
+
+/// The first message on the page of `screen` summaries holding `num`.
+pub fn page_start(num: usize, vars: &Variables) -> usize {
+    let screen = vars.screen_lines().get();
+    (num - 1) / screen * screen + 1
 }
 
 /// The date for the header summary, as `Www Mmm dd hh:mm`.

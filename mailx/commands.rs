@@ -654,12 +654,14 @@ fn cmd_from(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
     Ok(CommandResult::Continue)
 }
 
+/// `headers [message]`: the page of summaries holding `message`, which then
+/// makes the message at the top of that page current; without one, the page
+/// holding the current message, which stays current.
 fn cmd_headers(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult> {
     if !args.is_empty() {
         let msg_num = parse_message(args, mb, vars)?;
-        mb.set_current(msg_num);
+        mb.set_current(crate::summary::page_start(msg_num, vars));
     }
-
     crate::summary::print_page(mb, vars);
 
     Ok(CommandResult::Continue)

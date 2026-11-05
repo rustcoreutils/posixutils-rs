@@ -9,7 +9,7 @@
 
 //! Command-mode commands, one group per command.
 
-use crate::common::{copy_test_data, create_temp_mbox, mailx, mailx_env};
+use crate::common::{copy_test_data, create_temp_mailrc, create_temp_mbox, mailx, mailx_env};
 use plib::tmp::NamedTempFile;
 use std::io::Write;
 
@@ -1045,4 +1045,22 @@ fn edit_leaves_the_message_unchanged() {
         "the message is gone from the mailbox"
     );
     assert_eq!(output.status.code(), Some(0), "exit status");
+}
+
+/// `headers n` makes the message at the top of n's page current.
+#[test]
+fn headers_with_a_message_makes_its_page_top_current() {
+    let mbox = copy_test_data("testdata.mbox");
+    let mailrc = create_temp_mailrc("set screen=2\n");
+    let output = mailx_env(
+        &["-N", "-f", mbox.path().to_str().unwrap()],
+        "headers 2\n=\nheaders 3\n=\nexit\n",
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let numbers: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.parse::<usize>().is_ok())
+        .collect();
+    assert_eq!(numbers, ["1", "3"], "{}", stdout);
 }

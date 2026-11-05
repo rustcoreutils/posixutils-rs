@@ -187,7 +187,7 @@ impl Mailbox {
             // The mbox/touch commands force a message into the secondary mbox,
             // overriding a set `hold` variable (spec 104853-104855).
             if msg.force_mbox && msg.disposition != Disposition::Deleted {
-                mbox_messages.push(msg.clone());
+                mbox_messages.push(msg);
                 continue;
             }
             match msg.disposition {
@@ -203,9 +203,9 @@ impl Mailbox {
                     // entirely and discarded the message either way.
                     if keepsave {
                         if self.is_system_mailbox {
-                            mbox_messages.push(msg.clone());
+                            mbox_messages.push(msg);
                         } else {
-                            keep_messages.push(msg.clone());
+                            keep_messages.push(msg);
                         }
                     }
                 }
@@ -213,13 +213,13 @@ impl Mailbox {
                 // its read state. That state is no longer overwritten by the
                 // request, so `:r` still matches a preserved message that was
                 // read, and the `Status:` written back stays accurate.
-                Disposition::Preserved => keep_messages.push(msg.clone()),
+                Disposition::Preserved => keep_messages.push(msg),
                 Disposition::Keep => {
                     let migrate = self.is_system_mailbox && !hold && msg.read == ReadState::Read;
                     if migrate {
-                        mbox_messages.push(msg.clone());
+                        mbox_messages.push(msg);
                     } else {
-                        keep_messages.push(msg.clone());
+                        keep_messages.push(msg);
                     }
                 }
             }
@@ -266,9 +266,7 @@ impl Mailbox {
         include_from_line: bool,
     ) -> Result<u64> {
         let messages: Vec<&Message> = msg_nums.iter().filter_map(|&n| self.get(n)).collect();
-
-        let msgs: Vec<Message> = messages.iter().map(|m| (*m).clone()).collect();
-        append_messages_to_file(path, &msgs, include_from_line).context(path)
+        append_messages_to_file(path, &messages, include_from_line).context(path)
     }
 }
 
@@ -280,7 +278,7 @@ impl Mailbox {
 /// referring to the same file, and the mode, owner, and group are untouched.
 fn rewrite_mailbox(
     path: &str,
-    messages: &[Message],
+    messages: &[&Message],
     loaded_len: u64,
     keep: bool,
 ) -> io::Result<()> {
@@ -318,7 +316,7 @@ fn rewrite_mailbox(
 /// `noappend`, the default, places them at the *beginning* of mbox; `append`
 /// puts them at the end (spec 104579-104580). Neither truncates: the previously
 /// saved mail is retained in both cases.
-fn migrate_to_mbox(path: &str, messages: &[Message], append: bool) -> io::Result<()> {
+fn migrate_to_mbox(path: &str, messages: &[&Message], append: bool) -> io::Result<()> {
     let (mut file, _dotlock) = open_locked(path)?;
 
     let mut existing = Vec::new();
@@ -351,7 +349,7 @@ fn migrate_to_mbox(path: &str, messages: &[Message], append: bool) -> io::Result
 /// Returns the number of bytes appended.
 fn append_messages_to_file(
     path: &str,
-    messages: &[Message],
+    messages: &[&Message],
     include_from_line: bool,
 ) -> io::Result<u64> {
     let mut file = crate::util::private_open()

@@ -164,7 +164,7 @@ fn finish(mut msg: Message) -> Message {
 /// line, as the format requires.
 pub(crate) fn write_messages<W: Write>(
     w: &mut W,
-    messages: &[Message],
+    messages: &[&Message],
     include_from_line: bool,
 ) -> io::Result<()> {
     for msg in messages {

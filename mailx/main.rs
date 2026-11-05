@@ -17,6 +17,7 @@ mod mailbox;
 mod mbox;
 mod message;
 mod msglist;
+mod script;
 mod send;
 mod signals;
 mod summary;
@@ -304,7 +305,7 @@ fn load_rc_content(content: &str, path: &str, vars: &mut Variables, mode: RcMode
     // Start-up files have no message store. Commands that need one are excluded
     // by their context mask, so this scratch mailbox is never read from.
     let mut scratch = Mailbox::new(String::new());
-    commands::run_script(content, path, &mut scratch, vars);
+    script::run_script(content, path, &mut scratch, vars);
 }
 
 fn get_system_mailbox() -> String {

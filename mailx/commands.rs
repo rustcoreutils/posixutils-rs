@@ -494,10 +494,10 @@ pub fn execute_in(
     // Conditionals are handled before the context check, so an `if` guarding a
     // command that is illegal here still suppresses it rather than diagnosing
     // it.
-    if let Some(result) = conditional(cmd, args, vars) {
+    if let Some(result) = crate::script::conditional(cmd, args, vars) {
         return result.map(|_| CommandResult::Continue);
     }
-    if !vars.cond_active() {
+    if !vars.cond.active() {
         return Ok(CommandResult::Continue);
     }
 
@@ -550,47 +550,6 @@ pub fn execute_in(
     }
 
     Err(format!("Unknown command: {}", cmd).into())
-}
-
-/// Handle `if`/`else`/`endif`, returning `None` when `cmd` is none of them.
-///
-/// One engine for both contexts. There used to be two, disagreeing on whether a
-/// stray `else` was a warning or an error, and on whether `if s` was even
-/// recognized; a third copy in the start-up dispatcher matched the same words
-/// and did nothing with them.
-fn conditional(cmd: &str, args: &str, vars: &mut Variables) -> Option<Result<()>> {
-    let is = |name: &str, min: usize| {
-        cmd.len() >= min && name.len() >= cmd.len() && name.starts_with(cmd)
-    };
-
-    if is("if", 1) {
-        // `s` is true while reading a start-up file for Send Mode, `r` for
-        // Receive Mode. The command loop is Receive Mode by definition.
-        let matches = match args.trim() {
-            "r" => !vars.send_mode,
-            "s" => vars.send_mode,
-            _ => false,
-        };
-        vars.cond_stack.push((matches, false));
-        return Some(Ok(()));
-    }
-    if is("else", 2) {
-        return Some(match vars.cond_stack.pop() {
-            Some((_, true)) | None => Err("unexpected else".into()),
-            Some((matches, false)) => {
-                vars.cond_stack.push((!matches, true));
-                Ok(())
-            }
-        });
-    }
-    if is("endif", 2) {
-        return Some(if vars.cond_stack.pop().is_none() {
-            Err("unexpected endif".into())
-        } else {
-            Ok(())
-        });
-    }
-    None
 }
 
 fn parse_command_line(line: &str) -> (&str, &str) {
@@ -1365,27 +1324,8 @@ fn cmd_size(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
 fn cmd_source(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult> {
     let path = expand_filename(args.trim(), vars);
     let content = fs::read_to_string(&path).context(&path)?;
-    run_script(&content, &path, mb, vars);
+    crate::script::run_script(&content, &path, mb, vars);
     Ok(CommandResult::Continue)
-}
-
-/// Run every line of `content` as a start-up script.
-///
-/// Errors are reported and the script continues, which is one of the two
-/// behaviors spec 104559-104561 permits. An unterminated `if` is diagnosed at
-/// the end and the conditional stack is reset, so a malformed file cannot leave
-/// the rest of the session suppressed.
-pub fn run_script(content: &str, path: &str, mb: &mut Mailbox, vars: &mut Variables) {
-    let depth = vars.cond_stack.len();
-    for line in content.lines() {
-        if let Err(e) = execute_in(line, mb, vars, Context::Startup) {
-            eprintln!("mailx: {}: {}", path, e);
-        }
-    }
-    if vars.cond_stack.len() > depth {
-        eprintln!("mailx: {}: missing endif", path);
-        vars.cond_stack.truncate(depth);
-    }
 }
 
 fn cmd_top(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult> {

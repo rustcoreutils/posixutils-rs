@@ -12,6 +12,8 @@
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
+use crate::script::CondStack;
+
 /// Mailx internal variables
 #[derive(Debug)]
 pub struct Variables {
@@ -29,9 +31,8 @@ pub struct Variables {
     pub retained_headers: Vec<String>,
     /// Last shell command (for ! expansion with bang variable)
     pub last_shell_cmd: Option<String>,
-    /// Conditional (`if`/`else`/`endif`) nesting state:
-    /// each entry is (this branch matches, currently in the else branch).
-    pub cond_stack: Vec<(bool, bool)>,
+    /// The `if`/`else`/`endif` blocks the interpreter is inside.
+    pub cond: CondStack,
     /// Whether mailx was invoked in Send Mode.
     ///
     /// This is what `if s` and `if r` in a start-up file ask about. Receive
@@ -50,7 +51,7 @@ impl Variables {
             ignored_headers: Vec::new(),
             retained_headers: Vec::new(),
             last_shell_cmd: None,
-            cond_stack: Vec::new(),
+            cond: CondStack::default(),
             send_mode: false,
         };
 
@@ -203,12 +204,6 @@ impl Variables {
 
         active.pop();
         result
-    }
-
-    /// Whether commands should currently execute given the conditional stack
-    /// (true when every enclosing `if`/`else` branch matches).
-    pub fn cond_active(&self) -> bool {
-        self.cond_stack.iter().all(|(matches, _)| *matches)
     }
 
     /// Check if an address is an alternate for the user

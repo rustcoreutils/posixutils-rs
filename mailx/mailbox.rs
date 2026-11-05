@@ -79,7 +79,7 @@ impl Mailbox {
         mailbox.current = mailbox
             .messages
             .iter()
-            .position(|m| m.read == ReadState::New || m.read == ReadState::Unread)
+            .position(|m| m.read.is_unread())
             .map(|i| i + 1)
             .unwrap_or(if mailbox.messages.is_empty() { 0 } else { 1 });
 
@@ -168,16 +168,9 @@ impl Mailbox {
         None
     }
 
-    /// Whether any message's read state differs from the `Status:` it loaded.
+    /// Whether any message's read state differs from the one it loaded with.
     fn state_differs_from_disk(&self) -> bool {
-        self.messages.iter().any(|m| {
-            let on_disk = m.get_header("status");
-            match (on_disk, m.read.status_value()) {
-                (None, None) => false,
-                (Some(a), Some(b)) => a != b,
-                _ => true,
-            }
-        })
+        self.messages.iter().any(|m| m.read != m.loaded_read)
     }
 
     /// Handle quit - save read messages to mbox, delete saved, etc.

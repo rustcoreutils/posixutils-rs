@@ -1143,7 +1143,7 @@ fn cmd_touch(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comma
         if let Some(m) = mb.get_mut(num) {
             // touch marks a message read so it moves to the mbox at quit,
             // overriding a set `hold` variable (grouped with mbox, spec 104627).
-            if m.read == ReadState::New || m.read == ReadState::Unread {
+            if m.read.is_unread() {
                 m.read = ReadState::Read;
             }
             m.force_mbox = true;

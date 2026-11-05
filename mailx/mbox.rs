@@ -103,13 +103,13 @@ pub(crate) fn parse(bytes: &[u8]) -> Vec<Message> {
                         } else if value.contains('O') {
                             msg.read = ReadState::Unread;
                         }
+                        msg.loaded_read = msg.read;
                         // Not retained in `header_lines`: the writer
                         // regenerates it from `read`, and keeping the loaded
                         // copy would emit a stale one beside the fresh one.
                         // Its continuation lines go with it -- leaving the
                         // previous header current would append them to
                         // whatever came before `Status:`.
-                        msg.headers.insert(key, value);
                         last_header_key.clear();
                         header_continuation = false;
                         continue;

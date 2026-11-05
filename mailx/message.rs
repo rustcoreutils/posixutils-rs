@@ -51,6 +51,11 @@ impl ReadState {
             ReadState::Read => Some("RO"),
         }
     }
+
+    /// Whether the message has yet to be read: `new` or `unread`.
+    pub fn is_unread(&self) -> bool {
+        matches!(self, ReadState::New | ReadState::Unread)
+    }
 }
 
 impl Message {
@@ -100,6 +105,8 @@ pub struct Message {
     pub raw_bytes: usize,
     /// How much of the message the user has seen.
     pub read: ReadState,
+    /// The read state recorded in the mailbox file, by its `Status:` header.
+    pub loaded_read: ReadState,
     /// What should become of it when the mailbox closes.
     pub disposition: Disposition,
     /// Whether this message has been displayed
@@ -119,6 +126,7 @@ impl Message {
             raw_lines: 0,
             raw_bytes: 0,
             read: ReadState::New,
+            loaded_read: ReadState::New,
             disposition: Disposition::Keep,
             displayed: false,
             force_mbox: false,

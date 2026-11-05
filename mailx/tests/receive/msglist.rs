@@ -455,3 +455,25 @@ fn default_msglist_without_a_current_message_is_diagnosed() {
     assert!(!saved.exists(), "save created a file with nothing in it");
     assert_eq!(output.status.code(), Some(0), "exit status");
 }
+
+/// `$` skips deleted messages as `^` does, and for `undelete` names the last
+/// deleted message.
+#[test]
+fn dollar_is_the_last_visible_message() {
+    let mbox = copy_test_data("testdata.mbox");
+    let output = mailx(
+        &["-n", "-N", "-f", mbox.path().to_str().unwrap()],
+        "delete 3\nprint $\ndelete 1\nundelete $\nfrom *\nexit\n",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Subject: Project Update"),
+        "p $ should print 2: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("charlie@example.net ") && !stdout.contains("alice@example.com "),
+        "undelete $ should restore message 3, the last deleted, and leave 1: {}",
+        stdout
+    );
+}

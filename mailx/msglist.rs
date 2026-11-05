@@ -93,7 +93,7 @@ impl Selector {
     /// The messages this selects, in mailbox order.
     fn select(&self, mb: &Mailbox, want: Want, allnet: bool) -> Result<Vec<usize>> {
         let visible = |m: &Message| want == Want::Deleted || !m.is_deleted();
-        // What `^`, `+` and `-` step through.
+        // What `^`, `$`, `+` and `-` step through.
         let positional = |m: &Message| m.is_deleted() == (want == Want::Deleted);
         let one =
             |found: Option<usize>, none: &str| found.map(|n| vec![n]).ok_or_else(|| none.into());
@@ -123,8 +123,8 @@ impl Selector {
                 none("No messages", "No deleted messages"),
             ),
             Selector::Last => one(
-                (mb.message_count() > 0).then(|| mb.message_count()),
-                "No messages",
+                mb.find(mb.message_count() + 1, Direction::Backward, positional),
+                none("No messages", "No deleted messages"),
             ),
             Selector::All => Ok(matching(mb, visible)),
             Selector::Next => one(

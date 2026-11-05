@@ -560,3 +560,27 @@ fn send_operands_cannot_inject_header_lines() {
 
     drop(mailrc);
 }
+
+/// A body on standard input that is not UTF-8 is sent, not refused.
+#[test]
+fn send_mode_accepts_eight_bit_body() {
+    let mailrc = create_temp_mailrc("set debug\n");
+    let body: &[u8] = b"caf\xe9 \xff\n";
+    let output = plib::testing::run_test_base_with_env(
+        "mailx",
+        &[
+            String::from("-s"),
+            String::from("s"),
+            String::from("to@example.com"),
+        ],
+        body,
+        &[("MAILRC", mailrc.path().to_str().unwrap())],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "8-bit body refused: {}", stderr);
+    assert!(
+        stderr.contains(&format!("Body: {} bytes", body.len())),
+        "body not kept whole: {}",
+        stderr
+    );
+}

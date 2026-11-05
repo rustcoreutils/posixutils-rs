@@ -1664,8 +1664,8 @@ pub(crate) fn compose_body(
     let mut interrupt_count = 0;
 
     loop {
-        let mut line = String::new();
-        match crate::signals::read_line_interruptible(&mut line) {
+        let mut line = Vec::new();
+        match crate::signals::read_bytes_interruptible(&mut line) {
             Ok(0) => {
                 // EOF - if ignoreeof is set, require "." (or ~.) to end.
                 if vars.get_bool("ignoreeof") {
@@ -1693,15 +1693,19 @@ pub(crate) fn compose_body(
 
         interrupt_count = 0;
 
-        // Check for escape character (disabled when `escape` is null). Slice
-        // past the escape char by its UTF-8 length so a multibyte escape does
-        // not split a character boundary.
-        if let Some(ec) =
-            escape_char.filter(|ec| line.starts_with(*ec) && line.len() > ec.len_utf8())
-        {
+        // Check for escape character (disabled when `escape` is null). The
+        // line is bytes, so the escape char is compared in its UTF-8 form; the
+        // escape command itself is text.
+        let escape = escape_char.and_then(|ec| {
+            let mut buf = [0u8; 4];
+            let ec = ec.encode_utf8(&mut buf).as_bytes();
+            (line.starts_with(ec) && line.len() > ec.len())
+                .then(|| String::from_utf8_lossy(&line[ec.len()..]).into_owned())
+        });
+        if let Some(escape) = escape {
             // A tilde-escape error is diagnosed but does not abort the message
             // (spec 105114-105119).
-            let result = match handle_escape(&line[ec.len_utf8()..], composed, vars, mb) {
+            let result = match handle_escape(&escape, composed, vars, mb) {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("{}", e);
@@ -1724,11 +1728,11 @@ pub(crate) fn compose_body(
         }
 
         // Check for single period (if dot is set, or ignoreeof forces it)
-        if (vars.get_bool("dot") || vars.get_bool("ignoreeof")) && line.trim() == "." {
+        if (vars.get_bool("dot") || vars.get_bool("ignoreeof")) && line.trim_ascii() == b"." {
             break;
         }
 
-        composed.body.push_str(&line);
+        composed.body.extend_from_slice(&line);
     }
 
     Ok(())

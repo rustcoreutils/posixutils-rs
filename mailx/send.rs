@@ -10,7 +10,7 @@
 //! Send mode implementation for mailx
 
 use std::env;
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::process::{Command, Stdio};
 
 use crate::args::Args;
@@ -24,7 +24,8 @@ pub struct ComposedMessage {
     pub cc: Vec<String>,
     pub bcc: Vec<String>,
     pub subject: String,
-    pub body: String,
+    /// The body as entered or read, which need not be UTF-8.
+    pub body: Vec<u8>,
     pub headers: Vec<(String, String)>,
 }
 
@@ -46,7 +47,7 @@ impl ComposedMessage {
     }
 
     /// Format the message for sending
-    pub fn format(&self) -> String {
+    pub fn format(&self) -> Vec<u8> {
         let mut msg = String::new();
 
         if !self.to.is_empty() {
@@ -64,7 +65,8 @@ impl ComposedMessage {
         }
 
         msg.push('\n');
-        msg.push_str(&self.body);
+        let mut msg = msg.into_bytes();
+        msg.extend_from_slice(&self.body);
 
         msg
     }
@@ -162,16 +164,21 @@ pub fn send_mode(args: &Args, vars: &mut Variables) -> Result<(), String> {
     if is_tty {
         crate::commands::compose_body(&mut msg, None, vars)?;
     } else {
-        // Non-interactive - just read stdin
-        for line in stdin.lock().lines() {
-            let line = line.map_err(|e| e.to_string())?;
-            msg.body.push_str(&line);
-            msg.body.push('\n');
+        // Non-interactive - just read stdin, as bytes: mail need not be UTF-8,
+        // and reading it as text refused any body that was not.
+        let mut input = Vec::new();
+        stdin
+            .lock()
+            .read_to_end(&mut input)
+            .map_err(|e| e.to_string())?;
+        for line in crate::util::byte_lines(&input) {
+            msg.body.extend_from_slice(line);
+            msg.body.push(b'\n');
         }
     }
 
     // -E: discard a message with an empty body without sending it.
-    if args.discard_empty && msg.body.trim().is_empty() {
+    if args.discard_empty && msg.body.trim_ascii().is_empty() {
         return Ok(());
     }
 
@@ -265,7 +272,7 @@ pub fn send_message(
     {
         let stdin = child.stdin.as_mut().ok_or("Failed to open stdin")?;
         stdin
-            .write_all(msg.format().as_bytes())
+            .write_all(&msg.format())
             .map_err(|e| format!("Failed to write message: {}", plib::diag::io_error_text(&e)))?;
     }
 
@@ -337,17 +344,19 @@ pub(crate) fn record_message(
         let mut file = &file;
         writeln!(file, "From {} {}", user, date)?;
         let formatted = msg.format();
-        let (headers, body) = match formatted.split_once("\n\n") {
-            Some((h, b)) => (h, b),
-            None => (formatted.as_str(), ""),
+        let (headers, body) = match formatted.windows(2).position(|w| w == b"\n\n") {
+            Some(at) => (&formatted[..at], &formatted[at + 2..]),
+            None => (&formatted[..], &[][..]),
         };
-        writeln!(file, "{}", headers)?;
+        file.write_all(headers)?;
         writeln!(file)?;
-        for line in body.lines() {
-            if crate::mailbox::needs_from_quoting(line.as_bytes()) {
+        writeln!(file)?;
+        for line in crate::util::byte_lines(body) {
+            if crate::mailbox::needs_from_quoting(line) {
                 write!(file, ">")?;
             }
-            writeln!(file, "{}", line)?;
+            file.write_all(line)?;
+            writeln!(file)?;
         }
         writeln!(file)?;
         Ok(())
@@ -369,7 +378,7 @@ pub fn save_dead_letter(msg: &ComposedMessage, vars: &Variables) {
         .truncate(true)
         .open(&dead_path);
     if let Ok(mut file) = created {
-        let _ = write!(file, "{}", msg.format());
+        let _ = file.write_all(&msg.format());
         // Informative notice -> stdout (spec STDOUT, 104412-104414).
         println!("Message saved to {}", dead_path);
     }

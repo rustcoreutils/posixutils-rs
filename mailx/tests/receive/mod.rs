@@ -5440,3 +5440,43 @@ fn stored_bytes_round_trip_exactly() {
     assert_eq!(std::fs::read(&copied).expect("read copy"), read);
     assert_eq!(std::fs::read(&mbox).expect("read rewrite"), read);
 }
+
+/// Input mode keeps typed lines and `~r` files as their bytes, 8-bit or not.
+#[test]
+fn input_mode_keeps_eight_bit_bytes() {
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let inserted = dir.path().join("in.txt");
+    let out = dir.path().join("out.txt");
+    std::fs::write(&inserted, b"read \xe9\n").expect("write input");
+    let mbox = copy_test_data("testdata-single.mbox");
+
+    let mut stdin = b"mail to@example.com\ntyped \xff\n".to_vec();
+    stdin.extend_from_slice(
+        format!(
+            "~r {}\n~w {}\n~x\nexit\n",
+            inserted.display(),
+            out.display()
+        )
+        .as_bytes(),
+    );
+    let output = plib::testing::run_test_base_with_env(
+        "mailx",
+        &[
+            String::from("-n"),
+            String::from("-N"),
+            String::from("-f"),
+            mbox.path().to_str().unwrap().to_string(),
+        ],
+        &stdin,
+        &[],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&out).expect("read ~w output"),
+        b"typed \xff\nread \xe9\n"
+    );
+}

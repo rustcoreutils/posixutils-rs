@@ -121,8 +121,8 @@ pub fn handle_escape(
             // Insert Sign variable
             if let Some(sign) = vars.get("Sign") {
                 let sign = expand_escapes(sign);
-                msg.body.push_str(&sign);
-                msg.body.push('\n');
+                msg.body.extend_from_slice(sign.as_bytes());
+                msg.body.push(b'\n');
             }
             Ok(EscapeResult::continue_input())
         }
@@ -130,8 +130,8 @@ pub fn handle_escape(
             // Insert sign variable
             if let Some(sign) = vars.get("sign") {
                 let sign = expand_escapes(sign);
-                msg.body.push_str(&sign);
-                msg.body.push('\n');
+                msg.body.extend_from_slice(sign.as_bytes());
+                msg.body.push(b'\n');
             }
             Ok(EscapeResult::continue_input())
         }
@@ -153,8 +153,8 @@ pub fn handle_escape(
             // Read dead letter file
             let dead_path = crate::util::dead_letter_path(vars);
 
-            if let Ok(content) = fs::read_to_string(&dead_path) {
-                msg.body.push_str(&content);
+            if let Ok(content) = fs::read(&dead_path) {
+                msg.body.extend_from_slice(&content);
                 println!("\"{}\" {} bytes", dead_path, content.len());
             } else {
                 println!("{}: No such file", dead_path);
@@ -189,8 +189,8 @@ pub fn handle_escape(
             // Insert variable value
             if !args.is_empty() {
                 if let Some(value) = vars.get(args) {
-                    msg.body.push_str(value);
-                    msg.body.push('\n');
+                    msg.body.extend_from_slice(value.as_bytes());
+                    msg.body.push(b'\n');
                 }
             }
             Ok(EscapeResult::continue_input())
@@ -225,10 +225,11 @@ pub fn handle_escape(
                 output.push_str(&format!("Subject: {}\n", msg.subject));
             }
             output.push('\n');
-            output.push_str(&msg.body);
-            output.push_str("-------\n");
+            let mut output = output.into_bytes();
+            output.extend_from_slice(&msg.body);
+            output.extend_from_slice(b"-------\n");
 
-            crate::util::page_or_print(output.as_bytes(), vars);
+            crate::util::page_or_print(&output, vars);
             Ok(EscapeResult::continue_input())
         }
         'q' => {
@@ -239,15 +240,15 @@ pub fn handle_escape(
             // Read file or command output
             if let Some(cmd) = args.strip_prefix('!') {
                 // Read command output
-                let output = crate::util::shell_output(cmd, vars)?;
-                msg.body.push_str(&output);
+                let output = crate::util::shell_output_bytes(cmd, vars)?;
+                msg.body.extend_from_slice(&output);
                 println!("{} bytes", output.len());
             } else {
                 // Read file
                 let path = expand_filename(args, vars);
-                match fs::read_to_string(&path) {
+                match fs::read(&path) {
                     Ok(content) => {
-                        msg.body.push_str(&content);
+                        msg.body.extend_from_slice(&content);
                         println!("\"{}\" {} bytes", path, content.len());
                     }
                     Err(e) => {
@@ -282,7 +283,7 @@ pub fn handle_escape(
                 .create(true)
                 .append(true)
                 .open(&path)
-                .and_then(|mut f| f.write_all(msg.body.as_bytes()));
+                .and_then(|mut f| f.write_all(&msg.body));
             match result {
                 Ok(_) => println!("\"{}\" {} bytes", path, msg.body.len()),
                 Err(e) => println!("{}: {}", path, plib::diag::io_error_text(&e)),
@@ -309,9 +310,9 @@ pub fn handle_escape(
         }
         '~' => {
             // Literal escape character
-            msg.body.push('~');
-            msg.body.push_str(args);
-            msg.body.push('\n');
+            msg.body.push(b'~');
+            msg.body.extend_from_slice(args.as_bytes());
+            msg.body.push(b'\n');
             Ok(EscapeResult::continue_input())
         }
         _ => {
@@ -378,7 +379,7 @@ fn edit_message(msg: &mut ComposedMessage, editor: &str) -> Result<(), String> {
     // world-readable, and writing to it followed a symlink planted in advance.
     let mut tmp = plib::tmp::NamedTempFile::new().map_err(|e| e.to_string())?;
     tmp.as_file_mut()
-        .write_all(msg.format().as_bytes())
+        .write_all(&msg.format())
         .map_err(|e| e.to_string())?;
     tmp.as_file_mut().flush().map_err(|e| e.to_string())?;
 
@@ -387,16 +388,16 @@ fn edit_message(msg: &mut ComposedMessage, editor: &str) -> Result<(), String> {
         .status()
         .map_err(|e| e.to_string())?;
 
-    let edited = fs::read_to_string(tmp.path()).map_err(|e| e.to_string())?;
+    let edited = fs::read(tmp.path()).map_err(|e| e.to_string())?;
     parse_edited_message(&edited, msg)?;
 
     println!("(continue)");
     Ok(())
 }
 
-fn parse_edited_message(content: &str, msg: &mut ComposedMessage) -> Result<(), String> {
+fn parse_edited_message(content: &[u8], msg: &mut ComposedMessage) -> Result<(), String> {
     let mut in_headers = true;
-    let mut body = String::new();
+    let mut body = Vec::new();
 
     msg.to.clear();
     msg.cc.clear();
@@ -404,12 +405,14 @@ fn parse_edited_message(content: &str, msg: &mut ComposedMessage) -> Result<(), 
     msg.subject.clear();
     msg.headers.clear();
 
-    for line in content.lines() {
+    for raw in crate::util::byte_lines(content) {
         if in_headers {
-            if line.is_empty() {
+            if raw.is_empty() {
                 in_headers = false;
                 continue;
             }
+            // Header fields are text; the body stays as the bytes edited.
+            let line = String::from_utf8_lossy(raw);
 
             if let Some(colon_pos) = line.find(':') {
                 let name = line[..colon_pos].trim().to_lowercase();
@@ -441,8 +444,8 @@ fn parse_edited_message(content: &str, msg: &mut ComposedMessage) -> Result<(), 
                 }
             }
         } else {
-            body.push_str(line);
-            body.push('\n');
+            body.extend_from_slice(raw);
+            body.push(b'\n');
         }
     }
 
@@ -500,7 +503,7 @@ fn forward_messages(
             } else {
                 m.format_display(false, vars)
             };
-            msg.body.push_str(&String::from_utf8_lossy(&content));
+            msg.body.extend_from_slice(&content);
         }
     }
 
@@ -531,12 +534,12 @@ fn insert_messages(
                 m.format_display(false, vars)
             };
 
-            for line in String::from_utf8_lossy(&content).lines() {
+            for line in crate::util::byte_lines(&content) {
                 if !line.is_empty() {
-                    msg.body.push_str(indent);
+                    msg.body.extend_from_slice(indent.as_bytes());
                 }
-                msg.body.push_str(line);
-                msg.body.push('\n');
+                msg.body.extend_from_slice(line);
+                msg.body.push(b'\n');
             }
         }
     }
@@ -544,7 +547,7 @@ fn insert_messages(
     Ok(())
 }
 
-fn pipe_through_command(input: &str, cmd: &str, vars: &Variables) -> Result<String, String> {
+fn pipe_through_command(input: &[u8], cmd: &str, vars: &Variables) -> Result<Vec<u8>, String> {
     let shell = vars.get("SHELL").unwrap_or("/bin/sh");
 
     let mut child = Command::new(shell)
@@ -571,8 +574,8 @@ fn pipe_through_command(input: &str, cmd: &str, vars: &Variables) -> Result<Stri
     let _sigpipe = plib::io::SigPipeIgnored::new();
 
     let mut stdin = child.stdin.take().ok_or("Failed to open stdin")?;
-    let body = input.to_string();
-    let writer = std::thread::spawn(move || stdin.write_all(body.as_bytes()));
+    let body = input.to_vec();
+    let writer = std::thread::spawn(move || stdin.write_all(&body));
 
     let output = child.wait_with_output().map_err(|e| {
         format!(
@@ -596,7 +599,7 @@ fn pipe_through_command(input: &str, cmd: &str, vars: &Variables) -> Result<Stri
     }
 
     if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        Ok(output.stdout)
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(format!(

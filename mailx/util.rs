@@ -72,6 +72,11 @@ pub fn shell(cmd: &str, vars: &Variables) -> Result<std::process::ExitStatus, St
 
 /// Run `cmd` through `SHELL` and collect its standard output.
 pub fn shell_output(cmd: &str, vars: &Variables) -> Result<String, String> {
+    shell_output_bytes(cmd, vars).map(|out| String::from_utf8_lossy(&out).into_owned())
+}
+
+/// As [`shell_output`], keeping the output as the bytes written.
+pub fn shell_output_bytes(cmd: &str, vars: &Variables) -> Result<Vec<u8>, String> {
     let out = Command::new(vars.get("SHELL").unwrap_or("/bin/sh"))
         .arg("-c")
         .arg("--")
@@ -81,7 +86,7 @@ pub fn shell_output(cmd: &str, vars: &Variables) -> Result<String, String> {
     if !out.status.success() {
         return Err(format!("{}: {}", cmd, String::from_utf8_lossy(&out.stderr)));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    Ok(out.stdout)
 }
 
 /// Expand `!` to the previously run shell command.

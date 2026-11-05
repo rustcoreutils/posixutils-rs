@@ -58,6 +58,16 @@ pub fn take_sigint() -> bool {
 /// between calls) while still propagating `EINTR` — `BufReader`'s `read`/
 /// `fill_buf` do not swallow `Interrupted` the way `read_line` does.
 pub fn read_line_interruptible(buf: &mut String) -> io::Result<usize> {
+    let mut bytes = Vec::new();
+    let n = read_bytes_interruptible(&mut bytes)?;
+    buf.push_str(&String::from_utf8_lossy(&bytes));
+    Ok(n)
+}
+
+/// As [`read_line_interruptible`], keeping the line as the bytes read.
+///
+/// A message body need not be UTF-8; this is the reader input mode uses.
+pub fn read_bytes_interruptible(buf: &mut Vec<u8>) -> io::Result<usize> {
     let stdin = io::stdin();
     let mut handle = stdin.lock();
     let mut bytes: Vec<u8> = Vec::new();
@@ -79,12 +89,9 @@ pub fn read_line_interruptible(buf: &mut String) -> io::Result<usize> {
         }
     }
 
-    if bytes.is_empty() {
-        return Ok(0);
-    }
-
-    buf.push_str(&String::from_utf8_lossy(&bytes));
-    Ok(bytes.len())
+    let n = bytes.len();
+    buf.extend_from_slice(&bytes);
+    Ok(n)
 }
 
 #[cfg(test)]

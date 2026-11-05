@@ -5216,3 +5216,91 @@ fn eight_bit_mailbox_loads_and_round_trips() {
     assert!(out.status.success(), "write failed: {:?}", out);
     assert_eq!(std::fs::read(&body).expect("read body"), b"body \xe9\xff\n");
 }
+
+/// mailx waits for the `fcntl` lock that Linux delivery agents hold.
+///
+/// Postfix `local`, Exim, and procmail lock the spool with `fcntl`, which on
+/// Linux does not exclude `flock`. Holding only `flock`, mailx read the
+/// mailbox mid-delivery and truncated and rewrote it under an agent that was
+/// still appending, losing the mail being delivered.
+#[cfg(target_os = "linux")]
+#[test]
+fn mailbox_honors_fcntl_lock_of_delivery_agent() {
+    use std::io::{Read as _, Seek as _};
+    use std::os::unix::io::AsRawFd;
+    use std::process::{Command, Stdio};
+
+    let dir = plib::tmp::TempDir::new().expect("temp dir");
+    let mbox = dir.path().join("spool");
+    let original = "From a@b Mon Jan  1 00:00:00 2024\nFrom: a@b\nSubject: one\n\nfirst\n\n\
+                    From c@d Mon Jan  1 00:00:00 2024\nFrom: c@d\nSubject: two\n\nsecond\n\n";
+    std::fs::write(&mbox, original).expect("write mbox");
+
+    // Play the delivery agent: hold a write lock on the whole spool.
+    let mut agent = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&mbox)
+        .expect("open spool");
+    let set_lock = |file: &std::fs::File, kind: libc::c_int| {
+        // SAFETY: an all-zero flock is valid; start 0, length 0 is the whole file.
+        let mut fl: libc::flock = unsafe { std::mem::zeroed() };
+        fl.l_type = kind as libc::c_short;
+        fl.l_whence = libc::SEEK_SET as libc::c_short;
+        // SAFETY: the fd is open and `fl` outlives the call.
+        let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &fl) };
+        assert_eq!(rc, 0, "fcntl lock: {}", std::io::Error::last_os_error());
+    };
+    set_lock(&agent, libc::F_WRLCK);
+
+    let mut child = Command::new(plib::testing::get_binary_path("mailx"))
+        .args(["-n", "-f", mbox.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mailx");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"d 1\nquit\n")
+        .expect("write script");
+
+    // Read back through the agent's own descriptor: closing any other one
+    // this process had open on the spool would drop the lock.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let mut during = String::new();
+    agent.read_to_string(&mut during).expect("read spool");
+    let finished_early = child.try_wait().expect("try_wait").is_some();
+
+    // The delivery completes, then the agent lets go.
+    agent.seek(std::io::SeekFrom::End(0)).expect("seek");
+    agent
+        .write_all(b"From e@f Mon Jan  1 00:00:00 2024\nFrom: e@f\nSubject: three\n\nthird\n\n")
+        .expect("deliver");
+    set_lock(&agent, libc::F_UNLCK);
+
+    let output = child.wait_with_output().expect("wait for mailx");
+    let after = std::fs::read_to_string(&mbox)
+        .unwrap_or_else(|e| panic!("read spool: {}: {:?}", e, output));
+
+    assert_eq!(
+        during, original,
+        "mailx rewrote the spool while the delivery agent held its lock"
+    );
+    assert!(!finished_early, "mailx did not wait for the lock");
+    assert!(output.status.success(), "mailx failed: {:?}", output);
+    let summary = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        summary.contains("three"),
+        "the mailbox was read before the delivery finished: {}",
+        summary
+    );
+    assert!(!after.contains("first"), "deleted message kept: {}", after);
+    assert!(
+        after.contains("second") && after.contains("third"),
+        "mail was lost: {}",
+        after
+    );
+}

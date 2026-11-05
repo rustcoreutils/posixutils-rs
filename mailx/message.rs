@@ -257,8 +257,31 @@ impl Message {
 }
 
 const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const WEEKDAY_NAMES: [&str; 7] = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+];
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+const MONTH_NAMES: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
 ];
 
 /// A day of the month, `1` to `31`.
@@ -266,16 +289,22 @@ fn day_of_month(s: &str) -> Option<u32> {
     s.parse().ok().filter(|d| (1..=31).contains(d))
 }
 
-/// The `hh:mm` of an `hh:mm[:ss]` time.
-fn hours_minutes(s: &str) -> Option<&str> {
-    let hm = s.get(..5)?;
-    let b = hm.as_bytes();
-    let ok = b[2] == b':' && [0, 1, 3, 4].iter().all(|&i| b[i].is_ascii_digit());
-    ok.then_some(hm)
+/// The `hh:mm` of an `h:mm[:ss]` or `hh:mm[:ss]` time, if it is one.
+fn hours_minutes(s: &str) -> Option<String> {
+    let mut fields = s.split(':');
+    let (h, m) = (fields.next()?, fields.next()?);
+    let in_range = |f: &str, max: u32| {
+        (1..=2).contains(&f.len())
+            && f.bytes().all(|b| b.is_ascii_digit())
+            && f.parse::<u32>().is_ok_and(|n| n <= max)
+    };
+    let seconds_ok = fields.next().is_none_or(|sec| in_range(sec, 60));
+    (in_range(h, 23) && m.len() == 2 && in_range(m, 59) && seconds_ok && fields.next().is_none())
+        .then(|| format!("{:0>2}:{}", h, m))
 }
 
 /// Format the summary date from its parts.
-fn summary_date(weekday: Option<&str>, month: &str, day: u32, time: Option<&str>) -> String {
+fn summary_date(weekday: Option<&str>, month: &str, day: u32, time: Option<String>) -> String {
     let mut out = String::new();
     if let Some(w) = weekday {
         out.push_str(w);
@@ -284,7 +313,7 @@ fn summary_date(weekday: Option<&str>, month: &str, day: u32, time: Option<&str>
     out.push_str(&format!("{} {:>2}", month, day));
     if let Some(t) = time {
         out.push(' ');
-        out.push_str(t);
+        out.push_str(&t);
     }
     out
 }
@@ -299,14 +328,17 @@ fn envelope_date(s: &str) -> Option<String> {
     Some(summary_date(Some(weekday), month, day, Some(time)))
 }
 
-/// The three-letter abbreviation `s` names from `names`, accepting the
-/// full name too (`Nov`, `November`).
-fn abbreviation(s: &str, names: &[&'static str]) -> Option<&'static str> {
-    let prefix = s.get(..3)?;
-    names
+/// The abbreviation `s` stands for, when it is one of `abbrevs` or the
+/// matching full name in `names` (`Nov`, `November`), ignoring case.
+///
+/// Only whole words count: matching on the first three letters took any
+/// word that began like one, so `marked` read as March.
+fn abbreviation(s: &str, abbrevs: &[&'static str], names: &[&str]) -> Option<&'static str> {
+    abbrevs
         .iter()
-        .copied()
-        .find(|n| n.eq_ignore_ascii_case(prefix))
+        .zip(names)
+        .find(|(a, n)| s.eq_ignore_ascii_case(a) || s.eq_ignore_ascii_case(n))
+        .map(|(a, _)| *a)
 }
 
 /// The summary date of a `Date:` value.
@@ -321,11 +353,13 @@ fn header_date(s: &str) -> Option<String> {
         .split(|c: char| c.is_whitespace() || c == ',')
         .filter(|p| !p.is_empty())
         .collect();
-    let weekday = parts.first().and_then(|w| abbreviation(w, &WEEKDAYS));
+    let weekday = parts
+        .first()
+        .and_then(|w| abbreviation(w, &WEEKDAYS, &WEEKDAY_NAMES));
     let (at, month) = parts
         .iter()
         .enumerate()
-        .find_map(|(i, p)| abbreviation(p, &MONTHS).map(|m| (i, m)))?;
+        .find_map(|(i, p)| abbreviation(p, &MONTHS, &MONTH_NAMES).map(|m| (i, m)))?;
     let before = at.checked_sub(1).and_then(|i| day_of_month(parts[i]));
     let day = before.or_else(|| parts.get(at + 1).and_then(|p| day_of_month(p)))?;
     let time = parts.iter().find_map(|p| hours_minutes(p));

@@ -1471,3 +1471,32 @@ fn header_summary_showto_lists_every_recipient() {
     );
     assert!(out.contains("To a@x.org, b@x.org"), "{:?}", out);
 }
+
+/// A one-digit hour is a time; a word that merely begins like a month or
+/// weekday name is not one, and an impossible time is no time.
+#[test]
+fn header_summary_date_tokens_are_whole() {
+    let cases = [
+        ("Mon, 4 Nov 2024 9:05:00 -0500", "Mon Nov  4 09:05"),
+        ("marked 5 Nov 2024 10:00", "Nov  5 10:00"),
+        ("Mon, 4 Nov 2024 99:99 (Decided)", "Mon Nov  4"),
+    ];
+    for (header, want) in cases {
+        let (summary, _) = summary_and_commands(
+            &format!(
+                "From a@example.com\n\
+                 From: a@example.com\n\
+                 Date: {}\n\
+                 Subject: s\n\
+                 \n\
+                 body\n",
+                header
+            ),
+            "",
+        );
+        let row = summary.lines().next().unwrap_or("");
+        // The date is the 16 columns after the marker, number, and sender.
+        let date: String = row.chars().skip(28).take(16).collect();
+        assert_eq!(date.trim(), want, "Date: {}: {:?}", header, row);
+    }
+}

@@ -1112,3 +1112,34 @@ fn file_percent_opens_the_system_mailbox() {
         stderr
     );
 }
+
+/// `from` and `-H` list every message asked for; only the paging commands
+/// stop at a screenful.
+#[test]
+fn from_and_dash_h_are_not_cut_to_a_screen() {
+    let mut content = String::new();
+    for n in 1..=8 {
+        content.push_str(&format!(
+            "From u{n}@x Mon Jan  1 00:00:00 2024\nFrom: u{n}@x\nSubject: s{n}\n\nbody\n\n"
+        ));
+    }
+    let mbox = create_temp_mbox(&content);
+    let mailrc = create_temp_mailrc("set screen=3\n");
+    let path = mbox.path().to_str().unwrap();
+    let env = [("MAILRC", mailrc.path().to_str().unwrap())];
+    let rows = |out: &std::process::Output| {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.contains("@x "))
+            .count()
+    };
+    assert_eq!(
+        rows(&mailx_env(&["-N", "-f", path], "from *\nexit\n", &env)),
+        8
+    );
+    assert_eq!(rows(&mailx_env(&["-H", "-f", path], "", &env)), 8);
+    assert_eq!(
+        rows(&mailx_env(&["-N", "-f", path], "headers\nexit\n", &env)),
+        3
+    );
+}

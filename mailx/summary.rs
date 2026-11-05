@@ -13,16 +13,11 @@ use crate::mailbox::Mailbox;
 use crate::message::{extract_address, Message};
 use crate::variables::Variables;
 
-/// Print the header summary of `msg_nums`, or of every message.
-pub fn print_headers(mb: &Mailbox, msg_nums: Option<&[usize]>, vars: &Variables) {
-    let screen = vars.screen_lines().get();
+/// Print the header summary of the messages `nums`.
+pub fn print_headers(mb: &Mailbox, nums: impl IntoIterator<Item = usize>, vars: &Variables) {
     let show_to = vars.is_set("showto");
 
-    let nums: Vec<usize> = msg_nums
-        .map(|n| n.to_vec())
-        .unwrap_or_else(|| (1..=mb.messages.len()).collect());
-
-    for &num in nums.iter().take(screen) {
+    for num in nums {
         if let Some(msg) = mb.get(num) {
             let current_marker = if Some(num) == mb.current() { '>' } else { ' ' };
             let state_char = msg.status_char();
@@ -60,8 +55,7 @@ pub fn print_headers(mb: &Mailbox, msg_nums: Option<&[usize]>, vars: &Variables)
 pub fn print_page(mb: &Mailbox, vars: &Variables) {
     let screen = vars.screen_lines().get();
     let start = mb.current().map_or(1, |c| page_start(c, vars));
-    let nums: Vec<usize> = (start..=mb.message_count().min(start + screen - 1)).collect();
-    print_headers(mb, Some(&nums), vars);
+    print_headers(mb, start..=mb.message_count().min(start + screen - 1), vars);
 }
 
 /// The first message on the page of `screen` summaries holding `num`.

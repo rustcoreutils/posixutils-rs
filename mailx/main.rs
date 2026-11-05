@@ -92,7 +92,7 @@ fn run_headers_only(args: &Args) -> i32 {
     if mb.message_count() == 0 {
         print_no_mail();
     } else {
-        summary::print_headers(&mb, None, &vars);
+        summary::print_headers(&mb, 1..=mb.message_count(), &vars);
     }
     0
 }

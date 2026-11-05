@@ -587,7 +587,7 @@ fn cmd_file(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comman
     new_mb.is_system_mailbox = crate::util::same_file(&path, &crate::util::system_mailbox());
 
     *mb = new_mb;
-    crate::summary::print_headers(mb, None, vars);
+    crate::summary::print_page(mb, vars);
 
     Ok(CommandResult::Continue)
 }
@@ -638,7 +638,7 @@ fn cmd_followup(
 fn cmd_from(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<CommandResult> {
     let msg_nums = msglist_or_current(args, mb, vars)?;
 
-    crate::summary::print_headers(mb, Some(&msg_nums), vars);
+    crate::summary::print_headers(mb, msg_nums, vars);
     Ok(CommandResult::Continue)
 }
 
@@ -1193,7 +1193,7 @@ fn cmd_scroll(args: &str, mb: &mut Mailbox, vars: &mut Variables) -> Result<Comm
         mb.set_current(nums[0]);
     }
 
-    crate::summary::print_headers(mb, Some(&nums), vars);
+    crate::summary::print_headers(mb, nums, vars);
 
     Ok(CommandResult::Continue)
 }

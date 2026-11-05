@@ -9,6 +9,7 @@
 
 mod args;
 mod commands;
+mod compose;
 mod error;
 mod escapes;
 mod lock;

@@ -160,7 +160,7 @@ pub fn send_mode(args: &Args, vars: &mut Variables) -> Result<()> {
     let stdin = io::stdin();
 
     if is_tty {
-        crate::commands::compose_body(&mut msg, None, vars)?;
+        crate::compose::compose_body(&mut msg, None, vars)?;
     } else {
         // Non-interactive - just read stdin, as bytes: mail need not be UTF-8,
         // and reading it as text refused any body that was not.

@@ -197,3 +197,57 @@ fn ignoreeof_holds_command_mode_open_on_a_terminal() {
     let status = child.wait().unwrap();
     assert!(status.success(), "{:?}: {}", status, seen);
 }
+
+/// A hangup that was being ignored when mailx started -- `nohup mailx` --
+/// stays ignored, as in BSD mailx: the session carries on and quits
+/// normally.
+#[test]
+fn inherited_ignored_hangup_stays_ignored() {
+    use std::os::unix::process::CommandExt;
+
+    let mbox = copy_test_data("testdata.mbox");
+    let home = plib::tmp::TempDir::new().unwrap();
+    let rc = create_temp_mailrc("");
+    let mut command = Command::new(plib::testing::get_binary_path("mailx"));
+    command
+        .args(["-N", "-f", mbox.path().to_str().unwrap()])
+        .env("HOME", home.path())
+        .env("MAILRC", rc.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    // SAFETY: signal() is async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().expect("spawn mailx");
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"print 3\necho READY\n").unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    while !line.contains("READY") {
+        line.clear();
+        assert!(
+            stdout.read_line(&mut line).unwrap() > 0,
+            "mailx exited early"
+        );
+    }
+    // SAFETY: kill sends a signal to the child we started.
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGHUP);
+    }
+    stdin.write_all(b"quit\n").unwrap();
+    drop(stdin);
+    let status = child.wait().unwrap();
+    assert!(status.success(), "{:?}", status);
+    let after = std::fs::read_to_string(mbox.path()).unwrap();
+    assert!(after.contains("Subject: Re: Meeting Tomorrow"), "{}", after);
+    assert!(
+        !after.contains("Status: O\n"),
+        "message 3 was not marked read: {}",
+        after
+    );
+}

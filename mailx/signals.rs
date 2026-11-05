@@ -50,10 +50,17 @@ pub fn setup() {
     install(libc::SIGHUP, sighup_handler);
 }
 
+/// Catch `signal` with `handler`, unless it was ignored when mailx started:
+/// `nohup mailx` keeps its hangups ignored, as in BSD mailx.
 fn install(signal: libc::c_int, handler: extern "C" fn(libc::c_int)) {
     // SAFETY: the handler only stores to an atomic, which is
-    // async-signal-safe, and `sa` is fully initialized.
+    // async-signal-safe, and both sigaction structs are fully initialized.
     unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(signal, std::ptr::null(), &mut old);
+        if old.sa_sigaction == libc::SIG_IGN {
+            return;
+        }
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = handler as *const () as libc::sighandler_t;
         libc::sigemptyset(&mut sa.sa_mask);

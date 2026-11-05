@@ -9,8 +9,7 @@
 
 //! Message states and the `hold`, `preserve`, `mbox` dispositions.
 
-use crate::common::{copy_test_data, create_temp_mbox};
-use plib::testing::{run_test_with_checker, run_test_with_checker_and_env, TestPlan};
+use crate::common::{copy_test_data, create_temp_mbox, mailx, mailx_env};
 use plib::tmp::NamedTempFile;
 
 /// A message with no Status: header is `new` (shown as `N`); a `:n` selector
@@ -31,43 +30,31 @@ fn new_state_and_n_selector() {
                 stale\n";
     let mbox = create_temp_mbox(body);
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                mbox.path().to_str().unwrap().to_string(),
-            ],
-            // `from :n` lists header lines of new messages only.
-            stdin_data: String::from("from :n\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                stdout.contains("new@example.com"),
-                ":n should match the new message: {}",
-                stdout
-            );
-            assert!(
-                !stdout.contains("old@example.com"),
-                ":n must not match the already-read message: {}",
-                stdout
-            );
-            // The new message shows the `N` state character.
-            assert!(
-                stdout
-                    .lines()
-                    .any(|l| l.chars().nth(1) == Some('N') && l.contains("new@example.com")),
-                "new message should display state char N: {}",
-                stdout
-            );
-        },
+    // `from :n` lists header lines of new messages only.
+    let output = mailx(
+        &["-n", "-N", "-f", mbox.path().to_str().unwrap()],
+        "from :n\nquit\n",
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("new@example.com"),
+        ":n should match the new message: {}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("old@example.com"),
+        ":n must not match the already-read message: {}",
+        stdout
+    );
+    // The new message shows the `N` state character.
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.chars().nth(1) == Some('N') && l.contains("new@example.com")),
+        "new message should display state char N: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 /// `mbox` forces a message into the secondary mbox at quit even when the `hold`
@@ -86,26 +73,18 @@ fn mbox_overrides_hold_variable() {
     let sys_path = sys.path().to_str().unwrap().to_string();
     let mbox_path = mbox_file.path().to_str().unwrap().to_string();
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            // No -f: the MAIL file is the *system* mailbox, so mbox is allowed.
-            args: vec![String::from("-n"), String::from("-N")],
-            stdin_data: String::from("set hold\nmbox 1\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
+    // No -f: the MAIL file is the *system* mailbox, so mbox is allowed.
+    let output = mailx_env(
+        &["-n", "-N"],
+        "set hold\nmbox 1\nquit\n",
         &[("MAIL", &sys_path), ("MBOX", &mbox_path)],
-        |_plan, output| {
-            assert!(output.status.success());
-            let saved = std::fs::read_to_string(&mbox_path).unwrap_or_default();
-            assert!(
-                saved.contains("sender@example.com"),
-                "mbox should force the message into the secondary mbox despite hold: {:?}",
-                saved
-            );
-        },
+    );
+    assert!(output.status.success());
+    let saved = std::fs::read_to_string(&mbox_path).unwrap_or_default();
+    assert!(
+        saved.contains("sender@example.com"),
+        "mbox should force the message into the secondary mbox despite hold: {:?}",
+        saved
     );
 }
 
@@ -114,29 +93,17 @@ fn mbox_overrides_hold_variable() {
 fn mbox_rejected_outside_system_mailbox() {
     let mbox = copy_test_data("testdata.mbox");
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                mbox.path().to_str().unwrap().to_string(),
-            ],
-            stdin_data: String::from("mbox 1\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                stderr.contains("system mailbox"),
-                "mbox outside the system mailbox should be diagnosed: {}",
-                stderr
-            );
-        },
+    let output = mailx(
+        &["-n", "-N", "-f", mbox.path().to_str().unwrap()],
+        "mbox 1\nquit\n",
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("system mailbox"),
+        "mbox outside the system mailbox should be diagnosed: {}",
+        stderr
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 /// Read state must survive a reopen, via the `Status:` header (spec 104625).
@@ -159,54 +126,32 @@ fn read_state_survives_a_reopen() {
     let folder_path = folder.path().to_str().unwrap().to_string();
 
     // Read message 1, delete message 2 so the folder is rewritten.
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                folder_path.clone(),
-            ],
-            stdin_data: String::from("print 1\ndelete 2\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, _output| {
-            let after = std::fs::read_to_string(&folder_path).expect("folder");
-            assert!(
-                after.contains("Status:"),
-                "read state was never written back: {:?}",
-                after
-            );
-        },
+    let output = mailx(
+        &["-n", "-N", "-f", &folder_path],
+        "print 1\ndelete 2\nquit\n",
     );
+    let after = std::fs::read_to_string(&folder_path).expect("folder");
+    assert!(
+        after.contains("Status:"),
+        "read state was never written back: {:?}",
+        after
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 
     // Reopening must show it as read, not new.
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![String::from("-n"), String::from("-f"), folder_path.clone()],
-            stdin_data: String::from("exit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let out = String::from_utf8_lossy(&output.stdout);
-            let row = out
-                .lines()
-                .find(|l| l.contains("first"))
-                .unwrap_or_else(|| panic!("no header row for message 1: {}", out));
-            // The state is the row's second column; the date may hold `Nov`.
-            assert!(
-                row.chars().nth(1) != Some('N'),
-                "a message read in the previous session came back as new: {}",
-                row
-            );
-        },
+    let output = mailx(&["-n", "-f", &folder_path], "exit\n");
+    let out = String::from_utf8_lossy(&output.stdout);
+    let row = out
+        .lines()
+        .find(|l| l.contains("first"))
+        .unwrap_or_else(|| panic!("no header row for message 1: {}", out));
+    // The state is the row's second column; the date may hold `Nov`.
+    assert!(
+        row.chars().nth(1) != Some('N'),
+        "a message read in the previous session came back as new: {}",
+        row
     );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 /// `undelete` must restore the state the message had, not blanket it as read.
@@ -222,34 +167,22 @@ fn undelete_restores_the_previous_read_state() {
     );
     let mbox_path = mbox.path().to_str().unwrap().to_string();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                mbox_path,
-            ],
-            stdin_data: String::from("delete 1\nundelete 1\nheaders\nexit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let out = String::from_utf8_lossy(&output.stdout);
-            let row = out
-                .lines()
-                .find(|l| l.contains("never read"))
-                .unwrap_or_else(|| panic!("no header row: {}", out));
-            // The state is the row's second column; the date may hold `Nov`.
-            assert!(
-                row.chars().nth(1) == Some('N'),
-                "undelete marked an unread message as read: {}",
-                row
-            );
-        },
+    let output = mailx(
+        &["-n", "-N", "-f", &mbox_path],
+        "delete 1\nundelete 1\nheaders\nexit\n",
     );
+    let out = String::from_utf8_lossy(&output.stdout);
+    let row = out
+        .lines()
+        .find(|l| l.contains("never read"))
+        .unwrap_or_else(|| panic!("no header row: {}", out));
+    // The state is the row's second column; the date may hold `Nov`.
+    assert!(
+        row.chars().nth(1) == Some('N'),
+        "undelete marked an unread message as read: {}",
+        row
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 /// `preserve` must not erase read state: `:r` still has to match afterwards.
@@ -265,23 +198,16 @@ fn preserve_keeps_read_state() {
     );
     let sys_path = sys.path().to_str().unwrap().to_string();
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![String::from("-n"), String::from("-N")],
-            stdin_data: String::from("print 1\npreserve 1\nfrom :r\nexit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
+    let output = mailx_env(
+        &["-n", "-N"],
+        "print 1\npreserve 1\nfrom :r\nexit\n",
         &[("MAIL", &sys_path)],
-        |_plan, output| {
-            let out = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                out.contains("read then held"),
-                "`preserve` erased the read state, so `:r` no longer matched: {}",
-                out
-            );
-        },
     );
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        out.contains("read then held"),
+        "`preserve` erased the read state, so `:r` no longer matched: {}",
+        out
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }

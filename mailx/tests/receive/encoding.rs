@@ -9,8 +9,7 @@
 
 //! Mail that is not UTF-8, and control characters in headers.
 
-use crate::common::{copy_test_data, create_temp_mbox};
-use plib::testing::{run_test_with_checker, TestPlan};
+use crate::common::{copy_test_data, create_temp_mbox, mailx};
 use std::io::Write;
 
 /// A message carrying bytes that are not UTF-8 does not make the mailbox
@@ -28,35 +27,22 @@ fn eight_bit_mailbox_loads_and_round_trips() {
     let second: &[u8] = b"From c@d Mon Jan  1 00:00:00 2024\nFrom: c@d\nSubject: two\n\nsecond\n\n";
     std::fs::write(&mbox, [first, second].concat()).expect("write mbox");
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                mbox.to_str().unwrap().to_string(),
-            ],
-            stdin_data: format!("size 1\ncopy 1 {}\nd 2\nquit\n", copied.display()),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            assert_eq!(
-                output.status.code(),
-                Some(0),
-                "an 8-bit mailbox was refused: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            let out = String::from_utf8_lossy(&output.stdout);
-            assert!(out.contains("1: 68 bytes"), "size miscounted: {}", out);
-            assert!(
-                out.contains("1 messages 68 bytes"),
-                "copy miscounted: {}",
-                out
-            );
-        },
+    let output = mailx(
+        &["-n", "-N", "-f", mbox.to_str().unwrap()],
+        format!("size 1\ncopy 1 {}\nd 2\nquit\n", copied.display()),
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "an 8-bit mailbox was refused: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("1: 68 bytes"), "size miscounted: {}", out);
+    assert!(
+        out.contains("1 messages 68 bytes"),
+        "copy miscounted: {}",
+        out
     );
 
     let copy = std::fs::read(&copied).expect("read copy");
@@ -108,30 +94,15 @@ fn header_summary_shows_control_characters_as_question_marks() {
          \n",
     );
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-H"),
-                String::from("-n"),
-                String::from("-f"),
-                mbox.path().to_str().unwrap().to_string(),
-            ],
-            stdin_data: String::new(),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let out = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                !out.contains('\x1b') && !out.contains('\x07'),
-                "control characters reached the terminal: {:?}",
-                out
-            );
-            assert!(out.contains("hi?[2J?[Hgone"), "subject: {:?}", out);
-        },
+    let output = mailx(&["-H", "-n", "-f", mbox.path().to_str().unwrap()], "");
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !out.contains('\x1b') && !out.contains('\x07'),
+        "control characters reached the terminal: {:?}",
+        out
     );
+    assert!(out.contains("hi?[2J?[Hgone"), "subject: {:?}", out);
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 /// Messages are kept as stored bytes: a genuine private-use character comes
@@ -148,29 +119,17 @@ fn stored_bytes_round_trip_exactly() {
     let second: &[u8] = b"From c@d Mon Jan  1 00:00:00 2024\nFrom: c@d\nSubject: two\n\nsecond\n\n";
     std::fs::write(&mbox, [first, second].concat()).expect("write mbox");
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                mbox.to_str().unwrap().to_string(),
-            ],
-            stdin_data: format!("print 1\ncopy 1 {}\nd 2\nquit\n", copied.display()),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let wanted: &[u8] = b"pua \xef\x9f\xa9 raw \xe9\n";
-            assert!(
-                output.stdout.windows(wanted.len()).any(|w| w == wanted),
-                "print did not show the stored bytes: {:?}",
-                String::from_utf8_lossy(&output.stdout)
-            );
-        },
+    let output = mailx(
+        &["-n", "-N", "-f", mbox.to_str().unwrap()],
+        format!("print 1\ncopy 1 {}\nd 2\nquit\n", copied.display()),
     );
+    let wanted: &[u8] = b"pua \xef\x9f\xa9 raw \xe9\n";
+    assert!(
+        output.stdout.windows(wanted.len()).any(|w| w == wanted),
+        "print did not show the stored bytes: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 
     // Printing read the message, so both copies record that in `Status:`.
     let read: &[u8] = b"From a@b Mon Jan  1 00:00:00 2024\nFrom: a@b\nSubject: s\n\
@@ -197,17 +156,7 @@ fn input_mode_keeps_eight_bit_bytes() {
         )
         .as_bytes(),
     );
-    let output = plib::testing::run_test_base_with_env(
-        "mailx",
-        &[
-            String::from("-n"),
-            String::from("-N"),
-            String::from("-f"),
-            mbox.path().to_str().unwrap().to_string(),
-        ],
-        &stdin,
-        &[],
-    );
+    let output = mailx(&["-n", "-N", "-f", mbox.path().to_str().unwrap()], &stdin);
     assert!(
         output.status.success(),
         "{}",

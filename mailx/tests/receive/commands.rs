@@ -9,8 +9,7 @@
 
 //! Command-mode commands, one group per command.
 
-use crate::common::{copy_test_data, create_temp_mbox};
-use plib::testing::{run_test_with_checker, run_test_with_checker_and_env, TestPlan};
+use crate::common::{copy_test_data, create_temp_mbox, mailx, mailx_env};
 use plib::tmp::NamedTempFile;
 use std::io::Write;
 
@@ -24,30 +23,14 @@ fn cmd_cd_to_tmp() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("cd /tmp\n!pwd\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                stdout.contains("/tmp") || stdout.contains("/private/tmp"),
-                "Should change to /tmp directory: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "cd /tmp\n!pwd\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("/tmp") || stdout.contains("/private/tmp"),
+        "Should change to /tmp directory: {}",
+        stdout
     );
+    assert!(output.status.success());
 }
 
 /// Test chdir alias
@@ -56,30 +39,14 @@ fn cmd_chdir_alias() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("chdir /tmp\n!pwd\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                stdout.contains("/tmp") || stdout.contains("/private/tmp"),
-                "chdir should work like cd: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "chdir /tmp\n!pwd\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("/tmp") || stdout.contains("/private/tmp"),
+        "chdir should work like cd: {}",
+        stdout
     );
+    assert!(output.status.success());
 }
 
 /// Test cd to home directory (no argument)
@@ -88,25 +55,9 @@ fn cmd_cd_home() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("cd\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            // cd with no arg should go to HOME - just verify it doesn't error
-            assert!(output.status.success());
-        },
-    );
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "cd\nquit\n");
+    // cd with no arg should go to HOME - just verify it doesn't error
+    assert!(output.status.success());
 }
 
 // -----------------------------------------------------------------------------
@@ -121,31 +72,18 @@ fn cmd_copy_to_file() {
     let save_file = NamedTempFile::new().expect("failed to create temp file");
     let save_path = save_file.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: format!("copy 1 {}\nquit\n", save_path),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // copy should report file written
-            assert!(
-                stdout.contains("1 messages") || stdout.contains("bytes"),
-                "copy should report saved messages: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    let output = mailx(
+        &["-n", "-N", "-f", mbox_path],
+        format!("copy 1 {}\nquit\n", save_path),
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // copy should report file written
+    assert!(
+        stdout.contains("1 messages") && stdout.contains("bytes"),
+        "copy should report saved messages: {}",
+        stdout
+    );
+    assert!(output.status.success());
 }
 
 /// Test copy multiple messages
@@ -156,30 +94,17 @@ fn cmd_copy_multiple() {
     let save_file = NamedTempFile::new().expect("failed to create temp file");
     let save_path = save_file.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: format!("copy 1-2 {}\nquit\n", save_path),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                stdout.contains("2 messages") || stdout.contains("bytes"),
-                "copy should report 2 messages: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    let output = mailx(
+        &["-n", "-N", "-f", mbox_path],
+        format!("copy 1-2 {}\nquit\n", save_path),
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("2 messages") && stdout.contains("bytes"),
+        "copy should report 2 messages: {}",
+        stdout
+    );
+    assert!(output.status.success());
 }
 
 // -----------------------------------------------------------------------------
@@ -192,32 +117,18 @@ fn cmd_delete() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            // Delete message 1, then show remaining
-            stdin_data: String::from("delete 1\nfrom *\nexit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // After deleting msg 1, from * should only show 2 and 3
-            assert!(
-                !stdout.contains("alice") || stdout.contains("bob") || stdout.contains("charlie"),
-                "from * should not show deleted message: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    // Delete message 1, then show remaining
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "delete 1\nfrom *\nexit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // After deleting msg 1, from * should only show 2 and 3
+    assert!(
+        !stdout.contains("alice@example.com")
+            && stdout.contains("bob@example.org")
+            && stdout.contains("charlie@example.net"),
+        "from * should not show deleted message: {}",
+        stdout
     );
+    assert!(output.status.success());
 }
 
 // -----------------------------------------------------------------------------
@@ -230,31 +141,15 @@ fn cmd_dp() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("dp 1\nexit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // dp should delete msg 1 and print next
-            assert!(
-                stdout.contains("bob") || stdout.contains("Second"),
-                "dp should print next message after delete: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "dp 1\nexit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // dp should delete msg 1 and print next
+    assert!(
+        stdout.contains("Subject: Project Update") && stdout.contains("The project is on track."),
+        "dp should print next message after delete: {}",
+        stdout
     );
+    assert!(output.status.success());
 }
 
 /// Test dt alias for dp
@@ -263,30 +158,14 @@ fn cmd_dt() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("dt 1\nexit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                stdout.contains("bob") || stdout.contains("Second"),
-                "dt should work like dp: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "dt 1\nexit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Subject: Project Update") && stdout.contains("The project is on track."),
+        "dt should work like dp: {}",
+        stdout
     );
+    assert!(output.status.success());
 }
 
 // -----------------------------------------------------------------------------
@@ -299,30 +178,17 @@ fn cmd_echo() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("echo Hello World Test\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                stdout.contains("Hello World Test"),
-                "echo should output text: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    let output = mailx(
+        &["-n", "-N", "-f", mbox_path],
+        "echo Hello World Test\nquit\n",
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Hello World Test"),
+        "echo should output text: {}",
+        stdout
+    );
+    assert!(output.status.success());
 }
 
 // -----------------------------------------------------------------------------
@@ -335,25 +201,9 @@ fn cmd_exit() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("delete 1\nexit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            // exit should succeed without saving
-            assert!(output.status.success());
-        },
-    );
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "delete 1\nexit\n");
+    // exit should succeed without saving
+    assert!(output.status.success());
 }
 
 /// Test xit alias for exit
@@ -362,24 +212,8 @@ fn cmd_xit() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("xit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            assert!(output.status.success());
-        },
-    );
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "xit\n");
+    assert!(output.status.success());
 }
 
 // -----------------------------------------------------------------------------
@@ -392,31 +226,15 @@ fn cmd_file_info() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("file\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // file with no arg shows current mailbox info
-            assert!(
-                stdout.contains("3 messages") || stdout.contains("messages"),
-                "file should show mailbox info: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "file\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // file with no arg shows current mailbox info
+    assert!(
+        stdout.contains("3 messages"),
+        "file should show mailbox info: {}",
+        stdout
     );
+    assert!(output.status.success());
 }
 
 /// Test folder alias for file
@@ -425,30 +243,14 @@ fn cmd_folder_alias() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("folder\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                stdout.contains("messages"),
-                "folder should work like file: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "folder\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("messages"),
+        "folder should work like file: {}",
+        stdout
     );
+    assert!(output.status.success());
 }
 
 // -----------------------------------------------------------------------------
@@ -461,30 +263,14 @@ fn cmd_headers() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("headers\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
-            assert!(
-                stdout.contains("alice") && stdout.contains("bob"),
-                "headers should show message summary: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "headers\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    assert!(
+        stdout.contains("alice") && stdout.contains("bob"),
+        "headers should show message summary: {}",
+        stdout
     );
+    assert!(output.status.success());
 }
 
 // -----------------------------------------------------------------------------
@@ -497,31 +283,15 @@ fn cmd_help() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("help\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // help should show command list
-            assert!(
-                stdout.contains("delete") && stdout.contains("print"),
-                "help should show commands: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "help\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // help should show command list
+    assert!(
+        stdout.contains("delete") && stdout.contains("print"),
+        "help should show commands: {}",
+        stdout
     );
+    assert!(output.status.success());
 }
 
 /// Test ? alias for help
@@ -530,30 +300,14 @@ fn cmd_question_mark() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("?\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                stdout.contains("delete") && stdout.contains("print"),
-                "? should work like help: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "?\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("delete") && stdout.contains("print"),
+        "? should work like help: {}",
+        stdout
     );
+    assert!(output.status.success());
 }
 
 // -----------------------------------------------------------------------------
@@ -566,25 +320,9 @@ fn cmd_hold() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("hold 1\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            // hold should succeed
-            assert!(output.status.success());
-        },
-    );
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "hold 1\nquit\n");
+    // hold should succeed
+    assert!(output.status.success());
 }
 
 /// Test preserve alias for hold
@@ -593,24 +331,8 @@ fn cmd_preserve() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("preserve 1\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            assert!(output.status.success());
-        },
-    );
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "preserve 1\nquit\n");
+    assert!(output.status.success());
 }
 
 // -----------------------------------------------------------------------------
@@ -623,34 +345,18 @@ fn cmd_list() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("list\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // list should show command names
-            assert!(
-                stdout.contains("alias")
-                    && stdout.contains("delete")
-                    && stdout.contains("print")
-                    && stdout.contains("quit"),
-                "list should show commands: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "list\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // list should show command names
+    assert!(
+        stdout.contains("alias")
+            && stdout.contains("delete")
+            && stdout.contains("print")
+            && stdout.contains("quit"),
+        "list should show commands: {}",
+        stdout
     );
+    assert!(output.status.success());
 }
 
 // -----------------------------------------------------------------------------
@@ -663,24 +369,8 @@ fn cmd_mbox() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("mbox 1\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            assert!(output.status.success());
-        },
-    );
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "mbox 1\nquit\n");
+    assert!(output.status.success());
 }
 
 // -----------------------------------------------------------------------------
@@ -693,32 +383,16 @@ fn cmd_next() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            // Print msg 1, then next should go to msg 2
-            stdin_data: String::from("print 1\nnext\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // After print 1 and next, should show message 2
-            assert!(
-                stdout.contains("alice") && stdout.contains("bob"),
-                "next should advance to message 2: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    // Print msg 1, then next should go to msg 2
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "print 1\nnext\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // After print 1 and next, should show message 2
+    assert!(
+        stdout.contains("alice") && stdout.contains("bob"),
+        "next should advance to message 2: {}",
+        stdout
     );
+    assert!(output.status.success());
 }
 
 // -----------------------------------------------------------------------------
@@ -731,31 +405,15 @@ fn cmd_pipe() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("pipe 1 cat\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // pipe to cat should output the message
-            assert!(
-                stdout.contains("alice@example.com") || stdout.contains("meeting tomorrow"),
-                "pipe should output message through command: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "pipe 1 cat\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // pipe to cat should output the message
+    assert!(
+        stdout.contains("alice@example.com") && stdout.contains("meeting tomorrow"),
+        "pipe should output message through command: {}",
+        stdout
     );
+    assert!(output.status.success());
 }
 
 /// Test | alias for pipe
@@ -764,30 +422,14 @@ fn cmd_pipe_alias() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("| 1 cat\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                stdout.contains("alice@example.com") || stdout.contains("meeting tomorrow"),
-                "| should work like pipe: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "| 1 cat\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("alice@example.com") && stdout.contains("meeting tomorrow"),
+        "| should work like pipe: {}",
+        stdout
     );
+    assert!(output.status.success());
 }
 
 // -----------------------------------------------------------------------------
@@ -800,34 +442,21 @@ fn cmd_print_uppercase() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            // `discard` first: without it this asserts nothing, because the
-            // lowercase form prints Date: and From: too when no header is
-            // suppressed. That is how both of these passed while `Print` was
-            // unreachable and silently ran `print`.
-            stdin_data: String::from("discard Date\nPrint 1\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                stdout.contains("Date:") && stdout.contains("From:"),
-                "Print must override discard and show all headers: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    // `discard` first: without it this asserts nothing, because the
+    // lowercase form prints Date: and From: too when no header is
+    // suppressed. That is how both of these passed while `Print` was
+    // unreachable and silently ran `print`.
+    let output = mailx(
+        &["-n", "-N", "-f", mbox_path],
+        "discard Date\nPrint 1\nquit\n",
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Date:") && stdout.contains("From:"),
+        "Print must override discard and show all headers: {}",
+        stdout
+    );
+    assert!(output.status.success());
 }
 
 /// Test Type alias for Print
@@ -836,31 +465,18 @@ fn cmd_type_uppercase() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            // `discard` first, for the same reason as cmd_print_uppercase.
-            stdin_data: String::from("discard Date\nType 1\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                stdout.contains("Date:") && stdout.contains("From:"),
-                "Type must override discard, like Print: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    // `discard` first, for the same reason as cmd_print_uppercase.
+    let output = mailx(
+        &["-n", "-N", "-f", mbox_path],
+        "discard Date\nType 1\nquit\n",
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Date:") && stdout.contains("From:"),
+        "Type must override discard, like Print: {}",
+        stdout
+    );
+    assert!(output.status.success());
 }
 
 // -----------------------------------------------------------------------------
@@ -875,30 +491,17 @@ fn cmd_save() {
     let save_file = NamedTempFile::new().expect("failed to create temp file");
     let save_path = save_file.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: format!("save 1 {}\nexit\n", save_path),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                stdout.contains("1 messages") || stdout.contains("bytes"),
-                "save should report saved message: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    let output = mailx(
+        &["-n", "-N", "-f", mbox_path],
+        format!("save 1 {}\nexit\n", save_path),
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("1 messages") && stdout.contains("bytes"),
+        "save should report saved message: {}",
+        stdout
+    );
+    assert!(output.status.success());
 }
 
 /// Test write command saves message body only (no headers)
@@ -909,30 +512,17 @@ fn cmd_write() {
     let save_file = NamedTempFile::new().expect("failed to create temp file");
     let save_path = save_file.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: format!("write 1 {}\nexit\n", save_path),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                stdout.contains("1 messages") || stdout.contains("bytes"),
-                "write should report saved message: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    let output = mailx(
+        &["-n", "-N", "-f", mbox_path],
+        format!("write 1 {}\nexit\n", save_path),
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("1 messages") && stdout.contains("bytes"),
+        "write should report saved message: {}",
+        stdout
+    );
+    assert!(output.status.success());
 }
 
 // -----------------------------------------------------------------------------
@@ -945,31 +535,15 @@ fn cmd_size() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("size 1\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // size should show message number and bytes
-            assert!(
-                stdout.contains("1:") && stdout.contains("bytes"),
-                "size should show message size: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "size 1\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // size should show message number and bytes
+    assert!(
+        stdout.contains("1:") && stdout.contains("bytes"),
+        "size should show message size: {}",
+        stdout
     );
+    assert!(output.status.success());
 }
 
 /// Test size command with multiple messages
@@ -978,31 +552,15 @@ fn cmd_size_multiple() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("size *\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // size * should show all messages
-            assert!(
-                stdout.contains("1:") && stdout.contains("2:") && stdout.contains("3:"),
-                "size * should show all message sizes: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "size *\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // size * should show all messages
+    assert!(
+        stdout.contains("1:") && stdout.contains("2:") && stdout.contains("3:"),
+        "size * should show all message sizes: {}",
+        stdout
     );
+    assert!(output.status.success());
 }
 
 // -----------------------------------------------------------------------------
@@ -1023,31 +581,18 @@ fn cmd_source() {
     cmd_file.flush().expect("failed to flush");
     let cmd_path = cmd_file.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: format!("source {}\nset\nquit\n", cmd_path),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // After sourcing, testvar should be set
-            assert!(
-                stdout.contains("testvar"),
-                "source should execute commands from file: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    let output = mailx(
+        &["-n", "-N", "-f", mbox_path],
+        format!("source {}\nset\nquit\n", cmd_path),
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // After sourcing, testvar should be set
+    assert!(
+        stdout.contains("testvar"),
+        "source should execute commands from file: {}",
+        stdout
+    );
+    assert!(output.status.success());
 }
 
 // -----------------------------------------------------------------------------
@@ -1060,31 +605,15 @@ fn cmd_top() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("top 1\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // top should show headers and first lines of body
-            assert!(
-                stdout.contains("From:") && stdout.contains("reminder"),
-                "top should show message beginning: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "top 1\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // top should show headers and first lines of body
+    assert!(
+        stdout.contains("From:") && stdout.contains("reminder"),
+        "top should show message beginning: {}",
+        stdout
     );
+    assert!(output.status.success());
 }
 
 // -----------------------------------------------------------------------------
@@ -1097,24 +626,8 @@ fn cmd_touch() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("touch 1\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            assert!(output.status.success());
-        },
-    );
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "touch 1\nquit\n");
+    assert!(output.status.success());
 }
 
 // -----------------------------------------------------------------------------
@@ -1127,32 +640,19 @@ fn cmd_undelete() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            // Delete msg 1, then undelete it, then show from *
-            stdin_data: String::from("delete 1\nundelete 1\nfrom *\nexit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // After undelete, msg 1 should be visible again
-            assert!(
-                stdout.contains("alice") || stdout.contains("Meeting"),
-                "undelete should restore message: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    // Delete msg 1, then undelete it, then show from *
+    let output = mailx(
+        &["-n", "-N", "-f", mbox_path],
+        "delete 1\nundelete 1\nfrom *\nexit\n",
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // After undelete, msg 1 should be visible again
+    assert!(
+        stdout.contains("alice") && stdout.contains("Meeting"),
+        "undelete should restore message: {}",
+        stdout
+    );
+    assert!(output.status.success());
 }
 
 // -----------------------------------------------------------------------------
@@ -1165,25 +665,9 @@ fn cmd_z_forward() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("z\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            // z should show headers (or "last screenful" message)
-            assert!(output.status.success());
-        },
-    );
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "z\nquit\n");
+    // z should show headers (or "last screenful" message)
+    assert!(output.status.success());
 }
 
 /// Test z- command scrolls headers backward
@@ -1192,24 +676,8 @@ fn cmd_z_backward() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("z-\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            assert!(output.status.success());
-        },
-    );
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "z-\nquit\n");
+    assert!(output.status.success());
 }
 
 // -----------------------------------------------------------------------------
@@ -1222,33 +690,17 @@ fn cmd_equals() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("=\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // = prints the current message number. testdata.mbox has no `new`
-            // message but message 3 (`Status: O`) is unread, so the current
-            // message is the first unread = 3 (spec 104481-104482).
-            assert!(
-                stdout.trim().lines().any(|l| l.trim() == "3"),
-                "= should show the current message number (first unread = 3): {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "=\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // = prints the current message number. testdata.mbox has no `new`
+    // message but message 3 (`Status: O`) is unread, so the current
+    // message is the first unread = 3 (spec 104481-104482).
+    assert!(
+        stdout.trim().lines().any(|l| l.trim() == "3"),
+        "= should show the current message number (first unread = 3): {}",
+        stdout
     );
+    assert!(output.status.success());
 }
 
 // -----------------------------------------------------------------------------
@@ -1261,30 +713,17 @@ fn cmd_shell_escape() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("!echo TestOutput123\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                stdout.contains("TestOutput123"),
-                "! should execute shell command: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    let output = mailx(
+        &["-n", "-N", "-f", mbox_path],
+        "!echo TestOutput123\nquit\n",
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("TestOutput123"),
+        "! should execute shell command: {}",
+        stdout
+    );
+    assert!(output.status.success());
 }
 
 // -----------------------------------------------------------------------------
@@ -1297,31 +736,15 @@ fn cmd_message_number() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("2\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // Entering 2 should print message 2
-            assert!(
-                stdout.contains("bob") || stdout.contains("Second"),
-                "Message number should print that message: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    let output = mailx(&["-n", "-N", "-f", mbox_path], "2\nquit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Entering 2 should print message 2
+    assert!(
+        stdout.contains("Subject: Project Update") && stdout.contains("The project is on track."),
+        "Message number should print that message: {}",
+        stdout
     );
+    assert!(output.status.success());
 }
 
 // -----------------------------------------------------------------------------
@@ -1334,30 +757,17 @@ fn cmd_comment() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("# This is a comment\necho working\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                stdout.contains("working"),
-                "Comment should be ignored: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    let output = mailx(
+        &["-n", "-N", "-f", mbox_path],
+        "# This is a comment\necho working\nquit\n",
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("working"),
+        "Comment should be ignored: {}",
+        stdout
+    );
+    assert!(output.status.success());
 }
 
 // -----------------------------------------------------------------------------
@@ -1370,73 +780,47 @@ fn cmd_blank_line() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                String::from(mbox_path),
-            ],
-            stdin_data: String::from("\n\necho after_blanks\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                stdout.contains("after_blanks"),
-                "Blank lines should be handled: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    let output = mailx(
+        &["-n", "-N", "-f", mbox_path],
+        "\n\necho after_blanks\nquit\n",
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("after_blanks"),
+        "Blank lines should be handled: {}",
+        stdout
+    );
+    assert!(output.status.success());
 }
 
-/// With `crt` set, pagination is skipped when stdout is not a terminal
-/// (audit #15): the message prints inline and no pager is spawned.
+/// With `crt` set, pagination is skipped when stdout is not a terminal:
+/// the message prints inline and no pager is spawned.
 #[test]
 fn crt_pagination_gated_on_terminal() {
     let mbox = copy_test_data("testdata.mbox");
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                mbox.path().to_str().unwrap().to_string(),
-            ],
-            stdin_data: String::from("set crt=1\nprint 1\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        // A bogus pager: if pagination were (wrongly) attempted off a terminal,
+    let output = mailx_env(
+        &["-n", "-N", "-f", mbox.path().to_str().unwrap()],
+        "set crt=1\nprint 1\nquit\n", // A bogus pager: if pagination were (wrongly) attempted off a terminal,
         // spawning it would fail and surface a diagnostic.
         &[("PAGER", "nonexistent_pager_xyz123")],
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                stdout.contains("Meeting Tomorrow") || stdout.contains("alice"),
-                "message should print inline without paging: {}",
-                stdout
-            );
-            assert!(
-                !stderr.contains("nonexistent_pager_xyz123"),
-                "no pager should be spawned off a terminal: {}",
-                stderr
-            );
-        },
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("Meeting Tomorrow") && stdout.contains("alice"),
+        "message should print inline without paging: {}",
+        stdout
+    );
+    assert!(
+        !stderr.contains("nonexistent_pager_xyz123"),
+        "no pager should be spawned off a terminal: {}",
+        stderr
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
-/// `file #` reopens the previously-visited folder (audit #18).
+/// `file #` reopens the previously-visited folder.
 #[test]
 fn file_hash_previous_folder() {
     let folder_a = create_temp_mbox(
@@ -1456,41 +840,29 @@ fn file_hash_previous_folder() {
     let a_path = folder_a.path().to_str().unwrap().to_string();
     let b_path = folder_b.path().to_str().unwrap().to_string();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                a_path.clone(),
-            ],
-            // Open B, then `#` returns to A.
-            stdin_data: format!("file {}\nfile #\nquit\n", b_path),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                stdout.contains("bbb@b.example"),
-                "switching to folder B should show its summary: {}",
-                stdout
-            );
-            assert!(
-                stdout.contains("aaa@a.example"),
-                "`file #` should reopen folder A: {}",
-                stdout
-            );
-            assert!(
-                !stderr.contains("previous folder") && !stderr.contains("#:"),
-                "`file #` must resolve, not error: {}",
-                stderr
-            );
-        },
+    // Open B, then `#` returns to A.
+    let output = mailx(
+        &["-n", "-N", "-f", &a_path],
+        format!("file {}\nfile #\nquit\n", b_path),
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("bbb@b.example"),
+        "switching to folder B should show its summary: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("aaa@a.example"),
+        "`file #` should reopen folder A: {}",
+        stdout
+    );
+    assert!(
+        !stderr.contains("previous folder") && !stderr.contains("#:"),
+        "`file #` must resolve, not error: {}",
+        stderr
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 /// Editor temporaries must live under `$TMPDIR` with a name nobody can predict.
@@ -1515,35 +887,23 @@ fn editor_temp_file_honors_tmpdir() {
     let tmpdir = dir.path().to_str().unwrap().to_string();
     let editor_path = editor.to_str().unwrap().to_string();
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                mbox_path,
-            ],
-            stdin_data: format!("set EDITOR={}\nedit 1\nexit\n", editor_path),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
+    let output = mailx_env(
+        &["-n", "-N", "-f", &mbox_path],
+        format!("set EDITOR={}\nedit 1\nexit\n", editor_path),
         &[("TMPDIR", &tmpdir)],
-        |_plan, _output| {
-            let logged = std::fs::read_to_string(&log).unwrap_or_default();
-            let path = logged.trim();
-            assert!(!path.is_empty(), "the editor was never invoked");
-            assert!(
-                path.starts_with(&tmpdir),
-                "the editor temporary ignored $TMPDIR: {}",
-                path
-            );
-            assert!(
-                !path.contains("mailx."),
-                "the editor temporary still uses a predictable name: {}",
-                path
-            );
-        },
     );
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    let path = logged.trim();
+    assert!(!path.is_empty(), "the editor was never invoked");
+    assert!(
+        path.starts_with(&tmpdir),
+        "the editor temporary ignored $TMPDIR: {}",
+        path
+    );
+    assert!(
+        !path.contains("mailx."),
+        "the editor temporary still uses a predictable name: {}",
+        path
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }

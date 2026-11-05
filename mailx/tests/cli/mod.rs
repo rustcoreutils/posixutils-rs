@@ -21,9 +21,9 @@
 //!
 //! Tests use static test data files for reproducible results.
 
-use plib::testing::{run_test, run_test_with_checker, run_test_with_checker_and_env, TestPlan};
-
-use crate::common::{create_temp_mailrc, create_temp_mbox, test_data_path};
+use crate::common::{
+    assert_mailx, create_temp_mailrc, create_temp_mbox, mailx, mailx_env, test_data_path,
+};
 
 // =============================================================================
 // Test Data Helpers
@@ -38,19 +38,13 @@ use crate::common::{create_temp_mailrc, create_temp_mbox, test_data_path};
 fn opt_e_mail_present() {
     let mbox_path = test_data_path("testdata.mbox");
 
-    run_test(TestPlan {
-        cmd: String::from("mailx"),
-        args: vec![
-            String::from("-n"),
-            String::from("-e"),
-            String::from("-f"),
-            mbox_path.to_str().unwrap().to_string(),
-        ],
-        stdin_data: String::new(),
-        expected_out: String::new(),
-        expected_err: String::new(),
-        expected_exit_code: 0,
-    });
+    assert_mailx(
+        &["-n", "-e", "-f", mbox_path.to_str().unwrap()],
+        "",
+        "",
+        "",
+        0,
+    );
 }
 
 /// Test -e with empty mbox (should exit 1)
@@ -58,19 +52,13 @@ fn opt_e_mail_present() {
 fn opt_e_no_mail() {
     let mbox = create_temp_mbox("");
 
-    run_test(TestPlan {
-        cmd: String::from("mailx"),
-        args: vec![
-            String::from("-n"),
-            String::from("-e"),
-            String::from("-f"),
-            mbox.path().to_str().unwrap().to_string(),
-        ],
-        stdin_data: String::new(),
-        expected_out: String::new(),
-        expected_err: String::new(),
-        expected_exit_code: 1,
-    });
+    assert_mailx(
+        &["-n", "-e", "-f", mbox.path().to_str().unwrap()],
+        "",
+        "",
+        "",
+        1,
+    );
 }
 
 /// Test -e combined with -f
@@ -79,18 +67,7 @@ fn opt_e_with_f() {
     let mbox_path = test_data_path("testdata.mbox");
 
     // -e -f should check the specified file
-    run_test(TestPlan {
-        cmd: String::from("mailx"),
-        args: vec![
-            String::from("-n"),
-            String::from("-ef"),
-            mbox_path.to_str().unwrap().to_string(),
-        ],
-        stdin_data: String::new(),
-        expected_out: String::new(),
-        expected_err: String::new(),
-        expected_exit_code: 0,
-    });
+    assert_mailx(&["-n", "-ef", mbox_path.to_str().unwrap()], "", "", "", 0);
 }
 
 // =============================================================================
@@ -102,26 +79,10 @@ fn opt_e_with_f() {
 fn opt_f_explicit_file() {
     let mbox_path = test_data_path("testdata.mbox");
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                mbox_path.to_str().unwrap().to_string(),
-            ],
-            stdin_data: String::from("quit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            assert!(
-                output.status.success(),
-                "Should read from file successfully"
-            );
-        },
+    let output = mailx(&["-n", "-N", "-f", mbox_path.to_str().unwrap()], "quit\n");
+    assert!(
+        output.status.success(),
+        "Should read from file successfully"
     );
 }
 
@@ -130,67 +91,38 @@ fn opt_f_explicit_file() {
 fn opt_f_message_count() {
     let mbox_path = test_data_path("testdata.mbox");
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-f"),
-                mbox_path.to_str().unwrap().to_string(),
-            ],
-            stdin_data: String::from("quit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // Test data has 3 messages, should show them in header summary
-            assert!(
-                stdout.contains("alice") || stdout.contains("Alice"),
-                "Should show first message sender: {}",
-                stdout
-            );
-            assert!(
-                stdout.contains("bob") || stdout.contains("Bob"),
-                "Should show second message sender: {}",
-                stdout
-            );
-            assert!(
-                stdout.contains("charlie") || stdout.contains("Charlie"),
-                "Should show third message sender: {}",
-                stdout
-            );
-        },
-    );
+    let output = mailx(&["-n", "-f", mbox_path.to_str().unwrap()], "quit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The header summary lists each of the 3 messages by sender address.
+    for (num, sender) in [
+        (1, "alice@example.com"),
+        (2, "bob@example.org"),
+        (3, "charlie@example.net"),
+    ] {
+        assert!(
+            stdout
+                .lines()
+                .any(|l| l.contains(&format!("{} {}", num, sender))),
+            "Should list message {} from {}: {}",
+            num,
+            sender,
+            stdout
+        );
+    }
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 /// Test -f with nonexistent file
 #[test]
 fn opt_f_nonexistent_file() {
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-f"),
-                String::from("/nonexistent/path/to/mbox"),
-            ],
-            stdin_data: String::new(),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 1,
-        },
-        |_plan, output| {
-            assert!(!output.status.success(), "Should fail for nonexistent file");
-            // The system's text for the error, without Rust's "(os error N)".
-            let missing = "/nonexistent/path/to/mbox";
-            let open_error = plib::diag::io_error_text(&std::fs::File::open(missing).unwrap_err());
-            assert_eq!(
-                String::from_utf8_lossy(&output.stderr),
-                format!("mailx: {missing}: {open_error}\n")
-            );
-        },
+    let output = mailx(&["-n", "-f", "/nonexistent/path/to/mbox"], "");
+    assert!(!output.status.success(), "Should fail for nonexistent file");
+    // The system's text for the error, without Rust's "(os error N)".
+    let missing = "/nonexistent/path/to/mbox";
+    let open_error = plib::diag::io_error_text(&std::fs::File::open(missing).unwrap_err());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!("mailx: {missing}: {open_error}\n")
     );
 }
 
@@ -204,32 +136,19 @@ fn opt_f_uppercase_record() {
     let mailrc = create_temp_mailrc("set debug\n");
     let mailrc_path = mailrc.path().to_str().unwrap();
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-F"),
-                String::from("-s"),
-                String::from("Record Test"),
-                String::from("recipient@example.com"),
-            ],
-            stdin_data: String::from("Test message for -F option.\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
+    let output = mailx_env(
+        &["-F", "-s", "Record Test", "recipient@example.com"],
+        "Test message for -F option.\n",
         &[("MAILRC", mailrc_path)],
-        |_plan, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // With debug mode, should show message info
-            assert!(
-                stderr.contains("Debug mode"),
-                "Should be in debug mode: {}",
-                stderr
-            );
-            assert!(output.status.success());
-        },
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // With debug mode, should show message info
+    assert!(
+        stderr.contains("Debug mode"),
+        "Should be in debug mode: {}",
+        stderr
+    );
+    assert!(output.status.success());
 }
 
 // =============================================================================
@@ -241,36 +160,20 @@ fn opt_f_uppercase_record() {
 fn opt_h_headers_only() {
     let mbox_path = test_data_path("testdata.mbox");
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-H"),
-                String::from("-f"),
-                mbox_path.to_str().unwrap().to_string(),
-            ],
-            stdin_data: String::new(), // No input needed, -H exits after display
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // Should show message headers
-            assert!(
-                stdout.contains("Meeting Tomorrow") || stdout.contains("alice"),
-                "Should show first message info: {}",
-                stdout
-            );
-            assert!(
-                stdout.contains("Project Update") || stdout.contains("bob"),
-                "Should show second message info: {}",
-                stdout
-            );
-            assert!(output.status.success());
-        },
+    let output = mailx(&["-n", "-H", "-f", mbox_path.to_str().unwrap()], "");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Should show message headers
+    assert!(
+        stdout.contains("Meeting Tomorrow") && stdout.contains("alice"),
+        "Should show first message info: {}",
+        stdout
     );
+    assert!(
+        stdout.contains("Project Update") && stdout.contains("bob"),
+        "Should show second message info: {}",
+        stdout
+    );
+    assert!(output.status.success());
 }
 
 /// Test -H with empty mailbox
@@ -278,30 +181,14 @@ fn opt_h_headers_only() {
 fn opt_h_empty_mbox() {
     let mbox = create_temp_mbox("");
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-H"),
-                String::from("-f"),
-                mbox.path().to_str().unwrap().to_string(),
-            ],
-            stdin_data: String::new(),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // Should indicate no mail
-            assert!(
-                stdout.contains("No mail") || stdout.is_empty() || output.status.success(),
-                "Should handle empty mailbox gracefully: {}",
-                stdout
-            );
-        },
+    let output = mailx(&["-n", "-H", "-f", mbox.path().to_str().unwrap()], "");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.starts_with("No mail for "),
+        "Should report that there is no mail: {}",
+        stdout
     );
+    assert!(output.status.success());
 }
 
 /// Test -H combined with -f (common pattern)
@@ -309,28 +196,15 @@ fn opt_h_empty_mbox() {
 fn opt_h_with_f() {
     let mbox_path = test_data_path("testdata.mbox");
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-nHf"),
-                mbox_path.to_str().unwrap().to_string(),
-            ],
-            stdin_data: String::new(),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // Combined flags should work
-            assert!(
-                stdout.contains("alice") || stdout.contains("Meeting"),
-                "Combined -nHf should show headers: {}",
-                stdout
-            );
-        },
+    let output = mailx(&["-nHf", mbox_path.to_str().unwrap()], "");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Combined flags should work
+    assert!(
+        stdout.contains("alice") && stdout.contains("Meeting"),
+        "Combined -nHf should show headers: {}",
+        stdout
     );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 // =============================================================================
@@ -342,26 +216,12 @@ fn opt_h_with_f() {
 fn opt_i_accepted() {
     let mbox_path = test_data_path("testdata.mbox");
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-i"),
-                String::from("-N"),
-                String::from("-f"),
-                mbox_path.to_str().unwrap().to_string(),
-            ],
-            stdin_data: String::from("quit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            // Just verify -i is accepted without error
-            assert!(output.status.success(), "-i option should be accepted");
-        },
+    let output = mailx(
+        &["-n", "-i", "-N", "-f", mbox_path.to_str().unwrap()],
+        "quit\n",
     );
+    // Just verify -i is accepted without error
+    assert!(output.status.success(), "-i option should be accepted");
 }
 
 // =============================================================================
@@ -373,25 +233,12 @@ fn opt_i_accepted() {
 fn opt_n_no_init() {
     let mbox_path = test_data_path("testdata.mbox");
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                mbox_path.to_str().unwrap().to_string(),
-            ],
-            stdin_data: String::from("set\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            // With -n, should have minimal variables set
-            assert!(output.status.success());
-        },
+    let output = mailx(
+        &["-n", "-N", "-f", mbox_path.to_str().unwrap()],
+        "set\nquit\n",
     );
+    // With -n, should have minimal variables set
+    assert!(output.status.success());
 }
 
 /// Test without -n (MAILRC is honored)
@@ -401,30 +248,19 @@ fn opt_without_n_reads_mailrc() {
     let mailrc = create_temp_mailrc("set testvar\n");
     let mailrc_path = mailrc.path().to_str().unwrap();
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-N"),
-                String::from("-f"),
-                mbox_path.to_str().unwrap().to_string(),
-            ],
-            stdin_data: String::from("set\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
+    let output = mailx_env(
+        &["-N", "-f", mbox_path.to_str().unwrap()],
+        "set\nquit\n",
         &[("MAILRC", mailrc_path)],
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // Without -n, MAILRC should be read
-            assert!(
-                stdout.contains("testvar"),
-                "Without -n, MAILRC variables should be set: {}",
-                stdout
-            );
-        },
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Without -n, MAILRC should be read
+    assert!(
+        stdout.contains("testvar"),
+        "Without -n, MAILRC variables should be set: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 // =============================================================================
@@ -437,26 +273,10 @@ fn opt_n_uppercase_no_summary() {
     let mbox_path = test_data_path("testdata.mbox");
 
     // With -N, should not show initial headers
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                mbox_path.to_str().unwrap().to_string(),
-            ],
-            stdin_data: String::from("quit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            // With -N, initial summary is suppressed
-            // Output should be minimal (just prompt if any)
-            assert!(output.status.success());
-        },
-    );
+    let output = mailx(&["-n", "-N", "-f", mbox_path.to_str().unwrap()], "quit\n");
+    // With -N, initial summary is suppressed
+    // Output should be minimal (just prompt if any)
+    assert!(output.status.success());
 }
 
 /// Test without -N shows header summary
@@ -465,29 +285,15 @@ fn opt_without_n_uppercase_shows_summary() {
     let mbox_path = test_data_path("testdata.mbox");
 
     // Without -N, should show initial headers
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-f"),
-                mbox_path.to_str().unwrap().to_string(),
-            ],
-            stdin_data: String::from("quit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // Without -N, should show headers
-            assert!(
-                stdout.contains("alice") || stdout.contains("Meeting") || stdout.contains("1"),
-                "Without -N, should show header summary: {}",
-                stdout
-            );
-        },
+    let output = mailx(&["-n", "-f", mbox_path.to_str().unwrap()], "quit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Without -N, should show headers
+    assert!(
+        stdout.contains("alice") && stdout.contains("Meeting") && stdout.contains("1"),
+        "Without -N, should show header summary: {}",
+        stdout
     );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 // =============================================================================
@@ -500,29 +306,18 @@ fn opt_s_set_subject() {
     let mailrc = create_temp_mailrc("set debug\n");
     let mailrc_path = mailrc.path().to_str().unwrap();
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-s"),
-                String::from("Test Subject Line"),
-                String::from("user@example.com"),
-            ],
-            stdin_data: String::from("Message body.\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
+    let output = mailx_env(
+        &["-s", "Test Subject Line", "user@example.com"],
+        "Message body.\n",
         &[("MAILRC", mailrc_path)],
-        |_plan, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                stderr.contains("Test Subject Line") || stderr.contains("Subject:"),
-                "Should show subject in debug: {}",
-                stderr
-            );
-        },
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Test Subject Line") && stderr.contains("Subject:"),
+        "Should show subject in debug: {}",
+        stderr
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 /// Test -s with subject containing spaces
@@ -531,53 +326,27 @@ fn opt_s_subject_with_spaces() {
     let mailrc = create_temp_mailrc("set debug\n");
     let mailrc_path = mailrc.path().to_str().unwrap();
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-s"),
-                String::from("This is a multi-word subject"),
-                String::from("user@example.com"),
-            ],
-            stdin_data: String::from("Body.\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
+    let output = mailx_env(
+        &["-s", "This is a multi-word subject", "user@example.com"],
+        "Body.\n",
         &[("MAILRC", mailrc_path)],
-        |_plan, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                stderr.contains("multi-word") || stderr.contains("Subject:"),
-                "Should handle multi-word subject: {}",
-                stderr
-            );
-        },
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("multi-word") && stderr.contains("Subject:"),
+        "Should handle multi-word subject: {}",
+        stderr
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 /// Test -s without argument (should error)
 #[test]
 fn opt_s_missing_argument() {
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![String::from("-s")],
-            stdin_data: String::new(),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 1,
-        },
-        |_plan, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(!output.status.success(), "-s without argument should fail");
-            assert!(
-                stderr.contains("requires") || stderr.contains("argument") || stderr.contains("-s"),
-                "Should indicate missing argument: {}",
-                stderr
-            );
-        },
-    );
+    let output = mailx(&["-s"], "");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "-s without argument should fail");
+    assert_eq!(stderr, "mailx: option requires an argument -- s\n");
 }
 
 /// Test -s with attached subject (no space: -sSubject)
@@ -586,28 +355,18 @@ fn opt_s_attached_subject() {
     let mailrc = create_temp_mailrc("set debug\n");
     let mailrc_path = mailrc.path().to_str().unwrap();
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-sAttachedSubject"),
-                String::from("user@example.com"),
-            ],
-            stdin_data: String::from("Body.\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
+    let output = mailx_env(
+        &["-sAttachedSubject", "user@example.com"],
+        "Body.\n",
         &[("MAILRC", mailrc_path)],
-        |_plan, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                stderr.contains("AttachedSubject") || stderr.contains("Debug mode"),
-                "Should handle attached subject: {}",
-                stderr
-            );
-        },
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("AttachedSubject") && stderr.contains("Debug mode"),
+        "Should handle attached subject: {}",
+        stderr
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 // =============================================================================
@@ -619,52 +378,21 @@ fn opt_s_attached_subject() {
 #[test]
 fn opt_u_parsed_correctly() {
     // -u without system mail access should fail gracefully
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-e"),
-                String::from("-u"),
-                String::from("nonexistentuser12345"),
-            ],
-            stdin_data: String::new(),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 1, // Should fail - no such user/mailbox
-        },
-        |_plan, output| {
-            // Either fails to find mailbox or exits with code 1
-            assert!(
-                !output.status.success() || output.status.code() == Some(1),
-                "-u with nonexistent user should fail"
-            );
-        },
+    let output = mailx(&["-n", "-e", "-u", "nonexistentuser12345"], "");
+    // Either fails to find mailbox or exits with code 1
+    assert!(
+        !output.status.success() || output.status.code() == Some(1),
+        "-u with nonexistent user should fail"
     );
 }
 
 /// Test -u missing argument
 #[test]
 fn opt_u_missing_argument() {
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![String::from("-u")],
-            stdin_data: String::new(),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 1,
-        },
-        |_plan, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(!output.status.success(), "-u without argument should fail");
-            assert!(
-                stderr.contains("requires") || stderr.contains("argument") || stderr.contains("-u"),
-                "Should indicate missing argument: {}",
-                stderr
-            );
-        },
-    );
+    let output = mailx(&["-u"], "");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "-u without argument should fail");
+    assert_eq!(stderr, "mailx: option requires an argument -- u\n");
 }
 
 // =============================================================================
@@ -676,22 +404,8 @@ fn opt_u_missing_argument() {
 fn combined_n_n_f() {
     let mbox_path = test_data_path("testdata.mbox");
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-nNf"),
-                mbox_path.to_str().unwrap().to_string(),
-            ],
-            stdin_data: String::from("quit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            assert!(output.status.success(), "Combined -nNf should work");
-        },
-    );
+    let output = mailx(&["-nNf", mbox_path.to_str().unwrap()], "quit\n");
+    assert!(output.status.success(), "Combined -nNf should work");
 }
 
 /// Test -n -H -f combination
@@ -699,29 +413,14 @@ fn combined_n_n_f() {
 fn combined_n_h_f_separate() {
     let mbox_path = test_data_path("testdata.mbox");
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-H"),
-                String::from("-f"),
-                mbox_path.to_str().unwrap().to_string(),
-            ],
-            stdin_data: String::new(),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                stdout.contains("alice") || stdout.contains("Meeting"),
-                "Separate options should work: {}",
-                stdout
-            );
-        },
+    let output = mailx(&["-n", "-H", "-f", mbox_path.to_str().unwrap()], "");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("alice") && stdout.contains("Meeting"),
+        "Separate options should work: {}",
+        stdout
     );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 /// Test send mode options: -n -s subject recipient
@@ -730,53 +429,35 @@ fn combined_send_options() {
     let mailrc = create_temp_mailrc("set debug\n");
     let mailrc_path = mailrc.path().to_str().unwrap();
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-s"),
-                String::from("Combined Send Test"),
-                String::from("user1@example.com"),
-                String::from("user2@example.com"),
-            ],
-            stdin_data: String::from("Message to multiple recipients.\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
+    let output = mailx_env(
+        &[
+            "-s",
+            "Combined Send Test",
+            "user1@example.com",
+            "user2@example.com",
+        ],
+        "Message to multiple recipients.\n",
         &[("MAILRC", mailrc_path)],
-        |_plan, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                stderr.contains("Debug mode"),
-                "Send with multiple recipients should work: {}",
-                stderr
-            );
-        },
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Debug mode"),
+        "Send with multiple recipients should work: {}",
+        stderr
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 /// Test illegal option produces error
 #[test]
 fn illegal_option() {
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![String::from("-Z")], // -Z is not a valid option
-            stdin_data: String::new(),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 1,
-        },
-        |_plan, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(!output.status.success(), "Illegal option should fail");
-            assert!(
-                stderr.contains("illegal") || stderr.contains("Z") || stderr.contains("option"),
-                "Should indicate illegal option: {}",
-                stderr
-            );
-        },
+    let output = mailx(&["-Z"], "");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "Illegal option should fail");
+    assert!(
+        stderr.contains("illegal") && stderr.contains("Z") && stderr.contains("option"),
+        "Should indicate illegal option: {}",
+        stderr
     );
 }
 
@@ -790,30 +471,19 @@ fn stdin_send_mode() {
     let mailrc = create_temp_mailrc("set debug\n");
     let mailrc_path = mailrc.path().to_str().unwrap();
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-s"),
-                String::from("Stdin Test"),
-                String::from("recipient@example.com"),
-            ],
-            stdin_data: String::from("This message comes from stdin.\nSecond line.\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
+    let output = mailx_env(
+        &["-s", "Stdin Test", "recipient@example.com"],
+        "This message comes from stdin.\nSecond line.\n",
         &[("MAILRC", mailrc_path)],
-        |_plan, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Should process stdin as message body
-            assert!(
-                stderr.contains("Debug mode") && stderr.contains("bytes"),
-                "Should read message from stdin: {}",
-                stderr
-            );
-        },
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Should process stdin as message body
+    assert!(
+        stderr.contains("Debug mode") && stderr.contains("bytes"),
+        "Should read message from stdin: {}",
+        stderr
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 /// Test empty recipient list with -s (goes to receive mode)
@@ -822,63 +492,41 @@ fn subject_without_recipient() {
     let mbox_path = test_data_path("testdata.mbox");
 
     // With -s but no recipients and -f specified, should go to receive mode
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-s"),
-                String::from("Unused Subject"),
-                String::from("-f"),
-                mbox_path.to_str().unwrap().to_string(),
-            ],
-            stdin_data: String::from("quit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            // Should enter receive mode (no recipients means not send mode)
-            assert!(output.status.success());
-        },
+    let output = mailx(
+        &[
+            "-n",
+            "-N",
+            "-s",
+            "Unused Subject",
+            "-f",
+            mbox_path.to_str().unwrap(),
+        ],
+        "quit\n",
     );
+    // Should enter receive mode (no recipients means not send mode)
+    assert!(output.status.success());
 }
 
 // =============================================================================
-// -E Option: Discard messages with an empty body (audit #1)
+// -E Option: Discard messages with an empty body
 // =============================================================================
 
 /// -E with an empty body must succeed without attempting delivery.
 #[test]
 fn opt_e_uppercase_discards_empty_body() {
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-E"),
-                String::from("-s"),
-                String::from("Empty"),
-                String::from("recipient@example.com"),
-            ],
-            // Empty body (whitespace only): must be discarded, not sent.
-            stdin_data: String::from("   \n\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // No delivery attempt: sendmail is never invoked, so no "sendmail"
-            // failure diagnostic appears even on a host without sendmail.
-            assert!(output.status.success(), "Empty -E message should succeed");
-            assert!(
-                !stderr.contains("sendmail"),
-                "-E empty body must not attempt delivery: {}",
-                stderr
-            );
-        },
+    // Empty body (whitespace only): must be discarded, not sent.
+    let output = mailx(
+        &["-n", "-E", "-s", "Empty", "recipient@example.com"],
+        "   \n\n",
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // No delivery attempt: sendmail is never invoked, so no "sendmail"
+    // failure diagnostic appears even on a host without sendmail.
+    assert!(output.status.success(), "Empty -E message should succeed");
+    assert!(
+        !stderr.contains("sendmail"),
+        "-E empty body must not attempt delivery: {}",
+        stderr
     );
 }
 
@@ -888,34 +536,22 @@ fn opt_e_uppercase_keeps_nonempty_body() {
     let mailrc = create_temp_mailrc("set debug\n");
     let mailrc_path = mailrc.path().to_str().unwrap();
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-E"),
-                String::from("-s"),
-                String::from("NonEmpty"),
-                String::from("recipient@example.com"),
-            ],
-            stdin_data: String::from("This body is not empty.\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
+    let output = mailx_env(
+        &["-E", "-s", "NonEmpty", "recipient@example.com"],
+        "This body is not empty.\n",
         &[("MAILRC", mailrc_path)],
-        |_plan, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                stderr.contains("Debug mode"),
-                "-E with non-empty body should still send: {}",
-                stderr
-            );
-        },
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Debug mode"),
+        "-E with non-empty body should still send: {}",
+        stderr
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 // =============================================================================
-// -f file operand parsing (audit #5)
+// -f file operand parsing
 // =============================================================================
 
 /// `mailx -f -N file` must read the mailbox, not send to "file".
@@ -923,29 +559,13 @@ fn opt_e_uppercase_keeps_nonempty_body() {
 fn opt_f_operand_after_other_options() {
     let mbox_path = test_data_path("testdata.mbox");
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-f"),
-                String::from("-N"),
-                mbox_path.to_str().unwrap().to_string(),
-            ],
-            stdin_data: String::from("quit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            // Reading the file in Receive Mode succeeds; it is not parsed as a
-            // recipient address (which, lacking sendmail, would error out).
-            assert!(
-                output.status.success(),
-                "-f -N file should read the mailbox: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        },
+    let output = mailx(&["-n", "-f", "-N", mbox_path.to_str().unwrap()], "quit\n");
+    // Reading the file in Receive Mode succeeds; it is not parsed as a
+    // recipient address (which, lacking sendmail, would error out).
+    assert!(
+        output.status.success(),
+        "-f -N file should read the mailbox: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -954,39 +574,25 @@ fn opt_f_operand_after_other_options() {
 fn opt_f_clustered_fin_operand() {
     let mbox_path = test_data_path("testdata.mbox");
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-fiN"),
-                mbox_path.to_str().unwrap().to_string(),
-            ],
-            stdin_data: String::from("quit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // Header summary is suppressed by N, but the file must load: a
-            // `headers` command then lists messages from the file.
-            assert!(
-                output.status.success(),
-                "-fiN file should read the mailbox: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            // Sanity: no "No recipients"/send error leaked to stdout.
-            assert!(
-                !stdout.contains("No recipients"),
-                "Should be Receive Mode, not Send: {}",
-                stdout
-            );
-        },
+    let output = mailx(&["-fiN", mbox_path.to_str().unwrap()], "quit\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Header summary is suppressed by N, but the file must load: a
+    // `headers` command then lists messages from the file.
+    assert!(
+        output.status.success(),
+        "-fiN file should read the mailbox: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Sanity: no "No recipients"/send error leaked to stdout.
+    assert!(
+        !stdout.contains("No recipients"),
+        "Should be Receive Mode, not Send: {}",
+        stdout
     );
 }
 
 // =============================================================================
-// -n keeps the user MAILRC (audit #6)
+// -n keeps the user MAILRC
 // =============================================================================
 
 /// `mailx -n` must still process the user MAILRC (only the system file is skipped).
@@ -996,34 +602,22 @@ fn opt_n_still_reads_user_mailrc() {
     let mailrc = create_temp_mailrc("set testvar\n");
     let mailrc_path = mailrc.path().to_str().unwrap();
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                mbox_path.to_str().unwrap().to_string(),
-            ],
-            stdin_data: String::from("set\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
+    let output = mailx_env(
+        &["-n", "-N", "-f", mbox_path.to_str().unwrap()],
+        "set\nquit\n",
         &[("MAILRC", mailrc_path)],
-        |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                stdout.contains("testvar"),
-                "-n must still read the user MAILRC: {}",
-                stdout
-            );
-        },
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("testvar"),
+        "-n must still read the user MAILRC: {}",
+        stdout
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 // =============================================================================
-// Multibyte header-summary truncation must not panic (audit #3)
+// Multibyte header-summary truncation must not panic
 // =============================================================================
 
 /// A multibyte From/Subject longer than the column widths must truncate on a
@@ -1045,39 +639,23 @@ fn header_summary_multibyte_no_panic() {
     );
     let mbox = create_temp_mbox(&body);
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-H"),
-                String::from("-f"),
-                mbox.path().to_str().unwrap().to_string(),
-            ],
-            stdin_data: String::new(),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            assert!(
-                output.status.success(),
-                "header summary must not panic on multibyte text: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // Truncation appends an ellipsis.
-            assert!(
-                stdout.contains("..."),
-                "long fields should be truncated with ellipsis: {}",
-                stdout
-            );
-        },
+    let output = mailx(&["-n", "-H", "-f", mbox.path().to_str().unwrap()], "");
+    assert!(
+        output.status.success(),
+        "header summary must not panic on multibyte text: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Truncation appends an ellipsis.
+    assert!(
+        stdout.contains("..."),
+        "long fields should be truncated with ellipsis: {}",
+        stdout
     );
 }
 
 // =============================================================================
-// sh -c receives the -- argument (audit #4)
+// sh -c receives the -- argument
 // =============================================================================
 
 /// A piped command beginning with `-` must be handed to the program (after the
@@ -1086,36 +664,24 @@ fn header_summary_multibyte_no_panic() {
 fn pipe_command_leading_dash_reaches_program() {
     let mbox_path = test_data_path("testdata.mbox");
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                mbox_path.to_str().unwrap().to_string(),
-            ],
-            // Pipe message 1 to the command "-n": with `sh -c -- -n` the shell
-            // runs "-n" as a command (not found) instead of swallowing it as the
-            // shell's own `-n` option (which would silently succeed).
-            stdin_data: String::from("pipe 1 -n\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                stderr.contains("not found"),
-                "`-n` should reach the shell as a command (proves `--`): {}",
-                stderr
-            );
-        },
+    // Pipe message 1 to the command "-n": with `sh -c -- -n` the shell
+    // runs "-n" as a command (not found) instead of swallowing it as the
+    // shell's own `-n` option (which would silently succeed).
+    let output = mailx(
+        &["-n", "-N", "-f", mbox_path.to_str().unwrap()],
+        "pipe 1 -n\nquit\n",
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not found"),
+        "`-n` should reach the shell as a command (proves `--`): {}",
+        stderr
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 // =============================================================================
-// Locale initialization (audit #7)
+// Locale initialization
 // =============================================================================
 
 /// mailx initializes the locale from the environment without breaking; a
@@ -1133,34 +699,20 @@ fn locale_env_initialization() {
     );
     let mbox = create_temp_mbox(&body);
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-H"),
-                String::from("-f"),
-                mbox.path().to_str().unwrap().to_string(),
-            ],
-            stdin_data: String::new(),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        // The test controls the locale; C.UTF-8 exercises the UTF-8 ctype path.
+    let output = mailx_env(
+        &["-n", "-H", "-f", mbox.path().to_str().unwrap()],
+        "", // The test controls the locale; C.UTF-8 exercises the UTF-8 ctype path.
         &[("LC_ALL", "C.UTF-8")],
-        |_plan, output| {
-            assert!(
-                output.status.success(),
-                "mailx should run with an environment UTF-8 locale: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        },
+    );
+    assert!(
+        output.status.success(),
+        "mailx should run with an environment UTF-8 locale: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
 // =============================================================================
-// alias backslash recursion guard (audit #17)
+// alias backslash recursion guard
 // =============================================================================
 
 /// A leading backslash on an alias group member prevents its expansion.
@@ -1172,30 +724,23 @@ fn alias_backslash_prevents_expansion() {
         "set debug\nalias user expanded@example.com\nalias grp \\user other@example.com\n",
     );
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![String::from("grp")],
-            stdin_data: String::from("body\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
+    let output = mailx_env(
+        &["grp"],
+        "body\n",
         &[("MAILRC", mailrc.path().to_str().unwrap())],
-        |_plan, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                stderr.contains("user") && stderr.contains("other@example.com"),
-                "group members should be present: {}",
-                stderr
-            );
-            assert!(
-                !stderr.contains("expanded@example.com"),
-                "backslashed member must not be expanded: {}",
-                stderr
-            );
-        },
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("user") && stderr.contains("other@example.com"),
+        "group members should be present: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("expanded@example.com"),
+        "backslashed member must not be expanded: {}",
+        stderr
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 // An argument that is not valid UTF-8 is reported, not a panic.
@@ -1210,31 +755,13 @@ fn summary_and_commands(content: &str, commands: &str) -> (String, String) {
     let mbox = create_temp_mbox(content);
     let path = mbox.path().to_str().unwrap().to_string();
     let run = |flag: &str, stdin: &str| {
-        let mut stdout = String::new();
-        run_test_with_checker(
-            TestPlan {
-                cmd: String::from("mailx"),
-                args: vec![
-                    String::from("-n"),
-                    String::from(flag),
-                    String::from("-f"),
-                    path.clone(),
-                ],
-                stdin_data: String::from(stdin),
-                expected_out: String::new(),
-                expected_err: String::new(),
-                expected_exit_code: 0,
-            },
-            |_plan, output| {
-                assert!(
-                    output.status.success(),
-                    "mailx failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-            },
+        let output = mailx(&["-n", flag, "-f", &path], stdin);
+        assert!(
+            output.status.success(),
+            "mailx failed: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
-        stdout
+        String::from_utf8_lossy(&output.stdout).into_owned()
     };
     (run("-H", ""), run("-N", commands))
 }

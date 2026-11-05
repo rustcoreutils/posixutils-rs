@@ -7,13 +7,13 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! Fixtures shared by the mailx test modules.
-//!
-//! Each of these existed once per module, in four near-identical copies.
+//! Fixtures and runners shared by the mailx test modules.
 
+use plib::testing::run_test_base_with_env;
 use plib::tmp::NamedTempFile;
 use std::io::Write;
 use std::path::PathBuf;
+use std::process::Output;
 
 /// Path to a static test data file in `tests/`:
 ///
@@ -57,8 +57,28 @@ pub fn copy_test_data(filename: &str) -> NamedTempFile {
     temp_file_with(&content)
 }
 
+/// Run mailx with `args`, feeding it `stdin`.
+pub fn mailx(args: &[&str], stdin: impl AsRef<[u8]>) -> Output {
+    mailx_env(args, stdin, &[])
+}
+
+/// Run mailx with `args` and extra environment variables, feeding it `stdin`.
+pub fn mailx_env(args: &[&str], stdin: impl AsRef<[u8]>, env: &[(&str, &str)]) -> Output {
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    run_test_base_with_env("mailx", &args, stdin.as_ref(), env)
+}
+
+/// Run mailx and require exactly this standard output, standard error and
+/// exit status.
+pub fn assert_mailx(args: &[&str], stdin: &str, stdout: &str, stderr: &str, status: i32) {
+    let output = mailx(args, stdin);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), stdout, "stdout");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), stderr, "stderr");
+    assert_eq!(output.status.code(), Some(status), "exit status");
+}
+
 /// Assert a run completed without a Rust panic.
-pub fn assert_no_panic(output: &std::process::Output, what: &str) {
+pub fn assert_no_panic(output: &Output, what: &str) {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !stderr.contains("panicked"),

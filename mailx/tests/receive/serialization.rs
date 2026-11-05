@@ -9,8 +9,7 @@
 
 //! mbox serialization: separators, `From ` quoting, `Status:`.
 
-use crate::common::create_temp_mbox;
-use plib::testing::{run_test_with_checker, TestPlan};
+use crate::common::{create_temp_mbox, mailx};
 use plib::tmp::NamedTempFile;
 
 /// Saved messages must be separated by an empty line (spec 104420-104427).
@@ -34,46 +33,34 @@ fn saved_messages_are_separated_by_a_blank_line() {
     let out = NamedTempFile::new().expect("out file");
     let out_path = out.path().to_str().unwrap().to_string();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                mbox_path,
-            ],
-            stdin_data: format!("save 1 {}\nsave 1 {}\nexit\n", out_path, out_path),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, _output| {
-            let saved = std::fs::read_to_string(&out_path).expect("read saved mailbox");
-            let lines: Vec<&str> = saved.lines().collect();
-            assert_eq!(
-                lines.iter().filter(|l| l.starts_with("From ")).count(),
-                2,
-                "expected two messages: {:?}",
-                saved
-            );
-            for (i, line) in lines.iter().enumerate() {
-                if i > 0 && line.starts_with("From ") {
-                    assert_eq!(
-                        lines[i - 1],
-                        "",
-                        "a From line must be preceded by an empty line: {:?}",
-                        saved
-                    );
-                }
-            }
-            assert!(
-                !saved.contains("\n\n\nFrom "),
-                "the separator was doubled: {:?}",
-                saved
-            );
-        },
+    let output = mailx(
+        &["-n", "-N", "-f", &mbox_path],
+        format!("save 1 {}\nsave 1 {}\nexit\n", out_path, out_path),
     );
+    let saved = std::fs::read_to_string(&out_path).expect("read saved mailbox");
+    let lines: Vec<&str> = saved.lines().collect();
+    assert_eq!(
+        lines.iter().filter(|l| l.starts_with("From ")).count(),
+        2,
+        "expected two messages: {:?}",
+        saved
+    );
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 && line.starts_with("From ") {
+            assert_eq!(
+                lines[i - 1],
+                "",
+                "a From line must be preceded by an empty line: {:?}",
+                saved
+            );
+        }
+    }
+    assert!(
+        !saved.contains("\n\n\nFrom "),
+        "the separator was doubled: {:?}",
+        saved
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 /// Repeated quit cycles must not accumulate blank lines.
@@ -104,22 +91,12 @@ fn repeated_quit_cycles_do_not_grow_the_mailbox() {
         let mbox_path = mbox.path().to_str().unwrap().to_string();
         std::fs::write(&out_path, "").expect("truncate out");
 
-        run_test_with_checker(
-            TestPlan {
-                cmd: String::from("mailx"),
-                args: vec![
-                    String::from("-n"),
-                    String::from("-N"),
-                    String::from("-f"),
-                    mbox_path,
-                ],
-                stdin_data: format!("save 1 {}\nexit\n", out_path),
-                expected_out: String::new(),
-                expected_err: String::new(),
-                expected_exit_code: 0,
-            },
-            |_plan, _output| {},
+        let output = mailx(
+            &["-n", "-N", "-f", &mbox_path],
+            format!("save 1 {}\nexit\n", out_path),
         );
+
+        assert_eq!(output.status.code(), Some(0), "exit status");
 
         let current = std::fs::read_to_string(&out_path).expect("read saved");
         if round > 0 {
@@ -153,45 +130,33 @@ fn from_line_in_body_round_trips() {
     let out = NamedTempFile::new().expect("out file");
     let out_path = out.path().to_str().unwrap().to_string();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                mbox_path,
-            ],
-            stdin_data: format!("save 1 {}\nexit\n", out_path),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, _output| {
-            let saved = std::fs::read_to_string(&out_path).expect("read saved");
-            // Exactly one envelope line: the body's `From ` must stay escaped.
-            assert_eq!(
-                saved.lines().filter(|l| l.starts_with("From ")).count(),
-                1,
-                "an unescaped body line split the message: {:?}",
-                saved
-            );
-            assert!(
-                saved.contains(">From here it gets interesting"),
-                "the body's From line lost its quoting: {:?}",
-                saved
-            );
-            // `>From already quoted` on disk means `From already quoted` in
-            // the message, so it comes back out with one `>`; the doubly
-            // quoted line keeps its extra level. Quoting only `From ` and
-            // never `>From ` lost a level on every round trip.
-            assert!(
-                saved.contains(">>From doubly quoted"),
-                "a doubly quoted body line lost a level of quoting: {:?}",
-                saved
-            );
-        },
+    let output = mailx(
+        &["-n", "-N", "-f", &mbox_path],
+        format!("save 1 {}\nexit\n", out_path),
     );
+    let saved = std::fs::read_to_string(&out_path).expect("read saved");
+    // Exactly one envelope line: the body's `From ` must stay escaped.
+    assert_eq!(
+        saved.lines().filter(|l| l.starts_with("From ")).count(),
+        1,
+        "an unescaped body line split the message: {:?}",
+        saved
+    );
+    assert!(
+        saved.contains(">From here it gets interesting"),
+        "the body's From line lost its quoting: {:?}",
+        saved
+    );
+    // `>From already quoted` on disk means `From already quoted` in
+    // the message, so it comes back out with one `>`; the doubly
+    // quoted line keeps its extra level. Quoting only `From ` and
+    // never `>From ` lost a level on every round trip.
+    assert!(
+        saved.contains(">>From doubly quoted"),
+        "a doubly quoted body line lost a level of quoting: {:?}",
+        saved
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 /// A folded line after `Status:` belongs to it, not to the header before it.
@@ -210,33 +175,18 @@ fn status_continuation_does_not_corrupt_the_previous_header() {
     );
     let mbox_path = mbox.path().to_str().unwrap().to_string();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                mbox_path,
-            ],
-            stdin_data: String::from("print 1\nexit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let out = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                !out.contains("continued"),
-                "a continuation of the dropped Status: header was glued onto \
-                 the header before it: {}",
-                out
-            );
-            assert!(
-                out.contains("X-Long: first"),
-                "the preceding header was lost: {}",
-                out
-            );
-        },
+    let output = mailx(&["-n", "-N", "-f", &mbox_path], "print 1\nexit\n");
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !out.contains("continued"),
+        "a continuation of the dropped Status: header was glued onto \
+         the header before it: {}",
+        out
     );
+    assert!(
+        out.contains("X-Long: first"),
+        "the preceding header was lost: {}",
+        out
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }

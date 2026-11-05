@@ -9,8 +9,7 @@
 
 //! Filename resolution for commands that write files.
 
-use crate::common::copy_test_data;
-use plib::testing::{run_test_with_checker, TestPlan};
+use crate::common::{copy_test_data, mailx};
 
 /// A filename derived from a message header must never reach the shell.
 ///
@@ -68,27 +67,12 @@ fn save_to_a_character_device_succeeds() {
     let mbox = copy_test_data("testdata-single.mbox");
     let mbox_path = mbox.path().to_str().unwrap().to_string();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                mbox_path,
-            ],
-            stdin_data: String::from("save 1 /dev/null\nexit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let err = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                err.trim().is_empty(),
-                "saving to /dev/null reported an error: {}",
-                err
-            );
-        },
+    let output = mailx(&["-n", "-N", "-f", &mbox_path], "save 1 /dev/null\nexit\n");
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.trim().is_empty(),
+        "saving to /dev/null reported an error: {}",
+        err
     );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }

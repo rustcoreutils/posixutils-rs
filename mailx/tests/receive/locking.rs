@@ -9,8 +9,7 @@
 
 //! Mailbox locking and file permissions.
 
-use crate::common::copy_test_data;
-use plib::testing::{run_test_with_checker, TestPlan};
+use crate::common::{copy_test_data, mailx};
 use std::io::Write;
 
 /// mailx waits for the `fcntl` lock that Linux delivery agents hold.
@@ -113,40 +112,28 @@ fn created_mail_files_are_private() {
     let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap().to_string();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                mbox_path,
-            ],
-            stdin_data: format!(
-                "save 1 {}\nwrite 2 {}\nexit\n",
-                saved.display(),
-                written.display()
-            ),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, _output| {
-            for path in [&saved, &written] {
-                let mode = std::fs::metadata(path)
-                    .unwrap_or_else(|e| panic!("{}: {}", path.display(), e))
-                    .permissions()
-                    .mode();
-                assert_eq!(
-                    mode & 0o077,
-                    0,
-                    "{} is readable by others: {:o}",
-                    path.display(),
-                    mode
-                );
-            }
-        },
+    let output = mailx(
+        &["-n", "-N", "-f", &mbox_path],
+        format!(
+            "save 1 {}\nwrite 2 {}\nexit\n",
+            saved.display(),
+            written.display()
+        ),
     );
+    for path in [&saved, &written] {
+        let mode = std::fs::metadata(path)
+            .unwrap_or_else(|e| panic!("{}: {}", path.display(), e))
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "{} is readable by others: {:o}",
+            path.display(),
+            mode
+        );
+    }
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 /// mailx waits for a delivery agent's `<mailbox>.lock`, and takes and
@@ -202,17 +189,7 @@ fn mailbox_breaks_stale_dotlock() {
     drop(file);
 
     let started = std::time::Instant::now();
-    let output = plib::testing::run_test_base_with_env(
-        "mailx",
-        &[
-            String::from("-n"),
-            String::from("-H"),
-            String::from("-f"),
-            mbox.to_str().unwrap().to_string(),
-        ],
-        b"",
-        &[],
-    );
+    let output = mailx(&["-n", "-H", "-f", mbox.to_str().unwrap()], "");
     assert!(output.status.success(), "mailx failed: {:?}", output);
     assert!(
         started.elapsed() < std::time::Duration::from_secs(5),
@@ -243,17 +220,7 @@ fn mailbox_without_dotlock_access_still_opens() {
     .expect("write mbox");
     std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o555)).expect("chmod");
 
-    let output = plib::testing::run_test_base_with_env(
-        "mailx",
-        &[
-            String::from("-n"),
-            String::from("-H"),
-            String::from("-f"),
-            mbox.to_str().unwrap().to_string(),
-        ],
-        b"",
-        &[],
-    );
+    let output = mailx(&["-n", "-H", "-f", mbox.to_str().unwrap()], "");
     std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     assert!(output.status.success(), "mailx failed: {:?}", output);
     assert!(String::from_utf8_lossy(&output.stdout).contains("one"));

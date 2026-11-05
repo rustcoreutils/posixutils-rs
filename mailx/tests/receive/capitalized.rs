@@ -9,8 +9,7 @@
 
 //! Capitalized command forms, distinct from their lowercase ones.
 
-use crate::common::create_temp_mbox;
-use plib::testing::{run_test_with_checker, run_test_with_checker_and_env, TestPlan};
+use crate::common::{create_temp_mbox, mailx, mailx_env};
 use plib::tmp::NamedTempFile;
 
 /// A mailbox with a header that `discard` can suppress.
@@ -43,31 +42,19 @@ fn capitalized_print_overrides_discard() {
         let mbox = capitalized_fixture();
         let mbox_path = mbox.path().to_str().unwrap().to_string();
 
-        run_test_with_checker(
-            TestPlan {
-                cmd: String::from("mailx"),
-                args: vec![
-                    String::from("-n"),
-                    String::from("-N"),
-                    String::from("-f"),
-                    mbox_path,
-                ],
-                stdin_data: format!("discard X-Secret\n{}\nexit\n", cmd),
-                expected_out: String::new(),
-                expected_err: String::new(),
-                expected_exit_code: 0,
-            },
-            |_plan, output| {
-                let out = String::from_utf8_lossy(&output.stdout);
-                assert_eq!(
-                    out.contains("hidden-header"),
-                    want_secret,
-                    "`{}` handled the discarded header wrongly: {}",
-                    cmd,
-                    out
-                );
-            },
+        let output = mailx(
+            &["-n", "-N", "-f", &mbox_path],
+            format!("discard X-Secret\n{}\nexit\n", cmd),
         );
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            out.contains("hidden-header"),
+            want_secret,
+            "`{}` handled the discarded header wrongly: {}",
+            cmd,
+            out
+        );
+        assert_eq!(output.status.code(), Some(0), "exit status");
     }
 }
 
@@ -78,42 +65,30 @@ fn capitalized_reply_addresses_sender_only() {
         let mbox = capitalized_fixture();
         let mbox_path = mbox.path().to_str().unwrap().to_string();
 
-        run_test_with_checker_and_env(
-            TestPlan {
-                cmd: String::from("mailx"),
-                args: vec![
-                    String::from("-n"),
-                    String::from("-N"),
-                    String::from("-f"),
-                    mbox_path,
-                ],
-                stdin_data: format!("set debug\n{}\nbody\n.\nexit\n", cmd),
-                expected_out: String::new(),
-                expected_err: String::new(),
-                expected_exit_code: 0,
-            },
+        let output = mailx_env(
+            &["-n", "-N", "-f", &mbox_path],
+            format!("set debug\n{}\nbody\n.\nexit\n", cmd),
             &[("USER", "me"), ("LOGNAME", "me")],
-            |_plan, output| {
-                let err = String::from_utf8_lossy(&output.stderr);
-                let envelope = err
-                    .lines()
-                    .find(|l| l.starts_with("Envelope:"))
-                    .unwrap_or_else(|| panic!("no envelope for `{}`: {}", cmd, err));
-                assert!(
-                    envelope.contains("alice@example.com"),
-                    "`{}` dropped the sender: {}",
-                    cmd,
-                    envelope
-                );
-                assert_eq!(
-                    envelope.contains("carol@example.com"),
-                    want_all,
-                    "`{}` addressed the wrong set of recipients: {}",
-                    cmd,
-                    envelope
-                );
-            },
         );
+        let err = String::from_utf8_lossy(&output.stderr);
+        let envelope = err
+            .lines()
+            .find(|l| l.starts_with("Envelope:"))
+            .unwrap_or_else(|| panic!("no envelope for `{}`: {}", cmd, err));
+        assert!(
+            envelope.contains("alice@example.com"),
+            "`{}` dropped the sender: {}",
+            cmd,
+            envelope
+        );
+        assert_eq!(
+            envelope.contains("carol@example.com"),
+            want_all,
+            "`{}` addressed the wrong set of recipients: {}",
+            cmd,
+            envelope
+        );
+        assert_eq!(output.status.code(), Some(0), "exit status");
     }
 }
 
@@ -180,27 +155,12 @@ fn wrong_case_command_is_unknown() {
     let mbox = capitalized_fixture();
     let mbox_path = mbox.path().to_str().unwrap().to_string();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                mbox_path,
-            ],
-            stdin_data: String::from("COPY 1\nexit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            let err = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                err.contains("Unknown command: COPY"),
-                "`COPY` should not match `Copy`: {}",
-                err
-            );
-        },
+    let output = mailx(&["-n", "-N", "-f", &mbox_path], "COPY 1\nexit\n");
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("Unknown command: COPY"),
+        "`COPY` should not match `Copy`: {}",
+        err
     );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }

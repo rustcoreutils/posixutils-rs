@@ -9,8 +9,7 @@
 
 //! Writing mailboxes back: quit, migration to mbox, concurrent delivery.
 
-use crate::common::create_temp_mbox;
-use plib::testing::{run_test_with_checker, run_test_with_checker_and_env, TestPlan};
+use crate::common::{create_temp_mbox, mailx, mailx_env};
 use plib::tmp::NamedTempFile;
 
 /// Mail delivered while mailx is running must survive the rewrite at quit.
@@ -37,25 +36,18 @@ fn quit_preserves_mail_delivered_while_running() {
         sys_path
     );
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![String::from("-n"), String::from("-N")],
-            stdin_data: format!("!{}\ndelete 1\nquit\n", deliver),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
+    let output = mailx_env(
+        &["-n", "-N"],
+        format!("!{}\ndelete 1\nquit\n", deliver),
         &[("MAIL", &sys_path)],
-        |_plan, _output| {
-            let after = std::fs::read_to_string(&sys_path).expect("mailbox should still exist");
-            assert!(
-                after.contains("delivered late"),
-                "mail delivered while mailx ran was destroyed by quit: {:?}",
-                after
-            );
-        },
     );
+    let after = std::fs::read_to_string(&sys_path).expect("mailbox should still exist");
+    assert!(
+        after.contains("delivered late"),
+        "mail delivered while mailx ran was destroyed by quit: {:?}",
+        after
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 /// The quit rewrite must keep the same inode.
@@ -83,24 +75,13 @@ fn quit_rewrite_preserves_inode() {
     let sys_path = sys.path().to_str().unwrap().to_string();
     let before = std::fs::metadata(&sys_path).expect("stat before").ino();
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![String::from("-n"), String::from("-N")],
-            stdin_data: String::from("delete 1\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        &[("MAIL", &sys_path)],
-        |_plan, _output| {
-            let after = std::fs::metadata(&sys_path).expect("stat after").ino();
-            assert_eq!(
-                before, after,
-                "quit replaced the mailbox inode instead of rewriting it in place"
-            );
-        },
+    let output = mailx_env(&["-n", "-N"], "delete 1\nquit\n", &[("MAIL", &sys_path)]);
+    let after = std::fs::metadata(&sys_path).expect("stat after").ino();
+    assert_eq!(
+        before, after,
+        "quit replaced the mailbox inode instead of rewriting it in place"
     );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 /// `noappend` places migrated messages at the *start* of mbox (spec 104579).
@@ -127,39 +108,32 @@ fn quit_migration_does_not_truncate_mbox() {
     let sys_path = sys.path().to_str().unwrap().to_string();
     let mbox_path = mbox.path().to_str().unwrap().to_string();
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![String::from("-n"), String::from("-N")],
-            // Reading message 1 marks it read, so quit migrates it to mbox.
-            stdin_data: String::from("print 1\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
+    // Reading message 1 marks it read, so quit migrates it to mbox.
+    let output = mailx_env(
+        &["-n", "-N"],
+        "print 1\nquit\n",
         &[("MAIL", &sys_path), ("MBOX", &mbox_path)],
-        |_plan, _output| {
-            let after = std::fs::read_to_string(&mbox_path).expect("mbox should still exist");
-            assert!(
-                after.contains("previously saved"),
-                "migrating a read message truncated mbox and destroyed saved mail: {:?}",
-                after
-            );
-            assert!(
-                after.contains("fresh mail"),
-                "the migrated message never reached mbox: {:?}",
-                after
-            );
-            // noappend => the new message goes first.
-            let new_at = after.find("fresh mail").unwrap();
-            let old_at = after.find("previously saved").unwrap();
-            assert!(
-                new_at < old_at,
-                "noappend must place migrated messages before existing mbox content: {:?}",
-                after
-            );
-        },
     );
+    let after = std::fs::read_to_string(&mbox_path).expect("mbox should still exist");
+    assert!(
+        after.contains("previously saved"),
+        "migrating a read message truncated mbox and destroyed saved mail: {:?}",
+        after
+    );
+    assert!(
+        after.contains("fresh mail"),
+        "the migrated message never reached mbox: {:?}",
+        after
+    );
+    // noappend => the new message goes first.
+    let new_at = after.find("fresh mail").unwrap();
+    let old_at = after.find("previously saved").unwrap();
+    assert!(
+        new_at < old_at,
+        "noappend must place migrated messages before existing mbox content: {:?}",
+        after
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 /// `keepsave` must be honored in a secondary folder, not only the system mailbox.
@@ -186,35 +160,23 @@ fn keepsave_retains_saved_message_in_folder() {
     let out = NamedTempFile::new().expect("out file");
     let out_path = out.path().to_str().unwrap().to_string();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                folder_path.clone(),
-            ],
-            stdin_data: format!("set keepsave\nsave 1 {}\nquit\n", out_path),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, _output| {
-            let saved = std::fs::read_to_string(&out_path).unwrap_or_default();
-            assert!(
-                saved.contains("keep me here"),
-                "save did not write the message to the target file: {:?}",
-                saved
-            );
-            let after = std::fs::read_to_string(&folder_path).expect("folder should still exist");
-            assert!(
-                after.contains("keep me here"),
-                "keepsave was ignored in a secondary folder; the saved message was dropped: {:?}",
-                after
-            );
-        },
+    let output = mailx(
+        &["-n", "-N", "-f", &folder_path],
+        format!("set keepsave\nsave 1 {}\nquit\n", out_path),
     );
+    let saved = std::fs::read_to_string(&out_path).unwrap_or_default();
+    assert!(
+        saved.contains("keep me here"),
+        "save did not write the message to the target file: {:?}",
+        saved
+    );
+    let after = std::fs::read_to_string(&folder_path).expect("folder should still exist");
+    assert!(
+        after.contains("keep me here"),
+        "keepsave was ignored in a secondary folder; the saved message was dropped: {:?}",
+        after
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 /// The rewrite branch (not the unlink branch) must also keep newly delivered mail.
@@ -242,30 +204,23 @@ fn quit_rewrite_preserves_delivered_tail() {
         sys_path
     );
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![String::from("-n"), String::from("-N")],
-            stdin_data: format!("!{}\ndelete 1\nquit\n", deliver),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
+    let output = mailx_env(
+        &["-n", "-N"],
+        format!("!{}\ndelete 1\nquit\n", deliver),
         &[("MAIL", &sys_path)],
-        |_plan, _output| {
-            let after = std::fs::read_to_string(&sys_path).expect("mailbox should still exist");
-            assert!(
-                after.contains("delivered late"),
-                "the rewrite dropped mail delivered while mailx ran: {:?}",
-                after
-            );
-            assert!(
-                after.contains("second"),
-                "the rewrite dropped the kept message: {:?}",
-                after
-            );
-        },
     );
+    let after = std::fs::read_to_string(&sys_path).expect("mailbox should still exist");
+    assert!(
+        after.contains("delivered late"),
+        "the rewrite dropped mail delivered while mailx ran: {:?}",
+        after
+    );
+    assert!(
+        after.contains("second"),
+        "the rewrite dropped the kept message: {:?}",
+        after
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 /// An emptied mailbox is removed, or truncated when `keep` is set (spec 104636).
@@ -280,42 +235,24 @@ fn emptied_mailbox_removed_unless_keep_is_set() {
 
     let nokeep = create_temp_mbox(one);
     let nokeep_path = nokeep.path().to_str().unwrap().to_string();
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![String::from("-n"), String::from("-N")],
-            stdin_data: String::from("delete 1\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        &[("MAIL", &nokeep_path)],
-        |_plan, _output| {
-            assert!(
-                !std::path::Path::new(&nokeep_path).exists(),
-                "nokeep should remove an emptied mailbox"
-            );
-        },
+    let output = mailx_env(&["-n", "-N"], "delete 1\nquit\n", &[("MAIL", &nokeep_path)]);
+    assert!(
+        !std::path::Path::new(&nokeep_path).exists(),
+        "nokeep should remove an emptied mailbox"
     );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 
     let keep = create_temp_mbox(one);
     let keep_path = keep.path().to_str().unwrap().to_string();
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![String::from("-n"), String::from("-N")],
-            stdin_data: String::from("set keep\ndelete 1\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
+    let output = mailx_env(
+        &["-n", "-N"],
+        "set keep\ndelete 1\nquit\n",
         &[("MAIL", &keep_path)],
-        |_plan, _output| {
-            let meta = std::fs::metadata(&keep_path)
-                .expect("keep should truncate the mailbox, not remove it");
-            assert_eq!(meta.len(), 0, "keep should leave the mailbox zero-length");
-        },
     );
+    let meta =
+        std::fs::metadata(&keep_path).expect("keep should truncate the mailbox, not remove it");
+    assert_eq!(meta.len(), 0, "keep should leave the mailbox zero-length");
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 /// `append` places migrated messages after the existing mbox content (spec 104579).
@@ -340,29 +277,22 @@ fn append_places_migrated_messages_last() {
     let sys_path = sys.path().to_str().unwrap().to_string();
     let mbox_path = mbox.path().to_str().unwrap().to_string();
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![String::from("-n"), String::from("-N")],
-            stdin_data: String::from("set append\nprint 1\nquit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
+    let output = mailx_env(
+        &["-n", "-N"],
+        "set append\nprint 1\nquit\n",
         &[("MAIL", &sys_path), ("MBOX", &mbox_path)],
-        |_plan, _output| {
-            let after = std::fs::read_to_string(&mbox_path).expect("mbox should still exist");
-            let new_at = after.find("fresh mail").expect("migrated message missing");
-            let old_at = after
-                .find("previously saved")
-                .expect("saved mail destroyed");
-            assert!(
-                old_at < new_at,
-                "append must place migrated messages after existing mbox content: {:?}",
-                after
-            );
-        },
     );
+    let after = std::fs::read_to_string(&mbox_path).expect("mbox should still exist");
+    let new_at = after.find("fresh mail").expect("migrated message missing");
+    let old_at = after
+        .find("previously saved")
+        .expect("saved mail destroyed");
+    assert!(
+        old_at < new_at,
+        "append must place migrated messages after existing mbox content: {:?}",
+        after
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 /// `file` onto the mailbox already open must not duplicate a fragment of it.
@@ -388,41 +318,29 @@ fn file_onto_the_current_mailbox_does_not_duplicate_it() {
     );
     let path = mbox.path().to_str().unwrap().to_string();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                path.clone(),
-            ],
-            stdin_data: format!("print 1\nfile {}\nprint 1\nquit\n", path),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, _output| {
-            let after = std::fs::read_to_string(&path).expect("mailbox");
-            // Byte-exact: a duplicated tail is a few bytes appended past the
-            // last message, which a message count or a suffix check misses.
-            let expected = "From a@example.com Fri Nov 29 10:00:00 2024\n\
-                            From: a@example.com\n\
-                            Subject: first\n\
-                            Status: RO\n\
-                            \n\
-                            one\n\
-                            \n\
-                            From c@example.org Fri Nov 29 11:00:00 2024\n\
-                            From: c@example.org\n\
-                            Subject: second\n\
-                            \n\
-                            two\n\
-                            \n";
-            assert_eq!(
-                after, expected,
-                "reopening the current mailbox corrupted it"
-            );
-        },
+    let output = mailx(
+        &["-n", "-N", "-f", &path],
+        format!("print 1\nfile {}\nprint 1\nquit\n", path),
     );
+    let after = std::fs::read_to_string(&path).expect("mailbox");
+    // Byte-exact: a duplicated tail is a few bytes appended past the
+    // last message, which a message count or a suffix check misses.
+    let expected = "From a@example.com Fri Nov 29 10:00:00 2024\n\
+                    From: a@example.com\n\
+                    Subject: first\n\
+                    Status: RO\n\
+                    \n\
+                    one\n\
+                    \n\
+                    From c@example.org Fri Nov 29 11:00:00 2024\n\
+                    From: c@example.org\n\
+                    Subject: second\n\
+                    \n\
+                    two\n\
+                    \n";
+    assert_eq!(
+        after, expected,
+        "reopening the current mailbox corrupted it"
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }

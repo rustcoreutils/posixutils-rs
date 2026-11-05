@@ -9,8 +9,7 @@
 
 //! Inputs that once aborted the process.
 
-use crate::common::{assert_no_panic, copy_test_data, create_temp_mbox};
-use plib::testing::{run_test_with_checker, TestPlan};
+use crate::common::{assert_no_panic, copy_test_data, create_temp_mbox, mailx};
 
 /// A `From:` whose display name contains `>` before `<` must not abort.
 ///
@@ -28,22 +27,8 @@ fn from_with_reversed_angle_brackets_no_panic() {
     );
     let mbox_path = mbox.path().to_str().unwrap().to_string();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                mbox_path,
-            ],
-            stdin_data: String::from("followup 1\n.\nexit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| assert_no_panic(output, "followup on a reversed-bracket From:"),
-    );
+    let output = mailx(&["-n", "-N", "-f", &mbox_path], "followup 1\n.\nexit\n");
+    assert_no_panic(&output, "followup on a reversed-bracket From:");
 }
 
 /// A `From:` whose parenthesised comment closes before it opens must not abort.
@@ -62,17 +47,8 @@ fn from_with_reversed_parens_no_panic() {
     );
     let mbox_path = mbox.path().to_str().unwrap().to_string();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![String::from("-n"), String::from("-f"), mbox_path],
-            stdin_data: String::from("headers\nexit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| assert_no_panic(output, "header summary for a reversed-paren From:"),
-    );
+    let output = mailx(&["-n", "-f", &mbox_path], "headers\nexit\n");
+    assert_no_panic(&output, "header summary for a reversed-paren From:");
 }
 
 /// A multibyte character straight after the escape character must not abort.
@@ -85,22 +61,11 @@ fn multibyte_after_escape_char_no_panic() {
     let mbox = copy_test_data("testdata-single.mbox");
     let mbox_path = mbox.path().to_str().unwrap().to_string();
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                mbox_path,
-            ],
-            stdin_data: String::from("mail someone@example.com\n~élan\n~x\nexit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| assert_no_panic(output, "a multibyte character after the escape char"),
+    let output = mailx(
+        &["-n", "-N", "-f", &mbox_path],
+        "mail someone@example.com\n~élan\n~x\nexit\n",
     );
+    assert_no_panic(&output, "a multibyte character after the escape char");
 }
 
 /// `set screen=0` must not divide by zero in `headers` or `z`.
@@ -110,22 +75,11 @@ fn screen_zero_no_panic() {
         let mbox = copy_test_data("testdata.mbox");
         let mbox_path = mbox.path().to_str().unwrap().to_string();
 
-        run_test_with_checker(
-            TestPlan {
-                cmd: String::from("mailx"),
-                args: vec![
-                    String::from("-n"),
-                    String::from("-N"),
-                    String::from("-f"),
-                    mbox_path,
-                ],
-                stdin_data: format!("set screen=0\n{}\nexit\n", cmd),
-                expected_out: String::new(),
-                expected_err: String::new(),
-                expected_exit_code: 0,
-            },
-            |_plan, output| assert_no_panic(output, &format!("`set screen=0` then `{}`", cmd)),
+        let output = mailx(
+            &["-n", "-N", "-f", &mbox_path],
+            format!("set screen=0\n{}\nexit\n", cmd),
         );
+        assert_no_panic(&output, &format!("`set screen=0` then `{}`", cmd));
     }
 }
 
@@ -136,30 +90,18 @@ fn cyclic_alias_no_stack_overflow() {
         let mbox = copy_test_data("testdata-single.mbox");
         let mbox_path = mbox.path().to_str().unwrap().to_string();
 
-        run_test_with_checker(
-            TestPlan {
-                cmd: String::from("mailx"),
-                args: vec![
-                    String::from("-n"),
-                    String::from("-N"),
-                    String::from("-f"),
-                    mbox_path,
-                ],
-                stdin_data: format!("{}mail a\n~x\nexit\n", defs),
-                expected_out: String::new(),
-                expected_err: String::new(),
-                expected_exit_code: 0,
-            },
-            |_plan, output| {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                assert!(
-                    !stderr.contains("stack overflow"),
-                    "cyclic alias overflowed the stack: {}",
-                    stderr
-                );
-                assert_no_panic(output, "a cyclic alias");
-            },
+        let output = mailx(
+            &["-n", "-N", "-f", &mbox_path],
+            format!("{}mail a\n~x\nexit\n", defs),
         );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("stack overflow"),
+            "cyclic alias overflowed the stack: {}",
+            stderr
+        );
+        assert_no_panic(&output, "a cyclic alias");
+        assert_eq!(output.status.code(), Some(0), "exit status");
     }
 }
 
@@ -191,26 +133,11 @@ fn author_derived_filename_rejects_path_traversal() {
     }
     let _cleanup = RemoveOnDrop(probe);
 
-    run_test_with_checker(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-n"),
-                String::from("-N"),
-                String::from("-f"),
-                mbox_path,
-            ],
-            stdin_data: String::from("followup 1\n.\nexit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
-        |_plan, output| {
-            assert_no_panic(output, "a traversal-shaped author name");
-            assert!(
-                !probe.exists(),
-                "an author-derived filename escaped the working directory"
-            );
-        },
+    let output = mailx(&["-n", "-N", "-f", &mbox_path], "followup 1\n.\nexit\n");
+    assert_no_panic(&output, "a traversal-shaped author name");
+    assert!(
+        !probe.exists(),
+        "an author-derived filename escaped the working directory"
     );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }

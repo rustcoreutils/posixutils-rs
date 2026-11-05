@@ -10,8 +10,7 @@
 //! Start-up file handling.
 
 use super::capitalized::capitalized_fixture;
-use crate::common::{copy_test_data, create_temp_mailrc};
-use plib::testing::{run_test_with_checker_and_env, TestPlan};
+use crate::common::{copy_test_data, create_temp_mailrc, mailx_env};
 
 /// A `Copy` command in a start-up file is diagnosed (case-folded match).
 #[test]
@@ -19,29 +18,18 @@ fn startup_copy_is_diagnosed() {
     let mbox = copy_test_data("testdata.mbox");
     let mailrc = create_temp_mailrc("Copy 1\n");
 
-    run_test_with_checker_and_env(
-        TestPlan {
-            cmd: String::from("mailx"),
-            args: vec![
-                String::from("-N"),
-                String::from("-f"),
-                mbox.path().to_str().unwrap().to_string(),
-            ],
-            stdin_data: String::from("quit\n"),
-            expected_out: String::new(),
-            expected_err: String::new(),
-            expected_exit_code: 0,
-        },
+    let output = mailx_env(
+        &["-N", "-f", mbox.path().to_str().unwrap()],
+        "quit\n",
         &[("MAILRC", mailrc.path().to_str().unwrap())],
-        |_plan, output| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                stderr.contains("not valid in a start-up file"),
-                "Copy in a start-up file should be diagnosed: {}",
-                stderr
-            );
-        },
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not valid in a start-up file"),
+        "Copy in a start-up file should be diagnosed: {}",
+        stderr
+    );
+    assert_eq!(output.status.code(), Some(0), "exit status");
 }
 
 /// Lowercase `copy`/`save` are legal in a start-up file; only the capitalized
@@ -59,26 +47,15 @@ fn startup_rejects_only_the_capitalized_file_commands() {
         let rc = create_temp_mailrc(&format!("{}\n", line));
         let rc_path = rc.path().to_str().unwrap().to_string();
 
-        run_test_with_checker_and_env(
-            TestPlan {
-                cmd: String::from("mailx"),
-                args: vec![String::from("-N"), String::from("-f"), mbox_path],
-                stdin_data: String::from("exit\n"),
-                expected_out: String::new(),
-                expected_err: String::new(),
-                expected_exit_code: 0,
-            },
-            &[("MAILRC", &rc_path)],
-            |_plan, output| {
-                let err = String::from_utf8_lossy(&output.stderr);
-                assert_eq!(
-                    err.contains("not valid in a start-up file"),
-                    rejected,
-                    "start-up handling of `{}` is wrong: {}",
-                    line,
-                    err
-                );
-            },
+        let output = mailx_env(&["-N", "-f", &mbox_path], "exit\n", &[("MAILRC", &rc_path)]);
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            err.contains("not valid in a start-up file"),
+            rejected,
+            "start-up handling of `{}` is wrong: {}",
+            line,
+            err
         );
+        assert_eq!(output.status.code(), Some(0), "exit status");
     }
 }

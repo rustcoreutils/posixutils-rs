@@ -60,9 +60,25 @@ enum Failure {
 /// Bytes, not text: input need not be valid in any encoding, and what
 /// follows the control character is copied unchanged.
 fn asa_stream<R: BufRead, W: Write>(input: &mut R, out: &mut W) -> Result<(), Failure> {
-    let mut line: Vec<u8> = Vec::new();
     let mut first_line = true;
+    let result = asa_lines(input, out, &mut first_line);
+    // The last line's <newline>, held for a '+' that never came -- also
+    // when a read failed partway, or the next file's first line would be
+    // written onto this one.
+    if !first_line {
+        out.write_all(b"\n").map_err(Failure::Output)?;
+    }
+    result
+}
 
+/// [`asa_stream`]'s lines, all but the last one's held <newline>, with
+/// `first_line` left false once one has been written.
+fn asa_lines<R: BufRead, W: Write>(
+    input: &mut R,
+    out: &mut W,
+    first_line: &mut bool,
+) -> Result<(), Failure> {
+    let mut line: Vec<u8> = Vec::new();
     loop {
         line.clear();
         if input.read_until(b'\n', &mut line).map_err(Failure::Input)? == 0 {
@@ -72,13 +88,13 @@ fn asa_stream<R: BufRead, W: Write>(input: &mut R, out: &mut W) -> Result<(), Fa
         let control_end = next_char_offset(&line, 0).expect("a line is never empty");
         // A multibyte control character is none POSIX names.
         let control = if control_end == 1 { line[0] } else { b' ' };
-        let control = if first_line && control == b'+' {
+        let control = if *first_line && control == b'+' {
             b' '
         } else {
             control
         };
 
-        let separator: &[u8] = match (first_line, control) {
+        let separator: &[u8] = match (*first_line, control) {
             (true, _) => b"",
             (false, b'+') => b"\r",
             (false, _) => b"\n",
@@ -93,11 +109,7 @@ fn asa_stream<R: BufRead, W: Write>(input: &mut R, out: &mut W) -> Result<(), Fa
         for part in [separator, advance, text] {
             out.write_all(part).map_err(Failure::Output)?;
         }
-        first_line = false;
-    }
-
-    if !first_line {
-        out.write_all(b"\n").map_err(Failure::Output)?;
+        *first_line = false;
     }
     Ok(())
 }
@@ -138,4 +150,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     std::process::exit(plib::diag::exit_status())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufReader, Read};
+
+    /// Yields `data`, then fails every read, as a disk does when it gives
+    /// out partway through a file.
+    struct FailsAfter(&'static [u8]);
+
+    impl Read for FailsAfter {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.0.is_empty() {
+                return Err(io::Error::other("the disk gave out"));
+            }
+            let n = self.0.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+
+    // A file that fails partway still ends its last line, or the next
+    // file's first line would be written onto it.
+    #[test]
+    fn read_error_ends_the_held_line() {
+        let mut out = Vec::new();
+        let result = asa_stream(&mut BufReader::new(FailsAfter(b" a\n b\n")), &mut out);
+        assert!(matches!(result, Err(Failure::Input(_))), "{result:?}");
+        assert_eq!(out, b"a\nb\n");
+    }
+
+    #[test]
+    fn read_error_before_any_line_writes_nothing() {
+        let mut out = Vec::new();
+        let result = asa_stream(&mut BufReader::new(FailsAfter(b"")), &mut out);
+        assert!(matches!(result, Err(Failure::Input(_))), "{result:?}");
+        assert_eq!(out, b"");
+    }
 }

@@ -458,6 +458,19 @@ enum Arch {
     Aarch64,
 }
 
+/// The target the host is, or `None` on one c17 does not target: there the
+/// tables have nothing to be compared against.
+fn host_arch() -> Option<Arch> {
+    if cfg!(target_arch = "x86_64") {
+        Some(Arch::X86_64)
+    } else if cfg!(target_arch = "aarch64") {
+        Some(Arch::Aarch64)
+    } else {
+        eprintln!("SKIP <tgmath.h> tables: c17 does not target this host");
+        None
+    }
+}
+
 /// One macro call of a table row.
 struct Case {
     /// `sqrt(g_f32)`.
@@ -564,11 +577,7 @@ fn prologue(gnu: bool) -> String {
 
 /// The c17 options for `arch`, or `None` where its headers are missing.
 fn target_args(arch: Arch) -> Option<Vec<&'static str>> {
-    let host = if cfg!(target_arch = "x86_64") {
-        Arch::X86_64
-    } else {
-        Arch::Aarch64
-    };
+    let host = host_arch()?;
     if arch == host {
         return Some(Vec::new());
     }
@@ -679,15 +688,17 @@ fn tgmath_picks_gccs_function_for_every_macro_and_type() {
     }
 }
 
-/// The program that checks, for every call gcc accepts, that the macro's
-/// result has the type and the value of a direct call of gcc's function.
-fn value_program(arch: Arch, gnu: bool) -> String {
+/// The program that checks, for the calls gcc accepts, that the macro's
+/// result has the type and the value of a direct call of gcc's function:
+/// of the accepted calls in order, those whose position is `part` modulo
+/// `parts`, so that the `parts` programs together check every one.
+fn value_program(arch: Arch, gnu: bool, part: usize, parts: usize) -> String {
     let mut src = prologue(gnu);
     src += "int main(void) {\n    int bad = 0;\n";
-    for case in cases(arch, gnu) {
-        if case.function.is_none() {
-            continue;
-        }
+    let accepted = cases(arch, gnu)
+        .into_iter()
+        .filter(|case| case.function.is_some());
+    for (_, case) in accepted.enumerate().filter(|(n, _)| n % parts == part) {
         let (call, direct) = (&case.call, &case.direct);
         src += &format!(
             "    {{ __typeof__({direct}) want = {direct}, got = {call};\n\
@@ -700,30 +711,65 @@ fn value_program(arch: Arch, gnu: bool) -> String {
     src
 }
 
-/// The value and type of every accepted call, run on the host and, where the
-/// cross toolchain is installed, on aarch64 under qemu.
-#[test]
+/// The value and type of every accepted call for `arch`: run on the host
+/// when it is `arch`, and on aarch64 under qemu from an x86-64 host where
+/// the cross toolchain is installed.
+///
+/// One test per target, mode and part: each program is one function of
+/// thousands of calls, and a compiler built without optimization takes most
+/// of a minute over the whole of the GNU mode's, so that one is halved.
 #[cfg(target_os = "linux")]
-fn tgmath_values_are_the_picked_functions() {
-    let host = if cfg!(target_arch = "x86_64") {
-        Arch::X86_64
-    } else {
-        Arch::Aarch64
+fn values_are_the_picked_functions(arch: Arch, gnu: bool, part: usize, parts: usize) {
+    let Some(host) = host_arch() else {
+        return;
     };
-    for gnu in [true, false] {
-        let src = value_program(host, gnu);
+    let src = value_program(arch, gnu, part, parts);
+    if arch == host {
         assert_eq!(
             compile_and_run("tgmath_values", &src, &["-lm".to_string()]),
             0,
-            "gnu={gnu}"
+            "gnu={gnu}, part {part} of {parts}"
         );
-        if host == Arch::X86_64 {
-            let src = value_program(Arch::Aarch64, gnu);
-            if let Some(code) =
-                compile_and_run_aarch64_with("tgmath_values", &src, &["-O0"], &["-lm"])
-            {
-                assert_eq!(code, 0, "aarch64, gnu={gnu}");
-            }
+    } else if host == Arch::X86_64 {
+        if let Some(code) = compile_and_run_aarch64_with("tgmath_values", &src, &["-O0"], &["-lm"])
+        {
+            assert_eq!(code, 0, "aarch64, gnu={gnu}, part {part} of {parts}");
         }
     }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn tgmath_values_are_the_picked_functions_x86_64_gnu_1_of_2() {
+    values_are_the_picked_functions(Arch::X86_64, true, 0, 2);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn tgmath_values_are_the_picked_functions_x86_64_gnu_2_of_2() {
+    values_are_the_picked_functions(Arch::X86_64, true, 1, 2);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn tgmath_values_are_the_picked_functions_x86_64_default() {
+    values_are_the_picked_functions(Arch::X86_64, false, 0, 1);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn tgmath_values_are_the_picked_functions_aarch64_gnu_1_of_2() {
+    values_are_the_picked_functions(Arch::Aarch64, true, 0, 2);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn tgmath_values_are_the_picked_functions_aarch64_gnu_2_of_2() {
+    values_are_the_picked_functions(Arch::Aarch64, true, 1, 2);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn tgmath_values_are_the_picked_functions_aarch64_default() {
+    values_are_the_picked_functions(Arch::Aarch64, false, 0, 1);
 }

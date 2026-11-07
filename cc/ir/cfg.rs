@@ -176,13 +176,7 @@ impl BasicBlock {
     /// terminator alone would miss the rest of them and find those blocks
     /// unreachable.
     pub fn has_mid_block_edge(&self) -> bool {
-        self.insns.iter().any(|i| {
-            i.extra().landing_pad.is_some()
-                || i.extra()
-                    .asm_data
-                    .as_ref()
-                    .is_some_and(|d| !d.goto_labels.is_empty())
-        })
+        self.insns.iter().any(names_mid_block_edge)
     }
 
     fn has_phi(&self) -> bool {
@@ -219,6 +213,16 @@ impl BasicBlock {
         }
         br.bb_true.filter(|t| *t != self.id)
     }
+}
+
+/// Does `insn` name a successor though it is no terminator?
+fn names_mid_block_edge(insn: &Instruction) -> bool {
+    insn.extra().landing_pad.is_some()
+        || insn
+            .extra()
+            .asm_data
+            .as_ref()
+            .is_some_and(|d| !d.goto_labels.is_empty())
 }
 
 impl Function {
@@ -604,15 +608,35 @@ impl Function {
 
     /// Merge each block into its predecessor while it has just the one and
     /// is that predecessor's only successor.
+    ///
+    /// A chain can be as long as the function, so each merge looks only at
+    /// the instructions it brings: the rest of the block was looked at
+    /// before.
     fn merge_chains(&mut self) -> bool {
         let mut absorbed: HashSet<BasicBlockId> = HashSet::new();
         for a in 0..self.blocks.len() {
             if absorbed.contains(&self.blocks[a].id) {
                 continue;
             }
-            while let Some(b) = self.sole_successor(a) {
-                self.absorb(a, b);
+            // Each block merged into `a`, with where its instructions begin.
+            let mut starts: HashMap<BasicBlockId, usize> = HashMap::new();
+            let mut unseen = 0;
+            while let Some(b) = self.sole_successor(a, unseen) {
+                unseen = self.absorb(a, b);
+                starts.insert(b, unseen);
                 absorbed.insert(b);
+            }
+            // A phi in a merged block became a copy, and so does each
+            // `PhiSource` ahead of that block's instructions that fed it:
+            // one pass for the whole chain, not one per merge.
+            for (at, insn) in self.blocks[a].insns.iter_mut().enumerate() {
+                if insn
+                    .phi_source_dest()
+                    .is_some_and(|(phi_bb, _)| starts.get(&phi_bb).is_some_and(|&s| at < s))
+                {
+                    insn.op = Opcode::Copy;
+                    insn.phi_list.clear();
+                }
             }
         }
         if absorbed.is_empty() {
@@ -624,13 +648,15 @@ impl Function {
     }
 
     /// The block `a` falls into and nothing else reaches, if there is one.
-    fn sole_successor(&self, a: usize) -> Option<BasicBlockId> {
+    /// No instruction of `a` before `unseen` names a successor.
+    fn sole_successor(&self, a: usize, unseen: usize) -> Option<BasicBlockId> {
         let block = &self.blocks[a];
         let [b] = block.children[..] else {
             return None;
         };
         let ends_in_br = block.insns.last().is_some_and(|t| t.op == Opcode::Br);
-        if !ends_in_br || block.has_mid_block_edge() || b == block.id || b == self.entry {
+        let mid_block_edge = block.insns[unseen..].iter().any(names_mid_block_edge);
+        if !ends_in_br || mid_block_edge || b == block.id || b == self.entry {
             return None;
         }
         let next = self.get_block(b)?;
@@ -638,12 +664,12 @@ impl Function {
     }
 
     /// Move block `b`'s instructions onto the end of block `a`, its only
-    /// predecessor, in place of `a`'s branch to it. `b` is left empty and
-    /// unlinked for the caller to drop.
+    /// predecessor, in place of `a`'s branch to it, and return where they
+    /// begin. `b` is left empty and unlinked for the caller to drop.
     ///
     /// A phi with one predecessor is a copy of what that predecessor
-    /// supplies, and the `PhiSource` supplying it is a copy too.
-    fn absorb(&mut self, a: usize, b: BasicBlockId) {
+    /// supplies; the caller makes the `PhiSource` supplying it a copy too.
+    fn absorb(&mut self, a: usize, b: BasicBlockId) -> usize {
         let a_id = self.blocks[a].id;
         let bi = self.block_index(b).expect("a successor exists");
         let mut insns = std::mem::take(&mut self.blocks[bi].insns);
@@ -662,15 +688,7 @@ impl Function {
 
         let block = &mut self.blocks[a];
         block.insns.pop();
-        for insn in &mut block.insns {
-            if insn
-                .phi_source_dest()
-                .is_some_and(|(phi_bb, _)| phi_bb == b)
-            {
-                insn.op = Opcode::Copy;
-                insn.phi_list.clear();
-            }
-        }
+        let start = block.insns.len();
         block.insns.extend(insns);
         block.children = children.clone();
         for c in children {
@@ -678,6 +696,7 @@ impl Function {
                 .expect("a successor exists")
                 .rename_predecessor(b, a_id);
         }
+        start
     }
 
     /// Every block's successors, by id: `children`, which the validator holds
@@ -817,6 +836,61 @@ mod tests {
         );
         assert_eq!(f.blocks[0].insns[2].src, vec![PseudoId(10)]);
         assert!(f.blocks[0].insns.iter().all(|i| i.phi_list.is_empty()));
+        valid(&f);
+        assert!(!f.simplify_cfg(), "a second run finds nothing");
+    }
+
+    /// A chain as long as a function of sequential `if`s merges into its
+    /// head, every phi along it and every `PhiSource` feeding one a copy.
+    #[test]
+    fn simplify_cfg_merges_a_long_chain_of_phis_into_one_block() {
+        let int = TypeTable::new(&Target::host()).int_id;
+        let n: u32 = 500;
+        // Block `i` takes `%(100 + 2i - 1)` from its phi and hands it on as
+        // `%(100 + 2i)`, which feeds block `i + 1`'s phi.
+        let phi_of = |i: u32| PseudoId(99 + 2 * i);
+        let src_of = |i: u32| PseudoId(100 + 2 * i);
+        let mut blocks = Vec::new();
+        for i in 0..=n {
+            let mut insns = Vec::new();
+            let mut handed = PseudoId(2);
+            if i == 0 {
+                insns.push(entry());
+            } else {
+                let mut phi = Instruction::phi(phi_of(i), int, Bits::new(32));
+                phi.phi_list = vec![(BasicBlockId(i - 1), src_of(i - 1))];
+                insns.push(phi);
+                handed = phi_of(i);
+            }
+            if i == n {
+                insns.push(Instruction::ret(Some(handed)));
+                blocks.push((i, insns, vec![]));
+            } else {
+                let mut src = Instruction::phi_source(src_of(i), handed, int, Bits::new(32));
+                src.phi_list = vec![(BasicBlockId(i + 1), phi_of(i + 1))];
+                insns.push(src);
+                insns.push(br(i + 1));
+                blocks.push((i, insns, vec![i + 1]));
+            }
+        }
+        let mut f = function(blocks);
+        f.next_pseudo = 100 + 2 * n + 1;
+        assert!(f.simplify_cfg());
+        assert_eq!(ids(&f), vec![0]);
+        let insns = &f.blocks[0].insns;
+        assert_eq!(insns.len(), 2 * n as usize + 2);
+        assert_eq!(insns[0].op, Opcode::Entry);
+        assert_eq!(insns.last().unwrap().op, Opcode::Ret);
+        let middle = &insns[1..insns.len() - 1];
+        assert!(middle.iter().all(|i| i.op == Opcode::Copy));
+        assert!(middle.iter().all(|i| i.phi_list.is_empty()));
+        // Each copy reads what the one before it wrote, from `%2` on.
+        let mut prev = PseudoId(2);
+        for insn in middle {
+            assert_eq!(insn.src, vec![prev]);
+            prev = insn.target.expect("a copy has a target");
+        }
+        assert_eq!(insns.last().unwrap().src, vec![prev]);
         valid(&f);
         assert!(!f.simplify_cfg(), "a second run finds nothing");
     }

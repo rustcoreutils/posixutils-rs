@@ -91,40 +91,123 @@ fn many_gotos(n: usize) -> String {
     )
 }
 
-#[test]
-fn codegen_large_functions_compile_and_run() {
-    for (name, src) in [
-        ("sequential_ifs", sequential_ifs(20000)),
-        ("accumulating_ifs", accumulating_ifs(5000)),
-        ("many_locals", many_locals(5000)),
-        ("many_gotos", many_gotos(3000)),
-    ] {
-        assert_eq!(compile_and_run(name, &src, &[]), 0, "{name} -O0");
-        let opts = vec!["-O2".to_string()];
-        assert_eq!(compile_and_run(name, &src, &opts), 0, "{name} -O2");
-        for opt in ["-O0", "-O2"] {
-            if let Some(code) = compile_and_run_aarch64(name, &src, opt) {
-                assert_eq!(code, 0, "{name} aarch64 {opt}");
-            }
+/// Compile `src` and run it on the host at the matrix levels and at -O2, and
+/// on aarch64 at -O0 and -O2 where the cross toolchain is installed.
+///
+/// Each shape is a test of its own: a compiler built without optimization
+/// takes most of a minute over one of them, and they run in parallel.
+fn compiles_and_runs(name: &str, src: &str) {
+    assert_eq!(compile_and_run(name, src, &[]), 0, "{name} -O0");
+    let opts = vec!["-O2".to_string()];
+    assert_eq!(compile_and_run(name, src, &opts), 0, "{name} -O2");
+    for opt in ["-O0", "-O2"] {
+        if let Some(code) = compile_and_run_aarch64(name, src, opt) {
+            assert_eq!(code, 0, "{name} aarch64 {opt}");
         }
     }
 }
 
-/// No pass may recurse once per dominator-tree level: a function this long
-/// compiles in an 8 MB compiler stack, far below the one c17 runs itself on.
 #[test]
-fn codegen_deep_dominator_tree_needs_no_deep_stack() {
-    let c = create_c_file("deep_domtree", &sequential_ifs(100000));
-    for opt in ["-O0", "-O2"] {
+fn codegen_large_function_of_sequential_ifs() {
+    compiles_and_runs("sequential_ifs", &sequential_ifs(20000));
+}
+
+#[test]
+fn codegen_large_function_of_accumulating_ifs() {
+    compiles_and_runs("accumulating_ifs", &accumulating_ifs(5000));
+}
+
+#[test]
+fn codegen_large_function_of_many_locals() {
+    compiles_and_runs("many_locals", &many_locals(5000));
+}
+
+#[test]
+fn codegen_large_function_of_many_gotos() {
+    compiles_and_runs("many_gotos", &many_gotos(3000));
+}
+
+/// `n` block-scoped locals, each scope a diamond: every scope dominates the
+/// rest of the function, so placing phis by walking the dominator subtree
+/// below each definition costs n variables times n blocks. Declared with
+/// `qual` `volatile`, they stay in memory instead, thousands of locals
+/// reusing a few stack slots, and checking each against every other that
+/// ever shared its slot costs n squared again.
+fn scoped_locals(n: usize, qual: &str) -> String {
+    let body: String = (0..n)
+        .map(|i| {
+            format!(
+                "    {{ {qual} int want = x + {i}, got = x + {i};\n      if (got != want) bad = 1; }}\n"
+            )
+        })
+        .collect();
+    format!("int main(void)\n{{\n    volatile int x = 1;\n    int bad = 0;\n{body}    return bad;\n}}\n")
+}
+
+/// Compile `src` to assembly at each of `opts`, with the compiler's stack
+/// held to `stack` bytes.
+fn compiles_in(name: &str, src: &str, opts: &[&str], stack: &str) {
+    let c = create_c_file(name, src);
+    for opt in opts {
         let args: Vec<String> = [opt, "-S", "-o", "/dev/null", &c.path().to_string_lossy()]
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let out = run_test_base_with_env("c17", &args, &[], &[("RUST_MIN_STACK", "8388608")]);
+        let out = run_test_base_with_env("c17", &args, &[], &[("RUST_MIN_STACK", stack)]);
         assert!(
             out.status.success(),
-            "{opt}: {}",
+            "{name} {opt}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
     }
+}
+
+/// No pass may recurse once per dominator-tree level: a function this long
+/// compiles in a 2 MB compiler stack, far below the one c17 runs itself on.
+/// The ratio is what matters -- about 84 bytes a level, less than any
+/// recursive frame -- so the function is no longer than it needs to be.
+#[test]
+fn codegen_deep_dominator_tree_needs_no_deep_stack() {
+    compiles_in(
+        "deep_domtree",
+        &sequential_ifs(25000),
+        &["-O0", "-O2"],
+        "2097152",
+    );
+}
+
+/// Phi placement takes time linear in the function, not quadratic in its
+/// locals: this took minutes when it was.
+#[test]
+fn codegen_many_scoped_locals_compile_in_linear_time() {
+    compiles_in(
+        "scoped_locals",
+        &scoped_locals(20000, ""),
+        &["-O0", "-O2"],
+        "8388608",
+    );
+}
+
+/// Register allocation, and in a build with debug assertions its verifier,
+/// take time linear in the locals sharing a stack slot, not quadratic.
+#[test]
+fn codegen_many_slot_sharing_locals_compile_in_linear_time() {
+    compiles_in(
+        "slot_sharing_locals",
+        &scoped_locals(20000, "volatile"),
+        &["-O"],
+        "8388608",
+    );
+}
+
+/// CFG simplification merges a chain of diamonds in time linear in the
+/// chain, not quadratic: this took most of a minute when it was.
+#[test]
+fn codegen_long_merged_chain_compiles_in_linear_time() {
+    compiles_in(
+        "accumulating_ifs",
+        &accumulating_ifs(40000),
+        &["-O2"],
+        "8388608",
+    );
 }

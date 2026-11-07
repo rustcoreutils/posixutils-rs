@@ -633,7 +633,7 @@ after that, because merging would undo the splitting the copies depend on. See
 | File | Purpose |
 |------|---------|
 | `validate.rs` | The IR invariants: single definition; phi arity matching the predecessors; one terminator, at the end of the block; `parents`/`children` matching what the instructions name; branch targets that exist; operand types; every lifetime marker naming a local of its function; and displacements in range. Run at every stage listed above. That every memory access or barrier counts as a side effect is a property of the opcode table, tested over `Opcode::ALL` |
-| `dominate.rs` | Dominator tree by Lengauer–Tarjan (simple form, O(E log V)), and iterated dominance frontiers by Sreedhar–Gao. It returns a `DomTree` snapshot rather than writing into the blocks |
+| `dominate.rs` | Dominator tree by Lengauer–Tarjan (simple form, O(E log V)), and dominance frontiers by Cooper–Harvey–Kennedy, from which each iterated dominance frontier is a worklist. It returns `DomTree` and `DomFrontiers` snapshots rather than writing into the blocks |
 | `dataflow.rs` | The sparse conditional solver that `sccp` and `vrp` share: seeding, executable-edge marking, the worklists, the step budget, and rewriting what a solution proves. A pass supplies only the lattice and the transfer functions |
 | `range.rs` | A set of W-bit integers as one interval that may wrap, which answers signed and unsigned questions alike, plus its transfer functions. It has no IR types, so it is tested exhaustively at four bits |
 | `constfold.rs` | Evaluates one operation over constants, at the operand's width and the signedness the opcode implies, for integer and floating types. It is the one copy of these rules, shared by `instcombine`, `sccp`, `vrp`, `copyprop` and both back ends |
@@ -681,9 +681,9 @@ because that is the part an index cannot show.
   Computing Static Single Assignment Form and the Control Dependence Graph",
   *TOPLAS* 13(4), 1991: SSA construction by φ placement at dominance frontiers,
   then renaming over the dominator tree (`ssa.rs`).
-- V. C. Sreedhar, G. R. Gao, "A Linear Time Algorithm for Placing φ-Nodes",
-  *POPL* 1995: iterated dominance frontiers without computing frontiers first
-  (`dominate.rs::idf_compute`).
+- K. D. Cooper, T. J. Harvey, K. Kennedy, "A Simple, Fast Dominance
+  Algorithm", 2001: dominance frontiers by walking each join's predecessors
+  up the dominator tree (`dominate.rs::DomFrontiers::build`).
 - T. Lengauer, R. E. Tarjan, "A Fast Algorithm for Finding Dominators in a
   Flowgraph", *TOPLAS* 1(1), 1979: the dominator tree, in its simple form
   (`dominate.rs::domtree_build`).

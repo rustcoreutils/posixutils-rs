@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{run_test, run_test_u8, run_test_with_env, utf8_locale, TestPlan, TestPlanU8};
 
 fn asa_test(test_data: &str, expected_output: &str) {
     run_test(TestPlan {
@@ -174,17 +174,65 @@ fn asa_cjk_content() {
     asa_test(" 日本語テスト\n", "日本語テスト\n");
 }
 
-// Test multi-byte UTF-8 as control character (non-standard, treated as space per POSIX)
+/// `asa` over bytes, in the C locale the test runner forces.
+fn asa_test_bytes(test_data: &[u8], expected_output: &[u8]) {
+    run_test_u8(TestPlanU8 {
+        cmd: String::from("asa"),
+        args: vec![],
+        stdin_data: test_data.to_vec(),
+        expected_out: expected_output.to_vec(),
+        expected_err: vec![],
+        expected_exit_code: 0,
+    });
+}
+
+/// `asa` in a UTF-8 locale, or nothing where the host has none.
+fn asa_test_utf8(test_data: &str, expected_output: &str) {
+    let Some(locale) = utf8_locale() else {
+        return;
+    };
+    run_test_with_env(
+        TestPlan {
+            cmd: String::from("asa"),
+            args: vec![],
+            stdin_data: String::from(test_data),
+            expected_out: String::from(expected_output),
+            expected_err: String::from(""),
+            expected_exit_code: 0,
+        },
+        &[("LC_ALL", &locale)],
+    );
+}
+
+// A multibyte character as the control character is none POSIX names, so it
+// acts as a space: the whole character goes, in a locale where it is one.
 #[test]
 fn asa_multibyte_control_char() {
-    // Multi-byte char as control: treated as unknown, like space
-    asa_test("éhello\n", "hello\n");
+    asa_test_utf8("éhello\n", "hello\n");
 }
 
 #[test]
 fn asa_cjk_control_char() {
-    // 3-byte CJK char as control: treated as unknown, like space
-    asa_test("日test\n", "test\n");
+    asa_test_utf8("日test\n", "test\n");
+}
+
+// In the POSIX locale every byte is a character (XBD 6.2), so a file with
+// bytes that are not UTF-8 is a text file, and passes through whole.
+#[test]
+fn asa_non_utf8_bytes_in_posix_locale() {
+    asa_test_bytes(b" ok1\n caf\xe9\n ok3\n", b"ok1\ncaf\xe9\nok3\n");
+}
+
+// The first *character* is removed, and in the POSIX locale that is one
+// byte, even of what would be a UTF-8 sequence elsewhere.
+#[test]
+fn asa_first_character_is_one_byte_in_posix_locale() {
+    asa_test_bytes(b"\xe6\x97\xa5test\n", b"\x97\xa5test\n");
+}
+
+#[test]
+fn asa_nul_control_char() {
+    asa_test_bytes(b"\0a\0b\n x\n", b"a\0b\nx\n");
 }
 
 // ===== FILE ARGUMENT TESTS =====
@@ -397,11 +445,94 @@ fn asa_dash_interleaved_with_files() {
     assert_eq!(stdout, "first\nsecond\nthird\n", "got {stdout:?}");
 }
 
+/// `asa args` run in `dir`, for operands named relative to it.
+fn asa_run_in(dir: &std::path::Path, args: &[&str]) -> (String, i32) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_asa"))
+        .args(args)
+        .current_dir(dir)
+        .env("LC_ALL", "C")
+        .output()
+        .expect("failed to run asa");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
 #[test]
 fn asa_double_dash_ends_options() {
-    // A file whose name begins with `-` is reachable only after `--`.
+    // A file whose name begins with `-` is reachable only after `--`: named
+    // relative to its directory, since an absolute path never looks like an
+    // option and would pass with or without `--`.
     let f = tmp_file("-dashname", " body\n");
-    let (stdout, _, code) = asa_run(&["--", f.to_str().unwrap()]);
-    assert_eq!(code, 0);
+    let dir = f.parent().unwrap();
+    assert_eq!(asa_run_in(dir, &["--", "-dashname"]), ("body\n".into(), 0));
+    let (stdout, code) = asa_run_in(dir, &["-dashname"]);
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("", 2),
+        "without `--` it is an option"
+    );
+}
+
+// A directory operand is an error that does not stop the others.
+#[cfg(unix)]
+#[test]
+fn asa_directory_operand_continues() {
+    let f = tmp_file("good", " body\n");
+    let dir = f.parent().unwrap();
+    let (stdout, stderr, code) = asa_run(&[dir.to_str().unwrap(), f.to_str().unwrap()]);
+    assert_eq!(code, 1);
     assert_eq!(stdout, "body\n");
+    assert!(stderr.contains(dir.to_str().unwrap()), "stderr {stderr:?}");
+}
+
+// Each file starts afresh: a '+' first in the second file is a space too.
+#[test]
+fn asa_plus_first_in_a_later_file() {
+    let a = tmp_file("a", " a\n");
+    let b = tmp_file("b", "+b\n");
+    let (stdout, _, code) = asa_run(&[a.to_str().unwrap(), b.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "a\nb\n");
+}
+
+// A write that fails is reported as a write error and exits 1, even when
+// it is the last one, made only when the output is flushed at the end.
+#[cfg(target_os = "linux")]
+#[test]
+fn asa_write_error_on_full_device() {
+    plib::testing::assert_write_error_on_full_device("asa", &[], b" x\n", 1);
+}
+
+// Once standard output fails every later file would fail the same way:
+// one diagnostic, not one per operand.
+#[cfg(target_os = "linux")]
+#[test]
+fn asa_write_error_is_reported_once() {
+    let a = tmp_file("a", " first\n");
+    let b = tmp_file("b", " second\n");
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("open /dev/full");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_asa"))
+        .args([a.to_str().unwrap(), b.to_str().unwrap()])
+        .env("LC_ALL", "C")
+        .stdout(full)
+        .output()
+        .expect("run asa");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr {stderr:?}");
+    assert_eq!(stderr.lines().count(), 1, "stderr {stderr:?}");
+    assert!(stderr.contains("write error"), "stderr {stderr:?}");
+}
+
+// Into a closed pipe asa dies by SIGPIPE, as a filter should.
+#[cfg(unix)]
+#[test]
+fn asa_dies_by_sigpipe_on_a_closed_pipe() {
+    let big = " line of a long report\n".repeat(200_000);
+    let f = tmp_file("big", &big);
+    plib::testing::assert_dies_by_sigpipe("asa", &[f.to_str().unwrap()]);
 }

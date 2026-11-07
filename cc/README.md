@@ -52,7 +52,7 @@ algorithms and contracts live:
 | `types.rs` | The C type system: interned `TypeId`s, layout, bit-field placement, qualifiers |
 | `ir/mod.rs` | IR data structures -- opcodes, pseudos, instructions, blocks, functions. See [ir/README.md](ir/README.md) |
 | `ir/linearize.rs` | AST to IR: control flow, lvalues, initializers, lifetime markers |
-| `ir/ssa.rs`, `ir/dominate.rs` | SSA construction: phis at the iterated dominance frontier (Sreedhar-Gao), renaming |
+| `ir/ssa.rs`, `ir/dominate.rs` | SSA construction: phis at the iterated dominance frontier (worklist over Cooper-Harvey-Kennedy frontiers), renaming |
 | `ir/cfg.rs`, `ir/validate.rs` | Every CFG edit, critical-edge splitting, CFG simplification; the IR invariants every stage is checked against |
 | `opt.rs` | The optimizer: the pass order, and why each pass sits where it does |
 | `ir/dataflow.rs` | The sparse conditional solver (Wegman-Zadeck) behind `sccp` and `vrp` |

@@ -6,11 +6,13 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// Dominator tree computation.
+// Dominator tree and dominance frontiers.
 //
 // - Dominator tree: "A Fast Algorithm for Finding Dominators in a Flowgraph"
 //   by Lengauer and Tarjan, in its simple form
-// - IDF computation: "A Linear Time Algorithm for Placing phi-nodes" by Sreedhar and Gao
+// - Dominance frontiers: "A Simple, Fast Dominance Algorithm" by Cooper,
+//   Harvey and Kennedy, computed once per function; each iterated dominance
+//   frontier is then a worklist over them
 //
 
 use super::{BasicBlockId, Function};
@@ -38,7 +40,6 @@ pub struct DomTree {
     idom: Vec<Option<BasicBlockId>>,
     level: Vec<u32>,
     children: Vec<Vec<BasicBlockId>>,
-    max_level: u32,
 }
 
 impl DomTree {
@@ -65,11 +66,6 @@ impl DomTree {
         }
     }
 
-    /// The deepest level in the tree.
-    pub fn max_level(&self) -> u32 {
-        self.max_level
-    }
-
     /// Whether `a` dominates `b`: every path from entry to `b` passes
     /// through `a`. Reflexive.
     ///
@@ -90,8 +86,6 @@ impl DomTree {
         false
     }
 }
-
-const DEFAULT_IDF_CAPACITY: usize = 8;
 
 // Dominator Tree Construction (Lengauer-Tarjan)
 
@@ -187,7 +181,6 @@ pub fn domtree_build(func: &Function) -> DomTree {
         idom: vec![None; func.blocks.len()],
         level: vec![0; func.blocks.len()],
         children: vec![Vec::new(); func.blocks.len()],
-        max_level: 0,
     };
     if func.blocks.is_empty() {
         return dom;
@@ -269,18 +262,13 @@ pub fn domtree_build(func: &Function) -> DomTree {
     // Record, and level by DFS number: a node's immediate dominator is a DFS
     // ancestor, so it is numbered, and levelled, first.
     // A successor id with no block behind it is a node of the graph -- the
-    // walk reaches it -- but has no slot to record; it counts at level 1, as
-    // it always has.
+    // walk reaches it -- but has no slot to record.
     let mut level: Vec<u32> = vec![0; size];
     for w in 1..size {
         level[w] = level[idom[w]] + 1;
-        match dom.index.get(&vertex[w]) {
-            Some(&slot) => {
-                dom.idom[slot] = Some(vertex[idom[w]]);
-                dom.level[slot] = level[w];
-                dom.max_level = dom.max_level.max(level[w]);
-            }
-            None => dom.max_level = dom.max_level.max(1),
+        if let Some(&slot) = dom.index.get(&vertex[w]) {
+            dom.idom[slot] = Some(vertex[idom[w]]);
+            dom.level[slot] = level[w];
         }
     }
 
@@ -296,143 +284,105 @@ pub fn domtree_build(func: &Function) -> DomTree {
     dom
 }
 
-// Iterated Dominance Frontier (IDF) Computation
+// Dominance Frontiers
 
-/// Priority queue based on dominator tree level (higher level = higher priority).
-/// Used by the Sreedhar-Gao algorithm.
-struct LevelQueue {
-    /// Buckets indexed by level
-    buckets: Vec<Vec<BasicBlockId>>,
-    /// Current maximum non-empty level
-    max_level: usize,
-}
-
-impl LevelQueue {
-    fn new(max_level: u32) -> Self {
-        Self {
-            buckets: vec![Vec::new(); max_level as usize + 1],
-            max_level: 0,
-        }
-    }
-
-    fn push(&mut self, bb_id: BasicBlockId, level: u32) {
-        let level = level as usize;
-        self.buckets[level].push(bb_id);
-        if level > self.max_level {
-            self.max_level = level;
-        }
-    }
-
-    fn pop(&mut self) -> Option<BasicBlockId> {
-        loop {
-            if let Some(bb) = self.buckets[self.max_level].pop() {
-                return Some(bb);
-            }
-            if self.max_level == 0 {
-                return None;
-            }
-            self.max_level -= 1;
-        }
-    }
-}
-
-/// Compute the iterated dominance frontier of a set of blocks.
+/// The dominance frontier of every block of one function: for a block `x`,
+/// each block `y` with a predecessor `x` dominates, where `x` does not
+/// strictly dominate `y` itself -- where `x`'s dominance ends.
 ///
-/// The IDF of a set S is DF*(S) = DF(S) ∪ DF(DF(S)) ∪ DF(DF(DF(S))) ∪ ...
-/// until fixed point.
-///
-/// Uses the linear time algorithm from:
-/// "A Linear Time Algorithm for Placing phi-nodes" by Sreedhar and Gao
-pub fn idf_compute(func: &Function, dom: &DomTree, alpha: &[BasicBlockId]) -> Vec<BasicBlockId> {
-    let mut walk = IdfWalk {
-        func,
-        dom,
-        in_alpha: alpha.iter().copied().collect(),
-        visited: HashSet::with_capacity(DEFAULT_IDF_CAPACITY),
-        in_idf: HashSet::with_capacity(DEFAULT_IDF_CAPACITY),
-        idf: Vec::with_capacity(DEFAULT_IDF_CAPACITY),
-        queue: LevelQueue::new(dom.max_level()),
-    };
-    for &bb_id in alpha {
-        if func.get_block(bb_id).is_some() {
-            walk.queue.push(bb_id, dom.level(bb_id));
-        }
-    }
-    while let Some(x) = walk.queue.pop() {
-        walk.visited.insert(x);
-        let level = dom.level(x);
-        walk.j_edges(x, level);
-        for &child in dom.children(x) {
-            if !walk.visited.contains(&child) {
-                walk.visit_subtree(child, level);
-            }
-        }
-    }
-    walk.idf
+/// A snapshot like [`DomTree`], computed from one, and good only for the CFG
+/// both were built from.
+#[derive(Debug, Clone, Default)]
+pub struct DomFrontiers {
+    /// Each block's frontier, listed in `func.blocks` order. A block with an
+    /// empty frontier has no entry.
+    frontier: HashMap<BasicBlockId, Vec<BasicBlockId>>,
 }
 
-/// One Sreedhar-Gao walk: the blocks the IDF has gathered and the queue of
-/// those still to explore.
-struct IdfWalk<'a> {
-    func: &'a Function,
-    dom: &'a DomTree,
-    in_alpha: HashSet<BasicBlockId>,
-    visited: HashSet<BasicBlockId>,
-    in_idf: HashSet<BasicBlockId>,
-    idf: Vec<BasicBlockId>,
-    queue: LevelQueue,
-}
+impl DomFrontiers {
+    /// Compute every block's frontier.
+    ///
+    /// Cooper, Harvey and Kennedy, "A Simple, Fast Dominance Algorithm"
+    /// (2001), figure 5: `y` is in the frontier of each block on the
+    /// immediate-dominator chain from each predecessor of `y` up to, but not
+    /// including, `idom(y)`. A walk stops early at a block that already has
+    /// `y`: an earlier walk for `y` passed it and went on up to `idom(y)`, so
+    /// every block above has `y` too. Each step then adds one frontier entry,
+    /// and the cost is the edges plus the total frontier size -- never
+    /// predecessors x depth, for a join with thousands of predecessors under
+    /// a deep chain.
+    ///
+    /// The graph is the one `children` records, as for [`domtree_build`].
+    /// The entry and unreachable blocks have no immediate dominator, so a
+    /// walk into one of them runs off the top of the chain. A walk from an
+    /// unreachable predecessor is taken only into such a block: an unreachable
+    /// block dominates nothing reachable.
+    pub fn build(func: &Function, dom: &DomTree) -> Self {
+        let mut preds: HashMap<BasicBlockId, Vec<BasicBlockId>> = HashMap::new();
+        for bb in &func.blocks {
+            for &s in &bb.children {
+                preds.entry(s).or_default().push(bb.id);
+            }
+        }
+        let reachable = |id: BasicBlockId| id == func.entry || dom.idom(id).is_some();
 
-impl IdfWalk<'_> {
-    /// Add to the IDF the target of each J-edge out of `x` -- an edge to a
-    /// block `x` does not immediately dominate -- whose level is at or above
-    /// `level`, and queue each new one that is not in alpha.
-    fn j_edges(&mut self, x: BasicBlockId, level: u32) {
-        let (func, dom) = (self.func, self.dom);
-        let Some(bb) = func.get_block(x) else {
-            return;
-        };
-        for &y in &bb.children {
-            if dom.idom(y) == Some(x) {
-                continue;
-            }
-            let y_level = dom.level(y);
-            if y_level > level {
-                continue;
-            }
-            if self.in_idf.insert(y) {
-                self.idf.push(y);
-                if !self.in_alpha.contains(&y) {
-                    self.queue.push(y, y_level);
+        let mut frontier: HashMap<BasicBlockId, Vec<BasicBlockId>> = HashMap::new();
+        for y in func.blocks.iter().map(|bb| bb.id) {
+            let target = dom.idom(y);
+            for &p in preds.get(&y).into_iter().flatten() {
+                if target.is_some() && !reachable(p) {
+                    continue;
+                }
+                let mut runner = Some(p);
+                while let Some(r) = runner {
+                    if Some(r) == target {
+                        break;
+                    }
+                    let df = frontier.entry(r).or_default();
+                    if df.last() == Some(&y) {
+                        break;
+                    }
+                    df.push(y);
+                    runner = dom.idom(r);
                 }
             }
         }
+        DomFrontiers { frontier }
     }
 
-    /// Visit the dominator subtree under `root` in pre-order -- a block, then
-    /// each dominated child's subtree in order -- recording the J-edges that
-    /// leave it at or above `level`.
+    /// The dominance frontier of `id`.
+    pub fn frontier(&self, id: BasicBlockId) -> &[BasicBlockId] {
+        self.frontier.get(&id).map_or(&[], Vec::as_slice)
+    }
+
+    /// The iterated dominance frontier of a set of blocks: the limit of
+    /// DF(S), DF(S U DF(S)), ... -- the blocks that need a phi for a variable
+    /// defined in each block of S.
     ///
-    /// On an explicit stack rather than the call stack: a function of n
-    /// sequential `if` statements has a dominator tree n levels deep, and a
-    /// recursion per level overflowed the compiler's stack. Children are
-    /// pushed in reverse so they are popped, and so visited, in order.
-    fn visit_subtree(&mut self, root: BasicBlockId, level: u32) {
-        let dom = self.dom;
-        let mut stack = vec![root];
-        while let Some(bb_id) = stack.pop() {
-            if !self.visited.insert(bb_id) {
-                continue;
+    /// A worklist over the frontiers, so the cost is the frontier entries it
+    /// reads, not the size of the function. The result is in discovery order,
+    /// which depends only on `alpha` and the CFG.
+    pub fn idf(&self, alpha: &[BasicBlockId]) -> Vec<BasicBlockId> {
+        let mut queued: HashSet<BasicBlockId> = HashSet::with_capacity(alpha.len());
+        let mut work: Vec<BasicBlockId> = alpha
+            .iter()
+            .rev()
+            .copied()
+            .filter(|&a| queued.insert(a))
+            .collect();
+        let mut in_idf: HashSet<BasicBlockId> = HashSet::new();
+        let mut idf = Vec::new();
+        while let Some(x) = work.pop() {
+            for &y in self.frontier(x) {
+                if in_idf.insert(y) {
+                    idf.push(y);
+                    if queued.insert(y) {
+                        work.push(y);
+                    }
+                }
             }
-            self.j_edges(bb_id, level);
-            stack.extend(
-                dom.children(bb_id)
-                    .iter()
-                    .rev()
-                    .copied()
-                    .filter(|c| !self.visited.contains(c)),
-            );
         }
+        idf
     }
 }
 
@@ -560,14 +510,141 @@ mod tests {
     fn test_idf_compute() {
         let func = make_test_cfg();
         let dom = domtree_build(&func);
+        let df = DomFrontiers::build(&func, &dom);
 
         // IDF of {bb1} should be {merge}
-        let idf = idf_compute(&func, &dom, &[BasicBlockId(1)]);
-        assert!(idf.contains(&BasicBlockId(3)));
+        let idf = df.idf(&[BasicBlockId(1)]);
+        assert_eq!(idf, [BasicBlockId(3)]);
 
         // IDF of {bb1, bb2} should be {merge}
-        let idf2 = idf_compute(&func, &dom, &[BasicBlockId(1), BasicBlockId(2)]);
-        assert!(idf2.contains(&BasicBlockId(3)));
+        let idf2 = df.idf(&[BasicBlockId(1), BasicBlockId(2)]);
+        assert_eq!(idf2, [BasicBlockId(3)]);
+    }
+
+    fn sorted(mut v: Vec<BasicBlockId>) -> Vec<BasicBlockId> {
+        v.sort_by_key(|b| b.0);
+        v
+    }
+
+    fn ids(v: &[u32]) -> Vec<BasicBlockId> {
+        v.iter().map(|&i| BasicBlockId(i)).collect()
+    }
+
+    /// A loop whose body is a diamond with a second diamond nested in its
+    /// `then` arm. A definition deep in the inner diamond needs a phi at the
+    /// inner join (its frontier), at the outer join (the inner join's
+    /// frontier, reached only through it) and at the loop header (the outer
+    /// join's frontier, through the back edge).
+    #[test]
+    fn test_idf_loop_and_nested_diamonds() {
+        let func = cfg(&[
+            &[1],    // 0: entry
+            &[2, 9], // 1: loop header
+            &[3, 7], // 2: outer diamond
+            &[4, 5], // 3: inner diamond
+            &[6],    // 4
+            &[6],    // 5
+            &[8],    // 6: inner join
+            &[8],    // 7
+            &[1],    // 8: outer join, back edge
+            &[],     // 9: exit
+        ]);
+        let dom = domtree_build(&func);
+        let df = DomFrontiers::build(&func, &dom);
+
+        assert_eq!(df.frontier(BasicBlockId(4)), ids(&[6]));
+        assert_eq!(df.frontier(BasicBlockId(6)), ids(&[8]));
+        assert_eq!(df.frontier(BasicBlockId(8)), ids(&[1]));
+        assert_eq!(df.frontier(BasicBlockId(1)), ids(&[1]));
+        assert_eq!(df.frontier(BasicBlockId(2)), ids(&[1]));
+        assert!(df.frontier(BasicBlockId(0)).is_empty());
+        assert!(df.frontier(BasicBlockId(9)).is_empty());
+
+        assert_eq!(sorted(df.idf(&ids(&[4]))), ids(&[1, 6, 8]));
+        assert_eq!(sorted(df.idf(&ids(&[0, 7]))), ids(&[1, 8]));
+        assert_eq!(sorted(df.idf(&ids(&[4, 5]))), ids(&[1, 6, 8]));
+        assert_eq!(sorted(df.idf(&ids(&[0]))), ids(&[]));
+        assert_eq!(sorted(df.idf(&ids(&[9]))), ids(&[]));
+    }
+
+    /// The iterated frontier of `alpha`, by definition, over the oracle's
+    /// tree: `y` is in DF(x) when `x` dominates a predecessor of `y` but
+    /// does not strictly dominate `y`, iterated to the fixed point.
+    fn idf_by_definition(func: &Function, alpha: &[BasicBlockId]) -> Vec<BasicBlockId> {
+        let dom = oracle(func);
+        let reachable = |b: BasicBlockId| b == func.entry || dom.idom(b).is_some();
+        let df = |x: BasicBlockId| -> Vec<BasicBlockId> {
+            let mut out = Vec::new();
+            for bb in &func.blocks {
+                let y = bb.id;
+                let strictly = x != y && dom.dominates(x, y);
+                let pred_dominated = func
+                    .blocks
+                    .iter()
+                    .any(|p| reachable(p.id) && p.children.contains(&y) && dom.dominates(x, p.id));
+                if pred_dominated && !strictly {
+                    out.push(y);
+                }
+            }
+            out
+        };
+        let mut set: Vec<BasicBlockId> = Vec::new();
+        let mut from: Vec<BasicBlockId> = alpha.to_vec();
+        loop {
+            let mut grown = false;
+            for x in from.clone() {
+                for y in df(x) {
+                    if !set.contains(&y) {
+                        set.push(y);
+                        from.push(y);
+                        grown = true;
+                    }
+                }
+            }
+            if !grown {
+                return sorted(set);
+            }
+        }
+    }
+
+    /// The worklist agrees with the definition on many random graphs --
+    /// irreducible ones, self loops, repeated edges, unreachable blocks --
+    /// for definitions in reachable blocks.
+    #[test]
+    fn test_idf_matches_definition_on_random_graphs() {
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = |bound: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % u64::from(bound)) as u32
+        };
+        for case in 0..1000 {
+            let n = 1 + next(16);
+            let edges: Vec<Vec<u32>> = (0..n)
+                .map(|_| (0..next(4)).map(|_| next(n)).collect())
+                .collect();
+            let edges: Vec<&[u32]> = edges.iter().map(Vec::as_slice).collect();
+            let func = cfg(&edges);
+            let dom = domtree_build(&func);
+            let df = DomFrontiers::build(&func, &dom);
+            let reachable: Vec<BasicBlockId> = func
+                .blocks
+                .iter()
+                .map(|bb| bb.id)
+                .filter(|&b| b == func.entry || dom.idom(b).is_some())
+                .collect();
+            for _ in 0..4 {
+                let alpha: Vec<BasicBlockId> = (0..1 + next(3))
+                    .map(|_| reachable[next(reachable.len() as u32) as usize])
+                    .collect();
+                assert_eq!(
+                    sorted(df.idf(&alpha)),
+                    idf_by_definition(&func, &alpha),
+                    "random graph {case}: {edges:?}, alpha {alpha:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -660,7 +737,6 @@ mod tests {
             idom: vec![None; func.blocks.len()],
             level: vec![0; func.blocks.len()],
             children: vec![Vec::new(); func.blocks.len()],
-            max_level: 0,
         };
         for &n in nodes.iter().skip(1) {
             let d = &dom[&n];
@@ -670,13 +746,9 @@ mod tests {
                 .max_by_key(|x| dom[*x].len())
                 .copied();
             let level = (d.len() - 1) as u32;
-            match tree.index.get(&n) {
-                Some(&slot) => {
-                    tree.idom[slot] = idom;
-                    tree.level[slot] = level;
-                    tree.max_level = tree.max_level.max(level);
-                }
-                None => tree.max_level = tree.max_level.max(1),
+            if let Some(&slot) = tree.index.get(&n) {
+                tree.idom[slot] = idom;
+                tree.level[slot] = level;
             }
         }
         for (i, bb) in func.blocks.iter().enumerate() {
@@ -713,7 +785,6 @@ mod tests {
                 bb.id
             );
         }
-        assert_eq!(got.max_level(), want.max_level(), "{what}: max level");
     }
 
     /// A function whose blocks `0..n` have the given successor lists; block 0
@@ -798,7 +869,6 @@ mod tests {
         let dom = domtree_build(&cfg(&edges));
         assert_eq!(dom.idom(BasicBlockId(n - 1)), Some(BasicBlockId(n - 2)));
         assert_eq!(dom.level(BasicBlockId(n - 1)), n - 1);
-        assert_eq!(dom.max_level(), n - 1);
     }
 
     /// A tree is a snapshot: it describes the CFG it was built from.

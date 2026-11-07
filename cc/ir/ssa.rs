@@ -10,7 +10,7 @@
 // frontiers, then renaming to complete the construction.
 //
 
-use super::dominate::{domtree_build, idf_compute, DomTree};
+use super::dominate::{domtree_build, DomFrontiers, DomTree};
 use super::{BasicBlockId, Function, Instruction, Opcode, Pseudo, PseudoId, Site};
 use crate::types::{TypeId, TypeTable};
 use crate::units::Bits;
@@ -32,6 +32,10 @@ struct SsaConverter<'a> {
     /// or remove blocks or edges, so one snapshot is good for the whole run.
     dom: DomTree,
 
+    /// The dominance frontiers of `func`, from `dom`: computed once, then
+    /// read by each variable's iterated-frontier worklist.
+    frontiers: DomFrontiers,
+
     /// Variables marked for renaming, name -> the local's `Sym` pseudo.
     ///
     /// Keyed by name because `phis` and `DefStack` are, but carrying the
@@ -52,9 +56,11 @@ struct SsaConverter<'a> {
 
 impl<'a> SsaConverter<'a> {
     fn new(func: &'a mut Function, dom: DomTree) -> Self {
+        let frontiers = DomFrontiers::build(func, &dom);
         Self {
             func,
             dom,
+            frontiers,
             to_rename: HashMap::with_capacity(DEFAULT_SSA_RENAME_CAPACITY),
             phis: HashMap::new(),
             dead_stores: Vec::with_capacity(DEFAULT_SSA_PHI_CAPACITY),
@@ -200,7 +206,7 @@ fn analyze_variables(func: &Function, types: &TypeTable) -> HashMap<String, VarI
 /// Insert phi nodes for a variable at its iterated dominance frontier.
 fn insert_phi_nodes(converter: &mut SsaConverter, var_name: &str, var_info: &VarInfo) {
     // Compute IDF of definition blocks
-    let idf = idf_compute(converter.func, &converter.dom, &var_info.def_blocks);
+    let idf = converter.frontiers.idf(&var_info.def_blocks);
 
     // Insert phi node at each IDF block.
     for bb_id in idf {
@@ -652,11 +658,13 @@ fn convert(func: &mut Function, types: &TypeTable) -> Phis {
         return Phis::new();
     }
 
-    // Phase 0: Build dominator tree.
-    //
-    // No dominance frontiers: `idf_compute` is Sreedhar-Gao, which walks the
-    // dominator tree by level and never reads a precomputed frontier. One was
-    // computed for every function anyway, and the result was discarded.
+    // Phase 0: Build the dominator tree, and from it every block's dominance
+    // frontier, once for the function (`SsaConverter::new`). Each variable's
+    // iterated frontier is then a worklist over the frontiers of its
+    // definition blocks, costing what it reads rather than a walk of the
+    // dominator subtree below every definition -- which, in a function of
+    // many locals, each in a block scope dominating the rest of the
+    // function, was quadratic.
     let dom = domtree_build(func);
 
     let mut converter = SsaConverter::new(func, dom);

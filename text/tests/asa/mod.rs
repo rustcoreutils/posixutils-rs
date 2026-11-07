@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{run_test, run_test_u8, run_test_with_env, utf8_locale, TestPlan, TestPlanU8};
 
 fn asa_test(test_data: &str, expected_output: &str) {
     run_test(TestPlan {
@@ -174,17 +174,65 @@ fn asa_cjk_content() {
     asa_test(" 日本語テスト\n", "日本語テスト\n");
 }
 
-// Test multi-byte UTF-8 as control character (non-standard, treated as space per POSIX)
+/// `asa` over bytes, in the C locale the test runner forces.
+fn asa_test_bytes(test_data: &[u8], expected_output: &[u8]) {
+    run_test_u8(TestPlanU8 {
+        cmd: String::from("asa"),
+        args: vec![],
+        stdin_data: test_data.to_vec(),
+        expected_out: expected_output.to_vec(),
+        expected_err: vec![],
+        expected_exit_code: 0,
+    });
+}
+
+/// `asa` in a UTF-8 locale, or nothing where the host has none.
+fn asa_test_utf8(test_data: &str, expected_output: &str) {
+    let Some(locale) = utf8_locale() else {
+        return;
+    };
+    run_test_with_env(
+        TestPlan {
+            cmd: String::from("asa"),
+            args: vec![],
+            stdin_data: String::from(test_data),
+            expected_out: String::from(expected_output),
+            expected_err: String::from(""),
+            expected_exit_code: 0,
+        },
+        &[("LC_ALL", &locale)],
+    );
+}
+
+// A multibyte character as the control character is none POSIX names, so it
+// acts as a space: the whole character goes, in a locale where it is one.
 #[test]
 fn asa_multibyte_control_char() {
-    // Multi-byte char as control: treated as unknown, like space
-    asa_test("éhello\n", "hello\n");
+    asa_test_utf8("éhello\n", "hello\n");
 }
 
 #[test]
 fn asa_cjk_control_char() {
-    // 3-byte CJK char as control: treated as unknown, like space
-    asa_test("日test\n", "test\n");
+    asa_test_utf8("日test\n", "test\n");
+}
+
+// In the POSIX locale every byte is a character (XBD 6.2), so a file with
+// bytes that are not UTF-8 is a text file, and passes through whole.
+#[test]
+fn asa_non_utf8_bytes_in_posix_locale() {
+    asa_test_bytes(b" ok1\n caf\xe9\n ok3\n", b"ok1\ncaf\xe9\nok3\n");
+}
+
+// The first *character* is removed, and in the POSIX locale that is one
+// byte, even of what would be a UTF-8 sequence elsewhere.
+#[test]
+fn asa_first_character_is_one_byte_in_posix_locale() {
+    asa_test_bytes(b"\xe6\x97\xa5test\n", b"\x97\xa5test\n");
+}
+
+#[test]
+fn asa_nul_control_char() {
+    asa_test_bytes(b"\0a\0b\n x\n", b"a\0b\nx\n");
 }
 
 // ===== FILE ARGUMENT TESTS =====

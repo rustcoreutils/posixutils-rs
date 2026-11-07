@@ -7,12 +7,13 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use gettextrs::gettext;
 use plib::io::input_reader;
+use plib::locale::next_char_offset;
 
 /// asa - interpret carriage-control characters
 ///
@@ -34,96 +35,77 @@ struct Args {
     files: Vec<PathBuf>,
 }
 
-/// Process a single file according to POSIX asa rules
+/// Why a file stopped: reading it, or writing standard output.
+#[derive(Debug)]
+enum Failure {
+    Input(io::Error),
+    Output(io::Error),
+}
+
+/// Interpret one input stream, writing the result to `out`.
 ///
-/// POSIX.2024 Requirements:
-/// - Each line's first character is interpreted as a carriage-control character
-/// - The remainder of the line (after first character) is written to stdout
-/// - Control character determines line spacing/positioning
-/// - First line of file has special handling: '+' treated as space
-/// - Each file is processed independently with its own state
-fn asa_file(pathname: &Path) -> io::Result<()> {
-    let mut reader = input_reader(pathname, true)?;
+/// Each line's first character -- by `LC_CTYPE`, so one byte in the POSIX
+/// locale, where every byte is a character -- is its carriage control, and
+/// the rest of the line is written after the motion it asks for:
+/// - `' '` and any character POSIX does not name: the next line
+/// - `'0'`: a blank line, then the next line
+/// - `'-'`: two blank lines (a non-POSIX extension)
+/// - `'1'`: a new page
+/// - `'+'`: back to the start of the current line, to overprint it; as the
+///   first character of the input it is a space
+///
+/// A line's <newline> is held until the next line's control character is
+/// known, since `'+'` replaces it with a <carriage-return>.
+///
+/// Bytes, not text: input need not be valid in any encoding, and what
+/// follows the control character is copied unchanged.
+fn asa_stream<R: BufRead, W: Write>(input: &mut R, out: &mut W) -> Result<(), Failure> {
+    let mut line: Vec<u8> = Vec::new();
     let mut first_line = true;
-    let mut had_output = false;
 
     loop {
-        let mut raw_line = String::new();
-        let n_read = reader.read_line(&mut raw_line)?;
-        if n_read == 0 {
+        line.clear();
+        if input.read_until(b'\n', &mut line).map_err(Failure::Input)? == 0 {
             break;
         }
-
-        // Get first character as control character
-        let ch = match raw_line.chars().next() {
-            Some(c) => c,
-            None => continue, // empty line shouldn't happen, but handle gracefully
-        };
-
-        // Extract line content: skip first char (may be multi-byte), exclude trailing newline
-        let first_char_len = ch.len_utf8();
-        let line_end = if raw_line.ends_with('\n') {
-            raw_line.len() - 1
+        let end = line.len() - usize::from(line.ends_with(b"\n"));
+        let control_end = next_char_offset(&line, 0).expect("a line is never empty");
+        // A multibyte control character is none POSIX names.
+        let control = if control_end == 1 { line[0] } else { b' ' };
+        let control = if first_line && control == b'+' {
+            b' '
         } else {
-            raw_line.len()
-        };
-        let line = if line_end > first_char_len {
-            &raw_line[first_char_len..line_end]
-        } else {
-            "" // control char only, no content
+            control
         };
 
-        // POSIX: '+' as first character in input is equivalent to space
-        let effective_ch = if first_line && ch == '+' { ' ' } else { ch };
-
-        match effective_ch {
-            '+' => {
-                // Overprint: return to column 1 of current line
-                print!("\r{}", line);
-            }
-            '0' => {
-                // Double-space: newline before content (blank line)
-                if !first_line {
-                    println!();
-                }
-                println!();
-                print!("{}", line);
-            }
-            '-' => {
-                // Triple-space (non-POSIX extension): two blank lines before
-                if !first_line {
-                    println!();
-                }
-                println!();
-                println!();
-                print!("{}", line);
-            }
-            '1' => {
-                // New page: form-feed
-                if !first_line {
-                    println!();
-                }
-                print!("\x0c{}", line);
-            }
-            _ => {
-                // Space and other chars: normal single-spaced output
-                if !first_line {
-                    println!();
-                }
-                print!("{}", line);
-            }
+        let separator: &[u8] = match (first_line, control) {
+            (true, _) => b"",
+            (false, b'+') => b"\r",
+            (false, _) => b"\n",
         };
-
+        let advance: &[u8] = match control {
+            b'0' => b"\n",
+            b'-' => b"\n\n",
+            b'1' => b"\x0c",
+            _ => b"",
+        };
+        let text = &line[control_end.min(end)..end];
+        for part in [separator, advance, text] {
+            out.write_all(part).map_err(Failure::Output)?;
+        }
         first_line = false;
-        had_output = true;
     }
 
-    // Final newline if we had any output
-    if had_output {
-        println!();
+    if !first_line {
+        out.write_all(b"\n").map_err(Failure::Output)?;
     }
-
     Ok(())
+}
+
+/// Interpret the file `pathname` (standard input for `-`).
+fn asa_file<W: Write>(pathname: &Path, out: &mut W) -> Result<(), Failure> {
+    let mut reader = input_reader(pathname, true).map_err(Failure::Input)?;
+    asa_stream(&mut reader, out)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -136,13 +118,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.files.push(PathBuf::from("-"));
     }
 
+    let mut out = io::stdout().lock();
     for filename in &args.files {
-        if let Err(e) = asa_file(filename) {
-            plib::diag::error(&format!(
-                "{}: {}",
-                filename.display(),
-                plib::diag::io_error_text(&e)
-            ));
+        match asa_file(filename, &mut out) {
+            Ok(()) => {}
+            Err(Failure::Input(e)) => {
+                plib::diag::error(&format!(
+                    "{}: {}",
+                    filename.display(),
+                    plib::diag::io_error_text(&e)
+                ));
+            }
+            Err(Failure::Output(e)) => {
+                // Every later file would fail the same way.
+                plib::diag::write_error(&e);
+                std::process::exit(1);
+            }
         }
     }
 

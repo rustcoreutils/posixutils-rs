@@ -325,19 +325,20 @@ struct SetjmpCarry {
     after: Vec<(usize, Vec<PseudoId>)>,
 }
 
-/// The aliasing locals -- those whose slot shares a byte with something else
-/// -- and what each shares with.
+/// The aliasing locals -- those whose slot shares a byte with something else.
 struct LocalAliases {
     regions: LocalRegions,
-    /// By the local's index in `regions.locals`: the other locals and the
-    /// pseudos whose cells overlap its slot. Only locals with a partner.
-    partners: HashMap<usize, (Vec<usize>, Vec<PseudoId>)>,
+    /// By the local's index in `regions.locals`: its slot. Only locals with
+    /// a partner. Not the partners themselves: thousands of block-scoped
+    /// locals may reuse one slot, and a list of them for each would be
+    /// quadratic to build and to scan.
+    slot: HashMap<usize, usize>,
 }
 
 impl LocalAliases {
     /// Every aliasing local, in order.
     fn aliasing(&self) -> Vec<usize> {
-        let mut all: Vec<usize> = self.partners.keys().copied().collect();
+        let mut all: Vec<usize> = self.slot.keys().copied().collect();
         all.sort_unstable();
         all
     }
@@ -510,15 +511,10 @@ where
         }
     }
 
-    /// Which locals share bytes with anything, and with what. `None` when
-    /// none does, which is the usual case: then no local is looked at again.
+    /// Which locals share bytes with anything. `None` when none does, which
+    /// is the usual case: then no local is looked at again.
     fn local_aliases(&self) -> Option<LocalAliases> {
-        let mut owners: HashMap<usize, Vec<PseudoId>> = HashMap::new();
-        for (&p, cells) in &self.cells_of {
-            for &c in cells {
-                owners.entry(c).or_default().push(p);
-            }
-        }
+        let owned: HashSet<usize> = self.cells_of.values().flatten().copied().collect();
         let regions = LocalRegions::of(self.a.func, &self.block_start, &self.bb_idx);
         let index: HashMap<PseudoId, usize> = regions
             .locals
@@ -526,34 +522,28 @@ where
             .enumerate()
             .map(|(i, &l)| (l, i))
             .collect();
-        let mut by_cell: HashMap<usize, Vec<usize>> = HashMap::new();
+        // How many locals are in each cell.
+        let mut by_cell: HashMap<usize, usize> = HashMap::new();
         for (l, &c) in &self.local_cell {
-            if let Some(&i) = index.get(l) {
-                by_cell.entry(c).or_default().push(i);
+            if index.contains_key(l) {
+                *by_cell.entry(c).or_default() += 1;
             }
         }
-        let mut partners = HashMap::new();
+        let mut slot = HashMap::new();
         for (l, &c) in &self.local_cell {
             let Some(&i) = index.get(l) else { continue };
-            let mut locals = Vec::new();
-            let mut pseudos = Vec::new();
-            for &o in &self.table.overlaps[c] {
-                locals.extend(by_cell.get(&o).into_iter().flatten().filter(|&&j| j != i));
-                pseudos.extend(owners.get(&o).into_iter().flatten());
+            let shared = self.table.overlaps[c].iter().any(|o| {
+                let others = by_cell.get(o).copied().unwrap_or(0) - usize::from(*o == c);
+                others > 0 || owned.contains(o)
+            });
+            if shared {
+                slot.insert(i, c);
             }
-            if locals.is_empty() && pseudos.is_empty() {
-                continue;
-            }
-            locals.sort_unstable();
-            locals.dedup();
-            pseudos.sort();
-            pseudos.dedup();
-            partners.insert(i, (locals, pseudos));
         }
-        if partners.is_empty() {
+        if slot.is_empty() {
             return None;
         }
-        Some(LocalAliases { regions, partners })
+        Some(LocalAliases { regions, slot })
     }
 
     /// For each block, the pseudos live across a `setjmp` that must also be
@@ -623,7 +613,7 @@ where
     /// lifetime just after it.
     fn locals_after(&self, aliases: &LocalAliases, b: usize) -> Vec<Vec<usize>> {
         let n = self.a.func.blocks[b].insns.len();
-        let aliasing = |i: &usize| aliases.partners.contains_key(i);
+        let aliasing = |i: &usize| aliases.slot.contains_key(i);
         if aliases.regions.everywhere {
             return vec![aliases.aliasing(); n];
         }
@@ -657,7 +647,7 @@ where
         }
         aliases.regions.live_in[b]
             .iter()
-            .filter(|i| aliases.partners.contains_key(i))
+            .filter(|i| aliases.slot.contains_key(i))
             .collect()
     }
 
@@ -695,7 +685,7 @@ where
                 if let (Some(al), Some(after)) = (&aliases, &locals_after) {
                     let mut values: Vec<PseudoId> = occ.live.iter().copied().collect();
                     values.extend(&du.defs);
-                    self.check_locals(al, &after[i], &values, b, i);
+                    self.check_locals(al, &cells_of, &after[i], &values, b, i);
                 }
                 du.step(&mut occ);
             }
@@ -703,7 +693,7 @@ where
             if let Some(al) = &aliases {
                 let values: Vec<PseudoId> = occ.live.iter().copied().collect();
                 let inside = self.locals_in(al, b);
-                self.check_locals(al, &inside, &values, b, usize::MAX);
+                self.check_locals(al, &cells_of, &inside, &values, b, usize::MAX);
             }
             if Some(b) == entry {
                 self.check_arguments(&cells_of, &occ, b);
@@ -898,22 +888,54 @@ where
     fn check_locals(
         &mut self,
         aliases: &LocalAliases,
+        cells_of: &HashMap<PseudoId, Vec<usize>>,
         inside: &[usize],
         values: &[PseudoId],
         b: usize,
         i: usize,
     ) {
+        if inside.is_empty() {
+            return;
+        }
+        // What occupies each cell here, so that each local looks only at the
+        // few cells its slot overlaps: thousands of locals may be inside
+        // their lifetimes at once, and comparing each with every other at
+        // every instruction is quadratic there.
+        let mut locals_at: HashMap<usize, Vec<usize>> = HashMap::new();
+        for &m in inside {
+            locals_at.entry(aliases.slot[&m]).or_default().push(m);
+        }
+        let mut values_at: HashMap<usize, Vec<PseudoId>> = HashMap::new();
+        for q in values {
+            for &c in cells_of.get(q).into_iter().flatten() {
+                values_at.entry(c).or_default().push(*q);
+            }
+        }
         let mut hits = Vec::new();
         for &l in inside {
-            let (locals, pseudos) = &aliases.partners[&l];
+            let near = &self.table.overlaps[aliases.slot[&l]];
             let local = aliases.regions.locals[l];
-            for m in locals.iter().filter(|m| inside.contains(m)) {
-                let other = aliases.regions.locals[*m];
+            // Each in order, once, whatever order `inside` and `values` are.
+            let mut ms: Vec<usize> = near
+                .iter()
+                .flat_map(|c| locals_at.get(c).into_iter().flatten())
+                .copied()
+                .filter(|&m| m != l)
+                .collect();
+            ms.sort_unstable();
+            ms.dedup();
+            for m in ms {
+                let other = aliases.regions.locals[m];
                 hits.push((local.min(other), local.max(other)));
             }
-            for q in pseudos.iter().filter(|q| values.contains(q)) {
-                hits.push((local, *q));
-            }
+            let mut qs: Vec<PseudoId> = near
+                .iter()
+                .flat_map(|c| values_at.get(c).into_iter().flatten())
+                .copied()
+                .collect();
+            qs.sort_unstable();
+            qs.dedup();
+            hits.extend(qs.into_iter().map(|q| (local, q)));
         }
         for (x, y) in hits {
             let at = self.point(b, i);
@@ -1366,6 +1388,60 @@ mod tests {
         assert_eq!(
             conflicts(&found),
             [(Conflict::Local, p(6), Some(p(2)))],
+            "{found:?}"
+        );
+    }
+
+    /// Locals `%4`..`%7` all in one slot and `%8` in a wider one over it,
+    /// each stored to and ended in turn: disjoint lifetimes, so nothing to
+    /// report. Read `%4` again at the end and its lifetime spans every
+    /// other's: each pair with it is reported, latest first, as the walk
+    /// runs backwards.
+    #[test]
+    fn many_locals_in_one_slot_conflict_only_inside_a_lifetime() {
+        let types = types();
+        let scopes = |reread: bool| {
+            let mut insns = Vec::new();
+            for l in 4..=8 {
+                insns.push(Instruction::store(
+                    ONE,
+                    p(l),
+                    0,
+                    types.long_id,
+                    Bits::new(64),
+                ));
+                if !(reread && l == 4) {
+                    insns.push(Instruction::lifetime_end(p(l)));
+                }
+            }
+            if reread {
+                insns.push(Instruction::load(
+                    p(1),
+                    p(4),
+                    0,
+                    types.long_id,
+                    Bits::new(64),
+                ));
+                insns.push(Instruction::lifetime_end(p(4)));
+            }
+            insns.push(Instruction::ret(None));
+            let syms = [(4, "a.4"), (5, "b.5"), (6, "c.6"), (7, "d.7"), (8, "e.8")];
+            one_block(&types, &syms, insns)
+        };
+        let mut placed: Vec<(u32, Loc)> = (4..=7).map(|l| (l, Loc::S(-8, 8))).collect();
+        placed.push((8, Loc::S(-16, 16)));
+        placed.push((1, Loc::R(0)));
+        let found = check(&scopes(false), &placed, vec![], vec![], true);
+        assert!(found.is_empty(), "{found:?}");
+        let found = check(&scopes(true), &placed, vec![], vec![], true);
+        assert_eq!(
+            conflicts(&found),
+            [
+                (Conflict::Local, p(4), Some(p(8))),
+                (Conflict::Local, p(4), Some(p(7))),
+                (Conflict::Local, p(4), Some(p(6))),
+                (Conflict::Local, p(4), Some(p(5))),
+            ],
             "{found:?}"
         );
     }

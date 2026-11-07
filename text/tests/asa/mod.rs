@@ -453,3 +453,43 @@ fn asa_double_dash_ends_options() {
     assert_eq!(code, 0);
     assert_eq!(stdout, "body\n");
 }
+
+// A write that fails is reported as a write error and exits 1, even when
+// it is the last one, made only when the output is flushed at the end.
+#[cfg(target_os = "linux")]
+#[test]
+fn asa_write_error_on_full_device() {
+    plib::testing::assert_write_error_on_full_device("asa", &[], b" x\n", 1);
+}
+
+// Once standard output fails every later file would fail the same way:
+// one diagnostic, not one per operand.
+#[cfg(target_os = "linux")]
+#[test]
+fn asa_write_error_is_reported_once() {
+    let a = tmp_file("a", " first\n");
+    let b = tmp_file("b", " second\n");
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("open /dev/full");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_asa"))
+        .args([a.to_str().unwrap(), b.to_str().unwrap()])
+        .env("LC_ALL", "C")
+        .stdout(full)
+        .output()
+        .expect("run asa");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr {stderr:?}");
+    assert_eq!(stderr.lines().count(), 1, "stderr {stderr:?}");
+    assert!(stderr.contains("write error"), "stderr {stderr:?}");
+}
+
+// Into a closed pipe asa dies by SIGPIPE, as a filter should.
+#[cfg(unix)]
+#[test]
+fn asa_dies_by_sigpipe_on_a_closed_pipe() {
+    let big = " line of a long report\n".repeat(200_000);
+    let f = tmp_file("big", &big);
+    plib::testing::assert_dies_by_sigpipe("asa", &[f.to_str().unwrap()]);
+}

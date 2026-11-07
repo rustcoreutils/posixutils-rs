@@ -130,26 +130,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.files.push(PathBuf::from("-"));
     }
 
-    let mut out = io::stdout().lock();
+    // Block-buffered: a write(2) per line made asa thirty times slower than
+    // `cat` over the same file.
+    let mut out = io::BufWriter::new(io::stdout().lock());
     for filename in &args.files {
         match asa_file(filename, &mut out) {
             Ok(()) => {}
             Err(Failure::Input(e)) => {
+                // What came before the failure, before the diagnostic.
+                flush_or_exit(&mut out);
                 plib::diag::error(&format!(
                     "{}: {}",
                     filename.display(),
                     plib::diag::io_error_text(&e)
                 ));
             }
-            Err(Failure::Output(e)) => {
-                // Every later file would fail the same way.
-                plib::diag::write_error(&e);
-                std::process::exit(1);
-            }
+            Err(Failure::Output(e)) => write_error_exit(&e),
         }
     }
+    flush_or_exit(&mut out);
+    drop(out);
+    plib::diag::flush_stdout();
 
     std::process::exit(plib::diag::exit_status())
+}
+
+/// Write out what `out` holds, or report the failure and exit.
+fn flush_or_exit<W: Write>(out: &mut W) {
+    if let Err(e) = out.flush() {
+        write_error_exit(&e);
+    }
+}
+
+/// Report a failed write to standard output and exit 1: every later file
+/// would fail the same way.
+fn write_error_exit(e: &io::Error) -> ! {
+    plib::diag::write_error(e);
+    std::process::exit(1);
 }
 
 #[cfg(test)]

@@ -1,7 +1,0 @@
-schema_version: "1.1"
-name: review-asa
-expected_outcome: |
-  A read-only holistic review of the asa utility (text/asa.rs) at HEAD, with
-  the seven report sections in order, findings ranked P0-P3 with confidence
-  and status, spec citations from the POSIX asa page, an evidence
-  ledger of commands actually run, and no changes to tracked repo files.

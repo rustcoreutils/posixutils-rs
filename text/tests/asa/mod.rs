@@ -445,13 +445,56 @@ fn asa_dash_interleaved_with_files() {
     assert_eq!(stdout, "first\nsecond\nthird\n", "got {stdout:?}");
 }
 
+/// `asa args` run in `dir`, for operands named relative to it.
+fn asa_run_in(dir: &std::path::Path, args: &[&str]) -> (String, i32) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_asa"))
+        .args(args)
+        .current_dir(dir)
+        .env("LC_ALL", "C")
+        .output()
+        .expect("failed to run asa");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
 #[test]
 fn asa_double_dash_ends_options() {
-    // A file whose name begins with `-` is reachable only after `--`.
+    // A file whose name begins with `-` is reachable only after `--`: named
+    // relative to its directory, since an absolute path never looks like an
+    // option and would pass with or without `--`.
     let f = tmp_file("-dashname", " body\n");
-    let (stdout, _, code) = asa_run(&["--", f.to_str().unwrap()]);
-    assert_eq!(code, 0);
+    let dir = f.parent().unwrap();
+    assert_eq!(asa_run_in(dir, &["--", "-dashname"]), ("body\n".into(), 0));
+    let (stdout, code) = asa_run_in(dir, &["-dashname"]);
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("", 2),
+        "without `--` it is an option"
+    );
+}
+
+// A directory operand is an error that does not stop the others.
+#[cfg(unix)]
+#[test]
+fn asa_directory_operand_continues() {
+    let f = tmp_file("good", " body\n");
+    let dir = f.parent().unwrap();
+    let (stdout, stderr, code) = asa_run(&[dir.to_str().unwrap(), f.to_str().unwrap()]);
+    assert_eq!(code, 1);
     assert_eq!(stdout, "body\n");
+    assert!(stderr.contains(dir.to_str().unwrap()), "stderr {stderr:?}");
+}
+
+// Each file starts afresh: a '+' first in the second file is a space too.
+#[test]
+fn asa_plus_first_in_a_later_file() {
+    let a = tmp_file("a", " a\n");
+    let b = tmp_file("b", "+b\n");
+    let (stdout, _, code) = asa_run(&[a.to_str().unwrap(), b.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "a\nb\n");
 }
 
 // A write that fails is reported as a write error and exits 1, even when

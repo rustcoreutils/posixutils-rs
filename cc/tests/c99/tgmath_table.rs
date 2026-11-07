@@ -458,6 +458,19 @@ enum Arch {
     Aarch64,
 }
 
+/// The target the host is, or `None` on one c17 does not target: there the
+/// tables have nothing to be compared against.
+fn host_arch() -> Option<Arch> {
+    if cfg!(target_arch = "x86_64") {
+        Some(Arch::X86_64)
+    } else if cfg!(target_arch = "aarch64") {
+        Some(Arch::Aarch64)
+    } else {
+        eprintln!("SKIP <tgmath.h> tables: c17 does not target this host");
+        None
+    }
+}
+
 /// One macro call of a table row.
 struct Case {
     /// `sqrt(g_f32)`.
@@ -564,11 +577,7 @@ fn prologue(gnu: bool) -> String {
 
 /// The c17 options for `arch`, or `None` where its headers are missing.
 fn target_args(arch: Arch) -> Option<Vec<&'static str>> {
-    let host = if cfg!(target_arch = "x86_64") {
-        Arch::X86_64
-    } else {
-        Arch::Aarch64
-    };
+    let host = host_arch()?;
     if arch == host {
         return Some(Vec::new());
     }
@@ -711,10 +720,8 @@ fn value_program(arch: Arch, gnu: bool, part: usize, parts: usize) -> String {
 /// of a minute over the whole of the GNU mode's, so that one is halved.
 #[cfg(target_os = "linux")]
 fn values_are_the_picked_functions(arch: Arch, gnu: bool, part: usize, parts: usize) {
-    let host = if cfg!(target_arch = "x86_64") {
-        Arch::X86_64
-    } else {
-        Arch::Aarch64
+    let Some(host) = host_arch() else {
+        return;
     };
     let src = value_program(arch, gnu, part, parts);
     if arch == host {

@@ -41,6 +41,21 @@ fn binary_dir() -> PathBuf {
     }
 }
 
+/// Clear `cmd`'s environment, as `env -i` does, except for the variable that
+/// names a coverage build's profile file.
+///
+/// Without `LLVM_PROFILE_FILE` an instrumented utility writes its profile as
+/// `default_*.profraw` in whatever directory it runs in -- the source tree, or
+/// a temporary directory that is then removed -- and the run's coverage is
+/// lost. Outside a coverage build the variable is unset and nothing is kept.
+pub fn clear_env(cmd: &mut Command) -> &mut Command {
+    cmd.env_clear();
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        cmd.env("LLVM_PROFILE_FILE", profile);
+    }
+    cmd
+}
+
 pub struct TestPlan {
     pub cmd: String,
     pub args: Vec<String>,
@@ -1064,8 +1079,27 @@ pub mod seccomp {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_until_full, TempFile};
+    use super::{clear_env, read_until_full, TempFile};
     use std::io::Read;
+
+    /// A cleared environment keeps exactly the profile-file variable this
+    /// process has, so a coverage build's profile still lands where it should;
+    /// without one it is empty.
+    #[test]
+    fn clear_env_keeps_only_the_profile_file_variable() {
+        let mut cmd = std::process::Command::new("true");
+        cmd.env("HOME", "/nowhere");
+        clear_env(&mut cmd);
+        let envs: Vec<_> = cmd
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
+            .collect();
+        let want: Vec<_> = std::env::var_os("LLVM_PROFILE_FILE")
+            .map(|p| ("LLVM_PROFILE_FILE".into(), Some(p)))
+            .into_iter()
+            .collect();
+        assert_eq!(envs, want);
+    }
 
     /// The file holds what was written, under its own name, and dropping it
     /// takes the directory it was made in too.

@@ -2142,7 +2142,7 @@ fn test_extract_to_stdout_write_error_fails_once() {
     assert_exit_code(&output, 1, "tar -xO past the file-size limit");
     let err = stderr_str(&output);
     assert_eq!(
-        err.lines().count(),
+        diagnostic_lines(&output).len(),
         1,
         "one diagnostic, not one per member: {err}"
     );

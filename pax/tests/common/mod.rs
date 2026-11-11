@@ -883,6 +883,20 @@ pub fn stderr_str(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
 }
 
+/// The lines of stderr that pax wrote, for a test that counts diagnostics.
+///
+/// A binary built for coverage writes a profile file when it exits, under the
+/// same resource limits as the test put on pax. A test that sets a small
+/// file-size limit makes that write fail too, and the profiling runtime then
+/// adds its own "LLVM Profile Error:" line to stderr; that line is left out.
+pub fn diagnostic_lines(output: &Output) -> Vec<String> {
+    stderr_str(output)
+        .lines()
+        .filter(|line| !line.starts_with("LLVM Profile Error:"))
+        .map(str::to_string)
+        .collect()
+}
+
 /// A small file system mounted at a directory, for the tests that need a
 /// mount point (`-X`) or a second device (`-l` across devices). Unmounted when
 /// dropped.

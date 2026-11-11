@@ -30,7 +30,7 @@ fn run_env(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if clear_env {
-        c.env_clear();
+        plib::testing::clear_env(&mut c);
     }
     for (k, v) in envs {
         c.env(k, v);

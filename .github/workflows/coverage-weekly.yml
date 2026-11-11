@@ -38,11 +38,23 @@ jobs:
           command -v awk
           awk --version | head -n 1
 
-      - name: Generate LCOV (workspace)
-        run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info
+      # Run the suite once; both reports below read this run's profiles.
+      # --no-fail-fast so one failing crate does not hide the others.
+      - name: Run tests with coverage (workspace)
+        run: cargo llvm-cov --workspace --all-features --no-fail-fast --no-report
+
+      # A utility run under a umask that denies owner read writes its profile
+      # under that umask too, and llvm-profdata crashes on an unreadable input.
+      - name: Make every profile readable
+        run: find target/llvm-cov-target -name '*.profraw' ! -perm -u=r -exec chmod u+r {} +
+
+      # A utility run under a small `ulimit -f` leaves a truncated profile;
+      # `--failure-mode all` skips such a file with a warning.
+      - name: Generate LCOV
+        run: cargo llvm-cov report --failure-mode all --lcov --output-path lcov.info
 
       - name: Generate HTML report
-        run: cargo llvm-cov --workspace --all-features --html
+        run: cargo llvm-cov report --failure-mode all --html
 
       - name: Upload HTML artifact
         uses: actions/upload-artifact@v4

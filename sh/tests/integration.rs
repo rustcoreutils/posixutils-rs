@@ -2308,20 +2308,27 @@ mod audit_regressions {
         });
     }
 
+    // The limits these tests set stay in force until the shell exits, so they
+    // must leave room for any file the shell itself writes. A shell built for
+    // coverage writes a profile file of a few hundred KB at exit; below that
+    // it is killed by SIGXFSZ, whatever ulimit did. Tens of MB leave room.
+
     #[test]
     fn ulimit_with_no_options_reports_the_soft_file_size_limit() {
         set_env_vars();
-        run_successfully_and("ulimit -f 100\nulimit\n", |out| assert_eq!(out, "100\n"));
+        run_successfully_and("ulimit -f 100000\nulimit\n", |out| {
+            assert_eq!(out, "100000\n")
+        });
     }
 
     #[test]
     fn ulimit_soft_limit_may_not_exceed_the_hard_limit() {
         // Raising the hard limit needs privilege, so `-S` must refuse rather
         // than silently widening it.
-        expect_clean_failure("ulimit -f 100\nulimit -S -f 200\n");
+        expect_clean_failure("ulimit -f 100000\nulimit -S -f 200000\n");
         run_successfully_and(
-            "ulimit -f 100\nulimit -S -f 50\nulimit -S -f\nulimit -H -f\n",
-            |out| assert_eq!(out, "50\n100\n"),
+            "ulimit -f 100000\nulimit -S -f 50000\nulimit -S -f\nulimit -H -f\n",
+            |out| assert_eq!(out, "50000\n100000\n"),
         );
     }
 

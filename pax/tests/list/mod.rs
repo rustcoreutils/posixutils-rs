@@ -522,7 +522,7 @@ fn test_listing_write_error_fails_once() {
 
     assert_exit_code(&output, 1, "pax listing past the file-size limit");
     let stderr = stderr_str(&output);
-    assert_eq!(stderr.lines().count(), 1, "stderr:\n{stderr}");
+    assert_eq!(diagnostic_lines(&output).len(), 1, "stderr:\n{stderr}");
     assert!(!stderr.contains("member-"), "blamed a member:\n{stderr}");
 }
 

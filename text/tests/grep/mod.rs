@@ -1689,7 +1689,7 @@ fn test_line_not_valid_utf8_is_searched_in_the_c_locale() {
 #[test]
 fn test_line_not_valid_utf8_is_searched_with_no_locale() {
     let mut cmd = std::process::Command::new(plib::testing::get_binary_path("grep"));
-    cmd.env_clear()
+    plib::testing::clear_env(&mut cmd)
         .arg("foo")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

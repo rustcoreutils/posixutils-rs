@@ -130,3 +130,68 @@ fn test_vi_address_with_bar_prints_and_sets_context_mark() {
     e.execute_keys(":3|\r''").unwrap();
     assert_eq!(e.get_cursor().line, 1);
 }
+
+#[test]
+fn test_quit_twice_with_files_left() {
+    // 95262-95264: with files left, `:q` is an error -- unless the command
+    // before it was a quit too.
+    let dir = plib::tmp::TempDir::new().unwrap();
+    let (f, g) = (dir.path().join("f"), dir.path().join("g"));
+    std::fs::write(&f, "f\n").unwrap();
+    std::fs::write(&g, "g\n").unwrap();
+    let names = vec![
+        f.to_str().unwrap().to_string(),
+        g.to_str().unwrap().to_string(),
+    ];
+    let mut e = Editor::new_headless();
+    e.open_files(names.clone()).unwrap();
+    e.execute_keys(":q\r").unwrap();
+    assert!(!e.should_quit(), "files left: the first :q refuses");
+    e.execute_keys(":q\r").unwrap();
+    assert!(e.should_quit(), "a second :q in a row quits");
+
+    // A command in between starts the count again.
+    let mut e = Editor::new_headless();
+    e.open_files(names).unwrap();
+    e.execute_keys(":q\r0:q\r").unwrap();
+    assert!(!e.should_quit());
+}
+
+/// An editor on two files, `f` and `g`, in `dir`.
+fn on_two_files(dir: &plib::tmp::TempDir) -> Editor {
+    let names: Vec<String> = ["f", "g"]
+        .iter()
+        .map(|n| {
+            let p = dir.path().join(n);
+            std::fs::write(&p, format!("{n}\n")).unwrap();
+            p.to_str().unwrap().to_string()
+        })
+        .collect();
+    let mut e = Editor::new_headless();
+    e.open_files(names).unwrap();
+    e
+}
+
+#[test]
+fn test_wq_and_zz_follow_the_quit_rules() {
+    // 95497, 95537-95540: write, then quit as `:q` would.
+    let dir = plib::tmp::TempDir::new().unwrap();
+    let mut e = on_two_files(&dir);
+    e.execute_keys(":wq\r").unwrap();
+    assert!(!e.should_quit(), "files left");
+    e.execute_keys(":wq\r").unwrap();
+    assert!(e.should_quit());
+    let mut e = on_two_files(&dir);
+    e.execute_keys("ZZ").unwrap();
+    assert!(!e.should_quit(), "files left");
+    e.execute_keys("ZZ").unwrap();
+    assert!(e.should_quit());
+}
+
+#[test]
+fn test_a_search_between_quits_counts() {
+    let dir = plib::tmp::TempDir::new().unwrap();
+    let mut e = on_two_files(&dir);
+    e.execute_keys(":q\r/f\r:q\r").unwrap();
+    assert!(!e.should_quit(), "the search came between");
+}

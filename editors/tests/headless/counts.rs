@@ -157,3 +157,20 @@ fn test_dot_repeats_literal_control_characters() {
 fn test_count_open_autoindents_every_copy() {
     assert_eq!(text("  a\n", ":set ai\r2ox\x1b"), "  a\n  x\n  x\n");
 }
+
+#[test]
+fn test_autoindent_on_newline_in_append() {
+    // 95745-95749: a <newline> typed in `A` on an indented line indents
+    // the new line like it.
+    assert_eq!(text("  ab\n", ":set ai\rAx\ry\x1b"), "  abx\n  y\n");
+    assert_eq!(text("  ab\n", ":set ai\r^li\ry\x1b"), "  a\n  yb\n");
+}
+
+#[test]
+fn test_autoindent_follows_the_last_line_entered() {
+    // A line entered with more indent sets the next line's.
+    assert_eq!(
+        text("a\n", ":set ai sw=4\ro\x14b\rc\x1b"),
+        "a\n    b\n    c\n"
+    );
+}

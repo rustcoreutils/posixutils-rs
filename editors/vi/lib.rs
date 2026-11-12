@@ -97,9 +97,10 @@ impl InvokedAs {
 /// This is the main entry point for both vi and ex binaries.
 /// Returns the exit code.
 pub fn run_editor(invoked_as: InvokedAs, args: &[String]) -> i32 {
-    // Preserve the buffer on hangup/termination, and prune old recovery files.
+    // Preserve the buffer on hangup/termination.  Saved buffers are never
+    // removed behind the user's back, however old: as in historical ex and
+    // nvi, only recovering one removes it.
     signals::install_hangup_handlers();
-    recover::cleanup_stale(&recover::default_base(), 14 * 24 * 60 * 60);
 
     let mut opts = parse_args(invoked_as, args);
     let prog_name = invoked_as.name();

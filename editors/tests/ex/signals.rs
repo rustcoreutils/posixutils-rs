@@ -148,3 +148,38 @@ fn test_hangup_in_text_input_keeps_the_lines_entered() {
     .any(|body| body.contains("PENDING"));
     assert!(saved, "the line entered before the hangup is preserved");
 }
+
+#[test]
+fn test_suspend_without_job_control_does_not_stop() {
+    // 95403-95404.  ex runs as the leader of a session of its own, so its
+    // process group is the session's -- no job-control shell made it -- and
+    // it must not stop itself (it would stay stopped, and this test hang).
+    use std::os::unix::process::CommandExt;
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("f"), "a\n").unwrap();
+    let mut cmd = Command::new(get_binary_path("ex"));
+    cmd.args(["-s", "f"])
+        .current_dir(dir.path())
+        .env("HOME", dir.path())
+        .env_remove("EXINIT")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    // SAFETY: setsid is async-signal-safe, as pre_exec requires.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().expect("spawn ex");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"suspend\n.p\nq!\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\n");
+    assert_eq!(out.status.code(), Some(0));
+}

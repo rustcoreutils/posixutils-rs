@@ -366,14 +366,17 @@ fn apply_autoindent(
     state.ai_len = indent.len();
 }
 
-/// The autoindent prefix currently on the cursor's line, as a string.
-fn current_autoindent(buffer: &Buffer, state: &InsertState) -> String {
-    let line = buffer.cursor().line;
+/// The leading blanks of the cursor's line, before the cursor: the indent
+/// of the line a <newline> typed now ends, which the next line takes
+/// (95745-95749) -- whether autoindent put it there or the line already had
+/// it (`A` on an indented line).
+fn indent_before_cursor(buffer: &Buffer) -> String {
+    let pos = buffer.cursor();
     buffer
-        .line(line)
+        .line(pos.line)
         .map(|l| {
-            let c = l.content();
-            c[..state.ai_len.min(c.len())].to_string()
+            let c = &l.content()[..pos.column.min(l.len())];
+            c[..c.len() - c.trim_start_matches([' ', '\t']).len()].to_string()
         })
         .unwrap_or_default()
 }
@@ -576,6 +579,7 @@ fn insert_newline(buffer: &mut Buffer, state: &mut InsertState, opts: &Options) 
     // "If there are no characters other than autoindent characters on the
     // line, all characters on the line shall be discarded" (121819-121820).
     let line_num = buffer.cursor().line;
+    let typed_indent = indent_before_cursor(buffer);
     let only_autoindent = state.ai_len > 0
         && buffer
             .line(line_num)
@@ -588,11 +592,10 @@ fn insert_newline(buffer: &mut Buffer, state: &mut InsertState, opts: &Options) 
     // The indent the *next* line derives from. Normally the line just
     // terminated; after `^^D` the source is preserved instead (121779-121780).
     let source = if state.ai_source_indent.is_empty() || state.ai_len > 0 {
-        let cur = current_autoindent(buffer, state);
-        if cur.is_empty() {
+        if typed_indent.is_empty() {
             state.ai_source_indent.clone()
         } else {
-            cur
+            typed_indent
         }
     } else {
         state.ai_source_indent.clone()

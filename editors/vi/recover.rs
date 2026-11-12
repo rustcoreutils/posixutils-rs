@@ -447,9 +447,8 @@ fn read_header(dir: &Rc<RecoverDir>, name: &CString) -> io::Result<RecoverInfo> 
 
 /// List recoverable buffers under `base`, newest first.
 ///
-/// Listing never creates the recovery directory: every editor start lists
-/// (to prune stale files), and one that preserves nothing must leave nothing
-/// behind under `base`.
+/// Listing never creates the recovery directory: `vi -r` lists, and an
+/// editor that preserves nothing must leave nothing behind under `base`.
 pub fn list(base: &str) -> Vec<RecoverInfo> {
     let mut out = Vec::new();
     let Ok(dir) = open_dir(dir_path(base)) else {
@@ -519,14 +518,37 @@ pub fn remove(info: &RecoverInfo) {
     info.dir.unlink(&info.name);
 }
 
-/// Remove recovery files under `base` older than `max_age_secs`.
-pub fn cleanup_stale(base: &str, max_age_secs: u64) {
-    let now = now_secs();
-    for info in list(base) {
-        if now.saturating_sub(info.modified) > max_age_secs {
-            remove(&info);
-        }
-    }
+/// The mail `notify` sends (95222-95225): the file's name, when it was
+/// preserved, and an ex command that recovers it.
+fn notice(user: &str, orig: Option<&Path>, secs: u64) -> String {
+    let fname = orig
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "an unnamed buffer".to_string())
+        .replace(['\n', '\r'], " ");
+    let when = local_time(secs);
+    let command = match orig {
+        // Quoted for the shell: in single quotes, a quote as '\''.
+        Some(p) => format!(
+            "ex -r '{}'",
+            crate::bytes::from_path(&path_key(p))
+                .replace(['\n', '\r'], " ")
+                .replace('\'', "'\\''")
+        ),
+        None => "ex -r".to_string(),
+    };
+    format!(
+        "From: vi\nTo: {user}\nSubject: editor recovery\n\n\
+         A copy of an edit session for {fname} was saved at {when}.\n\
+         To recover it, run:\n\n    {command}\n"
+    )
+}
+
+/// `secs` since the epoch as a local date and time, as date(1) writes it.
+fn local_time(secs: u64) -> String {
+    i64::try_from(secs)
+        .ok()
+        .and_then(|t| plib::locale::strftime("%a %b %e %H:%M:%S %Z %Y", t).ok())
+        .unwrap_or_else(|| format!("{secs} seconds after the epoch"))
 }
 
 /// Best-effort email notification that a buffer was preserved.
@@ -541,15 +563,7 @@ pub fn notify(orig: Option<&Path>) {
     if user.contains(['\n', '\r']) {
         return;
     }
-    let fname = orig
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "an unnamed buffer".to_string())
-        .replace(['\n', '\r'], " ");
-    let body = format!(
-        "From: vi\nTo: {user}\nSubject: editor recovery\n\n\
-         A copy of an edit session for {fname} was saved.\n\
-         Run \"vi -r\" to recover it.\n"
-    );
+    let body = notice(&user, orig, now_secs());
     for prog in ["/usr/sbin/sendmail", "/usr/lib/sendmail", "sendmail"] {
         if let Ok(mut child) = Command::new(prog)
             .arg("-t")
@@ -632,12 +646,19 @@ mod tests {
     }
 
     #[test]
+    fn test_notice_names_file_time_and_command() {
+        let body = notice("u", Some(Path::new("/x/it's")), 0);
+        assert!(body.contains("/x/it's was saved at "), "{body}");
+        assert!(body.contains("1970") || body.contains("1969"), "{body}");
+        assert!(body.contains("ex -r '/x/it'\\''s'"), "{body}");
+    }
+
+    #[test]
     fn test_list_does_not_create_the_recovery_directory() {
         let td = plib::tmp::tempdir().unwrap();
         let base = td.path().to_str().unwrap();
 
         assert!(list(base).is_empty());
-        cleanup_stale(base, 0);
         assert_eq!(
             fs::read_dir(td.path()).unwrap().count(),
             0,

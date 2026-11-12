@@ -45,12 +45,18 @@ impl InputReader {
     pub fn read_key(&mut self) -> Result<Key> {
         let b = self.read_byte()?;
 
-        // Handle escape sequences
+        // An escape sequence, if what follows the ESC (already here, not
+        // still to come) is one.  Otherwise the ESC is a key of its own and
+        // the bytes after it are keys too: ESC then `j` typed or pasted fast
+        // is ESC and `j`, not an unknown Alt-j that loses both.
+        // A terminal writes a sequence whole, so only bytes already read
+        // count: a sequence's parse never waits for more input.
         if b == 27 {
-            // Check for escape sequence
-            if self.has_pending_byte()? {
-                return self.parse_escape_sequence();
+            let at = self.pos;
+            if let Some(key) = self.parse_escape_sequence() {
+                return Ok(key);
             }
+            self.pos = at;
             return Ok(Key::Escape);
         }
 
@@ -92,24 +98,20 @@ impl InputReader {
         Ok(b)
     }
 
-    /// Check if there are pending bytes available (non-blocking check).
-    fn has_pending_byte(&self) -> Result<bool> {
-        // In practice, if we just read escape, we need to check
-        // if there are more bytes waiting. This is a simplified check.
-        Ok(self.pos < self.len)
+    /// The next byte already read, if there is one; never reads more.
+    fn buffered_byte(&mut self) -> Option<u8> {
+        let b = *self.buffer[..self.len].get(self.pos)?;
+        self.pos += 1;
+        Some(b)
     }
 
-    /// Parse an escape sequence.
-    fn parse_escape_sequence(&mut self) -> Result<Key> {
-        let b1 = self.read_byte()?;
-
-        match b1 {
+    /// Parse an escape sequence: `None` if the bytes after the ESC are not
+    /// one (`ESC [` or `ESC O` with a valid tail).
+    fn parse_escape_sequence(&mut self) -> Option<Key> {
+        match self.buffered_byte()? {
             b'[' => self.parse_csi_sequence(),
             b'O' => self.parse_ss3_sequence(),
-            _ => {
-                // Alt+key or unknown
-                Ok(Key::Unknown)
-            }
+            _ => None,
         }
     }
 
@@ -123,19 +125,24 @@ impl InputReader {
     /// the sequence in the input stream, where it was read as ordinary
     /// commands: a Ctrl-Right arrow (`ESC [ 1 ; 5 C`) delivered `5C`, which
     /// changes to the end of the line -- a destructive edit from a cursor key.
-    fn parse_csi_sequence(&mut self) -> Result<Key> {
+    fn parse_csi_sequence(&mut self) -> Option<Key> {
         let mut params: Vec<u8> = Vec::new();
+        let mut intermediate = false;
         let final_byte = loop {
-            let b = self.read_byte()?;
+            let b = self.buffered_byte()?;
             match b {
                 0x30..=0x3F => params.push(b),
-                0x20..=0x2F => {} // intermediate bytes: consumed, unused
+                0x20..=0x2F => intermediate = true, // consumed, unused
                 0x40..=0x7E => break b,
-                // Not part of a CSI sequence at all; give up rather than
-                // consume unbounded input.
-                _ => return Ok(Key::Unknown),
+                // Not a CSI sequence at all.
+                _ => return None,
             }
         };
+        // A bare `ESC [` and a final byte no key ends -- `ESC [ [`, `ESC [ x`
+        // -- is ESC, then `[`, then keys typed fast after it.
+        if params.is_empty() && !intermediate && !b"ABCDHF".contains(&final_byte) {
+            return None;
+        }
 
         // The leading numeric parameter, if there is one.
         let num = params
@@ -145,16 +152,17 @@ impl InputReader {
                 acc.saturating_mul(10).saturating_add(b - b'0')
             });
 
-        match final_byte {
-            b'A' => Ok(Key::Up),
-            b'B' => Ok(Key::Down),
-            b'C' => Ok(Key::Right),
-            b'D' => Ok(Key::Left),
-            b'H' => Ok(Key::Home),
-            b'F' => Ok(Key::End),
-            b'~' => Ok(self.csi_number_to_key(num)),
-            _ => Ok(Key::Unknown),
-        }
+        // A whole CSI sequence: a key, or one this editor does not know.
+        Some(match final_byte {
+            b'A' => Key::Up,
+            b'B' => Key::Down,
+            b'C' => Key::Right,
+            b'D' => Key::Left,
+            b'H' => Key::Home,
+            b'F' => Key::End,
+            b'~' => self.csi_number_to_key(num),
+            _ => Key::Unknown,
+        })
     }
 
     /// Convert CSI number to key.
@@ -174,21 +182,22 @@ impl InputReader {
     }
 
     /// Parse SS3 sequences: ESC O
-    fn parse_ss3_sequence(&mut self) -> Result<Key> {
-        let b = self.read_byte()?;
-
-        match b {
-            b'A' => Ok(Key::Up),
-            b'B' => Ok(Key::Down),
-            b'C' => Ok(Key::Right),
-            b'D' => Ok(Key::Left),
-            b'H' => Ok(Key::Home),
-            b'F' => Ok(Key::End),
-            b'P' => Ok(Key::F(1)),
-            b'Q' => Ok(Key::F(2)),
-            b'R' => Ok(Key::F(3)),
-            b'S' => Ok(Key::F(4)),
-            _ => Ok(Key::Unknown),
+    ///
+    /// Only the SS3 keys a terminal sends: anything else is ESC, then `O`
+    /// (the open-above command), then more keys.
+    fn parse_ss3_sequence(&mut self) -> Option<Key> {
+        match self.buffered_byte()? {
+            b'A' => Some(Key::Up),
+            b'B' => Some(Key::Down),
+            b'C' => Some(Key::Right),
+            b'D' => Some(Key::Left),
+            b'H' => Some(Key::Home),
+            b'F' => Some(Key::End),
+            b'P' => Some(Key::F(1)),
+            b'Q' => Some(Key::F(2)),
+            b'R' => Some(Key::F(3)),
+            b'S' => Some(Key::F(4)),
+            _ => None,
         }
     }
 
@@ -230,6 +239,73 @@ impl Default for InputReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reader with `bytes` already read, so no test touches stdin.
+    fn reading(bytes: &[u8]) -> InputReader {
+        let mut r = InputReader::new();
+        r.buffer[..bytes.len()].copy_from_slice(bytes);
+        r.len = bytes.len();
+        r
+    }
+
+    fn keys(bytes: &[u8]) -> Vec<Key> {
+        let mut r = reading(bytes);
+        let mut out = Vec::new();
+        while r.pos < r.len {
+            out.push(r.read_key().unwrap());
+        }
+        out
+    }
+
+    #[test]
+    fn test_escape_then_keys_typed_fast() {
+        assert_eq!(keys(b"\x1bj"), [Key::Escape, Key::Char('j')]);
+        assert_eq!(
+            keys(b"x\x1b:wq"),
+            [
+                Key::Char('x'),
+                Key::Escape,
+                Key::Char(':'),
+                Key::Char('w'),
+                Key::Char('q')
+            ]
+        );
+        // ESC O then a letter that ends no SS3 sequence: ESC, `O`, the letter.
+        assert_eq!(
+            keys(b"\x1bOh"),
+            [Key::Escape, Key::Char('O'), Key::Char('h')]
+        );
+        // `[` then a byte no CSI sequence holds.
+        assert_eq!(
+            keys(b"\x1b[\x01"),
+            [Key::Escape, Key::Char('['), Key::Ctrl('a')]
+        );
+    }
+
+    #[test]
+    fn test_escape_then_bracket_commands() {
+        // `[[` typed fast after ESC is ESC and the motion.
+        assert_eq!(
+            keys(b"\x1b[["),
+            [Key::Escape, Key::Char('['), Key::Char('[')]
+        );
+        assert_eq!(
+            keys(b"\x1b[x"),
+            [Key::Escape, Key::Char('['), Key::Char('x')]
+        );
+        // ESC [ or ESC O last in what was read: ESC, then the letter, now --
+        // not a wait for a sequence that may never come.
+        assert_eq!(keys(b"\x1bO"), [Key::Escape, Key::Char('O')]);
+        assert_eq!(keys(b"\x1b["), [Key::Escape, Key::Char('[')]);
+    }
+
+    #[test]
+    fn test_escape_sequences_are_keys() {
+        assert_eq!(
+            keys(b"\x1b[A\x1bOB\x1b[5~"),
+            [Key::Up, Key::Down, Key::PageUp]
+        );
+    }
 
     #[test]
     fn test_csi_number_to_key() {

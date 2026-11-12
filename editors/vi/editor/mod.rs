@@ -63,6 +63,53 @@ pub struct LastSubstitution {
     pub global: bool,
 }
 
+/// Whether `access(path, W_OK)` says the file may not be written -- not
+/// merely that it does not exist (95855-95858).
+fn lacks_write_permission(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // Not unset by privilege (95860): with uid 0, which access() lets
+    // write anything, judge by the mode as for an unprivileged owner,
+    // group member or other.
+    // SAFETY: geteuid and getegid take no arguments.
+    if unsafe { libc::geteuid() } == 0 {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(m) = std::fs::metadata(path) else {
+            return false;
+        };
+        let bit = if m.uid() == 0 {
+            0o200
+        } else if m.gid() == unsafe { libc::getegid() } {
+            0o020
+        } else {
+            0o002
+        };
+        return m.mode() & bit == 0;
+    }
+    // SAFETY: a NUL-terminated path.
+    if unsafe { libc::access(c.as_ptr(), libc::W_OK) } == 0 {
+        return false;
+    }
+    matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EACCES | libc::EROFS | libc::EPERM)
+    )
+}
+
+/// Whether the editor runs under a shell with job control (`set -m`):
+/// such a shell runs each job in a process group of its own, not the
+/// session's, and can continue the job once it stops.  A shell without job
+/// control keeps its children in the session leader's group.
+fn job_control_enabled() -> bool {
+    // SAFETY: getpgrp and getsid take and return plain values.
+    unsafe {
+        let session = libc::getsid(0);
+        session >= 0 && libc::getpgrp() != session
+    }
+}
+
 /// How deeply `:so` and `:@` may nest.
 const MAX_NESTING: usize = 100;
 
@@ -180,6 +227,15 @@ pub struct Editor {
     ex_interrupted: bool,
     /// How deeply `:so` and `:@` are nested, against `MAX_NESTING`.
     nesting: usize,
+    /// A count of commands run (ex and vi), and the number of the last
+    /// quit, wq, xit or ZZ: `:q` again right after one quits with files
+    /// left to edit (95262-95264).
+    command_serial: u64,
+    last_quit_serial: Option<u64>,
+    /// Whether `readonly` is set only because the last file edited may not
+    /// be written -- so the next edit may unset it, where it keeps a
+    /// `:set readonly` the user made (95861-95863).
+    readonly_from_file: bool,
     /// Files (as [`crate::recover::path_key`]s) to recover the first time
     /// they are edited: `-r`'s operands (94444-94451), and `:recover`'s.
     recover_pending: Vec<PathBuf>,
@@ -344,6 +400,9 @@ impl Editor {
             insert_origin: None,
             ex_interrupted: false,
             nesting: 0,
+            command_serial: 0,
+            last_quit_serial: None,
+            readonly_from_file: false,
             recover_pending: Vec::new(),
             recover_next_edit: false,
             initial_commands: Vec::new(),
@@ -408,6 +467,9 @@ impl Editor {
             insert_origin: None,
             ex_interrupted: false,
             nesting: 0,
+            command_serial: 0,
+            last_quit_serial: None,
+            readonly_from_file: false,
             recover_pending: Vec::new(),
             recover_next_edit: false,
             initial_commands: Vec::new(),
@@ -475,6 +537,9 @@ impl Editor {
             insert_origin: None,
             ex_interrupted: false,
             nesting: 0,
+            command_serial: 0,
+            last_quit_serial: None,
+            readonly_from_file: false,
             recover_pending: Vec::new(),
             recover_next_edit: false,
             initial_commands: Vec::new(),
@@ -650,9 +715,12 @@ impl Editor {
     /// Open a file for editing.
     pub fn open(&mut self, path: &str) -> Result<()> {
         let path_buf = crate::bytes::path(path);
-        // Read before anything is replaced, so a failure leaves the editor as
-        // it was rather than half-switched to a file it could not open.
-        let mut new_buffer = read_file(&path_buf)?;
+        // 94952-94953: a file that cannot be read (a directory, no
+        // permission) gives an empty buffer, and editing goes on.
+        let (mut new_buffer, unreadable) = match read_file(&path_buf) {
+            Ok(buffer) => (buffer, None),
+            Err(e) => (Buffer::new(), Some(e)),
+        };
         let exists = path_buf.exists();
         // -r or :recover: saved contents in place of the file's, if any.
         let recovered = self.take_recovery(&path_buf);
@@ -708,9 +776,27 @@ impl Editor {
         if let Some(note) = recover_note {
             self.set_message(&note);
         }
+        // 95853-95858: readonly starts set with -R, or for a file this
+        // process may not write -- or could not read, whose empty buffer
+        // must not be written over it unforced.  A readonly the user set
+        // stays.
+        let user_set = self.options.readonly && !self.readonly_from_file;
+        let from_file = unreadable.is_some() || lacks_write_permission(&path_buf);
+        self.options.readonly = user_set || self.files.is_readonly() || from_file;
+        self.readonly_from_file = from_file && !user_set && !self.files.is_readonly();
+        if let Some(e) = &unreadable {
+            // A diagnostic, on standard error in ex (where -s silences
+            // messages) as on the status line in vi.
+            let msg = format!("{path}: {e}");
+            if self.ex_standalone_mode {
+                crate::bytes::eprintln(&msg);
+            }
+            self.set_error(&msg);
+        }
         // 94452-94459: the -c commands run in the first buffer loaded from
         // an existing file (or recovered), from its last line.
-        if (exists || was_recovered) && !self.initial_commands.is_empty() {
+        if ((exists && unreadable.is_none()) || was_recovered) && !self.initial_commands.is_empty()
+        {
             let commands = std::mem::take(&mut self.initial_commands);
             self.buffer.set_line(self.buffer.line_count().max(1));
             self.buffer.move_to_first_non_blank();
@@ -1288,6 +1374,10 @@ impl Editor {
             // makes.
             if matches!(self.mode, Mode::Command) {
                 self.buffer.take_dropped_marks();
+                // Every vi command begins here, `:`, `/` and ^^ among them.
+                if self.parser.is_ready() {
+                    self.command_serial += 1;
+                }
             }
             let result = match &self.mode {
                 Mode::Command => self.handle_command_key(q.key),
@@ -2355,8 +2445,11 @@ impl Editor {
             }
             // ZZ - write and quit
             'Z' => {
+                // A failure is the status line's, not a reason to leave vi.
                 if cmd.char_arg == Some('Z') {
-                    self.write_and_quit()?;
+                    if let Err(e) = self.write_and_quit() {
+                        self.set_error(&e.to_string());
+                    }
                 }
             }
             // Replace char
@@ -3498,6 +3591,10 @@ impl Editor {
         // A leading `/re/` or `?re?` is an address, not a search: what
         // follows it is the command to run there (`/b/d`).  vi's own `/` and
         // `?` prompts are searches, and are handled where the prompt ends.
+        // In ex each command counts; in vi the `:` that began the line did.
+        if self.ex_standalone_mode {
+            self.command_serial += 1;
+        }
         let (cmd, flags) = crate::ex::parser::parse_ex_line(command)?;
         // Marks this command drops go to the undo record it makes; any left
         // over from before are not its.
@@ -3671,11 +3768,11 @@ impl Editor {
         let cmd = self.expand_file_args(cmd)?;
         match cmd {
             ExCommand::Quit { force } => {
-                // POSIX: quit warns while more files remain in the argument
-                // list, unless forced. The modified-buffer check is in quit().
-                if !force && self.files.has_more_files() {
-                    return Err(ViError::MoreFiles);
-                }
+                // 95262-95264: with files left in the argument list, quit is
+                // an error -- unless forced, or the command before it was a
+                // quit too.  The modified-buffer check is in quit().
+                let again = self.quit_was_last();
+                self.check_more_files(force, again)?;
                 self.quit(force)?;
                 Ok(ExResult::Continue)
             }
@@ -3695,13 +3792,18 @@ impl Editor {
                 force,
                 xit,
             } => {
+                // wq is write then quit, and xit quit or wq (95497,
+                // 95537-95540): the quit rules apply after any write.
+                let again = self.quit_was_last();
                 // #X29: `xit` on a buffer unmodified since the last complete
                 // write is just `quit` (ex.md §95537); only `wq` always writes.
                 if xit && !self.buffer.is_modified() {
+                    self.check_more_files(force, again)?;
                     self.quit(force)?;
                 } else {
                     let lines = self.write_line_range(&range)?;
                     self.write(file.as_deref(), lines, false, force)?;
+                    self.check_more_files(force, again)?;
                     self.quit(true)?;
                 }
                 Ok(ExResult::Continue)
@@ -4884,6 +4986,12 @@ impl Editor {
     /// options" (95405): with `autowrite` set and a modified buffer, write it
     /// out before suspending unless `!` was given.
     fn execute_ex_suspend(&mut self, force: bool) -> Result<()> {
+        // 95403-95404: only if the invoking shell has job control -- else no
+        // one would ever continue the stopped editor.
+        if !job_control_enabled() {
+            self.set_message("suspend: no job control in the invoking shell");
+            return Ok(());
+        }
         if !force && self.options.autowrite && self.buffer.is_modified() {
             let lines = self.write_line_range(&crate::ex::AddressRange::empty())?;
             self.write(None, lines, false, false)?;
@@ -4894,10 +5002,12 @@ impl Editor {
             self.terminal.disable_raw_mode()?;
         }
 
-        // Send SIGTSTP to self
-        #[cfg(unix)]
+        // Stop the job -- the editor's whole process group, as a typed
+        // susp character would, so a wrapper (`git commit`, `sudo vi`)
+        // stops with it and the shell can continue them together.
+        // SAFETY: kill(0, ...) signals this process's group.
         unsafe {
-            libc::raise(libc::SIGTSTP);
+            libc::kill(0, libc::SIGTSTP);
         }
 
         // Re-enable terminal handling if we were in visual mode
@@ -5328,10 +5438,33 @@ impl Editor {
 
     /// Write and quit.
     fn write_and_quit(&mut self) -> Result<()> {
+        // ZZ is :x (95537-95540), quit rules and all.
+        let again = self.quit_was_last();
         if self.buffer.is_modified() {
             self.write(None, None, false, false)?;
         }
+        self.check_more_files(false, again)?;
         self.quit(true)
+    }
+
+    /// 95262-95264: with files left in the argument list, quitting is an
+    /// error -- unless forced, or `again`, the command before was a quit.
+    fn check_more_files(&self, force: bool, again: bool) -> Result<()> {
+        if !force && !again && self.files.has_more_files() {
+            return Err(ViError::MoreFiles);
+        }
+        Ok(())
+    }
+
+    /// Note that the command now running is a quit, wq, xit or ZZ, and say
+    /// whether the command before it was one too.
+    fn quit_was_last(&mut self) -> bool {
+        // The same serial: `q|q` typed as one vi `:` line.
+        let again = self
+            .last_quit_serial
+            .is_some_and(|s| s + 1 == self.command_serial || s == self.command_serial);
+        self.last_quit_serial = Some(self.command_serial);
+        again
     }
 
     /// Quit the editor.

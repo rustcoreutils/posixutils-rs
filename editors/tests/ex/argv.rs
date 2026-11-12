@@ -208,3 +208,51 @@ fn test_recovered_file_keeps_its_operand_name() {
     // `%` is the name as given, not the absolute one recovery records.
     assert!(out.lines().any(|l| l == "f"), "{out:?} {err}");
 }
+
+#[test]
+fn test_directory_operand_gives_an_empty_buffer() {
+    // 94952-94953: editing goes on, with nothing in the buffer.
+    let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join("d")).unwrap();
+    let (out, err, _) = run(dir.path(), &["-s", "d"], "a\nX\n.\n%p\nq!\n");
+    assert_eq!(out, "X\n", "{err}");
+}
+
+#[test]
+fn test_unwritable_file_starts_readonly() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = with_file("a\n");
+    let f = dir.path().join("f");
+    fs::set_permissions(&f, fs::Permissions::from_mode(0o444)).unwrap();
+    let (out, _, _) = run(dir.path(), &["-s", "f"], "set readonly?\nq!\n");
+    assert_eq!(out, "readonly\n");
+    fs::set_permissions(&f, fs::Permissions::from_mode(0o644)).unwrap();
+    let (out, _, _) = run(dir.path(), &["-s", "f"], "set readonly?\nq!\n");
+    assert_eq!(out, "noreadonly\n");
+}
+
+#[test]
+fn test_unreadable_file_starts_readonly_so_it_is_not_overwritten() {
+    use std::os::unix::fs::PermissionsExt;
+    // Root reads anything; the point is moot there.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let dir = with_file("precious\n");
+    let f = dir.path().join("f");
+    fs::set_permissions(&f, fs::Permissions::from_mode(0o200)).unwrap();
+    let (out, _, code) = run(dir.path(), &["-s", "f"], "set readonly?\nw\nq!\n");
+    fs::set_permissions(&f, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(out, "readonly\n");
+    assert_ne!(code, 0, "the write is refused");
+    assert_eq!(fs::read_to_string(&f).unwrap(), "precious\n");
+}
+
+#[test]
+fn test_readonly_set_by_the_user_survives_an_edit() {
+    // 95861-95863.
+    let dir = with_file("a\n");
+    fs::write(dir.path().join("g"), "g\n").unwrap();
+    let (out, _, _) = run(dir.path(), &["-s", "f"], "set ro\ne g\nset readonly?\nq!\n");
+    assert_eq!(out, "readonly\n");
+}

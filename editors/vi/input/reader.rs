@@ -11,7 +11,7 @@
 
 use super::key::Key;
 use crate::error::{Result, ViError};
-use std::io::{self, Read};
+use std::io;
 
 /// Reads key events from standard input.
 pub struct InputReader {
@@ -21,6 +21,14 @@ pub struct InputReader {
     len: usize,
     /// Current position in buffer.
     pos: usize,
+}
+
+/// Keys read ahead but not yet taken go back to standard input's buffer,
+/// for ex to read when the editor leaves visual mode.
+impl Drop for InputReader {
+    fn drop(&mut self) {
+        super::lines::unread(&self.buffer[self.pos..self.len]);
+    }
 }
 
 impl InputReader {
@@ -64,7 +72,7 @@ impl InputReader {
 
         // Read more bytes
         self.pos = 0;
-        self.len = match io::stdin().read(&mut self.buffer) {
+        self.len = match super::lines::read_some(&mut self.buffer) {
             Ok(n) => n,
             // A signal (SIGWINCH/SIGCONT/SIGINT) interrupted the read; surface
             // it so the caller can service the pending signal and redraw.
@@ -75,8 +83,8 @@ impl InputReader {
         };
 
         if self.len == 0 {
-            // End of input.
-            return Err(ViError::Interrupted);
+            // End of input: not an interrupt, which only asks for a redraw.
+            return Err(ViError::Io(io::ErrorKind::UnexpectedEof.into()));
         }
 
         let b = self.buffer[self.pos];

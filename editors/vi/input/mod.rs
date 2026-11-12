@@ -12,6 +12,7 @@
 //! This module provides key event types and input reading from the terminal.
 
 mod key;
+pub mod lines;
 mod queue;
 mod reader;
 

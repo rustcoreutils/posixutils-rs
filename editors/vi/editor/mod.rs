@@ -63,6 +63,9 @@ pub struct LastSubstitution {
     pub global: bool,
 }
 
+/// How deeply `:so` and `:@` may nest.
+const MAX_NESTING: usize = 100;
+
 /// File operands as paths.
 fn to_paths(files: &[String]) -> Vec<PathBuf> {
     files.iter().map(|f| crate::bytes::path(f)).collect()
@@ -172,6 +175,11 @@ pub struct Editor {
     insert_state: Option<InsertState>,
     /// The command that began the insert session, for `.` to repeat.
     insert_origin: Option<crate::command::ParsedCommand>,
+    /// An interrupt reached ex while it waited for input (see
+    /// `ex_signal_ends_session`).
+    ex_interrupted: bool,
+    /// How deeply `:so` and `:@` are nested, against `MAX_NESTING`.
+    nesting: usize,
     /// Files (as [`crate::recover::path_key`]s) to recover the first time
     /// they are edited: `-r`'s operands (94444-94451), and `:recover`'s.
     recover_pending: Vec<PathBuf>,
@@ -334,6 +342,8 @@ impl Editor {
             parser: CommandParser::new(),
             insert_state: None,
             insert_origin: None,
+            ex_interrupted: false,
+            nesting: 0,
             recover_pending: Vec::new(),
             recover_next_edit: false,
             initial_commands: Vec::new(),
@@ -396,6 +406,8 @@ impl Editor {
             parser: CommandParser::new(),
             insert_state: None,
             insert_origin: None,
+            ex_interrupted: false,
+            nesting: 0,
             recover_pending: Vec::new(),
             recover_next_edit: false,
             initial_commands: Vec::new(),
@@ -461,6 +473,8 @@ impl Editor {
             parser: CommandParser::new(),
             insert_state: None,
             insert_origin: None,
+            ex_interrupted: false,
+            nesting: 0,
             recover_pending: Vec::new(),
             recover_next_edit: false,
             initial_commands: Vec::new(),
@@ -808,11 +822,17 @@ impl Editor {
     fn run_ex_mode(&mut self) -> Result<i32> {
         use std::io::{self, IsTerminal, Write};
 
-        let stdin = io::stdin();
         let mut stdout = io::stdout();
-        let stdin_is_tty = stdin.is_terminal();
+        let stdin_is_tty = io::stdin().is_terminal();
+        crate::signals::install_ex_handlers();
 
         while !self.should_quit {
+            // A signal that came during the last command: a hangup ends the
+            // session (94312-94316), and so does an interrupt when standard
+            // input is not a terminal (94292-94293).
+            if self.ex_signal_ends_session(stdin_is_tty) {
+                break;
+            }
             // Check if we should switch to visual mode
             if !self.ex_standalone_mode {
                 // Switch to visual mode
@@ -823,23 +843,23 @@ impl Editor {
             if self.ex_insert_mode.is_some() {
                 // Read text lines until we see a line containing only "."
                 let mut line = String::new();
-                match read_text_line(&stdin, &mut line) {
-                    Ok(0) => {
+                match self.read_ex_line(&mut line, stdin_is_tty) {
+                    ExRead::Eof => {
                         // EOF - finalize pending input, preserve, and quit.
                         let _ = self.finalize_ex_insert();
                         self.preserve_buffer();
                         self.should_quit = true;
                         break;
                     }
-                    Ok(_) => {}
-                    Err(e) => {
-                        if !self.silent_mode {
-                            eprintln!("Read error: {}", e);
-                        }
-                        self.should_quit = true;
-                        self.exit_code = 1;
-                        break;
+                    ExRead::Line => {}
+                    // 94297-94299: the lines entered so far go into the
+                    // buffer, the partial one is dropped, and it is back to
+                    // the command prompt.
+                    ExRead::Interrupted => {
+                        let _ = self.finalize_ex_insert();
+                        continue;
                     }
+                    ExRead::Quit => break,
                 }
 
                 // Strip only the line terminator: in text input mode a
@@ -875,25 +895,16 @@ impl Editor {
 
             // Read a line of input
             let mut line = String::new();
-            match read_text_line(&stdin, &mut line) {
-                Ok(0) => {
+            match self.read_ex_line(&mut line, stdin_is_tty) {
+                ExRead::Eof => {
                     // EOF on the command stream: preserve unsaved work, then quit.
                     self.preserve_buffer();
                     self.should_quit = true;
                     break;
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    // A hangup/termination signal interrupts the read; preserve.
-                    if crate::signals::take(&crate::signals::HANGUP_RECEIVED) {
-                        self.preserve_buffer();
-                    } else if !self.silent_mode {
-                        eprintln!("Read error: {}", e);
-                    }
-                    self.should_quit = true;
-                    self.exit_code = 1;
-                    break;
-                }
+                ExRead::Line => {}
+                ExRead::Interrupted => continue,
+                ExRead::Quit => break,
             }
 
             // Remove the line terminator -- but not a <control>-V-escaped one,
@@ -907,14 +918,23 @@ impl Editor {
             //   /
             // splits a line in two. Without this the reader cut the command at
             // the newline and the trailing `/` parsed as a bare search.
+            let mut abandoned = false;
             while ends_with_odd_backslash(&line) {
                 line.pop(); // drop the escaping backslash
                 line.push('\n');
                 let mut cont = String::new();
-                match read_text_line(&stdin, &mut cont) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => line.push_str(cont.trim_end_matches(['\n', '\r'])),
+                match self.read_ex_line(&mut cont, stdin_is_tty) {
+                    ExRead::Line => line.push_str(cont.trim_end_matches(['\n', '\r'])),
+                    ExRead::Eof => break,
+                    // A hangup or an interrupt drops the half-entered command.
+                    ExRead::Interrupted | ExRead::Quit => {
+                        abandoned = true;
+                        break;
+                    }
                 }
+            }
+            if abandoned {
+                continue;
             }
             let line = line.trim_end_matches([' ', '\t']);
 
@@ -931,6 +951,11 @@ impl Editor {
                             crate::bytes::println(msg);
                         }
                     }
+                }
+                // 94300-94304: an interrupted command is abandoned with a
+                // message; on a terminal that is not an error.
+                Err(ViError::Interrupted) if stdin_is_tty => {
+                    crate::bytes::eprintln("Interrupted");
                 }
                 Err(e) => {
                     // Errors always go to stderr, and any error makes the
@@ -953,6 +978,70 @@ impl Editor {
         Ok(self.exit_code)
     }
 
+    /// Read a line of ex input into `line`, acting on the signals that
+    /// interrupt the read: see [`ExRead`].
+    fn read_ex_line(&mut self, line: &mut String, tty: bool) -> ExRead {
+        loop {
+            let result = read_text_line(line);
+            if result.is_ok() {
+                self.ex_interrupted = false;
+            }
+            match result {
+                Ok(0) => return ExRead::Eof,
+                Ok(_) => return ExRead::Line,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                    if self.ex_signal_ends_session(tty) {
+                        return ExRead::Quit;
+                    }
+                    if self.ex_interrupted {
+                        self.ex_interrupted = false;
+                        line.clear();
+                        crate::input::lines::discard_partial();
+                        return ExRead::Interrupted;
+                    }
+                    // Some other signal (a resize, say): read on.
+                }
+                Err(e) => {
+                    if !self.silent_mode {
+                        eprintln!("Read error: {}", e);
+                    }
+                    self.should_quit = true;
+                    self.exit_code = 1;
+                    return ExRead::Quit;
+                }
+            }
+        }
+    }
+
+    /// Act on a hangup or interrupt received in ex mode.  A hangup preserves
+    /// the buffer and ends the session, non-zero (94312-94316); so does an
+    /// interrupt with standard input not a terminal, without writing
+    /// (94292-94293).  An interrupt on a terminal is reported, and noted in
+    /// `ex_interrupted` for the read to return to its prompt.  Returns
+    /// whether the session is over.
+    fn ex_signal_ends_session(&mut self, tty: bool) -> bool {
+        if crate::signals::take(&crate::signals::HANGUP_RECEIVED) {
+            // The text input lines entered so far are part of the buffer.
+            if self.ex_insert_mode.is_some() {
+                let _ = self.finalize_ex_insert();
+            }
+            self.preserve_buffer();
+            self.should_quit = true;
+            self.exit_code = 1;
+            return true;
+        }
+        if crate::signals::take(self.interrupt) {
+            crate::bytes::eprintln("Interrupted");
+            if !tty {
+                self.should_quit = true;
+                self.exit_code = 1;
+                return true;
+            }
+            self.ex_interrupted = true;
+        }
+        false
+    }
+
     /// Visual mode main editing loop.
     fn visual_main_loop(&mut self) -> Result<()> {
         let mut reader = InputReader::new();
@@ -962,14 +1051,14 @@ impl Editor {
 
             match reader.read_key() {
                 Ok(key) => self.handle_key(key)?,
+                // A signal interrupted the read: service it and redraw.
                 Err(ViError::Interrupted) => {
-                    // The read was interrupted: service any pending signal and
-                    // redraw. If nothing is pending, it was a genuine EOF —
-                    // treat it like a hangup and preserve any unsaved work.
-                    if !self.handle_pending_signals()? {
-                        self.preserve_buffer();
-                        self.should_quit = true;
-                    }
+                    self.handle_pending_signals()?;
+                }
+                // End of input: like a hangup, preserve any unsaved work.
+                Err(ViError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    self.preserve_buffer();
+                    self.should_quit = true;
                 }
                 Err(e) => return Err(e),
             }
@@ -3283,6 +3372,11 @@ impl Editor {
             if seg.comment {
                 break;
             }
+            // 94300-94304: an interrupt aborts the command running -- a
+            // `:g`, `:so` or `:@` included, whose commands come through here.
+            if self.ex_standalone_mode && crate::signals::take(self.interrupt) {
+                return Err(ViError::Interrupted);
+            }
             // Inside a global, nothing more runs once the buffer has been
             // replaced (95006-95008), not even the rest of this line.
             if self.in_global && self.buffer_generation != generation {
@@ -3735,7 +3829,7 @@ impl Editor {
                 Ok(ExResult::Continue)
             }
             ExCommand::Source { file } => {
-                self.execute_source(&file)?;
+                self.nested(|ed| ed.execute_source(&file))?;
                 Ok(ExResult::Continue)
             }
             ExCommand::Append {
@@ -3900,7 +3994,7 @@ impl Editor {
                 Ok(ExResult::CommandOutput(vec![line_num.to_string()]))
             }
             ExCommand::Execute { range, buffer } => {
-                self.execute_ex_execute(&range, buffer)?;
+                self.nested(|ed| ed.execute_ex_execute(&range, buffer))?;
                 Ok(ExResult::Continue)
             }
             ExCommand::Suspend { force } => {
@@ -4087,6 +4181,20 @@ impl Editor {
         };
         self.screen.set_top_line(top);
         Ok(ExResult::EnterVisual)
+    }
+
+    /// Run a `:so` or `:@`, which run commands that may run more of them:
+    /// past `MAX_NESTING` deep it is an error, not a stack overflow.
+    fn nested(&mut self, f: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+        if self.nesting >= MAX_NESTING {
+            return Err(ViError::InvalidCommand(format!(
+                "commands nested more than {MAX_NESTING} deep"
+            )));
+        }
+        self.nesting += 1;
+        let result = f(self);
+        self.nesting -= 1;
+        result
     }
 
     /// Execute :source command - read and execute ex commands from file.
@@ -4754,13 +4862,24 @@ impl Editor {
         // `\n` in the replacement inserts lines mid-iteration, so walk the
         // range with an explicit cursor rather than a fixed `for` range.
         let mut line_num = start;
+        // A signal during a confirmation prompt aborts the substitute.
+        let mut aborted = false;
 
-        while line_num <= end {
+        while line_num <= end && !aborted {
             if let Some(line) = self.buffer.line(line_num) {
                 let content = line.content().to_string();
                 let (new_content, count) = if sub.needs_confirm() && !sub.is_count_only() {
                     sub.substitute_line_confirmed(&content, |line, s, e| {
-                        Self::confirm_substitution(line, s, e)
+                        if aborted {
+                            return false;
+                        }
+                        match Self::confirm_substitution(line, s, e) {
+                            Some(yes) => yes,
+                            None => {
+                                aborted = true;
+                                false
+                            }
+                        }
                     })
                 } else {
                     sub.substitute_line(&content)
@@ -4827,6 +4946,9 @@ impl Editor {
             self.buffer.set_line(line);
             self.buffer.move_to_first_non_blank();
         }
+        if aborted {
+            return Err(ViError::Interrupted);
+        }
 
         if total_count == 0 {
             // POSIX 95361: an error "if the substitution fails on every
@@ -4869,9 +4991,11 @@ impl Editor {
     ///
     /// POSIX/historical ex reads the answer from standard input, in batch as
     /// well as interactively, so a script can answer inline. A line beginning
-    /// with `y` accepts; anything else (including EOF) declines.
-    fn confirm_substitution(line: &str, start: usize, end: usize) -> bool {
-        use std::io::{BufRead, Write};
+    /// with `y` accepts; anything else (including EOF) declines.  `None`: a
+    /// hangup or an interrupt came instead of an answer, and the command is
+    /// to stop (the hangup is left for the ex loop to act on).
+    fn confirm_substitution(line: &str, start: usize, end: usize) -> Option<bool> {
+        use std::io::Write;
         let mut out = std::io::stdout();
         let _ = writeln!(out, "{}", line);
         let _ = writeln!(
@@ -4883,9 +5007,19 @@ impl Editor {
         let _ = out.flush();
 
         let mut answer = String::new();
-        match std::io::stdin().lock().read_line(&mut answer) {
-            Ok(0) | Err(_) => false,
-            Ok(_) => answer.trim_start().starts_with('y'),
+        loop {
+            match read_text_line(&mut answer) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                    use std::sync::atomic::Ordering;
+                    if crate::signals::HANGUP_RECEIVED.load(Ordering::SeqCst)
+                        || crate::signals::take(&crate::signals::SIGINT_RECEIVED)
+                    {
+                        return None;
+                    }
+                }
+                Ok(0) | Err(_) => return Some(false),
+                Ok(_) => return Some(answer.trim_start().starts_with('y')),
+            }
         }
     }
 
@@ -5832,12 +5966,24 @@ fn ends_with_odd_backslash(s: &str) -> bool {
 /// Read one line of ex input as editor text, escaping any byte that is not
 /// UTF-8 (see [`crate::bytes`]) so that a command may name the bytes a file
 /// holds.  Returns the number of bytes read, 0 at end of input.
-fn read_text_line(stdin: &std::io::Stdin, line: &mut String) -> std::io::Result<usize> {
-    use std::io::BufRead;
+fn read_text_line(line: &mut String) -> std::io::Result<usize> {
     let mut bytes = Vec::new();
-    let n = stdin.lock().read_until(b'\n', &mut bytes)?;
+    let n = crate::input::lines::read_line(&mut bytes)?;
     line.push_str(&crate::bytes::decode(&bytes));
     Ok(n)
+}
+
+/// What [`Editor::read_ex_line`] got.
+enum ExRead {
+    /// A line (or the last, unterminated, part of one).
+    Line,
+    /// End of file.
+    Eof,
+    /// SIGINT on a terminal: back to the prompt.
+    Interrupted,
+    /// The session is over (hangup, or an error or interrupt with standard
+    /// input not a terminal).
+    Quit,
 }
 
 #[cfg(test)]

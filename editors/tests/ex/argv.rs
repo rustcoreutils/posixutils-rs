@@ -31,12 +31,9 @@ fn run(dir: &Path, args: &[&str], script: &str) -> (String, String, i32) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn ex");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(script.as_bytes())
-        .unwrap();
+    // Ignore a write error: ex may exit (on a bad option) before it reads,
+    // and the write then fails with EPIPE.
+    let _ = child.stdin.as_mut().unwrap().write_all(script.as_bytes());
     let out = child.wait_with_output().expect("wait for ex");
     (
         String::from_utf8_lossy(&out.stdout).into_owned(),

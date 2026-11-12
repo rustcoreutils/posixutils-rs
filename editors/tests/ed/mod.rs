@@ -12,6 +12,8 @@
 //! These tests verify the ed binary works correctly as a POSIX ed editor,
 //! testing commands via stdin/stdout.
 
+mod parse;
+
 use plib::testing::{run_test, TestPlan};
 use plib::tmp::NamedTempFile;
 use std::fs;

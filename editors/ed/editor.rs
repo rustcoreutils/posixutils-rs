@@ -11,73 +11,91 @@
 
 use crate::ed::buffer::Buffer;
 use crate::ed::error::{EdError, EdResult};
-use crate::ed::parser::{parse, Address, AddressInfo, Command, PrintMode};
+use crate::ed::parser::{
+    continues_replacement, parse, Address, AddressInfo, Command, Parsed, PrintFlags,
+};
 use plib::regex::{Match, Regex, RegexFlags};
 use std::io::{self, BufRead, Write};
 use std::sync::atomic::Ordering;
 
-/// Parsed command with optional embedded input for a/i/c in global commands.
+/// One command of a `g`/`v` command list, parsed once for the whole global,
+/// with the text an `a`, `i` or `c` takes from the list itself.
 struct GlobalCommand {
-    /// The command text (e.g., "a", "s/foo/bar/", "d")
-    command: String,
+    parsed: Parsed,
     /// For a/i/c: the input text lines
     input_lines: Vec<String>,
 }
 
-/// Whether a `g`/`v` command-list entry is one of the input-taking commands
-/// (`a`, `i`, `c`), whose text comes from the command list itself.
-///
-/// Classifying by "first alphabetic character" mistook part of an address for
-/// the command: `.,/abc/d` reported `a`, so a delete looked like an append.
-fn is_input_command(line: &str) -> bool {
+/// Whether a command is one of the input-taking commands (`a`, `i`, `c`).
+fn is_input(cmd: &Command) -> bool {
     matches!(
-        parse(line),
-        Ok(Command::Append(_) | Command::Insert(_) | Command::Change(..))
+        cmd,
+        Command::Append(_) | Command::Insert(_) | Command::Change(..)
     )
 }
 
-/// Parse a global command list string into individual commands.
-/// Handles a/i/c commands with embedded input.
-fn parse_global_command_list(commands: &str) -> Vec<GlobalCommand> {
+/// Parse a global command list into its commands, every one before any
+/// runs: a bad command fails the global before it has changed anything.
+fn parse_global_command_list(commands: &str) -> EdResult<Vec<GlobalCommand>> {
     let lines: Vec<&str> = commands.split('\n').collect();
     let mut result = Vec::new();
     let mut i = 0;
 
     while i < lines.len() {
-        let line = lines[i];
+        // Leading blanks only: trailing ones can be text (the end of an
+        // unterminated `s` replacement), as they are outside a global.
+        let line = lines[i].trim_start();
+        i += 1;
         if line.is_empty() {
-            i += 1;
             continue;
         }
 
-        // Check if this is an a, i, or c command (possibly with address prefix)
-        if is_input_command(line) {
-            // Collect input lines until '.' or end of list
-            let mut input_lines = Vec::new();
+        let mut command = line.to_string();
+        // An `s` whose replacement runs onto the next line takes that
+        // line, newline included, as the rest of its replacement, as
+        // historical eds read it.  That is a line split, which POSIX
+        // forbids inside `g`/`v`, so the substitute then fails with `?`
+        // rather than quietly running half of what was typed.
+        while continues_replacement(&command) && i < lines.len() {
+            command.push('\n');
+            command.push_str(lines[i]);
             i += 1;
+        }
+        let parsed = parse(&command)?;
+
+        // a/i/c take the lines up to `.` (or the end of the list) as text.
+        // Classifying by "first alphabetic character" mistook part of an
+        // address for the command: `.,/abc/d` reported `a`.
+        let mut input_lines = Vec::new();
+        if is_input(&parsed.cmd) {
             while i < lines.len() {
                 let input_line = lines[i];
+                i += 1;
                 if input_line == "." {
-                    i += 1;
                     break;
                 }
                 input_lines.push(format!("{}\n", input_line));
-                i += 1;
             }
-            result.push(GlobalCommand {
-                command: line.to_string(),
-                input_lines,
-            });
-        } else {
-            result.push(GlobalCommand {
-                command: line.to_string(),
-                input_lines: Vec::new(),
-            });
-            i += 1;
         }
+        result.push(GlobalCommand {
+            parsed,
+            input_lines,
+        });
     }
 
-    result
+    Ok(result)
+}
+
+/// An `a`, `i` or `c` waiting for its text, its lines resolved when it was
+/// given: the text can follow only once the addresses are known to be good.
+#[derive(Clone, Copy, Debug)]
+enum PendingInput {
+    /// Append after this line (0: before the first).
+    Append(usize),
+    /// Insert before this line.
+    Insert(usize),
+    /// Replace these lines.
+    Change(usize, usize),
 }
 
 /// The ed editor state.
@@ -112,8 +130,8 @@ pub struct Editor<R: BufRead, W: Write> {
     input_lines: Vec<String>,
     /// Whether we're in input mode
     in_input_mode: bool,
-    /// The command that initiated input mode
-    pending_command: Option<Command>,
+    /// The command that initiated input mode, and its print suffix
+    pending_input: Option<(PendingInput, PrintFlags)>,
     /// Whether the editor should quit
     pub should_quit: bool,
     /// Quit warning given (for modified buffer)
@@ -143,7 +161,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             last_shell_command: None,
             input_lines: Vec::new(),
             in_input_mode: false,
-            pending_command: None,
+            pending_input: None,
             should_quit: false,
             quit_warning_given: false,
             last_interactive_cmd: None,
@@ -444,16 +462,16 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         };
 
         match parse(&full_line) {
-            Ok(cmd) => {
+            Ok(parsed) => {
                 // POSIX (ed, DESCRIPTION): ed exits on a repeated `e`/`q`
                 // only when the repeat has "no intervening command", so any
                 // other command re-arms the warning.  Without this the flag
                 // latched on the first warning and every later `q` discarded
                 // the buffer silently, however much had been edited since.
-                if !matches!(cmd, Command::Quit(_) | Command::Edit(..)) {
+                if !matches!(parsed.cmd, Command::Quit(_) | Command::Edit(..)) {
                     self.quit_warning_given = false;
                 }
-                if let Err(e) = self.execute_command(cmd) {
+                if let Err(e) = self.run_parsed(parsed) {
                     self.print_error(&e)?;
                 }
             }
@@ -472,9 +490,9 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         // Check for end of input marker
         if line == ".\n" || line == "." {
             self.in_input_mode = false;
-            if let Some(cmd) = self.pending_command.take() {
+            if let Some(pending) = self.pending_input.take() {
                 let lines = std::mem::take(&mut self.input_lines);
-                if let Err(e) = self.finish_input_command(cmd, lines) {
+                if let Err(e) = self.finish_input_command(pending, lines) {
                     self.print_error(&e)?;
                 }
             }
@@ -490,51 +508,150 @@ impl<R: BufRead, W: Write> Editor<R, W> {
     }
 
     /// Finish executing a command that required input.
-    fn finish_input_command(&mut self, cmd: Command, lines: Vec<String>) -> EdResult<()> {
-        match cmd {
-            Command::Append(addr) => {
-                let line_num = self.resolve_address(&addr)?;
-                self.buf.append(line_num, &lines);
-            }
-            Command::Insert(addr) => {
-                let line_num = self.resolve_address(&addr)?;
-                let insert_at = if line_num == 0 { 1 } else { line_num };
-                self.buf.insert(insert_at, &lines);
-            }
-            Command::Change(addr1, addr2) => {
-                let (start, end) = self.resolve_range(&addr1, &addr2)?;
-                self.buf.change(start, end, &lines)?;
-            }
-            _ => {}
+    fn finish_input_command(
+        &mut self,
+        (pending, suffix): (PendingInput, PrintFlags),
+        lines: Vec<String>,
+    ) -> EdResult<()> {
+        self.apply_input(pending, &lines)?;
+        self.print_suffix(suffix)
+    }
+
+    /// Put input text where an `a`, `i` or `c` said.
+    fn apply_input(&mut self, pending: PendingInput, lines: &[String]) -> EdResult<()> {
+        match pending {
+            PendingInput::Append(line) => self.buf.append(line, lines),
+            PendingInput::Insert(line) => self.buf.insert(line.max(1), lines),
+            PendingInput::Change(start, end) => self.buf.change(start, end, lines)?,
         }
         Ok(())
+    }
+
+    /// Resolve the addresses of an `a`, `i` or `c` -- all of them, with the
+    /// `;` rule, before any text is read.  Resolving `c`'s second address on
+    /// its own took `1;+1` from the current line rather than from 1.
+    fn resolve_input(&mut self, cmd: &Command) -> EdResult<PendingInput> {
+        Ok(match cmd {
+            Command::Append(addr) => PendingInput::Append(self.resolve_address(addr)?),
+            Command::Insert(addr) => PendingInput::Insert(self.resolve_address(addr)?),
+            Command::Change(addr1, addr2) => {
+                let (start, end) = self.resolve_range(addr1, addr2)?;
+                if start == 0 || start > end {
+                    return Err(EdError::AddressOutOfRange);
+                }
+                PendingInput::Change(start, end)
+            }
+            _ => return Err(EdError::Generic("not an input command".to_string())),
+        })
+    }
+
+    /// Run one parsed command, then write the current line as its print
+    /// suffix asks.  `a`, `i` and `c` keep the suffix until their text is in.
+    fn run_parsed(&mut self, parsed: Parsed) -> EdResult<()> {
+        let Parsed { cmd, suffix } = parsed;
+        if matches!(
+            cmd,
+            Command::Append(_) | Command::Insert(_) | Command::Change(..)
+        ) {
+            // Input mode is driven by the main loop, which does not run
+            // inside `g`/`v`.  The global path handles a/i/c itself; if
+            // one ever reaches here the mode would latch with nothing to
+            // service it, so refuse rather than leak it to the caller.
+            if self.buf.is_in_global() {
+                return Err(EdError::Generic(
+                    "a/i/c cannot enter input mode inside a global command".to_string(),
+                ));
+            }
+            let pending = self.resolve_input(&cmd)?;
+            self.in_input_mode = true;
+            self.pending_input = Some((pending, suffix));
+            self.input_lines.clear();
+            return Ok(());
+        }
+        self.execute_command(cmd)?;
+        self.print_suffix(suffix)
+    }
+
+    /// Write the current line as a print suffix asks, if it asks.
+    fn print_suffix(&mut self, suffix: PrintFlags) -> EdResult<()> {
+        if !suffix.any() {
+            return Ok(());
+        }
+        let cur = self.buf.cur_line;
+        if cur == 0 {
+            return Err(EdError::AddressOutOfRange);
+        }
+        self.write_line(cur, suffix)?;
+        Ok(())
+    }
+
+    /// Write line `n` the way `p`, `n` and `l` do, combined as `flags` says:
+    /// numbered first, then the text listed unambiguously or as is.
+    fn write_line(&mut self, n: usize, flags: PrintFlags) -> io::Result<()> {
+        // `buf` and `writer` are separate fields, so the line is written
+        // from where it is, not copied first.
+        let Some(line) = self.buf.get_line(n) else {
+            return Ok(());
+        };
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        let w = &mut self.writer;
+        if flags.number {
+            write!(w, "{}\t", n)?;
+        }
+        if !flags.list {
+            w.write_all(content.as_bytes())?;
+            return w.write_all(b"\n");
+        }
+        // POSIX: show non-printable characters unambiguously -- the C escapes
+        // for \\ \a \b \f \r \t \v, three-digit octal for any other byte, `$`
+        // escaped in the text and marking the end of the line -- and fold
+        // long lines with a `\` before the newline.
+        const FOLD_WIDTH: usize = 72;
+        let mut col = 0;
+        for ch in content.chars() {
+            let mut utf8 = [0u8; 4];
+            let mut octal = [0u8; 16];
+            let escaped: &[u8] = match ch {
+                '\\' => b"\\\\",
+                '\x07' => b"\\a",
+                '\x08' => b"\\b",
+                '\x0c' => b"\\f",
+                '\r' => b"\\r",
+                '\t' => b"\\t",
+                '\x0b' => b"\\v",
+                '$' => b"\\$",
+                c if c.is_control() || !c.is_ascii() => {
+                    let mut len = 0;
+                    for b in c.encode_utf8(&mut utf8).bytes() {
+                        octal[len] = b'\\';
+                        octal[len + 1] = b'0' + (b >> 6);
+                        octal[len + 2] = b'0' + ((b >> 3) & 7);
+                        octal[len + 3] = b'0' + (b & 7);
+                        len += 4;
+                    }
+                    &octal[..len]
+                }
+                c => c.encode_utf8(&mut utf8).as_bytes(),
+            };
+            // Fold before a character that would not fit.
+            if col + escaped.len() > FOLD_WIDTH {
+                w.write_all(b"\\\n")?;
+                col = 0;
+            }
+            w.write_all(escaped)?;
+            col += escaped.len();
+        }
+        w.write_all(b"$\n")
     }
 
     /// Execute a parsed command.
     fn execute_command(&mut self, cmd: Command) -> EdResult<()> {
         match cmd {
-            Command::Append(ref addr)
-            | Command::Insert(ref addr)
-            | Command::Change(ref addr, _) => {
-                // Input mode is driven by the main loop, which does not run
-                // inside `g`/`v`.  The global path handles a/i/c itself; if
-                // one ever reaches here the mode would latch with nothing to
-                // service it, so refuse rather than leak it to the caller.
-                if self.buf.is_in_global() {
-                    return Err(EdError::Generic(
-                        "a/i/c cannot enter input mode inside a global command".to_string(),
-                    ));
-                }
-                // Validate address before entering input mode
-                self.resolve_address(addr)?;
-                if let Command::Change(_, ref addr2) = cmd {
-                    self.resolve_address(addr2)?;
-                }
-                self.in_input_mode = true;
-                self.pending_command = Some(cmd);
-                self.input_lines.clear();
-                Ok(())
-            }
+            // `run_parsed` owns input mode and takes these before they get
+            // here.
+            Command::Append(_) | Command::Insert(_) | Command::Change(..) => Err(EdError::Generic(
+                "a/i/c must go through run_parsed".to_string(),
+            )),
             Command::Delete(ref addr1, ref addr2) => {
                 let (start, end) = self.resolve_range(addr1, addr2)?;
                 self.buf.delete(start, end)?;
@@ -609,15 +726,13 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 self.buf.set_mark(mark, line)?;
                 Ok(())
             }
-            Command::ListLines(addr1, addr2) => self.print_lines(&addr1, &addr2, PrintMode::List),
             Command::Move(addr1, addr2, dest) => {
                 let (start, end) = self.resolve_range(&addr1, &addr2)?;
                 let dest_line = self.resolve_address(&dest)?;
                 self.buf.move_lines(start, end, dest_line)?;
                 Ok(())
             }
-            Command::Number(addr1, addr2) => self.print_lines(&addr1, &addr2, PrintMode::Numbered),
-            Command::Print(addr1, addr2, mode) => self.print_lines(&addr1, &addr2, mode),
+            Command::Print(addr1, addr2, flags) => self.print_lines(&addr1, &addr2, flags),
             Command::PromptToggle => {
                 self.show_prompt = !self.show_prompt;
                 Ok(())
@@ -822,72 +937,16 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         }
     }
 
-    /// Print lines with the specified mode.
-    fn print_lines(&mut self, addr1: &Address, addr2: &Address, mode: PrintMode) -> EdResult<()> {
+    /// Write the lines of a range, as `flags` says.
+    fn print_lines(&mut self, addr1: &Address, addr2: &Address, flags: PrintFlags) -> EdResult<()> {
         let (start, end) = self.resolve_range(addr1, addr2)?;
 
-        if start == 0 || end == 0 {
+        if start == 0 || end == 0 || start > end {
             return Err(EdError::AddressOutOfRange);
         }
 
         for i in start..=end {
-            if let Some(line) = self.buf.get_line(i) {
-                match mode {
-                    PrintMode::Normal => {
-                        write!(self.writer, "{}", line)?;
-                    }
-                    PrintMode::Numbered => {
-                        // Remove trailing newline for formatting, then add it back
-                        let content = line.trim_end_matches('\n');
-                        writeln!(self.writer, "{}\t{}", i, content)?;
-                    }
-                    PrintMode::List => {
-                        // POSIX: Show non-printable characters in unambiguous form
-                        // Escape sequences: \\, \a, \b, \f, \r, \t, \v
-                        // Non-printable: three-digit octal with backslash
-                        // $ within text: escaped with backslash
-                        // End of line: marked with $
-                        // Long lines: folded with \ before newline
-                        const FOLD_WIDTH: usize = 72;
-                        let content = line.trim_end_matches('\n');
-                        let mut col = 0;
-
-                        for ch in content.chars() {
-                            // Get the escaped representation and its width
-                            let (escaped, width) = match ch {
-                                '\\' => ("\\\\".to_string(), 2),
-                                '\x07' => ("\\a".to_string(), 2),
-                                '\x08' => ("\\b".to_string(), 2),
-                                '\x0c' => ("\\f".to_string(), 2),
-                                '\r' => ("\\r".to_string(), 2),
-                                '\t' => ("\\t".to_string(), 2),
-                                '\x0b' => ("\\v".to_string(), 2),
-                                '$' => ("\\$".to_string(), 2),
-                                c if c.is_control() || !c.is_ascii() => {
-                                    let bytes = c.to_string().into_bytes();
-                                    let mut s = String::new();
-                                    for byte in &bytes {
-                                        s.push_str(&format!("\\{:03o}", byte));
-                                    }
-                                    let w = bytes.len() * 4;
-                                    (s, w)
-                                }
-                                c => (c.to_string(), 1),
-                            };
-
-                            // Check if we need to fold (leave room for the char + potential $)
-                            if col + width > FOLD_WIDTH {
-                                writeln!(self.writer, "\\")?;
-                                col = 0;
-                            }
-
-                            write!(self.writer, "{}", escaped)?;
-                            col += width;
-                        }
-                        writeln!(self.writer, "$")?;
-                    }
-                }
-            }
+            self.write_line(i, flags)?;
         }
 
         self.buf.set_cur_line(end)?;
@@ -1042,8 +1101,6 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             count,
             global,
             print,
-            numbered,
-            list,
         } = Self::parse_substitute_suffix(flags)?;
 
         // POSIX (ed, `u`): one `s` is one command however many lines it
@@ -1063,39 +1120,9 @@ impl<R: BufRead, W: Write> Editor<R, W> {
 
         self.buf.set_cur_line(last_matched_line)?;
 
-        // Print if requested
-        if print || numbered || list {
-            if let Some(line) = self.buf.get_line(last_matched_line) {
-                let content = line.trim_end_matches('\n');
-                if numbered {
-                    writeln!(self.writer, "{}\t{}", last_matched_line, content)?;
-                } else if list {
-                    // Use POSIX-compliant list format
-                    for ch in content.chars() {
-                        match ch {
-                            '\\' => write!(self.writer, "\\\\")?,
-                            '\x07' => write!(self.writer, "\\a")?,
-                            '\x08' => write!(self.writer, "\\b")?,
-                            '\x0c' => write!(self.writer, "\\f")?,
-                            '\r' => write!(self.writer, "\\r")?,
-                            '\t' => write!(self.writer, "\\t")?,
-                            '\x0b' => write!(self.writer, "\\v")?,
-                            '$' => write!(self.writer, "\\$")?,
-                            c if c.is_control() || !c.is_ascii() => {
-                                for byte in c.to_string().as_bytes() {
-                                    write!(self.writer, "\\{:03o}", byte)?;
-                                }
-                            }
-                            c => write!(self.writer, "{}", c)?,
-                        }
-                    }
-                    writeln!(self.writer, "$")?;
-                } else {
-                    write!(self.writer, "{}", line)?;
-                }
-            }
+        if print.any() {
+            self.write_line(last_matched_line, print)?;
         }
-
         Ok(())
     }
 
@@ -1185,11 +1212,10 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                     if !digits.is_empty() {
                         digits_done = true;
                     }
-                    match ch {
-                        'g' => out.global = true,
-                        'l' => out.list = true,
-                        'n' => out.numbered = true,
-                        _ => out.print = true,
+                    if ch == 'g' {
+                        out.global = true;
+                    } else {
+                        out.print.add(ch);
                     }
                 }
                 c if c.is_whitespace() => {}
@@ -1203,11 +1229,16 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         }
 
         if !digits.is_empty() {
-            out.count = Some(
-                digits
-                    .parse()
-                    .map_err(|_| EdError::Syntax("substitute count out of range".to_string()))?,
-            );
+            let count: usize = digits
+                .parse()
+                .map_err(|_| EdError::Syntax("substitute count out of range".to_string()))?;
+            // There is no zeroth occurrence: `s/a/b/0` used to act as 1.
+            if count == 0 {
+                return Err(EdError::Syntax(
+                    "substitute count must be positive".to_string(),
+                ));
+            }
+            out.count = Some(count);
         }
         Ok(out)
     }
@@ -1266,34 +1297,6 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             }
         }
         Ok(())
-    }
-
-    /// Execute an a/i/c command with pre-supplied input lines (for global commands).
-    /// This is used when a/i/c commands appear in g/v command lists with embedded input.
-    fn execute_input_command_with_lines(
-        &mut self,
-        command: &str,
-        input_lines: &[String],
-    ) -> EdResult<()> {
-        // Parse the command to get the address and command type
-        match parse(command) {
-            Ok(Command::Append(addr)) => {
-                let line_num = self.resolve_address(&addr)?;
-                self.buf.append(line_num, input_lines);
-                Ok(())
-            }
-            Ok(Command::Insert(addr)) => {
-                let line_num = self.resolve_address(&addr)?;
-                self.buf.insert(line_num, input_lines);
-                Ok(())
-            }
-            Ok(Command::Change(addr1, addr2)) => {
-                let (start, end) = self.resolve_range(&addr1, &addr2)?;
-                self.buf.change(start, end, input_lines)?;
-                Ok(())
-            }
-            _ => Err(EdError::Generic("invalid command".to_string())),
-        }
     }
 
     /// Execute a global command.
@@ -1361,10 +1364,18 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         let mut last_successful_line = original_cur_line;
 
         // Parse the command list into individual commands (handles a/i/c with embedded input)
-        let global_commands = parse_global_command_list(commands);
+        let global_commands = parse_global_command_list(commands)?;
 
         // For delete commands, process in reverse order to avoid line number shifts
-        let is_delete_only = global_commands.len() == 1 && global_commands[0].command.trim() == "d";
+        // (Only a plain `d` of the current line: what reversing assumes.)
+        let is_delete_only = global_commands.len() == 1
+            && match &global_commands[0].parsed {
+                Parsed {
+                    cmd: Command::Delete(a1, a2),
+                    suffix,
+                } => !suffix.any() && [a1, a2].iter().all(|a| **a == Address::current_line()),
+                _ => false,
+            };
         if is_delete_only {
             matching_lines.reverse();
         }
@@ -1398,87 +1409,23 @@ impl<R: BufRead, W: Write> Editor<R, W> {
 
             // Execute each command in the command list
             for gc in &global_commands {
-                if gc.command.is_empty() {
-                    continue;
-                }
-
-                let cmd = gc.command.trim();
-
                 // a/i/c take their text from the command list, so run them
                 // here even when that text is empty.  POSIX lets the `.` be
                 // omitted when it would be the last line of the list, which
                 // makes a bare `a` an append of nothing.  Falling through to
-                // `execute_command` instead set `in_input_mode` with nothing
-                // to service it: only the last match took effect, and the
-                // mode leaked out of the global and ate the following
-                // commands as input text.
-                if is_input_command(cmd) {
-                    self.execute_input_command_with_lines(cmd, &gc.input_lines)?;
-                    last_successful_line = self.buf.cur_line;
-                    continue;
+                // input mode instead set `in_input_mode` with nothing to
+                // service it: only the last match took effect, and the mode
+                // leaked out of the global and ate the following commands
+                // as input text.
+                if is_input(&gc.parsed.cmd) {
+                    let pending = self.resolve_input(&gc.parsed.cmd)?;
+                    self.apply_input(pending, &gc.input_lines)?;
+                    self.print_suffix(gc.parsed.suffix)?;
+                } else {
+                    // Abort the global on error and propagate.
+                    self.run_parsed(gc.parsed.clone())?;
                 }
-
-                // Handle common simple commands inline for performance
-                match cmd {
-                    "p" => {
-                        if let Some(line) = self.buf.get_line(self.buf.cur_line) {
-                            write!(self.writer, "{}", line)?;
-                        }
-                        last_successful_line = self.buf.cur_line;
-                    }
-                    "d" => {
-                        let cur = self.buf.cur_line;
-                        if self.buf.delete(cur, cur).is_ok() {
-                            last_successful_line = self.buf.cur_line;
-                        }
-                    }
-                    "n" => {
-                        if let Some(line) = self.buf.get_line(self.buf.cur_line) {
-                            let content = line.trim_end_matches('\n');
-                            writeln!(self.writer, "{}\t{}", self.buf.cur_line, content)?;
-                        }
-                        last_successful_line = self.buf.cur_line;
-                    }
-                    "l" => {
-                        if let Some(line) = self.buf.get_line(self.buf.cur_line) {
-                            let content = line.trim_end_matches('\n');
-                            for ch in content.chars() {
-                                match ch {
-                                    '\\' => write!(self.writer, "\\\\")?,
-                                    '\x07' => write!(self.writer, "\\a")?,
-                                    '\x08' => write!(self.writer, "\\b")?,
-                                    '\x0c' => write!(self.writer, "\\f")?,
-                                    '\r' => write!(self.writer, "\\r")?,
-                                    '\t' => write!(self.writer, "\\t")?,
-                                    '\x0b' => write!(self.writer, "\\v")?,
-                                    '$' => write!(self.writer, "\\$")?,
-                                    c if c.is_control() || !c.is_ascii() => {
-                                        for byte in c.to_string().as_bytes() {
-                                            write!(self.writer, "\\{:03o}", byte)?;
-                                        }
-                                    }
-                                    c => write!(self.writer, "{}", c)?,
-                                }
-                            }
-                            writeln!(self.writer, "$")?;
-                        }
-                        last_successful_line = self.buf.cur_line;
-                    }
-                    _ => {
-                        // Try to parse and execute other commands
-                        match parse(cmd) {
-                            Ok(parsed_cmd) => {
-                                // Abort the global on error and propagate.
-                                self.execute_command(parsed_cmd)?;
-                                last_successful_line = self.buf.cur_line;
-                            }
-                            Err(e) => {
-                                // Abort global on parse error
-                                return Err(e);
-                            }
-                        }
-                    }
-                }
+                last_successful_line = self.buf.cur_line;
             }
 
             // Update line offset based on how many lines were added/removed
@@ -1608,11 +1555,11 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             let lines_before = self.buf.line_count();
 
             match parse(&cmd_str) {
-                Ok(cmd) => {
+                Ok(parsed) => {
                     // POSIX: in the interactive G/V prompt, any one command
                     // other than a, c, i, g, G, v, V may be executed.
                     if matches!(
-                        cmd,
+                        parsed.cmd,
                         Command::Append(..)
                             | Command::Change(..)
                             | Command::Insert(..)
@@ -1622,7 +1569,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                             | Command::GlobalNotInteractive(..)
                     ) {
                         self.print_error(&EdError::Generic("invalid command".to_string()))?;
-                    } else if let Err(e) = self.execute_command(cmd) {
+                    } else if let Err(e) = self.run_parsed(parsed) {
                         self.print_error(&e)?;
                     }
                 }
@@ -1659,7 +1606,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             // If in input mode, exit input mode without completing the command
             if self.in_input_mode {
                 self.in_input_mode = false;
-                self.pending_command = None;
+                self.pending_input = None;
                 self.input_lines.clear();
             }
             return Ok(true);
@@ -1712,9 +1659,9 @@ impl<R: BufRead, W: Write> Editor<R, W> {
     fn handle_eof(&mut self) -> io::Result<()> {
         if self.in_input_mode {
             self.in_input_mode = false;
-            if let Some(cmd) = self.pending_command.take() {
+            if let Some(pending) = self.pending_input.take() {
                 let lines = std::mem::take(&mut self.input_lines);
-                if let Err(e) = self.finish_input_command(cmd, lines) {
+                if let Err(e) = self.finish_input_command(pending, lines) {
                     self.print_error(&e)?;
                 }
             }
@@ -1794,9 +1741,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
 struct SubstituteSuffix {
     count: Option<usize>,
     global: bool,
-    print: bool,
-    numbered: bool,
-    list: bool,
+    print: PrintFlags,
 }
 
 #[cfg(test)]

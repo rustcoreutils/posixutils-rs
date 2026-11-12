@@ -183,17 +183,18 @@ pub struct Address {
 }
 
 impl Address {
-    pub fn new() -> Self {
+    /// `.` with no offsets, as a defaulted address parses.
+    pub fn current_line() -> Self {
         Address {
-            info: AddressInfo::Null,
+            info: AddressInfo::Current,
             offsets: Vec::new(),
             relative_to_first: false,
         }
     }
 
-    pub fn current() -> Self {
+    pub fn new() -> Self {
         Address {
-            info: AddressInfo::Current,
+            info: AddressInfo::Null,
             offsets: Vec::new(),
             relative_to_first: false,
         }
@@ -206,12 +207,52 @@ impl Default for Address {
     }
 }
 
-/// Print mode for print commands.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum PrintMode {
-    Normal,
-    Numbered,
-    List,
+/// How lines are written: by `p`, `n` and `l`, by the print suffix those
+/// letters form after another command, and by the `s` flags.  They combine:
+/// `nl` numbers a line and lists it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PrintFlags {
+    pub print: bool,
+    pub number: bool,
+    pub list: bool,
+}
+
+impl PrintFlags {
+    /// Whether anything is to be written.
+    pub fn any(self) -> bool {
+        self.print || self.number || self.list
+    }
+
+    /// Add one of `l`, `n` or `p`; false for any other character.
+    pub fn add(&mut self, ch: char) -> bool {
+        match ch {
+            'p' => self.print = true,
+            'n' => self.number = true,
+            'l' => self.list = true,
+            _ => return false,
+        }
+        true
+    }
+}
+
+/// POSIX (ed): "any command other than e, E, f, q, Q, r, w, and ! can be
+/// suffixed by a command from l, n, or p".  Anything else after the command
+/// is an error: ignoring it made `1dx` a delete and `fromstdin` an `f`.
+fn parse_suffix(rest: &str) -> EdResult<PrintFlags> {
+    let mut flags = PrintFlags::default();
+    for ch in rest.trim().chars() {
+        if !flags.add(ch) {
+            return Err(EdError::Syntax(format!("invalid command suffix: {}", rest)));
+        }
+    }
+    Ok(flags)
+}
+
+/// A parsed command and the print suffix that followed it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Parsed {
+    pub cmd: Command,
+    pub suffix: PrintFlags,
 }
 
 /// Parsed ed command.
@@ -241,14 +282,10 @@ pub enum Command {
     Join(Address, Address),
     /// (.)k<x> - mark line
     Mark(Address, char),
-    /// (.,.)l - list lines unambiguously
-    ListLines(Address, Address),
     /// (.,.)m<addr> - move lines
     Move(Address, Address, Address),
-    /// (.,.)n - print with line numbers
-    Number(Address, Address),
-    /// (.)p - print lines
-    Print(Address, Address, PrintMode),
+    /// (.,.)p, n, l - write lines, as the flags say
+    Print(Address, Address, PrintFlags),
     /// P - toggle prompt
     PromptToggle,
     /// q - quit
@@ -373,14 +410,14 @@ fn normalize_addrvec(
     }
 }
 
-/// Parse a command line into a Command.
-pub fn parse(line: &str) -> EdResult<Command> {
+/// Parse a command line into a command and its print suffix.
+pub fn parse(line: &str) -> EdResult<Parsed> {
     let tokens = tokenize(line)?;
     parse_tokens(tokens)
 }
 
-/// Parse tokens into a Command.
-pub fn parse_tokens(mut tokens: Vec<Token>) -> EdResult<Command> {
+/// Parse tokens into a command and its print suffix.
+pub fn parse_tokens(mut tokens: Vec<Token>) -> EdResult<Parsed> {
     let mut addr = Address::new();
     let mut addr_dirty = false;
     let mut addrvec: Vec<Address> = Vec::new();
@@ -484,15 +521,46 @@ pub fn parse_tokens(mut tokens: Vec<Token>) -> EdResult<Command> {
     if !addrvec.is_empty() {
         // Just an address - go to that line
         normalize_addrvec(&mut addrvec, 1, separator, DefaultAddressing::Current);
-        return Ok(Command::Goto(addrvec[0].clone()));
+        return Ok(Parsed {
+            cmd: Command::Goto(addrvec[0].clone()),
+            suffix: PrintFlags::default(),
+        });
     }
 
     // Empty line - print next line
-    Ok(Command::Goto(Address {
-        info: AddressInfo::Offset(1),
-        offsets: Vec::new(),
-        relative_to_first: false,
-    }))
+    Ok(Parsed {
+        cmd: Command::Goto(Address {
+            info: AddressInfo::Offset(1),
+            offsets: Vec::new(),
+            relative_to_first: false,
+        }),
+        suffix: PrintFlags::default(),
+    })
+}
+
+/// Commands that take no address (`e E f q Q h H P u !`) refuse one,
+/// including a bare separator: `5u` used to undo and `,q` to quit.
+fn no_address(addrvec: &[Address], separator: Option<char>) -> EdResult<()> {
+    if separator.is_some() || addrvec.iter().any(|a| a.info != AddressInfo::Null) {
+        return Err(EdError::Syntax("unexpected address".to_string()));
+    }
+    Ok(())
+}
+
+/// The pathname argument of `e E f r w W`: empty, or separated from the
+/// command by a blank.  `fromstdin` is not `f romstdin`.
+fn filename_arg(rest_raw: &str) -> EdResult<Option<String>> {
+    if rest_raw.is_empty() {
+        return Ok(None);
+    }
+    if !rest_raw.starts_with([' ', '\t']) {
+        return Err(EdError::Syntax(format!(
+            "invalid command suffix: {}",
+            rest_raw
+        )));
+    }
+    let name = rest_raw.trim();
+    Ok((!name.is_empty()).then(|| name.to_string()))
 }
 
 /// Parse a specific command with its arguments.
@@ -501,41 +569,40 @@ fn parse_command(
     rest_raw: String,
     mut addrvec: Vec<Address>,
     separator: Option<char>,
-) -> EdResult<Command> {
-    // Every command but `w`/`W` wants the argument with surrounding blanks
-    // removed; those two need `rest_raw` to see whether a `q` is glued on.
+) -> EdResult<Parsed> {
+    // Every command but `w`/`W` and the pathname commands wants the argument
+    // with surrounding blanks removed.
     let rest = rest_raw.trim().to_string();
-    match cmd {
+    let mut suffix = PrintFlags::default();
+    let cmd = match cmd {
         'a' => {
             normalize_addrvec(&mut addrvec, 1, separator, get_default_addressing('a'));
-            Ok(Command::Append(addrvec[0].clone()))
+            suffix = parse_suffix(&rest)?;
+            Command::Append(addrvec[0].clone())
         }
         'c' => {
             normalize_addrvec(&mut addrvec, 2, separator, get_default_addressing('c'));
-            Ok(Command::Change(addrvec[0].clone(), addrvec[1].clone()))
+            suffix = parse_suffix(&rest)?;
+            Command::Change(addrvec[0].clone(), addrvec[1].clone())
         }
         'd' => {
             normalize_addrvec(&mut addrvec, 2, separator, get_default_addressing('d'));
-            Ok(Command::Delete(addrvec[0].clone(), addrvec[1].clone()))
+            suffix = parse_suffix(&rest)?;
+            Command::Delete(addrvec[0].clone(), addrvec[1].clone())
         }
         'e' | 'E' => {
-            if !addrvec.is_empty() && addrvec.iter().any(|a| a.info != AddressInfo::Null) {
-                return Err(EdError::Syntax("unexpected address".to_string()));
-            }
-            let filename = if rest.is_empty() { None } else { Some(rest) };
-            Ok(Command::Edit(filename, cmd == 'E'))
+            no_address(&addrvec, separator)?;
+            Command::Edit(filename_arg(&rest_raw)?, cmd == 'E')
         }
         'f' => {
-            if !addrvec.is_empty() && addrvec.iter().any(|a| a.info != AddressInfo::Null) {
-                return Err(EdError::Syntax("unexpected address".to_string()));
-            }
-            let filename = if rest.is_empty() { None } else { Some(rest) };
-            Ok(Command::Filename(filename))
+            no_address(&addrvec, separator)?;
+            Command::Filename(filename_arg(&rest_raw)?)
         }
         'g' | 'v' => {
             normalize_addrvec(&mut addrvec, 2, separator, get_default_addressing(cmd));
-            let (pattern, commands) = parse_global_args(&rest)?;
-            Ok(if cmd == 'g' {
+            // Leading blanks only: the list's last command may end in text.
+            let (pattern, commands) = parse_global_args(rest_raw.trim_start())?;
+            if cmd == 'g' {
                 Command::Global(
                     addrvec[0].clone(),
                     addrvec[1].clone(),
@@ -551,152 +618,146 @@ fn parse_command(
                     commands,
                     false,
                 )
-            })
+            }
         }
         'G' | 'V' => {
             normalize_addrvec(&mut addrvec, 2, separator, get_default_addressing('G'));
             let pattern = parse_global_pattern(&rest)?;
-            Ok(if cmd == 'G' {
+            if cmd == 'G' {
                 Command::GlobalInteractive(addrvec[0].clone(), addrvec[1].clone(), pattern)
             } else {
                 Command::GlobalNotInteractive(addrvec[0].clone(), addrvec[1].clone(), pattern)
-            })
+            }
         }
-        'h' => Ok(Command::Help),
-        'H' => Ok(Command::HelpMode),
+        'h' | 'H' | 'P' | 'u' => {
+            no_address(&addrvec, separator)?;
+            suffix = parse_suffix(&rest)?;
+            match cmd {
+                'h' => Command::Help,
+                'H' => Command::HelpMode,
+                'P' => Command::PromptToggle,
+                _ => Command::Undo,
+            }
+        }
         'i' => {
             normalize_addrvec(&mut addrvec, 1, separator, get_default_addressing('i'));
-            Ok(Command::Insert(addrvec[0].clone()))
+            suffix = parse_suffix(&rest)?;
+            Command::Insert(addrvec[0].clone())
         }
         'j' => {
             normalize_addrvec(&mut addrvec, 2, separator, get_default_addressing('j'));
-            Ok(Command::Join(addrvec[0].clone(), addrvec[1].clone()))
+            suffix = parse_suffix(&rest)?;
+            Command::Join(addrvec[0].clone(), addrvec[1].clone())
         }
         'k' => {
             normalize_addrvec(&mut addrvec, 1, separator, get_default_addressing('k'));
-            if rest.len() != 1 || !rest.chars().next().unwrap().is_ascii_lowercase() {
-                return Err(EdError::Syntax("invalid mark".to_string()));
+            let mut chars = rest.chars();
+            let mark = chars
+                .next()
+                .filter(|c| c.is_ascii_lowercase())
+                .ok_or_else(|| EdError::Syntax("invalid mark".to_string()))?;
+            suffix = parse_suffix(chars.as_str())?;
+            Command::Mark(addrvec[0].clone(), mark)
+        }
+        'l' | 'n' | 'p' => {
+            normalize_addrvec(&mut addrvec, 2, separator, get_default_addressing(cmd));
+            let mut flags = parse_suffix(&rest)?;
+            flags.add(cmd);
+            Command::Print(addrvec[0].clone(), addrvec[1].clone(), flags)
+        }
+        'm' | 't' => {
+            normalize_addrvec(&mut addrvec, 2, separator, get_default_addressing(cmd));
+            let (dest, flags) = parse_destination(&rest)?;
+            suffix = flags;
+            if cmd == 'm' {
+                Command::Move(addrvec[0].clone(), addrvec[1].clone(), dest)
+            } else {
+                Command::Copy(addrvec[0].clone(), addrvec[1].clone(), dest)
             }
-            Ok(Command::Mark(
-                addrvec[0].clone(),
-                rest.chars().next().unwrap(),
-            ))
         }
-        'l' => {
-            normalize_addrvec(&mut addrvec, 2, separator, get_default_addressing('l'));
-            Ok(Command::ListLines(addrvec[0].clone(), addrvec[1].clone()))
-        }
-        'm' => {
-            normalize_addrvec(&mut addrvec, 2, separator, get_default_addressing('m'));
-            let dest = parse_destination(&rest)?;
-            Ok(Command::Move(addrvec[0].clone(), addrvec[1].clone(), dest))
-        }
-        'n' => {
-            normalize_addrvec(&mut addrvec, 2, separator, get_default_addressing('n'));
-            Ok(Command::Number(addrvec[0].clone(), addrvec[1].clone()))
-        }
-        'p' => {
-            normalize_addrvec(&mut addrvec, 2, separator, get_default_addressing('p'));
-            Ok(Command::Print(
-                addrvec[0].clone(),
-                addrvec[1].clone(),
-                PrintMode::Normal,
-            ))
-        }
-        'P' => Ok(Command::PromptToggle),
         'q' | 'Q' => {
-            if !addrvec.is_empty() && addrvec.iter().any(|a| a.info != AddressInfo::Null) {
-                return Err(EdError::Syntax("unexpected address".to_string()));
+            no_address(&addrvec, separator)?;
+            if !rest.is_empty() {
+                return Err(EdError::Syntax(format!("invalid command suffix: {}", rest)));
             }
-            Ok(Command::Quit(cmd == 'Q'))
+            Command::Quit(cmd == 'Q')
         }
         'r' => {
             normalize_addrvec(&mut addrvec, 1, separator, DefaultAddressing::Last);
-            let filename = if rest.is_empty() { None } else { Some(rest) };
-            Ok(Command::Read(addrvec[0].clone(), filename))
+            Command::Read(addrvec[0].clone(), filename_arg(&rest_raw)?)
         }
         's' => {
             normalize_addrvec(&mut addrvec, 2, separator, get_default_addressing('s'));
-            let (pattern, replacement, flags) = parse_substitute_args(&rest)?;
-            Ok(Command::Substitute(
+            let (pattern, replacement, flags) = parse_substitute_args(&rest_raw)?;
+            Command::Substitute(
                 addrvec[0].clone(),
                 addrvec[1].clone(),
                 pattern,
                 replacement,
                 flags,
-            ))
+            )
         }
-        't' => {
-            normalize_addrvec(&mut addrvec, 2, separator, get_default_addressing('t'));
-            let dest = parse_destination(&rest)?;
-            Ok(Command::Copy(addrvec[0].clone(), addrvec[1].clone(), dest))
-        }
-        'u' => Ok(Command::Undo),
         'w' | 'W' => {
             normalize_addrvec(&mut addrvec, 2, separator, get_default_addressing('w'));
             // A `q` immediately after the command letter is the write-quit
             // form; anything after a blank is a pathname, even a bare "q".
             let (quit, args) = match rest_raw.strip_prefix('q') {
-                Some(after) => (true, after.trim()),
-                None => (false, rest_raw.trim()),
+                Some(after) => (true, after),
+                None => (false, rest_raw.as_str()),
             };
-            let filename = if args.is_empty() {
-                None
-            } else {
-                Some(args.to_string())
-            };
-            Ok(Command::Write {
+            Command::Write {
                 addr1: addrvec[0].clone(),
                 addr2: addrvec[1].clone(),
-                filename,
+                filename: filename_arg(args)?,
                 append: cmd == 'W',
                 quit,
-            })
+            }
         }
         'z' => {
             normalize_addrvec(&mut addrvec, 1, separator, get_default_addressing('z'));
-            let count = if rest.is_empty() {
+            let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+            let count = if digits == 0 {
                 None
             } else {
                 Some(
-                    rest.parse()
+                    rest[..digits]
+                        .parse()
                         .map_err(|_| EdError::Syntax("invalid count".to_string()))?,
                 )
             };
-            Ok(Command::Scroll(addrvec[0].clone(), count))
+            suffix = parse_suffix(&rest[digits..])?;
+            Command::Scroll(addrvec[0].clone(), count)
         }
         '=' => {
             normalize_addrvec(&mut addrvec, 1, separator, DefaultAddressing::Last);
-            Ok(Command::LineNumber(addrvec[0].clone()))
+            suffix = parse_suffix(&rest)?;
+            Command::LineNumber(addrvec[0].clone())
         }
-        '!' => Ok(Command::Shell(rest)),
+        '!' => {
+            no_address(&addrvec, separator)?;
+            Command::Shell(rest)
+        }
+        // A comment: the rest of the line is ignored.
         '#' => {
             normalize_addrvec(&mut addrvec, 1, separator, get_default_addressing('#'));
-            Ok(Command::Null(addrvec[0].clone()))
+            Command::Null(addrvec[0].clone())
         }
         '&' => {
             normalize_addrvec(&mut addrvec, 2, separator, get_default_addressing('&'));
-            Ok(Command::RepeatSubstitute(
-                addrvec[0].clone(),
-                addrvec[1].clone(),
-            ))
+            suffix = parse_suffix(&rest)?;
+            Command::RepeatSubstitute(addrvec[0].clone(), addrvec[1].clone())
         }
-        _ => Err(EdError::InvalidCommand(cmd.to_string())),
-    }
+        _ => return Err(EdError::InvalidCommand(cmd.to_string())),
+    };
+    Ok(Parsed { cmd, suffix })
 }
 
-/// Parse destination address for m/t commands.
-fn parse_destination(s: &str) -> EdResult<Address> {
-    if s.is_empty() {
-        return Ok(Address::current());
-    }
-    let tokens = tokenize(s)?;
-    if tokens.is_empty() {
-        return Ok(Address::current());
-    }
-
+/// Parse the destination address of `m`/`t`, and the print suffix after it.
+fn parse_destination(s: &str) -> EdResult<(Address, PrintFlags)> {
     let mut addr = Address::new();
-    for token in tokens {
+    let mut suffix = PrintFlags::default();
+    let mut tokens = tokenize(s)?.into_iter();
+    while let Some(token) = tokens.next() {
         match token {
             Token::CurrentLine => addr.info = AddressInfo::Current,
             Token::LastLine => addr.info = AddressInfo::Last,
@@ -710,125 +771,138 @@ fn parse_destination(s: &str) -> EdResult<Address> {
                 }
                 addr.offsets.push(i);
             }
+            // The tokenizer ends at the first letter and hands back the rest
+            // of the line, which is all suffix.
+            Token::Command(ch) => {
+                let rest = match tokens.next() {
+                    Some(Token::Rest(r)) => r,
+                    _ => String::new(),
+                };
+                suffix = parse_suffix(&format!("{}{}", ch, rest.trim()))?;
+            }
             _ => return Err(EdError::Syntax("invalid destination".to_string())),
         }
     }
     if addr.info == AddressInfo::Null {
         addr.info = AddressInfo::Current;
     }
-    Ok(addr)
+    Ok((addr, suffix))
 }
 
 /// Parse substitute command arguments: /pattern/replacement/flags
+///
+/// The flags are everything after the third delimiter, unsplit, so text
+/// after them (`s/a/b/g/x`) reaches the flag parser and is refused.  With the
+/// third delimiter missing, POSIX makes `s/s1/s2` mean `s/s1/s2/p`.
 fn parse_substitute_args(s: &str) -> EdResult<(String, String, String)> {
-    if s.is_empty() {
-        return Err(EdError::Syntax("no pattern delimiter".to_string()));
-    }
+    let (pattern, replacement, flags) = split_substitute(s)?;
+    Ok((
+        pattern,
+        replacement,
+        flags.unwrap_or_else(|| "p".to_string()),
+    ))
+}
 
-    let delim = s.chars().next().unwrap();
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut escaped = false;
-    let chars = s.chars().skip(1);
-
-    for ch in chars {
-        if escaped {
-            if ch == delim {
-                current.push(ch);
-            } else {
-                current.push('\\');
-                current.push(ch);
-            }
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
-        } else if ch == delim {
-            parts.push(current);
-            current = String::new();
-        } else {
-            current.push(ch);
+/// Whether `line` is an `s` whose replacement has no closing delimiter.
+///
+/// In a `g`/`v` command list such a line continues onto the next: the list
+/// arrives with its escaped newlines already turned into plain ones, so
+/// `g/x/s/a/b\<newline>c/` reaches the list as `s/a/b` and `c/`, and only
+/// joining them gives the substitute the newline it was asked to insert.
+pub fn continues_replacement(line: &str) -> bool {
+    let mut tokens = match tokenize(line) {
+        Ok(t) => t.into_iter(),
+        Err(_) => return false,
+    };
+    while let Some(token) = tokens.next() {
+        if token == Token::Command('s') {
+            return match tokens.next() {
+                Some(Token::Rest(rest)) => matches!(split_substitute(&rest), Ok((_, _, None))),
+                _ => false,
+            };
         }
     }
-    if escaped {
-        current.push('\\');
+    false
+}
+
+/// Characters a BRE gives a meaning to unescaped.
+const BRE_SPECIAL: &str = ".[*^$";
+/// Characters a replacement gives a meaning to unescaped.
+const REPLACEMENT_SPECIAL: &str = "&%";
+
+/// The delimiter that opens an `s`, `g`, `v`, `G` or `V` argument: any
+/// character but a blank, a newline or a backslash.
+fn take_delimiter(chars: &mut std::str::Chars) -> EdResult<char> {
+    match chars.next() {
+        None => Err(EdError::Syntax("no pattern delimiter".to_string())),
+        Some(c) if c.is_whitespace() || c == '\\' => Err(EdError::Syntax(format!(
+            "invalid pattern delimiter: {:?}",
+            c
+        ))),
+        Some(c) => Ok(c),
     }
-    parts.push(current);
+}
 
-    let pattern = parts.first().cloned().unwrap_or_default();
-    let replacement = parts.get(1).cloned().unwrap_or_default();
-    let flags = parts.get(2).cloned().unwrap_or_default();
+/// One delimited field: its text and whether the closing delimiter was
+/// there.
+///
+/// POSIX: an escaped delimiter is the delimiter as a literal character,
+/// "losing any special meaning".  Where the delimiter is a character the
+/// field gives a meaning to (`special`: `.` in an RE, `&` in a replacement),
+/// dropping the backslash would hand it that meaning back -- `s.a\.b.X.`
+/// matched `axb` -- so there the backslash stays.  Any other escape is kept
+/// for the RE or replacement to interpret.
+fn delimited_field(chars: &mut std::str::Chars, delim: char, special: &str) -> (String, bool) {
+    let mut text = String::new();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some(c) if c == delim && !special.contains(c) => text.push(c),
+                Some(c) => {
+                    text.push('\\');
+                    text.push(c);
+                }
+                None => text.push('\\'),
+            }
+        } else if ch == delim {
+            return (text, true);
+        } else {
+            text.push(ch);
+        }
+    }
+    (text, false)
+}
 
+/// Split `/pattern/replacement/flags`; the flags are `None` when the
+/// replacement's closing delimiter is missing.
+fn split_substitute(s: &str) -> EdResult<(String, String, Option<String>)> {
+    let mut chars = s.chars();
+    let delim = take_delimiter(&mut chars)?;
+    let (pattern, closed) = delimited_field(&mut chars, delim, BRE_SPECIAL);
+    if !closed {
+        return Err(EdError::Syntax("missing pattern delimiter".to_string()));
+    }
+    let (replacement, closed) = delimited_field(&mut chars, delim, REPLACEMENT_SPECIAL);
+    let flags = closed.then(|| chars.as_str().trim().to_string());
     Ok((pattern, replacement, flags))
 }
 
 /// Parse global command pattern and command list.
 fn parse_global_args(s: &str) -> EdResult<(String, String)> {
-    if s.is_empty() {
-        return Err(EdError::Syntax("no pattern delimiter".to_string()));
-    }
-
-    let delim = s.chars().next().unwrap();
-    let mut pattern = String::new();
-    let mut escaped = false;
-    let mut chars = s.chars().skip(1).peekable();
-
-    for ch in chars.by_ref() {
-        if escaped {
-            if ch == delim {
-                pattern.push(ch);
-            } else {
-                pattern.push('\\');
-                pattern.push(ch);
-            }
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
-        } else if ch == delim {
-            break;
-        } else {
-            pattern.push(ch);
-        }
-    }
-
-    let commands: String = chars.collect();
-    let commands = if commands.is_empty() {
-        "p".to_string() // Default to print
-    } else {
-        commands
-    };
-
-    Ok((pattern, commands))
+    let mut chars = s.chars();
+    let delim = take_delimiter(&mut chars)?;
+    let (pattern, _) = delimited_field(&mut chars, delim, BRE_SPECIAL);
+    let commands = chars.as_str();
+    // An empty command list is `p`.
+    let commands = if commands.is_empty() { "p" } else { commands };
+    Ok((pattern, commands.to_string()))
 }
 
 /// Parse global command pattern only.
 fn parse_global_pattern(s: &str) -> EdResult<String> {
-    if s.is_empty() {
-        return Err(EdError::Syntax("no pattern delimiter".to_string()));
-    }
-
-    let delim = s.chars().next().unwrap();
-    let mut pattern = String::new();
-    let mut escaped = false;
-
-    for ch in s.chars().skip(1) {
-        if escaped {
-            if ch == delim {
-                pattern.push(ch);
-            } else {
-                pattern.push('\\');
-                pattern.push(ch);
-            }
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
-        } else if ch == delim {
-            break;
-        } else {
-            pattern.push(ch);
-        }
-    }
-
-    Ok(pattern)
+    let mut chars = s.chars();
+    let delim = take_delimiter(&mut chars)?;
+    Ok(delimited_field(&mut chars, delim, BRE_SPECIAL).0)
 }
 
 #[cfg(test)]
@@ -847,24 +921,30 @@ mod tests {
 
     #[test]
     fn test_parse_quit() {
-        let cmd = parse("q").unwrap();
+        let cmd = parse("q").unwrap().cmd;
         assert_eq!(cmd, Command::Quit(false));
     }
 
     #[test]
     fn test_parse_force_quit() {
-        let cmd = parse("Q").unwrap();
+        let cmd = parse("Q").unwrap().cmd;
         assert_eq!(cmd, Command::Quit(true));
     }
 
     #[test]
     fn test_parse_print() {
-        let cmd = parse("1,5p").unwrap();
+        let cmd = parse("1,5p").unwrap().cmd;
         match cmd {
-            Command::Print(a1, a2, mode) => {
+            Command::Print(a1, a2, flags) => {
                 assert_eq!(a1.info, AddressInfo::Line(1));
                 assert_eq!(a2.info, AddressInfo::Line(5));
-                assert_eq!(mode, PrintMode::Normal);
+                assert_eq!(
+                    flags,
+                    PrintFlags {
+                        print: true,
+                        ..PrintFlags::default()
+                    }
+                );
             }
             _ => panic!("expected Print command"),
         }
@@ -872,7 +952,7 @@ mod tests {
 
     #[test]
     fn test_parse_append() {
-        let cmd = parse("a").unwrap();
+        let cmd = parse("a").unwrap().cmd;
         match cmd {
             Command::Append(a) => {
                 assert_eq!(a.info, AddressInfo::Current);
@@ -883,7 +963,7 @@ mod tests {
 
     #[test]
     fn test_parse_substitute() {
-        let cmd = parse("1,5s/foo/bar/g").unwrap();
+        let cmd = parse("1,5s/foo/bar/g").unwrap().cmd;
         match cmd {
             Command::Substitute(a1, a2, pat, repl, flags) => {
                 assert_eq!(a1.info, AddressInfo::Line(1));
@@ -894,5 +974,25 @@ mod tests {
             }
             _ => panic!("expected Substitute command"),
         }
+    }
+
+    #[test]
+    fn test_parse_print_suffix() {
+        let parsed = parse("1dpn").unwrap();
+        assert!(matches!(parsed.cmd, Command::Delete(..)));
+        assert!(parsed.suffix.print && parsed.suffix.number && !parsed.suffix.list);
+        assert!(parse("1dx").is_err());
+    }
+
+    #[test]
+    fn test_parse_substitute_unterminated() {
+        let Command::Substitute(_, _, pat, repl, flags) = parse("s/a/b").unwrap().cmd else {
+            panic!("expected Substitute command");
+        };
+        assert_eq!(
+            (pat.as_str(), repl.as_str(), flags.as_str()),
+            ("a", "b", "p")
+        );
+        assert!(parse("s/a").is_err());
     }
 }

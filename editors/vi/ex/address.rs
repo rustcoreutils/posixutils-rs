@@ -27,8 +27,8 @@ pub struct AddrCtx<'a> {
     pub buffer: &'a Buffer,
     /// The current line, i.e. what `.` resolves to.
     pub current: usize,
-    /// Mark table, indexed `a`..`z`.
-    pub marks: &'a [Option<Position>; 26],
+    /// Mark table, indexed `a`..`z`, then the previous-context mark.
+    pub marks: &'a [Option<Position>; crate::buffer::MARK_SLOTS],
     /// Permit line 0. POSIX allows it for the commands that insert *after* an
     /// address (`a`, `i`, `r`, `put`), where 0 means "before the first line".
     pub allow_zero: bool,
@@ -46,7 +46,8 @@ pub struct AddrCtx<'a> {
 impl<'a> AddrCtx<'a> {
     /// Context for the common case: no marks available, line 0 rejected.
     pub fn simple(buffer: &'a Buffer, current: usize) -> Self {
-        const NO_MARKS: [Option<Position>; 26] = [None; 26];
+        const NO_MARKS: [Option<Position>; crate::buffer::MARK_SLOTS] =
+            [None; crate::buffer::MARK_SLOTS];
         Self {
             buffer,
             current,
@@ -200,11 +201,8 @@ impl Address {
                 Err(ViError::PatternNotFound(pattern.clone()))
             }
             Address::Mark(c) => {
-                // #X16: marks are now reachable through the context.
-                let idx = match c {
-                    'a'..='z' => (*c as u8 - b'a') as usize,
-                    _ => return Err(ViError::MarkNotSet(*c)),
-                };
+                // `''` is the previous-context mark (95142).
+                let idx = crate::buffer::mark_slot(*c).ok_or(ViError::MarkNotSet(*c))?;
                 match ctx.marks[idx] {
                     Some(pos) if pos.line >= 1 && pos.line <= buffer.line_count() => Ok(pos.line),
                     _ => Err(ViError::MarkNotSet(*c)),
@@ -253,7 +251,33 @@ impl Address {
     }
 }
 
+impl Address {
+    /// Whether using this address is a jump that sets the previous-context
+    /// mark (POSIX 95144-95147): `$`, a positive line number, a search or a
+    /// mark -- with any offset.
+    pub fn is_jump(&self) -> bool {
+        match self {
+            Address::Line(n) => *n > 0,
+            Address::Last
+            | Address::SearchForward { .. }
+            | Address::SearchBackward { .. }
+            | Address::Mark(_) => true,
+            Address::Offset(base, _) => base.is_jump(),
+            _ => false,
+        }
+    }
+}
+
 impl AddressRange {
+    /// Whether the range uses an address that sets the previous-context
+    /// mark.
+    pub fn is_jump(&self) -> bool {
+        [&self.start, &self.end]
+            .into_iter()
+            .flatten()
+            .any(|a| a.is_jump())
+    }
+
     /// The non-empty search patterns this range names, in order, with their
     /// directions: each becomes the last RE used, as a search's would.
     pub fn search_patterns(&self) -> Vec<(String, char)> {

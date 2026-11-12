@@ -44,6 +44,13 @@ pub struct Change {
     pub old_lines: Vec<String>,
     /// For [`ChangeKind::ReplaceLines`]: the run that replaced it.
     pub new_lines: Vec<String>,
+    /// Marks the change dropped with the lines it removed, as (slot, where
+    /// they were): an undo restores the lines, and with them these marks
+    /// (POSIX 95139-95140).
+    pub dropped_marks: Vec<(usize, Position)>,
+    /// Marks undoing the change dropped with the lines it had added: a redo
+    /// adds the lines back, and with them these marks.
+    pub undone_marks: Vec<(usize, Position)>,
 }
 
 /// Types of changes.
@@ -84,6 +91,8 @@ impl Change {
             line_count,
             old_lines: Vec::new(),
             new_lines: Vec::new(),
+            dropped_marks: Vec::new(),
+            undone_marks: Vec::new(),
         }
     }
 
@@ -99,6 +108,8 @@ impl Change {
             line_count,
             old_lines: Vec::new(),
             new_lines: Vec::new(),
+            dropped_marks: Vec::new(),
+            undone_marks: Vec::new(),
         }
     }
 
@@ -114,6 +125,8 @@ impl Change {
             line_count,
             old_lines: Vec::new(),
             new_lines: Vec::new(),
+            dropped_marks: Vec::new(),
+            undone_marks: Vec::new(),
         }
     }
 
@@ -131,6 +144,8 @@ impl Change {
             line_count: old_lines.len(),
             old_lines: old_lines.to_vec(),
             new_lines: new_lines.to_vec(),
+            dropped_marks: Vec::new(),
+            undone_marks: Vec::new(),
         }
     }
 }
@@ -178,6 +193,9 @@ pub struct UndoManager {
     /// contents of the edit buffer, **including undo**" (95442), so `u` is its
     /// own inverse. This is what makes it alternate.
     last_was_undo: bool,
+    /// Marks the next recorded change dropped (see
+    /// [`UndoManager::note_dropped`]).
+    pending_marks: Vec<(usize, Position)>,
 }
 
 impl UndoManager {
@@ -190,6 +208,7 @@ impl UndoManager {
             line_original: None,
             max_levels: 0, // Unlimited
             last_was_undo: false,
+            pending_marks: Vec::new(),
         }
     }
 
@@ -232,10 +251,11 @@ impl UndoManager {
     }
 
     /// Record a change.
-    pub fn record(&mut self, change: Change) {
+    pub fn record(&mut self, mut change: Change) {
         // Any new edit invalidates the redo history and ends an undo run.
         self.redo_stack.clear();
         self.last_was_undo = false;
+        change.dropped_marks = std::mem::take(&mut self.pending_marks);
 
         match self.undo_stack.last_mut() {
             Some(group) if self.group_depth > 0 => group.push(change),
@@ -244,6 +264,14 @@ impl UndoManager {
                 self.trim();
             }
         }
+    }
+
+    /// Note `marks`, dropped with the lines of the edit about to be
+    /// recorded, so undoing that edit restores them (POSIX 95139-95140).
+    /// Each change keeps its own, in the line numbering it left behind, so
+    /// they are restored right after that change is undone.
+    pub fn note_dropped(&mut self, marks: Vec<(usize, Position)>) {
+        self.pending_marks = marks;
     }
 
     /// Drop the oldest commands past `max_levels`.
@@ -345,11 +373,17 @@ impl UndoManager {
     /// is where POSIX puts the cursor: "set to the first line added or changed"
     /// (95450).
     pub fn undo(&mut self, buffer: &mut Buffer) -> Result<Position> {
-        let group = self.undo_stack.pop().ok_or(ViError::NothingToUndo)?;
+        let mut group = self.undo_stack.pop().ok_or(ViError::NothingToUndo)?;
 
+        buffer.take_dropped_marks();
         let mut pos = buffer.cursor();
-        for change in group.iter().rev() {
+        for change in group.iter_mut().rev() {
             pos = self.apply_inverse(change, buffer)?;
+            // Undoing drops the marks on lines the change had added (redo
+            // brings them back); the marks it dropped come back with their
+            // lines.
+            change.undone_marks = buffer.take_dropped_marks();
+            buffer.restore_marks(&change.dropped_marks);
         }
 
         self.redo_stack.push(group);
@@ -359,11 +393,16 @@ impl UndoManager {
 
     /// Re-apply the last undone command.
     pub fn redo(&mut self, buffer: &mut Buffer) -> Result<Position> {
-        let group = self.redo_stack.pop().ok_or(ViError::AtFirstChange)?;
+        let mut group = self.redo_stack.pop().ok_or(ViError::AtFirstChange)?;
 
+        buffer.take_dropped_marks();
         let mut pos = buffer.cursor();
-        for change in group.iter() {
+        for change in group.iter_mut() {
             pos = self.apply_change(change, buffer)?;
+            // Redoing drops marks again, for the next undo to restore; the
+            // marks the undo dropped come back with their lines.
+            change.dropped_marks = buffer.take_dropped_marks();
+            buffer.restore_marks(&change.undone_marks);
         }
 
         self.undo_stack.push(group);
@@ -503,16 +542,80 @@ impl UndoManager {
     ///
     /// The two runs may differ in length, which is exactly what
     /// [`ChangeKind::ReplaceLines`] exists to express.
+    ///
+    /// Lines the two runs share at either end are left in place, and the
+    /// lines between are rewritten where they stand, so the marks on them
+    /// stay put (95138): most changes -- `>>`, `~`, a `:s` over a range --
+    /// edit lines rather than replace them.
     fn splice_lines(buffer: &mut Buffer, start: usize, old_count: usize, new_lines: &[&str]) {
-        if old_count > 0 {
-            let end = (start + old_count - 1).min(buffer.line_count());
-            if start <= buffer.line_count() {
-                buffer.delete_lines(start, end);
+        let old_count = old_count.min((buffer.line_count() + 1).saturating_sub(start));
+        let same = |i: usize, new: &str| buffer.line(start + i).is_some_and(|l| l.content() == new);
+        let shorter = old_count.min(new_lines.len());
+        let head = (0..shorter).take_while(|&i| same(i, new_lines[i])).count();
+        let tail = (0..shorter - head)
+            .take_while(|&k| same(old_count - 1 - k, new_lines[new_lines.len() - 1 - k]))
+            .count();
+        let (start, old_count) = (start + head, old_count - head - tail);
+        let new_lines = &new_lines[head..new_lines.len() - tail];
+        // A `:m` swaps two blocks; move the shorter one back, and both keep
+        // their lines and marks.
+        if let Some(k) = Self::rotation(buffer, start, old_count, new_lines) {
+            let last = start + old_count - 1;
+            if k <= old_count - k {
+                buffer.move_lines(start, start + k - 1, last);
+            } else {
+                buffer.move_lines(start + k, last, start - 1);
+            }
+            return;
+        }
+        let common = old_count.min(new_lines.len());
+        for (i, text) in new_lines[..common].iter().enumerate() {
+            let _ = buffer.replace_line(start + i, text);
+        }
+        if old_count > common {
+            buffer.delete_lines(start + common, start + old_count - 1);
+        }
+        for (i, text) in new_lines[common..].iter().enumerate() {
+            buffer.insert_line_after(start + common - 1 + i, Line::from(*text));
+        }
+    }
+
+    /// The `k` (0 < k < len) for which `new_lines` is the buffer's lines
+    /// `start..start+len` rotated left by `k`, if there is one: where
+    /// `new_lines` first occurs in the old run doubled, found by
+    /// Knuth-Morris-Pratt in linear time however the lines repeat.
+    fn rotation(buffer: &Buffer, start: usize, len: usize, new_lines: &[&str]) -> Option<usize> {
+        if len != new_lines.len() || len < 2 {
+            return None;
+        }
+        let old = |i: usize| buffer.line(start + i % len).map_or("", |l| l.content());
+        // fail[i]: the length of the longest proper border of new_lines[..=i].
+        let mut fail = vec![0usize; len];
+        let mut k = 0;
+        for i in 1..len {
+            while k > 0 && new_lines[i] != new_lines[k] {
+                k = fail[k - 1];
+            }
+            if new_lines[i] == new_lines[k] {
+                k += 1;
+            }
+            fail[i] = k;
+        }
+        // Scan old[1..] doubled; a full match ending at `i` starts at
+        // `i + 1 - len`.
+        let mut k = 0;
+        for i in 1..2 * len - 1 {
+            while k > 0 && old(i) != new_lines[k] {
+                k = fail[k - 1];
+            }
+            if old(i) == new_lines[k] {
+                k += 1;
+            }
+            if k == len {
+                return Some(i + 1 - len);
             }
         }
-        for (i, text) in new_lines.iter().enumerate() {
-            buffer.insert_line_after(start - 1 + i, Line::from(*text));
-        }
+        None
     }
 
     /// Apply inverse of a change (for undo).

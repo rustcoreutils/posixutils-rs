@@ -215,34 +215,8 @@ impl Editor {
             ));
         }
 
-        // Collect the lines to move
-        let mut lines_to_move = Vec::new();
-        for line_num in start..=end {
-            if let Some(line) = self.buffer.line(line_num) {
-                lines_to_move.push(line.content().to_string());
-            }
-        }
-
-        // Delete original lines (in reverse order)
-        for line_num in (start..=end).rev() {
-            self.buffer.delete_line(line_num);
-        }
-
-        // Adjust destination if it was after the deleted lines
-        let adjusted_dest = if dest > end {
-            dest - (end - start + 1)
-        } else {
-            dest
-        };
-
-        // Insert at new location
-        let insert_after = if adjusted_dest == 0 { 0 } else { adjusted_dest };
-        for (i, line_text) in lines_to_move.iter().enumerate() {
-            self.buffer
-                .insert_line_after(insert_after + i, Line::from(line_text.as_str()));
-        }
-
-        self.buffer.set_line(insert_after + lines_to_move.len());
+        let first = self.buffer.move_lines(start, end, dest);
+        self.buffer.set_line(first + (end - start));
 
         let move_count = end - start + 1;
         self.set_message(&format!("{} lines moved", move_count));
@@ -290,12 +264,15 @@ impl Editor {
     pub(super) fn execute_ex_mark(&mut self, line: Option<usize>, name: char) -> Result<()> {
         let target_line = line.unwrap_or_else(|| self.buffer.cursor().line);
 
-        if !name.is_ascii_lowercase() {
-            return Err(ViError::MarkNotSet(name));
-        }
-
-        let idx = (name as u8 - b'a') as usize;
-        self.marks[idx] = Some(Position::new(target_line, 0));
+        // 95130-95132: a lowercase letter, `` ` `` or `'`.
+        let slot = crate::buffer::mark_slot(name).ok_or(ViError::MarkNotSet(name))?;
+        // 95135-95137: at the first non-blank, else the last character.
+        let column = self
+            .buffer
+            .line(target_line)
+            .map_or(0, |l| l.first_non_blank());
+        self.buffer
+            .set_mark(slot, Position::new(target_line, column));
         Ok(())
     }
 
@@ -611,7 +588,7 @@ impl Editor {
         AddrCtx {
             buffer: &self.buffer,
             current,
-            marks: &self.marks,
+            marks: self.buffer.marks(),
             allow_zero: false,
             last_regex: self.last_regex(),
             ignorecase: self.options.ignorecase,

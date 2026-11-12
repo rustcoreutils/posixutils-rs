@@ -16,6 +16,7 @@ mod addresses;
 mod cmdline;
 mod fileio;
 mod global;
+mod marks;
 
 use plib::testing::{get_binary_path, run_test, TestPlan};
 use plib::tmp::{NamedTempFile, TempDir};

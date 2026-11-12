@@ -172,10 +172,10 @@ pub fn run_editor(invoked_as: InvokedAs, args: &[String]) -> i32 {
             return 1;
         }
     } else if let Some(tag) = &opts.tag {
-        // -t: open the file containing the tag and jump to it.
+        // -t: open the file containing the tag and jump to it.  A tag that
+        // cannot be found is a diagnostic, as for `:tag`; editing goes on.
         if let Err(e) = editor.tag(tag) {
             eprintln!("{}: {}", prog_name, e);
-            return 1;
         }
     } else if !opts.files.is_empty() {
         if let Err(e) = editor.open_files(opts.files) {

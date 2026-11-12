@@ -165,8 +165,6 @@ pub struct Editor {
     message: Option<String>,
     /// Whether message is an error.
     is_error: bool,
-    /// Marks (a-z for user, other for special).
-    marks: [Option<Position>; 26],
     /// `:map`, `:map!` and `:ab` definitions.
     maps: crate::maps::Maps,
     /// Keys waiting to be acted on: typed, expanded, or from an `@` buffer.
@@ -246,6 +244,8 @@ pub struct Editor {
     /// The print flags of the ex command running now, for print, number
     /// and list to fold into their output.
     pending_flags: ExFlags,
+    /// Whether a `|` ended the ex command now running (94553-94557).
+    ex_by_bar: bool,
     /// The flags an implied print uses (number, list): set by the last
     /// print, number or list command, or the last flags given (94561).
     remembered_print: (bool, bool),
@@ -299,7 +299,6 @@ impl Editor {
             screen: Screen::new(size),
             message: None,
             is_error: false,
-            marks: [None; 26],
             maps: crate::maps::Maps::default(),
             input: InputQueue::default(),
             expansion_group: false,
@@ -325,6 +324,7 @@ impl Editor {
             in_global: false,
             buffer_generation: 0,
             pending_flags: ExFlags::default(),
+            ex_by_bar: false,
             remembered_print: (false, false),
             silent_mode: false,
         })
@@ -354,7 +354,6 @@ impl Editor {
             screen: Screen::new(size),
             message: None,
             is_error: false,
-            marks: [None; 26],
             maps: crate::maps::Maps::default(),
             input: InputQueue::default(),
             expansion_group: false,
@@ -380,6 +379,7 @@ impl Editor {
             in_global: false,
             buffer_generation: 0,
             pending_flags: ExFlags::default(),
+            ex_by_bar: false,
             remembered_print: (false, false),
             silent_mode: true,
         })
@@ -412,7 +412,6 @@ impl Editor {
             screen: Screen::new(size),
             message: None,
             is_error: false,
-            marks: [None; 26],
             maps: crate::maps::Maps::default(),
             input: InputQueue::default(),
             expansion_group: false,
@@ -438,6 +437,7 @@ impl Editor {
             in_global: false,
             buffer_generation: 0,
             pending_flags: ExFlags::default(),
+            ex_by_bar: false,
             remembered_print: (false, false),
             silent_mode: false,
         }
@@ -597,6 +597,11 @@ impl Editor {
         };
         self.buffer.set_line(start_line);
         self.buffer.move_to_first_non_blank();
+        // POSIX 95159-95164: a newly loaded buffer gets its previous-context
+        // mark where editing starts -- in ex mode, only if it is not empty.
+        if !self.ex_standalone_mode || !self.buffer.is_empty() {
+            self.set_context_mark(self.buffer.cursor());
+        }
         self.undo.clear();
         Ok(())
     }
@@ -966,6 +971,13 @@ impl Editor {
                 self.clear_message();
             }
 
+            // Marks a command drops go to the undo record it makes; any left
+            // over from before are not this command's.  Not between the keys
+            // of an insert session: its drops belong to the record its ESC
+            // makes.
+            if matches!(self.mode, Mode::Command) {
+                self.buffer.take_dropped_marks();
+            }
             let result = match &self.mode {
                 Mode::Command => self.handle_command_key(q.key),
                 Mode::Insert(_) | Mode::Replace | Mode::Open => self.handle_insert_key(q.key),
@@ -1296,7 +1308,18 @@ impl Editor {
                 // escape -- an `Err` out of `handle_key` unwinds to
                 // `run_editor`, which prints and exits the editor.
                 if let Some(tag) = self.word_under_cursor() {
-                    if let Err(e) = self.goto_tag(&tag) {
+                    // 95148: ^] sets the previous-context mark -- in this
+                    // buffer; a jump to another file starts afresh there.
+                    let before = self.buffer.cursor();
+                    let generation = self.buffer_generation;
+                    let outcome = self.goto_tag(&tag, false);
+                    if outcome.is_ok()
+                        && self.buffer_generation == generation
+                        && self.buffer.cursor() != before
+                    {
+                        self.set_context_mark(before);
+                    }
+                    if let Err(e) = outcome {
                         self.set_error(&e.to_string());
                     }
                 }
@@ -1398,6 +1421,7 @@ impl Editor {
                     self.undo.begin_group();
                     let removed = self.buffer.delete_to_end_of_line();
                     if !removed.is_empty() {
+                        self.undo.note_dropped(self.buffer.take_dropped_marks());
                         self.undo.record_delete(at, &removed, false);
                     }
                     self.enter_insert(InsertKind::Append);
@@ -1475,6 +1499,7 @@ impl Editor {
                 }
                 // Record for undo
                 if !state.inserted_text.is_empty() {
+                    self.undo.note_dropped(self.buffer.take_dropped_marks());
                     self.undo
                         .record_insert(state.start_pos, &state.inserted_text, false);
                 }
@@ -1541,11 +1566,20 @@ impl Editor {
                 // very work the warning exists to protect.
                 // A `/` or `?` prompt is a search; a `:` line is an ex
                 // command, where `/re/` is an address like any other.
+                let before = self.buffer.cursor();
                 let outcome = match (self.ex_prompt, input.chars().next()) {
                     ('/', Some('/')) => self.ex_search(&input[1..], '/', SearchDirection::Forward),
                     ('?', Some('?')) => self.ex_search(&input[1..], '?', SearchDirection::Backward),
                     _ => self.execute_ex_input(&input),
                 };
+                // POSIX 95151: a `/` or `?` that moves the cursor sets the
+                // previous-context mark to where it was.
+                if matches!(self.ex_prompt, '/' | '?')
+                    && outcome.is_ok()
+                    && self.buffer.cursor() != before
+                {
+                    self.set_context_mark(before);
+                }
                 self.ex_prompt = ':';
                 if let Err(e) = outcome {
                     self.set_error(&e.to_string());
@@ -1734,6 +1768,35 @@ impl Editor {
 
     /// Execute a parsed command from the parser.
     fn execute_command(&mut self, cmd: &crate::command::ParsedCommand) -> Result<()> {
+        // POSIX 95148-95152: these commands set the previous-context mark
+        // to where the cursor was (as commands; as an operator's motion they
+        // go through `execute_motion` instead).  `' G H L M z` only when the
+        // current line changes (rule 6); the rest when the line or column
+        // does -- for `% ( ) [ ] { }` (rule 5) a success that stays put is
+        // not told apart from a failure, which must not set it.
+        let line_only = match cmd.command {
+            '\'' | 'G' | 'H' | 'L' | 'M' | 'z' => true,
+            '%' | '(' | ')' | '{' | '}' | '[' | ']' | '`' | 'n' | 'N' => false,
+            _ => return self.execute_command_inner(cmd),
+        };
+        // Set once the command has moved the cursor -- not before, or `''`
+        // would read back the position it was about to leave.
+        let before = self.buffer.cursor();
+        let generation = self.buffer_generation;
+        let result = self.execute_command_inner(cmd);
+        let after = self.buffer.cursor();
+        let moved = if line_only {
+            after.line != before.line
+        } else {
+            after != before
+        };
+        if result.is_ok() && moved && self.buffer_generation == generation {
+            self.set_context_mark(before);
+        }
+        result
+    }
+
+    fn execute_command_inner(&mut self, cmd: &crate::command::ParsedCommand) -> Result<()> {
         use crate::command::motion;
 
         let count = cmd.count;
@@ -1996,6 +2059,7 @@ impl Editor {
                         .line(first)
                         .map(|l| vec![l.content().to_string()])
                         .unwrap_or_default();
+                    self.undo.note_dropped(self.buffer.take_dropped_marks());
                     self.undo.record_replace_lines(
                         Position::new(first, 0),
                         &before[..(joined + 1).min(before.len())],
@@ -2012,11 +2076,9 @@ impl Editor {
             }
             // Mark
             'm' => {
-                if let Some(name) = cmd.char_arg {
-                    if name.is_ascii_lowercase() {
-                        let idx = (name as u8 - b'a') as usize;
-                        self.marks[idx] = Some(self.buffer.cursor());
-                    }
+                // 95130-95134: a lowercase letter, `` ` `` or `'`.
+                if let Some(slot) = cmd.char_arg.and_then(crate::buffer::mark_slot) {
+                    self.buffer.set_mark(slot, self.buffer.cursor());
                 }
             }
             '\'' | '`' => {
@@ -2243,6 +2305,7 @@ impl Editor {
                     if let Some(state) = self.insert_state.take() {
                         self.mode = Mode::Command;
                         if !text.is_empty() {
+                            self.undo.note_dropped(self.buffer.take_dropped_marks());
                             self.undo.record_insert(
                                 state.start_pos,
                                 &text.repeat(repeat_count),
@@ -2418,6 +2481,7 @@ impl Editor {
         let new = snapshot(self, new_last.min(self.buffer.line_count()));
 
         if old != new {
+            self.undo.note_dropped(self.buffer.take_dropped_marks());
             self.undo
                 .record_replace_lines(Position::new(first, 0), &old, &new);
         }
@@ -2446,6 +2510,7 @@ impl Editor {
         if let Some(text) = result.affected_text.as_deref() {
             if !text.is_empty() {
                 let linewise = range.mode == BufferMode::Line;
+                self.undo.note_dropped(self.buffer.take_dropped_marks());
                 self.undo.record_delete(range.start, text, linewise);
             }
         }
@@ -3071,7 +3136,7 @@ impl Editor {
                 break;
             }
             after_bar = seg.ended_by_bar;
-            self.execute_one_ex_command(&seg.command, seg.text.as_deref())?;
+            self.execute_one_ex_command(&seg.command, seg.text.as_deref(), seg.ended_by_bar)?;
             if self.should_quit {
                 break;
             }
@@ -3081,11 +3146,23 @@ impl Editor {
 
     /// Run one ex command; `text` is the input text an `a`, `c` or `i`
     /// took from the rest of its line.
-    fn execute_one_ex_command(&mut self, command: &str, text: Option<&str>) -> Result<()> {
+    ///
+    /// `by_bar` says a `|` ended it: in open or visual mode a line of
+    /// addresses alone moves the cursor only when a newline ends it (94555),
+    /// and otherwise prints.
+    fn execute_one_ex_command(
+        &mut self,
+        command: &str,
+        text: Option<&str>,
+        by_bar: bool,
+    ) -> Result<()> {
         // A leading `/re/` or `?re?` is an address, not a search: what
         // follows it is the command to run there (`/b/d`).  vi's own `/` and
         // `?` prompts are searches, and are handled where the prompt ends.
         let (cmd, flags) = crate::ex::parser::parse_ex_line(command)?;
+        // Marks this command drops go to the undo record it makes; any left
+        // over from before are not its.
+        self.buffer.take_dropped_marks();
 
         // A search address is a search: its RE becomes the last RE used,
         // and the search pattern for `n`, before the command runs -- so the
@@ -3110,10 +3187,50 @@ impl Editor {
             _ => None,
         };
 
+        // POSIX 95142-95158: the previous-context mark is set to where we
+        // are before a command that addresses `$`, a line number, a search
+        // or a mark -- unless that is just a move in visual mode (6.a) --
+        // and before z, undo, global and v; but not if the command fails.
+        let visual_move =
+            matches!(cmd, ExCommand::GotoAddress { .. }) && !self.ex_standalone_mode && !by_bar;
+        let dest_jumps = match &cmd {
+            ExCommand::Copy { dest, .. } | ExCommand::Move { dest, .. } => dest.is_jump(),
+            _ => false,
+        };
+        // A `:k '` sets the mark itself, after the jump would have.
+        let sets_context = matches!(
+            cmd,
+            ExCommand::Mark {
+                name: '\'' | '`',
+                ..
+            }
+        );
+        let jumps = ((range.is_jump() || dest_jumps) && !visual_move
+            || matches!(
+                cmd,
+                ExCommand::Z { .. } | ExCommand::Undo | ExCommand::Global { .. }
+            ))
+            && !sets_context;
+        // Set once the command has run (`''` must still read the old one),
+        // to where the cursor was, followed through the command's own edits.
+        let before = self.buffer.cursor();
+        if jumps {
+            self.buffer.hold(before);
+        }
+        let generation = self.buffer_generation;
+
         self.pending_flags = flags;
+        self.ex_by_bar = by_bar;
         let result = self.execute_ex(cmd);
         self.pending_flags = ExFlags::default();
-        self.apply_ex_result(result?)?;
+        let before_now = if jumps { self.buffer.release() } else { None };
+        let result = result?;
+        if self.buffer_generation == generation {
+            if let Some(pos) = before_now {
+                self.set_context_mark(pos);
+            }
+        }
+        self.apply_ex_result(result)?;
 
         // 94640-94642: the rest of the line is the text of an `a`, `c` or
         // `i`, as if typed, and ends it.
@@ -3284,7 +3401,7 @@ impl Editor {
                 }
             }
             ExCommand::GotoAddress { range } => {
-                if !self.ex_standalone_mode {
+                if !self.ex_standalone_mode && !self.ex_by_bar {
                     // Open or visual mode: the current line is set to the
                     // last address (94555).  A line number past either end
                     // goes to that end, as vi always has: `:0` and `:999`
@@ -3341,7 +3458,13 @@ impl Editor {
                 Ok(ExResult::StatusMessage(info))
             }
             ExCommand::Undo => {
-                self.undo.undo(&mut self.buffer)?;
+                // POSIX 95442: `u` undoes the last change *including an
+                // undo*, so a second `u` redoes -- as vi's `u` does -- and the
+                // current line is where the change was (95450).
+                let pos = self.undo.undo_toggle(&mut self.buffer)?;
+                self.buffer
+                    .set_line(pos.line.clamp(1, self.buffer.line_count().max(1)));
+                self.buffer.move_to_first_non_blank();
                 Ok(ExResult::Continue)
             }
             ExCommand::Redo => {
@@ -3642,11 +3765,7 @@ impl Editor {
                 }
             }
             ExCommand::Tag { tag, force } => {
-                // 95408: without `!`, replacing a modified buffer is an error.
-                if !force && self.buffer.is_modified() {
-                    return Err(ViError::FileModified);
-                }
-                self.goto_tag(&tag)?;
+                self.goto_tag(&tag, force)?;
                 Ok(ExResult::Continue)
             }
             // Parsed but not implemented. These returned `Continue` through the
@@ -4399,10 +4518,13 @@ impl Editor {
 
     /// Where a mark points, if it is set.
     fn mark_position(&self, name: char) -> Option<Position> {
-        if !name.is_ascii_lowercase() {
-            return None;
-        }
-        self.marks[(name as u8 - b'a') as usize]
+        self.buffer.mark(crate::buffer::mark_slot(name)?)
+    }
+
+    /// Set the previous-context mark (`'`/`` ` ``) to `pos`: done before a
+    /// jump, so `''` returns to where it started (POSIX 95142-95166).
+    fn set_context_mark(&mut self, pos: Position) {
+        self.buffer.set_mark(crate::buffer::CONTEXT_MARK, pos);
     }
 
     /// Go to a mark.
@@ -4497,6 +4619,7 @@ impl Editor {
                     if new_content.contains('\n') {
                         let parts: Vec<String> =
                             new_content.split('\n').map(|s| s.to_string()).collect();
+                        self.undo.note_dropped(self.buffer.take_dropped_marks());
                         self.undo.record_replace_lines(
                             Position::new(line_num, 0),
                             std::slice::from_ref(&content),
@@ -4518,6 +4641,7 @@ impl Editor {
                         line_num += parts.len();
                         continue;
                     }
+                    self.undo.note_dropped(self.buffer.take_dropped_marks());
                     self.undo.record_replace(
                         Position::new(line_num, 0),
                         &content,
@@ -5368,15 +5492,17 @@ impl Editor {
     }
 
     /// Go to tag.
-    fn goto_tag(&mut self, tag: &str) -> Result<()> {
+    ///
+    /// `force` is the `!` of `:tag!`: replace a modified buffer anyway.
+    fn goto_tag(&mut self, tag: &str, force: bool) -> Result<()> {
         // The `tags` option is a space-separated list of tags files.
         let tags_opt = self.options.tags.clone();
         let files: Vec<&str> = tags_opt.split_whitespace().collect();
         let taglength = self.options.taglength;
 
         let Some(m) = crate::tags::lookup(&files, tag, taglength) else {
-            self.set_error(&format!("tag not found: {}", tag));
-            return Ok(());
+            // 95413: "it shall be an error".
+            return Err(ViError::InvalidCommand(format!("tag not found: {}", tag)));
         };
 
         // Where we are now, read before open() can replace the buffer. `None`
@@ -5395,9 +5521,10 @@ impl Editor {
             .map(|(path, _)| path.as_str() == m.file.as_str())
             .unwrap_or(false);
         if !already_open {
-            // Match :edit/:next: refuse to abandon a modified buffer (open()
-            // would otherwise silently discard the changes).
-            if self.buffer.is_modified() {
+            // 95419-95423: only replacing the buffer with another file
+            // refuses a modified one, and `!` overrides that.  A tag in the
+            // current file just moves the cursor, modified or not.
+            if !force && self.buffer.is_modified() {
                 return Err(ViError::FileModified);
             }
             self.open(&m.file)?;
@@ -5421,26 +5548,34 @@ impl Editor {
         // Move to the definition.
         match m.address {
             crate::tags::TagAddress::Line(n) => {
-                let target = n.clamp(1, self.buffer.line_count().max(1));
-                self.buffer.set_line(target);
+                // 95425-95426: a line past the end is an error.
+                if n == 0 || n > self.buffer.line_count() {
+                    return Err(ViError::InvalidAddress(format!("tag line {}", n)));
+                }
+                self.buffer.set_line(n);
                 self.buffer.move_to_first_non_blank();
             }
             crate::tags::TagAddress::Pattern(pat) => {
-                if let Ok(re) = crate::bytes::TextRegex::new(&pat, plib::regex::RegexFlags::bre()) {
-                    let mut found = None;
-                    for n in 1..=self.buffer.line_count() {
-                        if let Some(line) = self.buffer.line(n) {
-                            if re.is_match(line.content()) {
-                                found = Some(n);
-                                break;
-                            }
-                        }
-                    }
-                    if let Some(n) = found {
+                // 95417-95418: the pattern is an RE used in the editor -- the
+                // last RE from now on.  Compiled without `magic`, as
+                // historical vi searched tags: ctags writes the source line
+                // with only `\` and `/` escaped, so its `*` and `[` are text.
+                let re = crate::search::compile_pattern(&pat, self.options.ignorecase, false)?;
+                // As the last RE, in the form that means the same whatever
+                // `magic` is: its specials escaped.
+                self.set_last_regex(&crate::search::literal_pattern(&pat));
+                let found = (1..=self.buffer.line_count()).find(|&n| {
+                    self.buffer
+                        .line(n)
+                        .is_some_and(|line| re.is_match(line.content()))
+                });
+                match found {
+                    Some(n) => {
                         self.buffer.set_line(n);
                         self.buffer.move_to_first_non_blank();
-                    } else {
-                        self.set_error(&format!("tag pattern not found: {}", pat));
+                    }
+                    None => {
+                        return Err(ViError::PatternNotFound(pat));
                     }
                 }
             }
@@ -5487,7 +5622,7 @@ impl Editor {
 
     /// Public entry for the `-t` startup option and the `:tag` command.
     pub fn tag(&mut self, tag: &str) -> Result<()> {
-        self.goto_tag(tag)
+        self.goto_tag(tag, false)
     }
 }
 

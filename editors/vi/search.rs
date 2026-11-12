@@ -289,6 +289,12 @@ pub fn compile_pattern(pattern: &str, ignorecase: bool, magic: bool) -> Result<T
         .map_err(|e| ViError::InvalidPattern(e.to_string()))
 }
 
+/// `pattern` as it reads under `nomagic`, spelled so that it reads the
+/// same whatever `magic` is.
+pub fn literal_pattern(pattern: &str) -> String {
+    convert_pattern(pattern, false)
+}
+
 /// Convert a vi pattern to a POSIX Basic Regular Expression for the libc
 /// engine (`plib::regex`).
 fn convert_pattern(pattern: &str, magic: bool) -> String {

@@ -74,3 +74,59 @@ fn test_global_keeps_the_search_direction() {
     // Backward from line 5 is line 3; forward would have wrapped to 1.
     assert_eq!(e.get_cursor().line, 3);
 }
+
+#[test]
+fn test_vi_mark_follows_its_line() {
+    let mut e = editor("a\nb\nc\nd\n");
+    // Mark `b`, delete the line above it, and go back to the mark.
+    e.execute_keys("jmakdd'a").unwrap();
+    assert_eq!(e.get_cursor().line, 1);
+    assert_eq!(e.get_buffer_text(), "b\nc\nd\n");
+}
+
+#[test]
+fn test_vi_previous_context_mark() {
+    let mut e = editor("a\nb\nc\nd\n");
+    e.execute_keys("3G").unwrap();
+    e.execute_keys("1G''").unwrap();
+    assert_eq!(e.get_cursor().line, 3);
+    e.execute_keys("``").unwrap();
+    assert_eq!(e.get_cursor().line, 1);
+}
+
+#[test]
+fn test_vi_multi_line_join_undo_restores_mark() {
+    let mut e = editor("a\nb\nc\nd\n");
+    e.execute_keys("3Gmx1G3Ju'x").unwrap();
+    assert_eq!(e.get_cursor().line, 3);
+}
+
+#[test]
+fn test_vi_undo_of_shift_keeps_mark() {
+    let mut e = editor("a\nb\nc\n");
+    e.execute_keys("2Gma>>u1G'a").unwrap();
+    assert_eq!(e.get_cursor().line, 2);
+}
+
+#[test]
+fn test_vi_g_without_line_change_keeps_context_mark() {
+    // Rule 6: `G` sets `''` only when the current line changes.
+    let mut e = editor("a\nb\n  c\n");
+    e.execute_keys("2G3G$G''").unwrap();
+    assert_eq!(e.get_cursor().line, 2);
+}
+
+#[test]
+fn test_vi_m_accepts_quote_mark() {
+    let mut e = editor("a\nb\nc\n");
+    e.execute_keys("3Gm'1G`'").unwrap();
+    assert_eq!(e.get_cursor().line, 3);
+}
+
+#[test]
+fn test_vi_address_with_bar_prints_and_sets_context_mark() {
+    // 94553-94561: `:3|` is not 6.a -- it is an implied print, which jumps.
+    let mut e = editor("a\nb\nc\n");
+    e.execute_keys(":3|\r''").unwrap();
+    assert_eq!(e.get_cursor().line, 1);
+}

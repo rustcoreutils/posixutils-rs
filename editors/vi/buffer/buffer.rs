@@ -27,6 +27,37 @@ pub struct Buffer {
     /// Nesting depth of line-reference tracking.  Edits are journalled only
     /// while a tracker is active, so the log cannot grow without bound.
     track_depth: usize,
+    /// The marks `a`-`z`, then the previous-context mark (`'`/`` ` ``).
+    /// Kept here, where every structural edit passes, so each mark follows
+    /// its line (POSIX 95138): before, they were bare line numbers in the
+    /// editor and `'a` named whatever line had moved into the slot.
+    marks: [Option<Position>; MARK_SLOTS],
+    /// Marks dropped because their line went, since the last
+    /// `take_dropped_marks`: what an undo of that change gives back.  Each
+    /// is numbered as the buffer stood at that last call, which is where an
+    /// undo of the change puts the lines back.
+    dropped: Vec<(usize, Position)>,
+    /// The structural edits since the last `take_dropped_marks`, to number
+    /// a dropped mark as the buffer stood then.
+    since_take: Vec<LineEdit>,
+    /// Positions held for callers ([`Buffer::hold`]), a stack: followed
+    /// through edits as marks are, but not marks.
+    held: Vec<Option<Position>>,
+}
+
+/// Slots in the mark table: `a`-`z`, then the previous-context mark.
+pub const MARK_SLOTS: usize = 27;
+/// The previous-context mark's slot.
+pub const CONTEXT_MARK: usize = 26;
+
+/// The mark-table slot of mark `name`: `a`-`z`, or `'`/`` ` `` for the
+/// previous-context mark.
+pub fn mark_slot(name: char) -> Option<usize> {
+    match name {
+        'a'..='z' => Some((name as u8 - b'a') as usize),
+        '\'' | '`' => Some(CONTEXT_MARK),
+        _ => None,
+    }
 }
 
 /// A structural change to the buffer's line numbering.
@@ -81,6 +112,32 @@ impl LineEdit {
             LineEdit::Reset => None,
         }
     }
+
+    /// Where `line`, numbered as after this edit, was before it; `None` if
+    /// the edit made it (an inserted line).  A line of a replacement maps
+    /// to the replaced line at the same offset, or the last of them.
+    fn unmap(&self, line: usize) -> Option<usize> {
+        match *self {
+            LineEdit::Insert { after, count } => match line {
+                l if l <= after => Some(l),
+                l if l > after + count => Some(l - count),
+                _ => None,
+            },
+            LineEdit::Delete { start, end } => Some(if line >= start {
+                line + (end - start + 1)
+            } else {
+                line
+            }),
+            LineEdit::Replace { start, end, count } => Some(if line < start {
+                line
+            } else if line >= start + count {
+                line - count + (end - start + 1)
+            } else {
+                start + (line - start).min(end - start)
+            }),
+            LineEdit::Reset => None,
+        }
+    }
 }
 
 /// Snap a character-mode span to character boundaries: the start rounds down
@@ -105,6 +162,10 @@ impl Buffer {
             modified: false,
             edits: Vec::new(),
             track_depth: 0,
+            marks: [None; MARK_SLOTS],
+            dropped: Vec::new(),
+            since_take: Vec::new(),
+            held: Vec::new(),
         }
     }
 
@@ -118,6 +179,101 @@ impl Buffer {
             modified: false,
             edits: Vec::new(),
             track_depth: 0,
+            marks: [None; MARK_SLOTS],
+            dropped: Vec::new(),
+            since_take: Vec::new(),
+            held: Vec::new(),
+        }
+    }
+
+    /// Mark slot `slot` (see [`MARK_SLOTS`]), if set.
+    pub fn mark(&self, slot: usize) -> Option<Position> {
+        self.marks.get(slot).copied().flatten()
+    }
+
+    /// Set mark slot `slot` to `pos`.
+    pub fn set_mark(&mut self, slot: usize, pos: Position) {
+        if let Some(m) = self.marks.get_mut(slot) {
+            *m = Some(pos);
+        }
+    }
+
+    /// The marks on lines `start..=end`, as (slot, where).
+    fn marks_in(&self, start: usize, end: usize) -> Vec<(usize, Position)> {
+        self.marks
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, m)| m.map(|p| (slot, p)))
+            .filter(|(_, p)| p.line >= start && p.line <= end)
+            .collect()
+    }
+
+    /// Move lines `start..=end` to follow line `after` (numbered as before
+    /// the move, and outside the range; 0 for the top).  A moved line is the
+    /// same line, and keeps its marks (POSIX 95138).  Returns the moved
+    /// lines' new first line number.
+    pub fn move_lines(&mut self, start: usize, end: usize, after: usize) -> usize {
+        // Lift the moved lines' marks off first, so the delete does not drop
+        // them, and set them again where the lines land.
+        let marks = self.marks_in(start, end);
+        for &(slot, _) in &marks {
+            self.marks[slot] = None;
+        }
+        let mut held = Vec::new();
+        for (i, h) in self.held.iter_mut().enumerate() {
+            if let Some(p) = h.filter(|p| (start..=end).contains(&p.line)) {
+                held.push((i, p));
+                *h = None;
+            }
+        }
+        let moved: Vec<Line> = self.lines.drain(start - 1..end).collect();
+        self.push_edit(LineEdit::Delete { start, end });
+        let count = moved.len();
+        let after = if after > end { after - count } else { after };
+        self.lines.splice(after..after, moved);
+        self.push_edit(LineEdit::Insert { after, count });
+        let landed = |pos: Position| Position::new(pos.line - start + after + 1, pos.column);
+        for (slot, pos) in marks {
+            self.marks[slot] = Some(landed(pos));
+        }
+        for (i, pos) in held {
+            self.held[i] = Some(landed(pos));
+        }
+        self.modified = true;
+        after + 1
+    }
+
+    /// Hold `pos`, to be followed through the edits that come, as a mark's
+    /// line is, until the matching [`Buffer::release`].  Holds nest.
+    pub fn hold(&mut self, pos: Position) {
+        self.held.push(Some(pos));
+    }
+
+    /// Release the latest hold: where its position is now, or `None` if its
+    /// line went.
+    pub fn release(&mut self) -> Option<Position> {
+        self.held.pop().flatten()
+    }
+
+    /// The whole mark table, for address resolution.
+    pub fn marks(&self) -> &[Option<Position>; MARK_SLOTS] {
+        &self.marks
+    }
+
+    /// The marks dropped since the last call, as (slot, where it was).
+    pub fn take_dropped_marks(&mut self) -> Vec<(usize, Position)> {
+        self.since_take.clear();
+        std::mem::take(&mut self.dropped)
+    }
+
+    /// Put back marks a change dropped, now that undo has restored their
+    /// lines (POSIX 95139-95140) -- each only if it has not been set again
+    /// since and its line is there.
+    pub fn restore_marks(&mut self, marks: &[(usize, Position)]) {
+        for &(slot, pos) in marks {
+            if self.marks.get(slot) == Some(&None) && pos.line <= self.lines.len() {
+                self.marks[slot] = Some(pos);
+            }
         }
     }
 
@@ -148,6 +304,35 @@ impl Buffer {
 
     /// Record a structural change, if anything is watching.
     fn push_edit(&mut self, edit: LineEdit) {
+        // Marks follow every edit; a mark whose line is gone is dropped, and
+        // kept aside for an undo to give back.  A replacement keeps a mark
+        // on its first line, which survives (a delete that joins lines).
+        for (slot, mark) in self.marks.iter_mut().enumerate() {
+            let Some(pos) = *mark else { continue };
+            let kept_first = matches!(edit, LineEdit::Replace { start, count, .. }
+                if count > 0 && pos.line == start);
+            match edit.remap(pos.line) {
+                _ if kept_first => {}
+                Some(line) => *mark = Some(Position::new(line, pos.column)),
+                None => {
+                    // Numbered as the buffer stood at the last take; a mark
+                    // on a line this run of edits made has nowhere to go.
+                    let was = self
+                        .since_take
+                        .iter()
+                        .rev()
+                        .try_fold(pos.line, |line, e| e.unmap(line));
+                    if let Some(line) = was {
+                        self.dropped.push((slot, Position::new(line, pos.column)));
+                    }
+                    *mark = None;
+                }
+            }
+        }
+        for held in &mut self.held {
+            *held = held.and_then(|p| Some(Position::new(edit.remap(p.line)?, p.column)));
+        }
+        self.since_take.push(edit);
         if self.track_depth > 0 {
             self.edits.push(edit);
         }

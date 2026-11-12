@@ -1052,6 +1052,7 @@ name = "posixutils-editors"
 version = "0.9.1"
 dependencies = [
  "clap",
+ "errno",
  "gettext-rs",
  "libc",
  "plib",

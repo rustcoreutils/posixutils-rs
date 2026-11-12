@@ -871,7 +871,7 @@ impl Editor {
     pub fn recover(&mut self, file: Option<&str>) -> Result<()> {
         match crate::recover::find_for(&self.options.directory, file) {
             Some(info) => {
-                let body = crate::recover::load_body(&info.recovery_path).map_err(ViError::Io)?;
+                let body = crate::recover::load_body(&info).map_err(ViError::Io)?;
                 self.buffer = Buffer::from_text(&body);
                 // Recovered content is not yet written back to the file.
                 self.buffer.mark_modified();
@@ -880,7 +880,7 @@ impl Editor {
                 }
                 self.buffer.set_line(1);
                 self.undo.clear();
-                crate::recover::remove(&info.recovery_path);
+                crate::recover::remove(&info);
                 let msg = match &info.orig_path {
                     Some(p) => format!("Recovered {}", p),
                     None => "Recovered buffer".to_string(),

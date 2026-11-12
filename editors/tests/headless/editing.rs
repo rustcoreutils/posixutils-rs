@@ -612,7 +612,8 @@ fn test_ex_substitute_newline_terminates() {
     std::thread::spawn(move || {
         let mut editor = Editor::new_headless();
         editor.set_buffer_text("a\n");
-        let r = editor.execute_keys(":1s/^/\\n/\n");
+        // POSIX 95369-95371: in vi a `^V`-escaped carriage return splits.
+        let r = editor.execute_keys(":1s/^/\x16\r/\r");
         let _ = tx.send(r.map(|()| editor.get_buffer_text()));
     });
 
@@ -622,7 +623,7 @@ fn test_ex_substitute_newline_terminates() {
             "the empty match at `^` should have split line 1 in two"
         ),
         Ok(Err(e)) => panic!("substitute failed: {}", e),
-        Err(_) => panic!("`:1s/^/\\n/` did not terminate within 10s"),
+        Err(_) => panic!("`:1s/^/^V^M/` did not terminate within 10s"),
     }
 }
 

@@ -19,6 +19,7 @@
 use crate::buffer::{floor_char_boundary, next_char_boundary, Buffer, Position};
 use crate::bytes::TextRegex;
 use crate::error::{Result, ViError};
+use crate::ex::command::CTRL_V;
 use crate::options::Options;
 use plib::regex::{Match, RegexFlags};
 
@@ -104,6 +105,11 @@ impl SearchState {
         self.direction = direction;
 
         Ok(())
+    }
+
+    /// The compiled current pattern.
+    pub fn compiled(&self) -> Option<&TextRegex> {
+        self.regex.as_ref()
     }
 
     /// Get the current pattern.
@@ -375,10 +381,18 @@ enum CaseMode {
 /// Build a `:s` replacement string for one match from its capture groups.
 ///
 /// Supports `&` (whole match), `\1`-`\9` (back-references), `\&` (literal `&`),
-/// `\\` (literal backslash), the `\n`/`\t` vi conveniences, `~` (the previous
-/// replacement, passed in as `prev`), and the POSIX case escapes
-/// `\u \l \U \L \e \E` (ex.md §95726-95732).
-fn build_replacement(template: &str, input: &str, matches: &[Match], prev: &str) -> String {
+/// `\\` (literal backslash), `~` (the previous replacement, passed in as
+/// `prev`), the POSIX case escapes `\u \l \U \L \e \E` (ex.md
+/// §95726-95732), and a carriage return -- `\`-escaped, or `^V`-quoted in
+/// vi -- as a line split.  With `magic` off, `&` and `~` are literal and
+/// `\&` and `\~` are the special ones (95712-95714).
+fn build_replacement(
+    template: &str,
+    input: &str,
+    matches: &[Match],
+    prev: &str,
+    magic: bool,
+) -> String {
     let mut result = String::with_capacity(template.len() + 16);
     let mut chars = template.chars();
     // `sticky` is the \U/\L mode; `one_shot` is a pending \u/\l for one char.
@@ -408,6 +422,22 @@ fn build_replacement(template: &str, input: &str, matches: &[Match], prev: &str)
     };
 
     while let Some(c) = chars.next() {
+        // Under nomagic the escape is what makes `&` and `~` special, so
+        // `\&` reads as `&` would with magic, and `&` as `\&`.
+        let c = match c {
+            '\\' if !magic => match chars.clone().next() {
+                Some(k @ ('&' | '~')) => {
+                    chars.next();
+                    k
+                }
+                _ => c,
+            },
+            '&' | '~' if !magic => {
+                push(&mut result, &c.to_string(), &mut sticky, &mut one_shot);
+                continue;
+            }
+            _ => c,
+        };
         match c {
             '&' => {
                 let m = matches[0];
@@ -416,9 +446,22 @@ fn build_replacement(template: &str, input: &str, matches: &[Match], prev: &str)
             }
             // `~` stands for the previous replacement text (ex.md §95724).
             '~' => push(&mut result, prev, &mut sticky, &mut one_shot),
+            // POSIX 95369-95371: a carriage return entered in the
+            // replacement -- `^V^M` in open or vi mode, `\` and a newline in
+            // ex -- splits the line there, and is itself discarded.
+            '\r' => result.push('\n'),
+            // vi keeps a `^V` on the command line with the character it
+            // quotes; here it quotes that character, and a quoted carriage
+            // return is the split above.
+            CTRL_V => match chars.next() {
+                Some('\r') => result.push('\n'),
+                Some(q) => push(&mut result, &q.to_string(), &mut sticky, &mut one_shot),
+                None => {}
+            },
+            // POSIX 95724: after a backslash, any character but these is
+            // itself -- `\n` is `n`, `\t` is `t`.
             '\\' => match chars.next() {
-                Some('n') => result.push('\n'),
-                Some('t') => result.push('\t'),
+                Some('\r') | Some('\n') => result.push('\n'),
                 Some('&') => push(&mut result, "&", &mut sticky, &mut one_shot),
                 Some('~') => push(&mut result, "~", &mut sticky, &mut one_shot),
                 Some('\\') => push(&mut result, "\\", &mut sticky, &mut one_shot),
@@ -475,6 +518,8 @@ pub struct SubstituteConfig<'a> {
     pub count_only: bool,
     /// The `ignorecase` edit option.
     pub ignorecase: bool,
+    /// The `magic` edit option.
+    pub magic: bool,
     /// Previous replacement text, which `~` expands to (ex.md §95724).
     pub prev_replacement: &'a str,
 }
@@ -492,6 +537,7 @@ impl<'a> SubstituteConfig<'a> {
             number: false,
             count_only: false,
             ignorecase: false,
+            magic: true,
             prev_replacement: "",
         }
     }
@@ -534,18 +580,16 @@ pub struct Substitutor {
     count_only: bool,
     /// Previous replacement, for `~`.
     prev_replacement: String,
+    /// The `magic` edit option, for the replacement's `&` and `~`.
+    magic: bool,
 }
 
 impl Substitutor {
     /// Create a new substitutor.
     pub fn new(cfg: SubstituteConfig<'_>) -> Result<Self> {
-        // The :s pattern is a POSIX BRE (vi magic mode); compile via libc.
-        let mut flags = RegexFlags::bre();
-        if cfg.ignorecase {
-            flags = flags.ignore_case();
-        }
-        let regex = TextRegex::new(cfg.pattern, flags)
-            .map_err(|e| ViError::InvalidPattern(e.to_string()))?;
+        // Compiled as every RE the editor matches is, `magic` and
+        // `ignorecase` applied.
+        let regex = compile_pattern(cfg.pattern, cfg.ignorecase, cfg.magic)?;
 
         Ok(Self {
             regex,
@@ -557,6 +601,7 @@ impl Substitutor {
             number: cfg.number,
             count_only: cfg.count_only,
             prev_replacement: cfg.prev_replacement.to_string(),
+            magic: cfg.magic,
         })
     }
 
@@ -582,6 +627,7 @@ impl Substitutor {
                 line,
                 &caps,
                 &self.prev_replacement,
+                self.magic,
             ));
             last_end = me;
             count += 1;
@@ -655,6 +701,7 @@ impl Substitutor {
                     line,
                     &caps,
                     &self.prev_replacement,
+                    self.magic,
                 ));
                 count += 1;
             } else {

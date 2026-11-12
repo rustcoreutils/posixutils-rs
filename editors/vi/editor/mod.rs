@@ -240,6 +240,9 @@ pub struct Editor {
     ex_standalone_mode: bool,
     /// Whether a `:g`/`:v` command list is running.
     in_global: bool,
+    /// Counts the times the edit buffer has been replaced (`:e`, `:n`,
+    /// `:recover`), so a global can tell that its marks mean nothing now.
+    buffer_generation: u64,
     /// The print flags of the ex command running now, for print, number
     /// and list to fold into their output.
     pending_flags: ExFlags,
@@ -320,6 +323,7 @@ impl Editor {
             ex_insert_text: Vec::new(),
             ex_standalone_mode: false,
             in_global: false,
+            buffer_generation: 0,
             pending_flags: ExFlags::default(),
             remembered_print: (false, false),
             silent_mode: false,
@@ -374,6 +378,7 @@ impl Editor {
             ex_insert_text: Vec::new(),
             ex_standalone_mode: true,
             in_global: false,
+            buffer_generation: 0,
             pending_flags: ExFlags::default(),
             remembered_print: (false, false),
             silent_mode: true,
@@ -431,6 +436,7 @@ impl Editor {
             ex_insert_text: Vec::new(),
             ex_standalone_mode: false,
             in_global: false,
+            buffer_generation: 0,
             pending_flags: ExFlags::default(),
             remembered_print: (false, false),
             silent_mode: false,
@@ -495,7 +501,7 @@ impl Editor {
 
     /// Set the buffer content directly (for testing).
     pub fn set_buffer_text(&mut self, text: &str) {
-        self.buffer = Buffer::from_text(text);
+        self.replace_buffer(Buffer::from_text(text));
     }
 
     /// Get the buffer content as a string (for testing).
@@ -573,7 +579,7 @@ impl Editor {
         // command expanded to the same thing as `%`.
         let old_current = self.shell_current_file();
 
-        self.buffer = new_buffer;
+        self.replace_buffer(new_buffer);
         self.files.set_current_file(Some(path_buf.clone()));
         self.shell
             .set_current_file(Some(crate::bytes::from_path(&path_buf)));
@@ -885,7 +891,7 @@ impl Editor {
         match crate::recover::find_for(&self.options.directory, file) {
             Some(info) => {
                 let body = crate::recover::load_body(&info).map_err(ViError::Io)?;
-                self.buffer = Buffer::from_text(&body);
+                self.replace_buffer(Buffer::from_text(&body));
                 // Recovered content is not yet written back to the file.
                 self.buffer.mark_modified();
                 if let Some(p) = &info.orig_path {
@@ -3050,9 +3056,15 @@ impl Editor {
         // separates them, by rules that depend on the command.  An error
         // stops the rest of the line.
         let mut after_bar = false;
+        let generation = self.buffer_generation;
         for seg in crate::ex::cmdline::split_line(&actual_input) {
             if seg.comment {
                 break;
+            }
+            // Inside a global, nothing more runs once the buffer has been
+            // replaced (95006-95008), not even the rest of this line.
+            if self.in_global && self.buffer_generation != generation {
+                return Err(Self::buffer_replaced());
             }
             // 94557: an empty command after a `|` runs nothing.
             if after_bar && seg.command.trim().is_empty() {
@@ -4169,18 +4181,25 @@ impl Editor {
     /// unambiguously as the flags ask.
     fn format_lines(&self, start: usize, end: usize, number: bool, list: bool) -> Vec<String> {
         let mut lines = Vec::new();
+        // A numbered row starts with the 8 columns of `"%6d  "`.
+        let width = self
+            .list_width()
+            .saturating_sub(if number { 8 } else { 0 })
+            .max(1);
         for line_num in start..=end {
             if let Some(line) = self.buffer.line(line_num) {
-                let text = if list {
-                    Self::list_form(line.content())
+                let rows = if list {
+                    Self::list_rows(line.content(), width)
                 } else {
-                    line.content().to_string()
+                    vec![line.content().to_string()]
                 };
-                lines.push(if number {
-                    format!("{:6}  {}", line_num, text)
-                } else {
-                    text
-                });
+                for (i, row) in rows.into_iter().enumerate() {
+                    lines.push(if number && i == 0 {
+                        format!("{:6}  {}", line_num, row)
+                    } else {
+                        row
+                    });
+                }
             }
         }
         lines
@@ -4201,9 +4220,28 @@ impl Editor {
             (1, self.buffer.line_count())
         };
 
-        // Compile the pattern as a POSIX BRE.
-        let regex = crate::bytes::TextRegex::new(pattern, plib::regex::RegexFlags::bre())
-            .map_err(|e| ViError::InvalidPattern(e.to_string()))?;
+        // Compiled as every RE the editor matches is: the edit options
+        // apply, and an empty pattern is the last RE (94995) -- compiled raw,
+        // `g//d` matched every line and deleted the buffer.  The pattern then
+        // becomes the last RE, so `g/re/s//X/` means `re`.
+        let pattern = if pattern.is_empty() {
+            self.last_regex()
+                .ok_or(ViError::NoPreviousSearch)?
+                .to_string()
+        } else {
+            pattern.to_string()
+        };
+        // The search pattern and the last RE, with the search direction left
+        // as it was: a global is not a search forward.  Compiled once, there.
+        self.search.update_options(&self.options);
+        self.search.set_pattern(&pattern, self.search.direction())?;
+        self.registers.set_search(&pattern);
+        self.set_last_regex(&pattern);
+        let regex = self
+            .search
+            .compiled()
+            .cloned()
+            .ok_or(ViError::NoPreviousSearch)?;
 
         // Collect matching line numbers first (to avoid mutation during iteration)
         let mut matching_lines = Vec::new();
@@ -4237,34 +4275,56 @@ impl Editor {
         self.undo.begin_group();
         self.buffer.begin_line_tracking();
         let was_in_global = std::mem::replace(&mut self.in_global, true);
-        for idx in 0..pending.len() {
-            let Some(line_num) = pending[idx] else {
-                continue;
-            };
-            if line_num == 0 || line_num > self.buffer.line_count() {
-                continue;
-            }
+        let generation = self.buffer_generation;
+        let outcome = (|| -> Result<()> {
+            for idx in 0..pending.len() {
+                let Some(line_num) = pending[idx] else {
+                    continue;
+                };
+                if line_num == 0 || line_num > self.buffer.line_count() {
+                    continue;
+                }
 
-            self.buffer.set_line(line_num);
-            let mark = self.buffer.edit_log_len();
-            if let Err(e) = self.execute_ex_input(command) {
-                self.set_error(&e.to_string());
-            }
+                self.buffer.set_line(line_num);
+                let mark = self.buffer.edit_log_len();
+                // POSIX 95005-95008: an error, or the buffer being replaced
+                // (by `:e`, say), ends the global and is reported.  Going on
+                // ran the rest of the list against whatever the buffer had
+                // become.  (`execute_ex_input` checks the generation between
+                // the commands of one list, too.)
+                self.execute_ex_input(command)?;
+                if self.buffer_generation != generation {
+                    return Err(Self::buffer_replaced());
+                }
 
-            let edits: Vec<_> = self.buffer.edits_since(mark).to_vec();
-            if !edits.is_empty() {
-                for slot in &mut pending[idx + 1..] {
-                    for edit in &edits {
-                        *slot = slot.and_then(|line| edit.remap(line));
+                let edits: Vec<_> = self.buffer.edits_since(mark).to_vec();
+                if !edits.is_empty() {
+                    for slot in &mut pending[idx + 1..] {
+                        for edit in &edits {
+                            *slot = slot.and_then(|line| edit.remap(line));
+                        }
                     }
                 }
             }
-        }
+            Ok(())
+        })();
+        // One way out, whatever happened.
         self.in_global = was_in_global;
         self.buffer.end_line_tracking();
         self.undo.end_group();
+        outcome
+    }
 
-        Ok(())
+    /// The error a global reports when its command list replaced the buffer.
+    fn buffer_replaced() -> ViError {
+        ViError::InvalidCommand("global: the edit buffer was replaced".to_string())
+    }
+
+    /// Replace the edit buffer, and count it: a global running when the
+    /// buffer is replaced must stop (95006-95008), and checks this count.
+    fn replace_buffer(&mut self, buffer: Buffer) {
+        self.buffer = buffer;
+        self.buffer_generation += 1;
     }
 
     /// Execute :cd command - change directory.
@@ -4396,6 +4456,7 @@ impl Editor {
             number: flags.number,
             count_only: flags.count,
             ignorecase: self.options.ignorecase,
+            magic: self.options.magic,
             prev_replacement: &prev_replacement,
         })?;
 
@@ -4548,7 +4609,21 @@ impl Editor {
         }
     }
 
-    /// Render a line in `list` form, per ex.md §95237-95244:
+    /// The width `:l` folds at: the terminal's, less the column the `\`
+    /// marking a fold takes.
+    fn list_width(&self) -> usize {
+        let cols = self.terminal.size().cols as usize;
+        if cols > 1 {
+            cols - 1
+        } else {
+            79
+        }
+    }
+
+    /// Render a line in `list` form, per ex.md §95237-95244, folded into
+    /// rows of at most `width` columns, each but the last ending in `\`
+    /// ("Long lines shall be folded, with the point of folding indicated by
+    /// <newline> preceded by <backslash>"):
     ///
     /// 1. characters in XBD Table 5-1 are written as their escape sequence;
     /// 2. other non-printable characters as a three-digit octal escape per
@@ -4556,44 +4631,63 @@ impl Editor {
     /// 3. the end of the line is marked `$`, and a literal `$` is written
     ///    `\$`.
     ///
-    /// Shared by the `:list` command and the substitute `l` flag, which
-    /// previously disagreed -- `:l` used `^I`-style caret notation, escaped
-    /// neither backslash nor `$`, and so was not unambiguous at all.
-    fn list_form(s: &str) -> String {
-        let mut out = String::with_capacity(s.len() + 1);
-        for c in s.chars() {
-            // A byte that is not UTF-8: its own octal escape.
-            if let Some(b) = crate::bytes::escaped_byte(c) {
-                out.push_str(&format!("\\{:03o}", b));
-                continue;
+    /// Used by the `:list` command and the substitute `l` flag alike.
+    ///
+    /// A character the locale says is printable is written as itself, a
+    /// multibyte one included (`é` in a UTF-8 locale); anything else -- a
+    /// control, a byte that is not a character in the locale -- as the C
+    /// escape or one octal escape per byte.
+    fn list_rows(s: &str, width: usize) -> Vec<String> {
+        let mut rows = Vec::new();
+        let mut row = String::new();
+        let mut col = 0usize;
+        let mut emit = |piece: &str, w: usize, row: &mut String, col: &mut usize| {
+            if *col + w > width && *col > 0 {
+                row.push('\\');
+                rows.push(std::mem::take(row));
+                *col = 0;
             }
-            match c {
-                // XBD Table 5-1.
-                '\\' => out.push_str("\\\\"),
-                '\x07' => out.push_str("\\a"),
-                '\x08' => out.push_str("\\b"),
-                '\x0c' => out.push_str("\\f"),
-                '\n' => out.push_str("\\n"),
-                '\r' => out.push_str("\\r"),
-                '\t' => out.push_str("\\t"),
-                '\x0b' => out.push_str("\\v"),
-                // A literal '$' must not be mistaken for the end marker.
-                '$' => out.push_str("\\$"),
-                c if (c as u32) < 0x20 || c as u32 == 0x7f => {
-                    out.push_str(&format!("\\{:03o}", c as u32));
-                }
-                // Non-ASCII: one octal escape per byte of the encoding.
-                c if !c.is_ascii() => {
-                    let mut buf = [0u8; 4];
-                    for b in c.encode_utf8(&mut buf).as_bytes() {
-                        out.push_str(&format!("\\{:03o}", b));
+            row.push_str(piece);
+            *col += w;
+        };
+        for c in s.chars() {
+            let piece: String = if let Some(b) = crate::bytes::escaped_byte(c) {
+                // A byte that is not UTF-8: its own octal escape.
+                format!("\\{:03o}", b)
+            } else {
+                match c {
+                    // XBD Table 5-1.
+                    '\\' => "\\\\".to_string(),
+                    '\x07' => "\\a".to_string(),
+                    '\x08' => "\\b".to_string(),
+                    '\x0c' => "\\f".to_string(),
+                    '\n' => "\\n".to_string(),
+                    '\r' => "\\r".to_string(),
+                    '\t' => "\\t".to_string(),
+                    '\x0b' => "\\v".to_string(),
+                    // A literal '$' must not be mistaken for the end marker.
+                    '$' => "\\$".to_string(),
+                    c if plib::locale::isprint(c) => c.to_string(),
+                    // Not printable here: one octal escape per byte.
+                    c => {
+                        let mut buf = [0u8; 4];
+                        c.encode_utf8(&mut buf)
+                            .bytes()
+                            .map(|b| format!("\\{:03o}", b))
+                            .collect()
                     }
                 }
-                c => out.push(c),
-            }
+            };
+            let w = if piece.chars().count() == 1 {
+                plib::locale::wcwidth_char(c).max(1) as usize
+            } else {
+                piece.len()
+            };
+            emit(&piece, w, &mut row, &mut col);
         }
-        out.push('$');
-        out
+        emit("$", 1, &mut row, &mut col);
+        rows.push(row);
+        rows
     }
 
     /// Write buffer to file.

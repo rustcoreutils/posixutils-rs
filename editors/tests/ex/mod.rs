@@ -15,6 +15,7 @@
 mod addresses;
 mod cmdline;
 mod fileio;
+mod global;
 
 use plib::testing::{get_binary_path, run_test, TestPlan};
 use plib::tmp::{NamedTempFile, TempDir};
@@ -1033,7 +1034,7 @@ fn test_ex_substitute_newline_splits_line() {
     // corruption.
     ex_test_with_file(
         "a-b\nc-d\n",
-        "1s/-/\\n/\n1,$nu\nq!\n",
+        "1s/-/\\\n/\n1,$nu\nq!\n",
         "     1  a\n     2  b\n     3  c-d\n",
     );
 }
@@ -1048,7 +1049,7 @@ fn test_ex_substitute_newline_is_undoable() {
     // where no split ever happened.
     ex_test_with_file(
         "a-b\nc-d\n",
-        "1s/-/\\n/\n$=\nu\n$=\n1,$nu\nq!\n",
+        "1s/-/\\\n/\n$=\nu\n$=\n1,$nu\nq!\n",
         "3\n2\n     1  a-b\n     2  c-d\n",
     );
 }
@@ -1059,7 +1060,7 @@ fn test_ex_substitute_newline_over_a_range_visits_every_line() {
     // with it or the tail of the range gets skipped.
     ex_test_with_file(
         "a-b\nc-d\n",
-        "1,$s/-/\\n/\n1,$nu\nq!\n",
+        "1,$s/-/\\\n/\n1,$nu\nq!\n",
         "     1  a\n     2  b\n     3  c\n     4  d\n",
     );
 }

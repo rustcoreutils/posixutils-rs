@@ -20,6 +20,15 @@ use std::process::{Command, Stdio};
 /// `ex -s f` on a file holding `content`, `script` on stdin:
 /// (stdout, stderr, exit code, the file afterwards).
 pub(super) fn ex(content: &str, script: &str) -> (String, String, i32, String) {
+    ex_env(content, script, &[])
+}
+
+/// `ex`, with extra environment variables.
+pub(super) fn ex_env(
+    content: &str,
+    script: &str,
+    env: &[(&str, &str)],
+) -> (String, String, i32, String) {
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("f"), content).unwrap();
     let mut child = Command::new(get_binary_path("ex"))
@@ -27,6 +36,7 @@ pub(super) fn ex(content: &str, script: &str) -> (String, String, i32, String) {
         .current_dir(dir.path())
         .env("HOME", dir.path())
         .env_remove("EXINIT")
+        .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

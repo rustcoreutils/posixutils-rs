@@ -62,3 +62,15 @@ fn test_failed_ampersand_stays_on_the_status_line() {
     assert!(e.execute_keys("j&").is_ok());
     assert_eq!(e.get_buffer_text(), "x\nbar\n");
 }
+
+#[test]
+fn test_global_keeps_the_search_direction() {
+    let mut e = editor("x\nfoo\nx\nfoo\nx\n");
+    e.execute_keys("G?foo\r").unwrap();
+    // The global's RE becomes the last RE; the direction stays backward.
+    e.execute_keys(":g/x/p\r").unwrap();
+    assert_eq!(e.get_cursor().line, 5);
+    e.execute_keys("n").unwrap();
+    // Backward from line 5 is line 3; forward would have wrapped to 1.
+    assert_eq!(e.get_cursor().line, 3);
+}

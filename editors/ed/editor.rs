@@ -662,7 +662,34 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         // of the line -- and fold long lines with a `\` before the newline.
         const FOLD_WIDTH: usize = 72;
         let mut col = 0;
-        for &b in content {
+        let mut at = 0;
+        while at < content.len() {
+            // One character of the locale's encoding.  A multibyte one the
+            // locale calls printable is written as itself (`é` in a UTF-8
+            // locale); anything else goes byte by byte, below.
+            let next = plib::locale::next_char_offset(content, at).unwrap_or(at + 1);
+            let ch = &content[at..next];
+            if ch.len() > 1 {
+                // Decoded by the locale (`mbrtowc`), so any multibyte
+                // encoding works, not just UTF-8.
+                let printable = match plib::locale::MbDecoder::new().decode(ch)[..] {
+                    [Some(c)] if plib::locale::isprint(c) => Some(c),
+                    _ => None,
+                };
+                if let Some(c) = printable {
+                    let cw = plib::locale::wcwidth_char(c).max(1) as usize;
+                    if col + cw > FOLD_WIDTH {
+                        w.write_all(b"\\\n")?;
+                        col = 0;
+                    }
+                    w.write_all(ch)?;
+                    col += cw;
+                    at = next;
+                    continue;
+                }
+            }
+            let b = content[at];
+            at += 1;
             let octal;
             let plain = [b];
             let escaped: &[u8] = match b {

@@ -149,11 +149,10 @@ fn test_empty_match_after_a_match_is_not_another() {
 #[test]
 fn test_multibyte_delimiter() {
     // A delimiter is one character of the locale's encoding.
-    let utf8 = if cfg!(target_os = "macos") {
-        "en_US.UTF-8"
-    } else {
-        "C.UTF-8"
+    let Some(utf8) = plib::testing::utf8_locale() else {
+        return; // no UTF-8 locale installed here
     };
+    let utf8 = utf8.as_str();
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("f"), b"abc\nd\n").unwrap();
     let (out, code) = run_env(
@@ -179,4 +178,22 @@ fn test_nul_bytes_roundtrip() {
 fn test_global_remembers_re_even_when_list_is_bad() {
     let (out, _, _) = ed(b"foo\nbar\n", b"g/foo/x\n//p\nQ\n");
     assert_eq!(out, b"?\nfoo\n");
+}
+
+#[test]
+fn test_list_shows_printable_multibyte_in_a_utf8_locale() {
+    let Some(utf8) = plib::testing::utf8_locale() else {
+        return; // no UTF-8 locale installed here
+    };
+    for (locale, want) in [(utf8.as_str(), "caf\u{e9}$\n"), ("C", "caf\\303\\251$\n")] {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("f"), "caf\u{e9}\n").unwrap();
+        let (out, _) = run_env(
+            dir.path(),
+            &[OsStr::new("-s"), OsStr::new("f")],
+            b"l\nQ\n",
+            &[("LC_ALL", locale)],
+        );
+        assert_eq!(String::from_utf8(out).unwrap(), want, "{locale}");
+    }
 }

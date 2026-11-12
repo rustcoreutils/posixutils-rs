@@ -183,15 +183,6 @@ pub struct Address {
 }
 
 impl Address {
-    /// `.` with no offsets, as a defaulted address parses.
-    pub fn current_line() -> Self {
-        Address {
-            info: AddressInfo::Current,
-            offsets: Vec::new(),
-            relative_to_first: false,
-        }
-    }
-
     pub fn new() -> Self {
         Address {
             info: AddressInfo::Null,

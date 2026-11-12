@@ -787,7 +787,18 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 append,
                 quit,
             } => {
-                let (start, end) = self.resolve_range(&addr1, &addr2)?;
+                // The default `1,$` of an empty buffer is no lines, not an
+                // error: writing it empties the file, as it should, where
+                // refusing kept text the user had deleted.
+                let whole = |a: &Address, info: AddressInfo| a.info == info && a.offsets.is_empty();
+                let (start, end) = if self.buf.line_count() == 0
+                    && whole(&addr1, AddressInfo::Line(1))
+                    && whole(&addr2, AddressInfo::Last)
+                {
+                    (1, 0)
+                } else {
+                    self.resolve_range(&addr1, &addr2)?
+                };
                 let path = filename.as_ref().unwrap_or(&self.buf.pathname);
                 if path.is_empty() {
                     return Err(EdError::NoFilename);
@@ -1296,23 +1307,10 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         // POSIX: Check for forbidden commands
         self.check_global_commands(commands)?;
 
-        let (start, end) = self.resolve_range(&addr1, &addr2)?;
-
-        let (_, re) = self.compile_re(pattern)?;
-
-        // Collect matching lines first (POSIX: mark every line that matches)
-        let mut matching_lines = Vec::new();
-        for i in start..=end {
-            if let Some(line) = self.buf.get_line(i) {
-                let matches = re.is_match(line.trim_end_matches('\n'));
-                if matches != invert {
-                    matching_lines.push(i);
-                }
-            }
-        }
+        let marked = self.mark_matches(&addr1, &addr2, pattern, invert)?;
 
         // POSIX: If there were no matching lines, the current line number shall not be changed
-        if matching_lines.is_empty() {
+        if marked.is_empty() {
             return Ok(());
         }
 
@@ -1323,64 +1321,54 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         // "inside a global", which silently disabled undo for the rest of
         // the session.
         self.buf.begin_global();
-        let outcome = self.run_global_commands(commands, &matching_lines);
+        let outcome = self.run_global_commands(commands, &marked);
         self.buf.end_global();
         outcome
     }
 
-    /// Run a `g`/`v` command list against each already-matched line.
-    fn run_global_commands(&mut self, commands: &str, matching_lines: &[usize]) -> EdResult<()> {
-        let mut matching_lines = matching_lines.to_vec();
+    /// The first step of g/v/G/V: mark every line of the range that matches
+    /// (or, inverted, does not).  The marks are line identities, so each
+    /// pass finds its line wherever earlier passes moved it, and a marked
+    /// line an earlier pass deleted or replaced is simply gone.  Counting
+    /// lines added and removed could not follow a line `m` moved, nor tell
+    /// which line a `+1d` had taken.
+    fn mark_matches(
+        &mut self,
+        addr1: &Address,
+        addr2: &Address,
+        pattern: &str,
+        invert: bool,
+    ) -> EdResult<Vec<u64>> {
+        let (start, end) = self.resolve_range(addr1, addr2)?;
+        let (_, re) = self.compile_re(pattern)?;
+        let mut marked = Vec::new();
+        for i in start..=end {
+            if let Some(line) = self.buf.get_line(i) {
+                if re.is_match(line.trim_end_matches('\n')) != invert {
+                    marked.extend(self.buf.line_id(i));
+                }
+            }
+        }
+        Ok(marked)
+    }
 
-        // Track the current line set by the last successfully executed command
-        let original_cur_line = self.buf.cur_line;
-        let mut last_successful_line = original_cur_line;
-
-        // Parse the command list into individual commands (handles a/i/c with embedded input)
+    /// Run a `g`/`v` command list against each marked line still there.
+    fn run_global_commands(&mut self, commands: &str, marked: &[u64]) -> EdResult<()> {
+        // Parsed up front: a bad command fails the global before any change.
         let global_commands = parse_global_command_list(commands)?;
 
-        // For delete commands, process in reverse order to avoid line number shifts
-        // (Only a plain `d` of the current line: what reversing assumes.)
-        let is_delete_only = global_commands.len() == 1
-            && match &global_commands[0].parsed {
-                Parsed {
-                    cmd: Command::Delete(a1, a2),
-                    suffix,
-                } => !suffix.any() && [a1, a2].iter().all(|a| **a == Address::current_line()),
-                _ => false,
+        // POSIX: when g completes, the current line is the one the last
+        // command assigned.
+        let mut last_line = self.buf.cur_line;
+        let mut hint = 1;
+
+        for &id in marked {
+            let Some(line) = self.buf.line_of_id_near(id, hint) else {
+                continue; // deleted or replaced by an earlier pass
             };
-        if is_delete_only {
-            matching_lines.reverse();
-        }
+            hint = line;
+            self.buf.set_cur_line(line)?;
 
-        // Track line offset for insert/append operations
-        // When we insert N lines, subsequent matching line numbers shift by N
-        let mut line_offset: isize = 0;
-
-        // Execute commands on each matching line
-        for line_num in matching_lines {
-            // Adjust line_num for lines that may have been deleted or shifted
-            let adjusted_line = if is_delete_only {
-                line_num
-            } else {
-                // Apply offset for lines that shifted due to insertions
-                let shifted = (line_num as isize + line_offset) as usize;
-                // Check if line still exists
-                if shifted > self.buf.line_count() || shifted == 0 {
-                    continue;
-                }
-                shifted
-            };
-
-            // Set current line
-            if self.buf.set_cur_line(adjusted_line).is_err() {
-                continue; // Line may have been deleted
-            }
-
-            // Track line count before command to detect insertions
-            let line_count_before = self.buf.line_count();
-
-            // Execute each command in the command list
             for gc in &global_commands {
                 // a/i/c take their text from the command list, so run them
                 // here even when that text is empty.  POSIX lets the `.` be
@@ -1398,19 +1386,11 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                     // Abort the global on error and propagate.
                     self.run_parsed(gc.parsed.clone())?;
                 }
-                last_successful_line = self.buf.cur_line;
-            }
-
-            // Update line offset based on how many lines were added/removed
-            if !is_delete_only {
-                let line_count_after = self.buf.line_count();
-                line_offset += line_count_after as isize - line_count_before as isize;
+                last_line = self.buf.cur_line;
             }
         }
 
-        // POSIX: When g command completes, current line is value assigned by last command
-        let _ = self.buf.set_cur_line(last_successful_line);
-
+        let _ = self.buf.set_cur_line(last_line);
         Ok(())
     }
 
@@ -1423,39 +1403,26 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         pattern: &str,
         invert: bool,
     ) -> EdResult<()> {
-        let (start, end) = self.resolve_range(&addr1, &addr2)?;
-
-        let (_, re) = self.compile_re(pattern)?;
-
-        // Collect matching lines first
-        let mut matching_lines = Vec::new();
-        for i in start..=end {
-            if let Some(line) = self.buf.get_line(i) {
-                let matches = re.is_match(line.trim_end_matches('\n'));
-                if matches != invert {
-                    matching_lines.push(i);
-                }
-            }
-        }
-
-        if matching_lines.is_empty() {
+        let marked = self.mark_matches(&addr1, &addr2, pattern, invert)?;
+        if marked.is_empty() {
             return Ok(());
         }
 
         // Save one undo record for the entire operation; see the note in
         // `execute_global` for why the pairing lives out here.
         self.buf.begin_global();
-        let outcome = self.run_global_interactive(&matching_lines);
+        let outcome = self.run_global_interactive(&marked);
         self.buf.end_global();
         outcome
     }
 
-    /// Prompt for and run a command per already-matched line (`G`/`V`).
-    fn run_global_interactive(&mut self, matching_lines: &[usize]) -> EdResult<()> {
-        let mut matching_lines = matching_lines.to_vec();
-
-        let mut idx = 0;
-        while idx < matching_lines.len() {
+    /// Prompt for and run a command per marked line still there (`G`/`V`).
+    fn run_global_interactive(&mut self, marked: &[u64]) -> EdResult<()> {
+        // POSIX: `&` repeats the last command "within the current invocation
+        // of G", never one from an earlier G.
+        self.last_interactive_cmd = None;
+        let mut hint = 1;
+        for &id in marked {
             // Check for SIGINT
             if crate::SIGINT_RECEIVED.swap(false, Ordering::SeqCst) {
                 writeln!(self.writer, "?")?;
@@ -1463,19 +1430,18 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 return Ok(());
             }
 
-            let line_num = matching_lines[idx];
+            let Some(line_num) = self.buf.line_of_id_near(id, hint) else {
+                continue; // deleted or replaced by an earlier command
+            };
+            hint = line_num;
 
-            // Check if line still exists (may have been deleted by previous commands)
-            if line_num == 0 || line_num > self.buf.line_count() {
-                idx += 1;
-                continue;
-            }
-
-            // Print the line
+            // Show the line the command will act on; it is the current line
+            // from now, whatever is typed -- a null command included.
             if let Some(line) = self.buf.get_line(line_num) {
                 write!(self.writer, "{}", line)?;
             }
             self.writer.flush()?;
+            self.buf.set_cur_line(line_num)?;
 
             // Read command from user
             let cmd_line = match self.read_line()? {
@@ -1487,71 +1453,38 @@ impl<R: BufRead, W: Write> Editor<R, W> {
 
             // Empty line = skip, no action
             if trimmed.is_empty() {
-                idx += 1;
                 continue;
             }
 
             // & = repeat previous command
             let cmd_str = if trimmed == "&" {
-                match &self.last_interactive_cmd {
-                    Some(prev) => prev.clone(),
-                    None => {
-                        // No previous command
-                        idx += 1;
-                        continue;
-                    }
-                }
+                self.last_interactive_cmd
+                    .clone()
+                    .ok_or_else(|| EdError::Generic("no previous command".to_string()))?
             } else {
                 self.last_interactive_cmd = Some(trimmed.to_string());
                 trimmed.to_string()
             };
 
-            // Set current line and execute
-            if self.buf.set_cur_line(line_num).is_err() {
-                idx += 1;
-                continue;
+            // A command that fails ends the G, as in historical ed: going on
+            // would read the following input as answers to prompts the user
+            // never saw.
+            let parsed = parse(&cmd_str)?;
+            // POSIX: in the interactive G/V prompt, any one command other
+            // than a, c, i, g, G, v, V may be executed.
+            if matches!(
+                parsed.cmd,
+                Command::Append(..)
+                    | Command::Change(..)
+                    | Command::Insert(..)
+                    | Command::Global(..)
+                    | Command::GlobalNot(..)
+                    | Command::GlobalInteractive(..)
+                    | Command::GlobalNotInteractive(..)
+            ) {
+                return Err(EdError::Generic("invalid command".to_string()));
             }
-
-            // Track line count before and after to adjust remaining line numbers
-            let lines_before = self.buf.line_count();
-
-            match parse(&cmd_str) {
-                Ok(parsed) => {
-                    // POSIX: in the interactive G/V prompt, any one command
-                    // other than a, c, i, g, G, v, V may be executed.
-                    if matches!(
-                        parsed.cmd,
-                        Command::Append(..)
-                            | Command::Change(..)
-                            | Command::Insert(..)
-                            | Command::Global(..)
-                            | Command::GlobalNot(..)
-                            | Command::GlobalInteractive(..)
-                            | Command::GlobalNotInteractive(..)
-                    ) {
-                        self.print_error(&EdError::Generic("invalid command".to_string()))?;
-                    } else if let Err(e) = self.run_parsed(parsed) {
-                        self.print_error(&e)?;
-                    }
-                }
-                Err(e) => {
-                    self.print_error(&e)?;
-                }
-            }
-
-            // Adjust remaining line numbers if lines were deleted or added
-            let lines_after = self.buf.line_count();
-            if lines_after != lines_before {
-                let diff = lines_after as isize - lines_before as isize;
-                // Adjust all remaining line numbers (those after current position)
-                for remaining_line in &mut matching_lines[(idx + 1)..] {
-                    if *remaining_line > line_num {
-                        *remaining_line = (*remaining_line as isize + diff) as usize;
-                    }
-                }
-            }
-
-            idx += 1;
+            self.run_parsed(parsed)?;
         }
 
         Ok(())

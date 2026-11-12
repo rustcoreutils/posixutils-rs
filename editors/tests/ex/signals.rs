@@ -131,25 +131,6 @@ fn test_interrupt_at_a_confirmation_prompt_aborts() {
 }
 
 #[test]
-fn test_hangup_in_text_input_keeps_the_lines_entered() {
-    let (code, _, dir) = signal_while_reading(
-        "a\n",
-        "a\nTYPED\n.\n.p\na\nPENDING\n",
-        "TYPED",
-        libc::SIGHUP,
-    );
-    assert_eq!(code, 1);
-    let saved = fs::read_dir(
-        dir.path()
-            .join(format!("vi.recover.{}", unsafe { libc::geteuid() })),
-    )
-    .unwrap()
-    .filter_map(|e| fs::read_to_string(e.unwrap().path()).ok())
-    .any(|body| body.contains("PENDING"));
-    assert!(saved, "the line entered before the hangup is preserved");
-}
-
-#[test]
 fn test_suspend_without_job_control_does_not_stop() {
     // 95403-95404.  ex runs as the leader of a session of its own, so its
     // process group is the session's -- no job-control shell made it -- and

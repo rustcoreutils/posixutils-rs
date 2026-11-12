@@ -42,9 +42,25 @@ fn run_env(dir: &Path, args: &[&OsStr], script: &[u8], env: &[(&str, &str)]) -> 
 
 /// `ed -s f` on a file holding `content`; (stdout, exit code, file after).
 fn ed(content: &[u8], script: &[u8]) -> (Vec<u8>, i32, Vec<u8>) {
+    ed_env(content, script, &[])
+}
+
+/// `ed`, in the C locale: where every byte is a character, so an RE that
+/// holds a byte which is no UTF-8 is defined.  (In a UTF-8 locale it is not:
+/// glibc matches the byte, macOS's regcomp refuses the pattern.)
+fn ed_c(content: &[u8], script: &[u8]) -> (Vec<u8>, i32, Vec<u8>) {
+    ed_env(content, script, &[("LC_ALL", "C")])
+}
+
+fn ed_env(content: &[u8], script: &[u8], env: &[(&str, &str)]) -> (Vec<u8>, i32, Vec<u8>) {
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("f"), content).unwrap();
-    let (out, code) = run(dir.path(), &[OsStr::new("-s"), OsStr::new("f")], script);
+    let (out, code) = run_env(
+        dir.path(),
+        &[OsStr::new("-s"), OsStr::new("f")],
+        script,
+        env,
+    );
     (out, code, fs::read(dir.path().join("f")).unwrap())
 }
 
@@ -64,16 +80,16 @@ fn test_non_utf8_file_lists_as_octal() {
 
 #[test]
 fn test_non_utf8_pattern_and_replacement() {
-    let (_, code, file) = ed(b"a\xffb\n", b"s/\xff/\xfe\xfe/\nw\nq\n");
+    let (_, code, file) = ed_c(b"a\xffb\n", b"s/\xff/\xfe\xfe/\nw\nq\n");
     assert_eq!(code, 0);
     assert_eq!(file, b"a\xfe\xfeb\n");
 }
 
 #[test]
 fn test_non_utf8_global_and_address() {
-    let (_, _, file) = ed(b"x\n\xff1\ny\n\xff2\n", b"g/\xff/d\nw\nq\n");
+    let (_, _, file) = ed_c(b"x\n\xff1\ny\n\xff2\n", b"g/\xff/d\nw\nq\n");
     assert_eq!(file, b"x\ny\n");
-    let (out, _, _) = ed(b"x\n\xff1\n", b"/\xff/p\nQ\n");
+    let (out, _, _) = ed_c(b"x\n\xff1\n", b"/\xff/p\nQ\n");
     assert_eq!(out, b"\xff1\n");
 }
 
@@ -100,7 +116,10 @@ fn test_non_utf8_read_file_and_command_output() {
 fn test_non_utf8_pathname() {
     let dir = TempDir::new().unwrap();
     let name = OsStr::from_bytes(b"n\xffm");
-    fs::write(dir.path().join(name), b"old\n").unwrap();
+    let Some(_) = plib::testing::create_non_utf8(dir.path(), b"n\xffm", |p| fs::write(p, b"old\n"))
+    else {
+        return;
+    };
     run(
         dir.path(),
         &[OsStr::new("-s")],

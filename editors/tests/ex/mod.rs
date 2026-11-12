@@ -1729,7 +1729,10 @@ fn assert_non_utf8_operand_edits(editor: &str) {
     use plib::testing::os_bytes;
     let dir = TempDir::new().unwrap();
     let name = os_bytes(b"x\xff");
-    fs::write(dir.path().join(&name), b"old\n").unwrap();
+    let Some(_) = plib::testing::create_non_utf8(dir.path(), b"x\xff", |p| fs::write(p, b"old\n"))
+    else {
+        return;
+    };
     let mut child = Command::new(get_binary_path(editor))
         .arg("-s")
         .arg(&name)

@@ -156,11 +156,21 @@ fn test_ex_read_file_is_undoable() {
 
 /// `ex -s` in `dir` with raw `args` and a raw `script`: (stdout, status).
 fn ex_raw(dir: &Path, args: &[&std::ffi::OsStr], script: &[u8]) -> (Vec<u8>, i32) {
+    ex_raw_env(dir, args, script, &[])
+}
+
+fn ex_raw_env(
+    dir: &Path,
+    args: &[&std::ffi::OsStr],
+    script: &[u8],
+    env: &[(&str, &str)],
+) -> (Vec<u8>, i32) {
     let mut child = Command::new(get_binary_path("ex"))
         .arg("-s")
         .args(args)
         .current_dir(dir)
         .env("TMPDIR", dir)
+        .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -202,7 +212,18 @@ fn test_ex_print_and_list_non_utf8() {
 
 #[test]
 fn test_ex_substitute_non_utf8_pattern() {
-    let (_, code, file) = ex_bytes(b"a\xffb\n", b"s/\xff/\xfe\xfe/\nwq\n");
+    // In the C locale, where a byte that is no UTF-8 is a character and an
+    // RE holding it defined (see `ed_c` in the ed tests).
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("f"), b"a\xffb\n").unwrap();
+    let f = std::ffi::OsStr::new("f");
+    let (_, code) = ex_raw_env(
+        dir.path(),
+        &[f],
+        b"s/\xff/\xfe\xfe/\nwq\n",
+        &[("LC_ALL", "C")],
+    );
+    let file = fs::read(dir.path().join("f")).unwrap();
     assert_eq!((code, file.as_slice()), (0, &b"a\xfe\xfeb\n"[..]));
 }
 
@@ -227,7 +248,10 @@ fn test_ex_non_utf8_pathname_argument() {
     use std::os::unix::ffi::OsStrExt;
     let dir = TempDir::new().unwrap();
     let name = std::ffi::OsStr::from_bytes(b"n\xffm");
-    fs::write(dir.path().join(name), b"old\n").unwrap();
+    let Some(_) = plib::testing::create_non_utf8(dir.path(), b"n\xffm", |p| fs::write(p, b"old\n"))
+    else {
+        return;
+    };
     let (_, code) = ex_raw(dir.path(), &[name], b"s/old/new/\nwq\n");
     assert_eq!(code, 0);
     assert_eq!(fs::read(dir.path().join(name)).unwrap(), b"new\n");
@@ -237,6 +261,10 @@ fn test_ex_non_utf8_pathname_argument() {
 fn test_ex_write_to_non_utf8_pathname() {
     use std::os::unix::ffi::OsStrExt;
     let dir = TempDir::new().unwrap();
+    // ex makes the name here; a filesystem that refuses it cannot have it.
+    if !plib::testing::non_utf8_names_supported(dir.path()) {
+        return;
+    }
     fs::write(dir.path().join("f"), b"t\n").unwrap();
     ex_raw(dir.path(), &[std::ffi::OsStr::new("f")], b"w o\xffut\nq\n");
     let out = dir.path().join(std::ffi::OsStr::from_bytes(b"o\xffut"));
@@ -284,8 +312,14 @@ fn test_ex_non_utf8_current_pathname_is_kept() {
     let dir = TempDir::new().unwrap();
     let a = std::ffi::OsStr::from_bytes(b"a\xff");
     let b = std::ffi::OsStr::from_bytes(b"b\xfe");
-    fs::write(dir.path().join(a), b"one\n").unwrap();
-    fs::write(dir.path().join(b), b"two\n").unwrap();
+    let made = [(b"a\xff", b"one\n"), (b"b\xfe", b"two\n")]
+        .iter()
+        .all(|(n, body)| {
+            plib::testing::create_non_utf8(dir.path(), *n, |p| fs::write(p, body)).is_some()
+        });
+    if !made {
+        return;
+    }
     let (out, code) = ex_raw(dir.path(), &[a, b], b"e!\np\nr\n$p\nn!\np\n!cat %\nq\n");
     assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
     assert_eq!(out, b"one\none\ntwo\ntwo\n");

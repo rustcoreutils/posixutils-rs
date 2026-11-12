@@ -170,7 +170,11 @@ impl Default for Options {
             term: std::env::var("TERM").unwrap_or_else(|_| "xterm".to_string()),
 
             // Shell
-            shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
+            // 95905-95909: from SHELL, or `sh` if that is unset or empty.
+            shell: std::env::var("SHELL")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "sh".to_string()),
 
             // Additional POSIX options (defaults per the spec)
             beautify: false,
@@ -329,6 +333,11 @@ impl Options {
                 self.wrapmargin = value
                     .parse()
                     .map_err(|_| ViError::InvalidOption(format!("{}={}", name, value)))?;
+            }
+            // 95904 (and paragraphs likewise): character pairs, so an odd
+            // number of characters is an error.
+            "paragraphs" | "sections" if !value.chars().count().is_multiple_of(2) => {
+                return Err(ViError::InvalidOption(format!("{}={}", name, value)));
             }
             "paragraphs" => self.paragraphs = value.to_string(),
             "sections" => self.sections = value.to_string(),

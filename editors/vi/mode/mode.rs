@@ -61,6 +61,8 @@ pub enum InsertKind {
     Change,
     /// Substitute (s).
     Substitute,
+    /// Replace characters (R): typed characters overwrite the line's.
+    Replace,
 }
 
 impl std::fmt::Display for Mode {

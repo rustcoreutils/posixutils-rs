@@ -10,15 +10,164 @@
 //! Buffer management for the ed editor.
 
 use crate::ed::error::{EdError, EdResult};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
+
+/// One line of the buffer and the identity it keeps while it exists.
+///
+/// Historical ed stores marks as pointers into a linked list of lines, so a
+/// mark follows its line through every edit and comes back with it on undo.
+/// The identity gives a `Vec` the same property: marks name an identity,
+/// not a position, so nothing has to renumber them, and an undo that puts
+/// the old lines back puts their identities back too.
+#[derive(Clone, Debug)]
+struct Line {
+    id: u64,
+    text: Vec<u8>,
+}
+
+/// The buffer's lines, held as a gap buffer: one array with a run of empty
+/// slots (the gap) at the last edit, so edits at the gap are O(1) and moving
+/// it is one slice rotation over the distance moved.
+///
+/// ed's edits cluster around a moving position -- a global's passes walk
+/// down the buffer -- and with a plain `Vec` every edit near the front moved
+/// every line after it: `g/re/d` over a large file was quadratic.
+#[derive(Debug, Default)]
+struct LineStore {
+    /// Lines, with `None` in the gap `gap_start..gap_end` and nowhere else.
+    slots: Vec<Option<Line>>,
+    gap_start: usize,
+    gap_end: usize,
+}
+
+/// A copy holds the live lines alone: undo snapshots every command, and
+/// copying the gap too made each snapshot cost what the buffer once held.
+impl Clone for LineStore {
+    fn clone(&self) -> Self {
+        LineStore::from_vec(self.range(0, self.len()).cloned().collect())
+    }
+}
+
+impl LineStore {
+    fn from_vec(lines: Vec<Line>) -> Self {
+        let len = lines.len();
+        LineStore {
+            slots: lines.into_iter().map(Some).collect(),
+            gap_start: len,
+            gap_end: len,
+        }
+    }
+
+    fn gap_len(&self) -> usize {
+        self.gap_end - self.gap_start
+    }
+
+    fn len(&self) -> usize {
+        self.slots.len() - self.gap_len()
+    }
+
+    /// Line `i`, counting from 0.
+    fn get(&self, i: usize) -> Option<&Line> {
+        let slot = if i < self.gap_start {
+            i
+        } else {
+            i + self.gap_len()
+        };
+        self.slots.get(slot).and_then(Option::as_ref)
+    }
+
+    /// Lines `start..end`, counting from 0: the part before the gap, then
+    /// the part after it.
+    fn range(&self, start: usize, end: usize) -> impl Iterator<Item = &Line> {
+        let end = end.min(self.len());
+        let start = start.min(end);
+        let slot = |i: usize| {
+            if i < self.gap_start {
+                i
+            } else {
+                i + self.gap_len()
+            }
+        };
+        let split = self.gap_start.clamp(start, end);
+        self.slots[start..split]
+            .iter()
+            .chain(self.slots[slot(split)..slot(end).max(slot(split))].iter())
+            .flatten()
+    }
+
+    /// Put the gap before line `at`, counting from 0.
+    fn move_gap(&mut self, at: usize) {
+        let at = at.min(self.len());
+        let gap = self.gap_len();
+        if at < self.gap_start {
+            // [lines at..gap_start][gap] -> [gap][lines]
+            self.slots[at..self.gap_end].rotate_right(gap);
+        } else if at > self.gap_start {
+            // [gap][lines gap_end..] -> [lines][gap]
+            self.slots[self.gap_start..at + gap].rotate_left(gap);
+        }
+        self.gap_start = at;
+        self.gap_end = at + gap;
+    }
+
+    /// Make the gap at least `n` slots long, growing it geometrically.
+    fn reserve_gap(&mut self, n: usize) {
+        if self.gap_len() < n {
+            let extra = n.max(self.slots.len() / 2).max(16);
+            self.slots.splice(
+                self.gap_end..self.gap_end,
+                std::iter::repeat_with(|| None).take(extra),
+            );
+            self.gap_end += extra;
+        }
+    }
+
+    /// Replace lines `start..end` (counting from 0) with `new`, returning
+    /// the lines removed, in order.
+    fn splice(&mut self, start: usize, end: usize, new: Vec<Line>) -> Vec<Line> {
+        let start = start.min(self.len());
+        self.move_gap(start);
+        let count = end.saturating_sub(start).min(self.len() - start);
+        let removed = self.slots[self.gap_end..self.gap_end + count]
+            .iter_mut()
+            .filter_map(Option::take)
+            .collect();
+        self.gap_end += count;
+        // A buffer that was once large and has shrunk keeps no more than a
+        // gap the size of what is left.
+        if self.gap_len() > 2 * self.len() + 1024 {
+            *self = self.clone();
+            self.move_gap(start);
+        }
+        self.reserve_gap(new.len());
+        for line in new {
+            self.slots[self.gap_start] = Some(line);
+            self.gap_start += 1;
+        }
+        removed
+    }
+
+    /// The index (from 0) of the line with identity `id`, looking from
+    /// index `from` onward first, then before it.
+    fn position_near(&self, id: u64, from: usize) -> Option<usize> {
+        let len = self.len();
+        let from = from.min(len);
+        (from..len)
+            .chain(0..from)
+            .find(|&i| self.get(i).is_some_and(|l| l.id == id))
+    }
+}
 
 /// Undo record storing previous buffer state.
 #[derive(Clone, Debug)]
 pub struct UndoRecord {
     /// Lines before the change
-    lines: Vec<String>,
+    lines: LineStore,
     /// Current line before the change
     cur_line: usize,
     /// Whether the buffer was modified before the change
@@ -29,15 +178,17 @@ pub struct UndoRecord {
 #[derive(Debug)]
 pub struct Buffer {
     /// The remembered filename
-    pub pathname: String,
+    pub pathname: Vec<u8>,
     /// Current line number (1-indexed, 0 means empty buffer)
     pub cur_line: usize,
     /// All lines in the buffer
-    lines: Vec<String>,
+    lines: LineStore,
+    /// The identity the next new line gets.
+    next_id: u64,
     /// Whether the buffer has been modified since last write
     pub modified: bool,
-    /// Line marks ('a'-'z')
-    marks: HashMap<char, usize>,
+    /// Line marks ('a'-'z'), by line identity
+    marks: HashMap<char, u64>,
     /// Single-level undo (POSIX requirement)
     undo_record: Option<UndoRecord>,
     /// Nesting depth of the current undo group.  While non-zero, individual
@@ -57,48 +208,28 @@ pub struct Buffer {
     /// substitution may not split a line inside a global -- and so must not
     /// become true merely because some other command grouped its undo.
     in_global: bool,
-}
-
-/// A structural change to the buffer's line numbering.
-///
-/// Every mutator reports one of these so that line *references* -- marks
-/// today -- keep denoting the same text.  Historical ed gets this for free by
-/// storing marks as pointers into a linked list; with a `Vec<String>` the
-/// bookkeeping has to be explicit, and doing it in `delete` alone left a mark
-/// silently naming a different line after any other edit.
-#[derive(Debug, Clone, Copy)]
-enum LineEdit {
-    /// `count` lines inserted immediately after line `after`.
-    Insert { after: usize, count: usize },
-    /// Lines `start..=end` removed.
-    Delete { start: usize, end: usize },
-    /// Lines `start..=end` replaced by `count` new lines.
-    Replace {
-        start: usize,
-        end: usize,
-        count: usize,
-    },
-    /// Lines `start..=end` moved to immediately after line `dest`.
-    Move {
-        start: usize,
-        end: usize,
-        dest: usize,
-    },
+    /// During a global: the identities of the lines it has deleted or
+    /// replaced, so looking for a marked line an earlier pass removed fails
+    /// at once rather than after scanning the buffer -- which made a global
+    /// whose passes delete later marked lines (`g/x/.,+1d`) quadratic.
+    gone: Option<HashSet<u64>>,
 }
 
 impl Buffer {
     /// Create a new empty buffer.
     pub fn new() -> Buffer {
         Buffer {
-            pathname: String::new(),
+            pathname: Vec::new(),
             cur_line: 0,
-            lines: Vec::new(),
+            lines: LineStore::default(),
+            next_id: 0,
             modified: false,
             marks: HashMap::new(),
             undo_record: None,
             undo_depth: 0,
             group_snapshotted: false,
             in_global: false,
+            gone: None,
         }
     }
 
@@ -122,12 +253,64 @@ impl Buffer {
     }
 
     /// Get a line by number (1-indexed).
-    pub fn get_line(&self, line_num: usize) -> Option<&String> {
-        if line_num == 0 || line_num > self.lines.len() {
-            None
-        } else {
-            Some(&self.lines[line_num - 1])
+    pub fn get_line(&self, line_num: usize) -> Option<&[u8]> {
+        line_num
+            .checked_sub(1)
+            .and_then(|i| self.lines.get(i))
+            .map(|l| l.text.as_slice())
+    }
+
+    /// The identity of line `line_num`, which it keeps through every edit
+    /// that does not replace or delete it.
+    pub fn line_id(&self, line_num: usize) -> Option<u64> {
+        line_num
+            .checked_sub(1)
+            .and_then(|i| self.lines.get(i))
+            .map(|l| l.id)
+    }
+
+    /// Where the line with identity `id` is now, if it still exists.
+    pub fn line_of_id(&self, id: u64) -> Option<usize> {
+        self.line_of_id_near(id, 1)
+    }
+
+    /// `line_of_id`, looking from line `hint` onward first, then before it.
+    ///
+    /// A global visits its marked lines in order, and each is usually at or
+    /// just after where the previous one was, so starting there keeps a
+    /// global over a large buffer from being quadratic.
+    pub fn line_of_id_near(&self, id: u64, hint: usize) -> Option<usize> {
+        if self.gone.as_ref().is_some_and(|gone| gone.contains(&id)) {
+            return None;
         }
+        self.lines
+            .position_near(id, hint.saturating_sub(1))
+            .map(|i| i + 1)
+    }
+
+    /// Fresh lines, each with a new identity.
+    fn new_lines(&mut self, texts: &[Vec<u8>]) -> Vec<Line> {
+        texts
+            .iter()
+            .map(|text| {
+                let id = self.next_id;
+                self.next_id += 1;
+                Line {
+                    id,
+                    text: text.clone(),
+                }
+            })
+            .collect()
+    }
+
+    /// Replace the whole buffer with `texts`, as a read does: nothing to
+    /// undo, no marks.
+    fn reset_lines(&mut self, texts: &[Vec<u8>]) {
+        self.lines = LineStore::from_vec(self.new_lines(texts));
+        self.cur_line = self.lines.len();
+        self.modified = false;
+        self.marks.clear();
+        self.undo_record = None;
     }
 
     /// Take the undo snapshot unconditionally.
@@ -173,11 +356,13 @@ impl Buffer {
     pub fn begin_global(&mut self) {
         self.begin_undo_group();
         self.in_global = true;
+        self.gone = Some(HashSet::new());
     }
 
     /// End a global command.
     pub fn end_global(&mut self) {
         self.in_global = false;
+        self.gone = None;
         self.end_undo_group();
     }
 
@@ -187,6 +372,10 @@ impl Buffer {
     }
 
     /// Undo the last change. Returns true if undo was performed.
+    ///
+    /// Marks need nothing: the restored lines carry their identities, so a
+    /// mark on one of them names it again, and a mark on a line the change
+    /// made is gone with that line.
     pub fn undo(&mut self) -> bool {
         if let Some(record) = self.undo_record.take() {
             // Swap current state with undo record
@@ -196,136 +385,78 @@ impl Buffer {
                 modified: std::mem::replace(&mut self.modified, record.modified),
             };
             self.undo_record = Some(current);
+            // Lines a global removed may be back.
+            if let Some(gone) = &mut self.gone {
+                gone.clear();
+            }
             true
         } else {
             false
         }
     }
 
-    /// Renumber line references to survive a structural change.
-    fn apply_line_edit(&mut self, edit: LineEdit) {
-        match edit {
-            LineEdit::Insert { after, count } => {
-                for line in self.marks.values_mut() {
-                    if *line > after {
-                        *line += count;
-                    }
-                }
-            }
-            LineEdit::Delete { start, end } => {
-                // A mark on removed text goes with it: `'a` then reports an
-                // invalid address rather than naming whatever moved up.
-                self.marks.retain(|_, line| *line < start || *line > end);
-                let removed = end - start + 1;
-                for line in self.marks.values_mut() {
-                    if *line > end {
-                        *line -= removed;
-                    }
-                }
-            }
-            LineEdit::Replace { start, end, count } => {
-                self.marks.retain(|_, line| *line < start || *line > end);
-                let removed = end - start + 1;
-                for line in self.marks.values_mut() {
-                    if *line > end {
-                        *line = *line - removed + count;
-                    }
-                }
-            }
-            LineEdit::Move { start, end, dest } => {
-                let moved = end - start + 1;
-                // Where the block lands once it has been lifted out.
-                let landing = if dest > end { dest - moved } else { dest };
-                for line in self.marks.values_mut() {
-                    *line = if *line >= start && *line <= end {
-                        // Inside the block: keep its offset, follow the text.
-                        landing + (*line - start) + 1
-                    } else if *line < start {
-                        if *line > landing {
-                            *line + moved
-                        } else {
-                            *line
-                        }
-                    } else {
-                        // Below the block, so it first shifts up by `moved`.
-                        let lifted = *line - moved;
-                        if lifted > landing {
-                            *line
-                        } else {
-                            lifted
-                        }
-                    };
-                }
-            }
+    /// The current line after lines were removed from `start` on with
+    /// nothing put in their place.
+    ///
+    /// POSIX: "The address of the line after the last line deleted shall
+    /// become the current line number; if the lines deleted were originally
+    /// at the end of the buffer, the current line number shall be set to the
+    /// address of the new last line; if no lines remain in the buffer, the
+    /// current line number shall be set to zero."
+    fn cur_after_removal(&self, start: usize) -> usize {
+        start.min(self.lines.len())
+    }
+
+    /// Note lines removed for good, for a global looking for its marks.
+    fn note_gone(&mut self, removed: Vec<Line>) {
+        if let Some(gone) = &mut self.gone {
+            gone.extend(removed.into_iter().map(|l| l.id));
         }
     }
 
+    /// Check that `dest` is a line `m` or `t` can put lines after (0: before
+    /// the first).
+    fn check_dest(&self, dest: usize) -> EdResult<()> {
+        if dest > self.lines.len() {
+            return Err(EdError::AddressOutOfRange);
+        }
+        Ok(())
+    }
+
+    /// Check that `start..=end` is a non-empty range of existing lines.
+    fn check_range(&self, start: usize, end: usize) -> EdResult<()> {
+        if start == 0 || start > end || end > self.lines.len() {
+            return Err(EdError::AddressOutOfRange);
+        }
+        Ok(())
+    }
+
     /// Append lines after the current line (or at start if empty).
-    pub fn append(&mut self, at_line: usize, lines: &[String]) {
+    pub fn append(&mut self, at_line: usize, lines: &[Vec<u8>]) {
         self.save_undo();
 
-        let insert_idx = if at_line == 0 { 0 } else { at_line };
-
-        for (i, line) in lines.iter().enumerate() {
-            self.lines.insert(insert_idx + i, line.clone());
-        }
-
         if !lines.is_empty() {
-            self.cur_line = insert_idx + lines.len();
+            let new = self.new_lines(lines);
+            self.lines.splice(at_line, at_line, new);
+            self.cur_line = at_line + lines.len();
             self.modified = true;
-            self.apply_line_edit(LineEdit::Insert {
-                after: insert_idx,
-                count: lines.len(),
-            });
         }
     }
 
     /// Insert lines before the specified line.
-    pub fn insert(&mut self, before_line: usize, lines: &[String]) {
-        self.save_undo();
-
-        let insert_idx = if before_line == 0 { 0 } else { before_line - 1 };
-
-        for (i, line) in lines.iter().enumerate() {
-            self.lines.insert(insert_idx + i, line.clone());
-        }
-
-        if !lines.is_empty() {
-            self.cur_line = insert_idx + lines.len();
-            self.modified = true;
-            self.apply_line_edit(LineEdit::Insert {
-                after: insert_idx,
-                count: lines.len(),
-            });
-        }
+    pub fn insert(&mut self, before_line: usize, lines: &[Vec<u8>]) {
+        self.append(before_line.saturating_sub(1), lines);
     }
 
     /// Delete lines from start to end (inclusive, 1-indexed).
     pub fn delete(&mut self, start: usize, end: usize) -> EdResult<()> {
-        if start == 0 || start > end || end > self.lines.len() {
-            return Err(EdError::AddressOutOfRange);
-        }
+        self.check_range(start, end)?;
 
         self.save_undo();
-        self.lines.drain(start - 1..end);
-
-        // POSIX: "The address of the line after the last line deleted shall
-        // become the current line number; if the lines deleted were originally
-        // at the end of the buffer, the current line number shall be set to
-        // the address of the new last line; if no lines remain in the buffer,
-        // the current line number shall be set to zero."
-        if self.lines.is_empty() {
-            self.cur_line = 0;
-        } else if start <= self.lines.len() {
-            // Line after deleted exists at position 'start'
-            self.cur_line = start;
-        } else {
-            // Deleted at end, current is new last line
-            self.cur_line = self.lines.len();
-        }
-
+        let removed = self.lines.splice(start - 1, end, Vec::new());
+        self.note_gone(removed);
+        self.cur_line = self.cur_after_removal(start);
         self.modified = true;
-        self.apply_line_edit(LineEdit::Delete { start, end });
 
         Ok(())
     }
@@ -342,9 +473,9 @@ impl Buffer {
         }
 
         let mut byte_count = 0;
-        for line in &self.lines[start_line - 1..end_line] {
-            writer.write_all(line.as_bytes())?;
-            byte_count += line.len();
+        for line in self.lines.range(start_line - 1, end_line) {
+            writer.write_all(&line.text)?;
+            byte_count += line.text.len();
         }
         Ok(byte_count)
     }
@@ -354,9 +485,9 @@ impl Buffer {
         &mut self,
         start_line: usize,
         end_line: usize,
-        pathname: &str,
+        pathname: &[u8],
     ) -> io::Result<usize> {
-        let mut file = fs::File::create(pathname)?;
+        let mut file = fs::File::create(as_path(pathname))?;
         let bytes = self.write_lines(start_line, end_line, &mut file)?;
 
         // If we wrote the whole buffer, mark as unmodified
@@ -367,162 +498,117 @@ impl Buffer {
         Ok(bytes)
     }
 
+    /// Split everything `reader` holds into buffer lines, and say how many
+    /// bytes that was.
+    ///
+    /// Bytes, not text: ed edits any file, and reading it as UTF-8 refused
+    /// one byte that was not -- after `e` had already taken its name, so a
+    /// later `w` wrote an empty buffer over it.  A last line without a
+    /// newline gets one, as historical ed does, or text appended after it
+    /// would be glued onto it; the count is still of the bytes read.
+    fn split_lines<R: BufRead>(mut reader: R) -> io::Result<(Vec<Vec<u8>>, usize)> {
+        let mut lines = Vec::new();
+        let mut byte_count = 0;
+        loop {
+            let mut line = Vec::new();
+            let n = reader.read_until(b'\n', &mut line)?;
+            if n == 0 {
+                break;
+            }
+            byte_count += n;
+            if line.last() != Some(&b'\n') {
+                line.push(b'\n');
+            }
+            lines.push(line);
+        }
+        Ok((lines, byte_count))
+    }
+
+    /// Read every line of `pathname`, and how many bytes that was.
+    fn read_lines(pathname: &[u8]) -> io::Result<(Vec<Vec<u8>>, usize)> {
+        Self::split_lines(BufReader::new(fs::File::open(as_path(pathname))?))
+    }
+
     /// Read a file into the buffer, replacing contents.
-    pub fn read_file(&mut self, pathname: &str) -> io::Result<usize> {
+    pub fn read_file(&mut self, pathname: &[u8]) -> io::Result<usize> {
         // POSIX e: the remembered pathname is set to the file whether or not
         // it can be read, so a file that does not exist yet is the one `w`
         // writes.
-        self.pathname = String::from(pathname);
-        let file = fs::File::open(pathname)?;
-        let mut reader = BufReader::new(file);
-        let mut lines = Vec::new();
-        let mut byte_count = 0;
-
-        loop {
-            let mut line = String::new();
-            let rc = reader.read_line(&mut line)?;
-            if rc == 0 {
-                break;
-            }
-            byte_count += line.len();
-            lines.push(line);
-        }
-
-        self.lines = lines;
-        self.cur_line = if self.lines.is_empty() {
-            0
-        } else {
-            self.lines.len()
-        };
-        self.modified = false;
-        self.marks.clear();
-        self.undo_record = None;
-
+        self.pathname = pathname.to_vec();
+        let (lines, byte_count) = Self::read_lines(pathname)?;
+        self.reset_lines(&lines);
         Ok(byte_count)
     }
 
-    /// Load buffer from a string (for shell command output).
+    /// Load buffer from command output (`e !command`).
     /// Does not set pathname.
-    pub fn load_from_string(&mut self, content: &str) {
-        let mut lines = Vec::new();
-        for line in content.lines() {
-            lines.push(format!("{}\n", line));
-        }
-        // Handle case where content doesn't end with newline
-        if !content.is_empty() && !content.ends_with('\n') {
-            // Last line already has \n from the loop above
-        }
-        self.lines = lines;
-        self.cur_line = if self.lines.is_empty() {
-            0
-        } else {
-            self.lines.len()
-        };
-        self.modified = false;
-        self.marks.clear();
-        self.undo_record = None;
+    pub fn load_from_bytes(&mut self, content: &[u8]) {
+        let (lines, _) = Self::split_lines(content).unwrap_or_default();
+        self.reset_lines(&lines);
     }
 
-    /// Append content from a string after a line (for shell command output).
-    pub fn append_from_string(&mut self, after_line: usize, content: &str) {
-        let mut lines = Vec::new();
-        for line in content.lines() {
-            lines.push(format!("{}\n", line));
-        }
+    /// Append command output after a line (`r !command`).
+    pub fn append_from_bytes(&mut self, after_line: usize, content: &[u8]) {
+        let (lines, _) = Self::split_lines(content).unwrap_or_default();
         if !lines.is_empty() {
             self.append(after_line, &lines);
         }
     }
 
     /// Read a file and append after a line.
-    pub fn read_file_at(&mut self, pathname: &str, after_line: usize) -> io::Result<usize> {
+    pub fn read_file_at(&mut self, pathname: &[u8], after_line: usize) -> io::Result<usize> {
         // POSIX r: the file becomes the remembered pathname when none is,
         // whether or not it can be read.
         if self.pathname.is_empty() {
-            self.pathname = String::from(pathname);
+            self.pathname = pathname.to_vec();
         }
-        let file = fs::File::open(pathname)?;
-        let mut reader = BufReader::new(file);
-        let mut lines = Vec::new();
-        let mut byte_count = 0;
-
-        loop {
-            let mut line = String::new();
-            let rc = reader.read_line(&mut line)?;
-            if rc == 0 {
-                break;
-            }
-            byte_count += line.len();
-            lines.push(line);
-        }
-
+        let (lines, byte_count) = Self::read_lines(pathname)?;
         if !lines.is_empty() {
             self.append(after_line, &lines);
         }
-
         Ok(byte_count)
     }
 
     /// Set a mark on a line.
     pub fn set_mark(&mut self, mark: char, line: usize) -> EdResult<()> {
-        if line == 0 || line > self.lines.len() {
-            return Err(EdError::AddressOutOfRange);
-        }
-        self.marks.insert(mark, line);
+        let id = self.line_id(line).ok_or(EdError::AddressOutOfRange)?;
+        self.marks.insert(mark, id);
         Ok(())
     }
 
-    /// Get the line number for a mark.
+    /// Get the line number for a mark: none once its line is gone, so `'a`
+    /// is an invalid address rather than whatever moved into its place.
+    /// (A scan of the buffer, linear in its length: no index is kept from
+    /// identity to position, since every insertion would have to update it.)
     pub fn get_mark(&self, mark: char) -> Option<usize> {
-        self.marks.get(&mark).copied()
+        self.marks.get(&mark).and_then(|&id| self.line_of_id(id))
     }
 
     /// Join lines from start to end into a single line.
     pub fn join(&mut self, start: usize, end: usize) -> EdResult<()> {
-        if start == 0 || start > end || end > self.lines.len() {
-            return Err(EdError::AddressOutOfRange);
-        }
+        self.check_range(start, end)?;
 
         if start == end {
             // Nothing to join
             return Ok(());
         }
 
-        self.save_undo();
-
-        // Collect and join lines
-        let mut joined = String::new();
-        for i in start..=end {
-            let line = &self.lines[i - 1];
-            // Strip trailing newline before joining
-            let content = line.trim_end_matches('\n');
-            joined.push_str(content);
+        let mut joined = Vec::new();
+        for line in self.lines.range(start - 1, end) {
+            joined.extend_from_slice(body(&line.text));
         }
-        joined.push('\n');
+        joined.push(b'\n');
 
-        // Replace the range with the joined line
-        self.lines.drain(start - 1..end);
-        self.lines.insert(start - 1, joined);
-
-        self.cur_line = start;
-        self.modified = true;
         // The joined text is a new line, so marks on any of the joined lines
         // go with the originals -- matching historical ed, which allocates a
         // fresh node for the join.
-        self.apply_line_edit(LineEdit::Replace {
-            start,
-            end,
-            count: 1,
-        });
-
-        Ok(())
+        self.change(start, end, &[joined])
     }
 
     /// Move lines from (start, end) to after dest_line.
     pub fn move_lines(&mut self, start: usize, end: usize, dest: usize) -> EdResult<()> {
-        if start == 0 || start > end || end > self.lines.len() {
-            return Err(EdError::AddressOutOfRange);
-        }
+        self.check_range(start, end)?;
+        self.check_dest(dest)?;
         // POSIX (ed, `m`): it is an error if the destination falls within the
         // range of moved lines -- and the range is inclusive, so `dest == end`
         // is inside it.  Letting it through indexed past the drained vector.
@@ -532,97 +618,65 @@ impl Buffer {
 
         self.save_undo();
 
-        // Extract lines
-        let extracted: Vec<String> = self.lines.drain(start - 1..end).collect();
+        // The moved lines keep their identities, so marks go with them.
+        let extracted = self.lines.splice(start - 1, end, Vec::new());
         let num_lines = extracted.len();
-
-        // Adjust destination if it was after the removed lines
         let adjusted_dest = if dest > end { dest - num_lines } else { dest };
-
-        // Insert at destination
-        for (i, line) in extracted.into_iter().enumerate() {
-            self.lines.insert(adjusted_dest + i, line);
-        }
+        self.lines.splice(adjusted_dest, adjusted_dest, extracted);
 
         self.cur_line = adjusted_dest + num_lines;
         self.modified = true;
-        self.apply_line_edit(LineEdit::Move { start, end, dest });
 
         Ok(())
     }
 
     /// Copy lines from (start, end) to after dest_line.
     pub fn copy_lines(&mut self, start: usize, end: usize, dest: usize) -> EdResult<()> {
-        if start == 0 || start > end || end > self.lines.len() {
-            return Err(EdError::AddressOutOfRange);
-        }
+        self.check_range(start, end)?;
+        self.check_dest(dest)?;
 
-        self.save_undo();
-
-        // Copy lines
-        let copied: Vec<String> = self.lines[start - 1..end].to_vec();
-        let num_lines = copied.len();
-
-        // Insert at destination. Nothing is removed, so unlike `move_lines`
-        // the destination needs no adjustment.
-        for (i, line) in copied.into_iter().enumerate() {
-            self.lines.insert(dest + i, line);
-        }
-
-        self.cur_line = dest + num_lines;
-        self.modified = true;
-        // The original keeps its mark; the copy is unmarked.
-        self.apply_line_edit(LineEdit::Insert {
-            after: dest,
-            count: num_lines,
-        });
-
+        // The copies are new lines: the original keeps its mark.
+        let texts: Vec<Vec<u8>> = self
+            .lines
+            .range(start - 1, end)
+            .map(|l| l.text.clone())
+            .collect();
+        self.append(dest, &texts);
         Ok(())
     }
 
     /// Change lines (delete and prepare for insert).
-    pub fn change(&mut self, start: usize, end: usize, new_lines: &[String]) -> EdResult<()> {
-        if start == 0 || start > end || end > self.lines.len() {
-            return Err(EdError::AddressOutOfRange);
-        }
+    pub fn change(&mut self, start: usize, end: usize, new_lines: &[Vec<u8>]) -> EdResult<()> {
+        self.check_range(start, end)?;
 
         self.save_undo();
 
-        // Remove old lines
-        self.lines.drain(start - 1..end);
+        // The replacement lines are new: a mark on a replaced line goes.
+        let new = self.new_lines(new_lines);
+        let removed = self.lines.splice(start - 1, end, new);
+        self.note_gone(removed);
 
-        // Insert new lines
-        for (i, line) in new_lines.iter().enumerate() {
-            self.lines.insert(start - 1 + i, line.clone());
-        }
-
-        if new_lines.is_empty() {
-            // POSIX: if no lines input, current line is:
-            // - the line after the last deleted (now at position start-1)
-            // - if deleted at end, the new last line
-            // - if buffer empty, 0
-            if self.lines.is_empty() {
-                self.cur_line = 0;
-            } else if start <= self.lines.len() {
-                // Line after deleted is at position start
-                self.cur_line = start;
-            } else {
-                // Deleted at end, current is new last line
-                self.cur_line = self.lines.len();
-            }
+        self.cur_line = if new_lines.is_empty() {
+            // POSIX: with no lines input, as for `d`.
+            self.cur_after_removal(start)
         } else {
-            self.cur_line = start - 1 + new_lines.len();
-        }
+            start - 1 + new_lines.len()
+        };
 
         self.modified = true;
-        self.apply_line_edit(LineEdit::Replace {
-            start,
-            end,
-            count: new_lines.len(),
-        });
 
         Ok(())
     }
+}
+
+/// A line without its newline.
+pub fn body(line: &[u8]) -> &[u8] {
+    line.strip_suffix(b"\n").unwrap_or(line)
+}
+
+/// A pathname held as the bytes it was given as.
+pub fn as_path(name: &[u8]) -> &Path {
+    Path::new(OsStr::from_bytes(name))
 }
 
 impl Default for Buffer {
@@ -646,7 +700,7 @@ mod tests {
     #[test]
     fn test_append() {
         let mut buf = Buffer::new();
-        buf.append(0, &["line 1\n".to_string(), "line 2\n".to_string()]);
+        buf.append(0, &[b"line 1\n".to_vec(), b"line 2\n".to_vec()]);
         assert_eq!(buf.line_count(), 2);
         assert_eq!(buf.cur_line, 2);
         assert!(buf.modified);
@@ -655,11 +709,11 @@ mod tests {
     #[test]
     fn test_insert() {
         let mut buf = Buffer::new();
-        buf.append(0, &["line 2\n".to_string()]);
-        buf.insert(1, &["line 1\n".to_string()]);
+        buf.append(0, &[b"line 2\n".to_vec()]);
+        buf.insert(1, &[b"line 1\n".to_vec()]);
         assert_eq!(buf.line_count(), 2);
-        assert_eq!(buf.get_line(1), Some(&"line 1\n".to_string()));
-        assert_eq!(buf.get_line(2), Some(&"line 2\n".to_string()));
+        assert_eq!(buf.get_line(1), Some(&b"line 1\n"[..]));
+        assert_eq!(buf.get_line(2), Some(&b"line 2\n"[..]));
     }
 
     #[test]
@@ -668,21 +722,21 @@ mod tests {
         buf.append(
             0,
             &[
-                "line 1\n".to_string(),
-                "line 2\n".to_string(),
-                "line 3\n".to_string(),
+                b"line 1\n".to_vec(),
+                b"line 2\n".to_vec(),
+                b"line 3\n".to_vec(),
             ],
         );
         buf.delete(2, 2).unwrap();
         assert_eq!(buf.line_count(), 2);
-        assert_eq!(buf.get_line(1), Some(&"line 1\n".to_string()));
-        assert_eq!(buf.get_line(2), Some(&"line 3\n".to_string()));
+        assert_eq!(buf.get_line(1), Some(&b"line 1\n"[..]));
+        assert_eq!(buf.get_line(2), Some(&b"line 3\n"[..]));
     }
 
     #[test]
     fn test_undo() {
         let mut buf = Buffer::new();
-        buf.append(0, &["line 1\n".to_string()]);
+        buf.append(0, &[b"line 1\n".to_vec()]);
         assert_eq!(buf.line_count(), 1);
 
         buf.delete(1, 1).unwrap();
@@ -692,12 +746,53 @@ mod tests {
         assert_eq!(buf.line_count(), 1);
     }
 
+    fn store(ids: &[u64]) -> LineStore {
+        LineStore::from_vec(
+            ids.iter()
+                .map(|&id| Line {
+                    id,
+                    text: format!("{id}\n").into_bytes(),
+                })
+                .collect(),
+        )
+    }
+
+    fn ids(s: &LineStore) -> Vec<u64> {
+        s.range(0, s.len()).map(|l| l.id).collect()
+    }
+
+    #[test]
+    fn test_line_store_splice_anywhere() {
+        let mut s = store(&[0, 1, 2, 3, 4]);
+        let removed = s.splice(1, 3, Vec::new());
+        assert_eq!(removed.iter().map(|l| l.id).collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(ids(&s), [0, 3, 4]);
+        // The gap now sits at 1; edit behind it, then past the end.
+        s.splice(0, 0, store(&[9]).splice(0, 1, Vec::new()));
+        assert_eq!(ids(&s), [9, 0, 3, 4]);
+        s.splice(4, 4, store(&[7, 8]).splice(0, 2, Vec::new()));
+        assert_eq!(ids(&s), [9, 0, 3, 4, 7, 8]);
+        s.splice(2, 6, Vec::new());
+        assert_eq!(ids(&s), [9, 0]);
+        assert_eq!(s.get(1).map(|l| l.id), Some(0));
+        assert!(s.get(2).is_none());
+    }
+
+    #[test]
+    fn test_line_store_position_near_wraps() {
+        let mut s = store(&[5, 6, 7, 8]);
+        s.move_gap(2);
+        assert_eq!(s.position_near(6, 3), Some(1));
+        assert_eq!(s.position_near(8, 0), Some(3));
+        assert_eq!(s.position_near(9, 1), None);
+    }
+
     #[test]
     fn test_join() {
         let mut buf = Buffer::new();
-        buf.append(0, &["hello\n".to_string(), "world\n".to_string()]);
+        buf.append(0, &[b"hello\n".to_vec(), b"world\n".to_vec()]);
         buf.join(1, 2).unwrap();
         assert_eq!(buf.line_count(), 1);
-        assert_eq!(buf.get_line(1), Some(&"helloworld\n".to_string()));
+        assert_eq!(buf.get_line(1), Some(&b"helloworld\n"[..]));
     }
 }

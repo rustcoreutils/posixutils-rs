@@ -287,9 +287,18 @@ fn test_motion_paragraph_forward() {
     let buffer = Buffer::from_text("para one\n\npara two\n\npara three");
     // Buffer: line 1 = "para one", line 2 = "", line 3 = "para two", line 4 = "", line 5 = "para three"
 
-    let result = command::motion::move_paragraph_forward(&buffer, 1).unwrap();
-    // Move from line 1, skips non-blank, finds blank (line 2), then finds next non-blank (line 3)
-    assert_eq!(result.position.line, 3); // Start of "para two"
+    let result = command::motion::move_to_boundary(
+        &buffer,
+        1,
+        true,
+        command::motion::Boundary::Paragraph {
+            sections: &vi_rs::options::Options::default().sections,
+            paragraphs: &vi_rs::options::Options::default().paragraphs,
+        },
+    )
+    .unwrap();
+    // POSIX 120988-120992: to the next paragraph boundary, the blank line.
+    assert_eq!(result.position.line, 2);
 }
 
 #[test]
@@ -298,9 +307,18 @@ fn test_motion_paragraph_backward() {
     buffer.set_cursor(Position::new(5, 0));
     // Buffer: line 1 = "para one", line 2 = "", line 3 = "para two", line 4 = "", line 5 = "para three"
 
-    let result = command::motion::move_paragraph_backward(&buffer, 1).unwrap();
-    // Move from line 5 backward, skips blanks, finds start of previous paragraph
-    assert_eq!(result.position.line, 3); // Start of "para two"
+    let result = command::motion::move_to_boundary(
+        &buffer,
+        1,
+        false,
+        command::motion::Boundary::Paragraph {
+            sections: &vi_rs::options::Options::default().sections,
+            paragraphs: &vi_rs::options::Options::default().paragraphs,
+        },
+    )
+    .unwrap();
+    // The previous paragraph boundary: the blank line above.
+    assert_eq!(result.position.line, 4);
 }
 
 // ============================================================================
@@ -784,7 +802,7 @@ fn test_ex_global() {
 #[test]
 fn test_ex_line_number() {
     let cmd = ex::parse_ex_command("10").unwrap();
-    assert!(matches!(cmd, ExCommand::Goto { line: 10 }));
+    assert!(matches!(cmd, ExCommand::GotoAddress { .. }));
 }
 
 // ============================================================================
@@ -1077,23 +1095,6 @@ fn test_text_object_is_blank() {
     assert!(command::text_object::is_blank(' '));
     assert!(command::text_object::is_blank('\t'));
     assert!(!command::text_object::is_blank('a'));
-}
-
-#[test]
-fn test_text_object_paragraph_boundary() {
-    let buffer = Buffer::from_text("text\n\nmore text");
-
-    assert!(!command::text_object::is_paragraph_boundary(&buffer, 1));
-    assert!(command::text_object::is_paragraph_boundary(&buffer, 2));
-    assert!(!command::text_object::is_paragraph_boundary(&buffer, 3));
-}
-
-#[test]
-fn test_text_object_section_boundary() {
-    let buffer = Buffer::from_text("text\n{\nmore");
-
-    assert!(!command::text_object::is_section_boundary(&buffer, 1));
-    assert!(command::text_object::is_section_boundary(&buffer, 2));
 }
 
 // ============================================================================
@@ -1444,7 +1445,7 @@ fn test_line_first_non_blank() {
 fn test_shell_executor_expand_percent() {
     let mut exec = ShellExecutor::new("/bin/sh");
     exec.set_current_file(Some("test.txt".to_string()));
-    let result = exec.expand_command("cat %").unwrap();
+    let result = exec.expand_command("cat %").unwrap().0;
     assert_eq!(result, "cat test.txt");
 }
 
@@ -1453,7 +1454,7 @@ fn test_shell_executor_expand_hash() {
     let mut exec = ShellExecutor::new("/bin/sh");
     exec.set_current_file(Some("current.txt".to_string()));
     exec.set_alternate_file(Some("alternate.txt".to_string()));
-    let result = exec.expand_command("diff % #").unwrap();
+    let result = exec.expand_command("diff % #").unwrap().0;
     assert_eq!(result, "diff current.txt alternate.txt");
 }
 
@@ -1461,7 +1462,7 @@ fn test_shell_executor_expand_hash() {
 fn test_shell_executor_expand_escaped() {
     let mut exec = ShellExecutor::new("/bin/sh");
     exec.set_current_file(Some("test.txt".to_string()));
-    let result = exec.expand_command("echo \\%").unwrap();
+    let result = exec.expand_command("echo \\%").unwrap().0;
     assert_eq!(result, "echo %");
 }
 
@@ -1498,7 +1499,7 @@ fn test_shell_executor_last_command() {
     assert_eq!(exec.last_command(), Some("echo test"));
 
     // ! should expand to last command
-    let result = exec.expand_command("!").unwrap();
+    let result = exec.expand_command("!").unwrap().0;
     assert_eq!(result, "echo test");
 }
 
@@ -1571,24 +1572,36 @@ fn test_ex_shell_write_parse() {
 
 #[test]
 fn test_motion_section_forward() {
-    use vi_rs::command::motion::move_section_forward;
-
     // Test section motion with function-like structure
     let buffer = Buffer::from_text("line 1\n{\nline 3\n}\nline 5\n{\nline 7");
 
     // Move forward to first section boundary (line starting with '{')
-    let result = move_section_forward(&buffer, 1).unwrap();
+    let result = command::motion::move_to_boundary(
+        &buffer,
+        1,
+        true,
+        command::motion::Boundary::Section {
+            sections: &vi_rs::options::Options::default().sections,
+        },
+    )
+    .unwrap();
     assert_eq!(result.position.line, 2); // Line with '{'
 }
 
 #[test]
 fn test_motion_section_backward() {
-    use vi_rs::command::motion::move_section_backward;
-
     let mut buffer = Buffer::from_text("{\nline 2\n}\nline 4\n{\nline 6");
     buffer.set_line(6); // Start at last line
 
-    let result = move_section_backward(&buffer, 1).unwrap();
+    let result = command::motion::move_to_boundary(
+        &buffer,
+        1,
+        false,
+        command::motion::Boundary::Section {
+            sections: &vi_rs::options::Options::default().sections,
+        },
+    )
+    .unwrap();
     assert_eq!(result.position.line, 5); // Line with '{'
 }
 
@@ -1667,18 +1680,34 @@ fn test_yank_lines_operation() {
 
 #[test]
 fn test_paragraph_motion_in_buffer() {
-    use vi_rs::command::motion::{move_paragraph_backward, move_paragraph_forward};
-
     let buffer = Buffer::from_text("para 1\n\npara 2\n\npara 3");
 
     // Forward
-    let result = move_paragraph_forward(&buffer, 1).unwrap();
+    let result = command::motion::move_to_boundary(
+        &buffer,
+        1,
+        true,
+        command::motion::Boundary::Paragraph {
+            sections: &vi_rs::options::Options::default().sections,
+            paragraphs: &vi_rs::options::Options::default().paragraphs,
+        },
+    )
+    .unwrap();
     assert!(result.position.line > 1);
 
     // Backward from end
     let mut buffer2 = Buffer::from_text("para 1\n\npara 2\n\npara 3");
     buffer2.set_line(5);
-    let result = move_paragraph_backward(&buffer2, 1).unwrap();
+    let result = command::motion::move_to_boundary(
+        &buffer2,
+        1,
+        false,
+        command::motion::Boundary::Paragraph {
+            sections: &vi_rs::options::Options::default().sections,
+            paragraphs: &vi_rs::options::Options::default().paragraphs,
+        },
+    )
+    .unwrap();
     assert!(result.position.line < 5);
 }
 

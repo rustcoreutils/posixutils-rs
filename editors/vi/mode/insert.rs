@@ -33,7 +33,7 @@ pub struct InsertState {
     pub return_column: Option<usize>,
     /// Text inserted in this session (for repeat with '.').
     ///
-    /// Mutate only through [`push_input`], [`pop_input`] and [`clear_input`],
+    /// Mutate only through [`push_input`] and [`pop_input`],
     /// which keep [`InsertState::input_log`] in step with it.
     pub inserted_text: String,
     /// One entry per character of `inserted_text`: the character, and whether
@@ -81,6 +81,14 @@ pub struct InsertState {
     /// (121777-121778). Tracked explicitly rather than sniffed out of
     /// `inserted_text`, which would misread a `0` typed on a previous line.
     pub last_input_char: Option<char>,
+    /// The line the session types on, numbered when it began, and its text
+    /// then: the session's undo record is that line against the lines it
+    /// has become.
+    pub first_line: usize,
+    pub orig_line: String,
+    /// For `R`: per character typed, the character it overwrote, so an
+    /// erase puts it back (`None`: it was added past the end).
+    pub overwritten: Vec<Option<char>>,
 }
 
 impl InsertState {
@@ -101,7 +109,24 @@ impl InsertState {
             ai_source_indent: String::new(),
             ai_line_is_new: false,
             last_input_char: None,
+            first_line: start_pos.line,
+            orig_line: String::new(),
+            overwritten: Vec::new(),
         }
+    }
+
+    /// The `count - 1` copies of the input a count adds: each on a line of
+    /// its own for `o` and `O` (121425-121427), which starts with the same
+    /// autoindent as the line the command opened (121501-121502) -- all
+    /// that line held when the session began.
+    fn extra_copies(&self) -> String {
+        let prefix = if matches!(self.kind, InsertKind::OpenBelow | InsertKind::OpenAbove) {
+            format!("\n{}", self.orig_line)
+        } else {
+            String::new()
+        };
+        let one = prefix + &self.inserted_text;
+        one.repeat(self.count.saturating_sub(1))
     }
 
     /// Set return column for append operations.
@@ -183,8 +208,9 @@ pub fn enter_insert_mode(
             buffer.set_column(0);
             apply_autoindent(buffer, &mut state, opts, &source_indent);
         }
-        InsertKind::Change | InsertKind::Substitute => {
-            // 'c' / 's' - Position is set by caller after delete
+        InsertKind::Change | InsertKind::Substitute | InsertKind::Replace => {
+            // 'c' / 's' - Position is set by caller after delete; `R` types
+            // where the cursor is.
         }
     }
 
@@ -198,6 +224,11 @@ pub fn enter_insert_mode(
     // column. `A` was the worst case: `Axy<ESC>u` on "base" removed two
     // characters from column 0 and left "sexy".
     state.start_pos = buffer.cursor();
+    state.first_line = state.start_pos.line;
+    state.orig_line = buffer
+        .line(state.first_line)
+        .map(|l| l.content().to_string())
+        .unwrap_or_default();
 
     Ok(state)
 }
@@ -335,14 +366,17 @@ fn apply_autoindent(
     state.ai_len = indent.len();
 }
 
-/// The autoindent prefix currently on the cursor's line, as a string.
-fn current_autoindent(buffer: &Buffer, state: &InsertState) -> String {
-    let line = buffer.cursor().line;
+/// The leading blanks of the cursor's line, before the cursor: the indent
+/// of the line a <newline> typed now ends, which the next line takes
+/// (95745-95749) -- whether autoindent put it there or the line already had
+/// it (`A` on an indented line).
+fn indent_before_cursor(buffer: &Buffer) -> String {
+    let pos = buffer.cursor();
     buffer
-        .line(line)
+        .line(pos.line)
         .map(|l| {
-            let c = l.content();
-            c[..state.ai_len.min(c.len())].to_string()
+            let c = &l.content()[..pos.column.min(l.len())];
+            c[..c.len() - c.trim_start_matches([' ', '\t']).len()].to_string()
         })
         .unwrap_or_default()
 }
@@ -350,7 +384,7 @@ fn current_autoindent(buffer: &Buffer, state: &InsertState) -> String {
 /// Record one character of this session's text input.
 ///
 /// `inserted_text` and `input_log` describe the same characters, so they are
-/// only ever changed together -- through this, [`pop_input`] or [`clear_input`].
+/// only ever changed together -- through this or [`pop_input`].
 fn push_input(state: &mut InsertState, c: char, escaped: bool) {
     state.inserted_text.push(c);
     state.input_log.push((c, escaped));
@@ -364,20 +398,42 @@ fn pop_input(state: &mut InsertState) {
     debug_assert_eq!(state.inserted_text.chars().count(), state.input_log.len());
 }
 
-/// Forget this session's text input entirely.
-fn clear_input(state: &mut InsertState) {
-    state.inserted_text.clear();
-    state.input_log.clear();
-}
-
 /// Erase `n` characters of text input from the buffer and the session record.
 ///
 /// Used by abbreviation expansion to take back the word that triggered it.
 pub fn erase_input(buffer: &mut Buffer, state: &mut InsertState, n: usize) {
     for _ in 0..n {
-        buffer.delete_char_before();
-        pop_input(state);
+        erase_one(buffer, state);
     }
+}
+
+/// The column on the cursor's line that erasing stops at: where input
+/// began on the line the session started on, the start of any line it made.
+fn erase_floor(buffer: &Buffer, state: &InsertState) -> usize {
+    if buffer.cursor().line == state.first_line {
+        state.start_pos.column
+    } else {
+        0
+    }
+}
+
+/// Erase the input character before the cursor on this line, putting back
+/// the character an `R` overwrote with it.  `false` if there is none: input
+/// before where it began is not the session's to erase (121802).
+fn erase_one(buffer: &mut Buffer, state: &mut InsertState) -> bool {
+    if buffer.cursor().column <= erase_floor(buffer, state) {
+        return false;
+    }
+    buffer.delete_char_before();
+    if !state.inserted_text.is_empty() {
+        pop_input(state);
+        if let Some(Some(orig)) = state.overwritten.pop() {
+            buffer.insert_char(orig);
+            let col = buffer.cursor().column - orig.len_utf8();
+            buffer.set_column_for_insert(col);
+        }
+    }
+    true
 }
 
 /// Insert a character at cursor.
@@ -387,6 +443,11 @@ fn insert_char(buffer: &mut Buffer, c: char, state: &mut InsertState) {
 
 /// Insert a character, recording whether it was entered literally after a `^V`.
 fn insert_char_escaped(buffer: &mut Buffer, c: char, state: &mut InsertState, escaped: bool) {
+    // `R` overwrites the character under the cursor, while there is one.
+    if state.kind == InsertKind::Replace {
+        let gone = buffer.delete_char_at_insert();
+        state.overwritten.push(gone);
+    }
     buffer.insert_char(c);
     push_input(state, c, escaped);
     state.last_input_char = Some(c);
@@ -397,8 +458,10 @@ fn delete_char_before(buffer: &mut Buffer, state: &mut InsertState) -> Result<()
     let pos = buffer.cursor();
 
     if pos.column == 0 {
-        // At start of line - join with previous line if not first line
-        if pos.line > 1 {
+        // At start of line - join with previous line, if that is a line this
+        // session made: the session never reaches above the line it began
+        // on.
+        if pos.line > state.first_line {
             let prev_line = buffer
                 .line(pos.line - 1)
                 .ok_or(ViError::InvalidLine(pos.line - 1))?;
@@ -418,12 +481,7 @@ fn delete_char_before(buffer: &mut Buffer, state: &mut InsertState) -> Result<()
             }
         }
     } else {
-        buffer.delete_char_before();
-
-        // Update inserted text
-        if !state.inserted_text.is_empty() {
-            pop_input(state);
-        }
+        erase_one(buffer, state);
     }
 
     Ok(())
@@ -475,18 +533,14 @@ fn delete_word_before(buffer: &mut Buffer, state: &mut InsertState) {
     // line.
     let delete_count = chars.len() - idx;
 
-    // Delete the characters.  `set_column_for_insert`, not `set_column`: the
-    // latter clamps to the last character, dragging an end-of-line cursor
-    // back one before the deletion even starts.
+    // Erase the characters, one at a time so an `R` gets each original
+    // back, and never past where input began.  `set_column_for_insert`, not
+    // `set_column`: the latter clamps to the last character, dragging an
+    // end-of-line cursor back one before the deletion even starts.
     buffer.set_column_for_insert(pos.column);
     for _ in 0..delete_count {
-        buffer.delete_char_before();
-    }
-
-    // Update inserted text
-    for _ in 0..delete_count {
-        if !state.inserted_text.is_empty() {
-            pop_input(state);
+        if !erase_one(buffer, state) {
+            break;
         }
     }
 }
@@ -499,12 +553,8 @@ fn delete_to_line_start(buffer: &mut Buffer, state: &mut InsertState) {
         return;
     }
 
-    // Delete back to start of inserted text or start of line
-    let delete_to = if pos.column > state.start_pos.column && pos.line == state.start_pos.line {
-        state.start_pos.column
-    } else {
-        0
-    };
+    // Delete back to where input began on this line.
+    let delete_to = erase_floor(buffer, state).min(pos.column);
 
     // Again a character count, not a byte distance: as a byte distance this
     // deleted past the start of the line and consumed the preceding newline,
@@ -520,11 +570,8 @@ fn delete_to_line_start(buffer: &mut Buffer, state: &mut InsertState) {
 
     buffer.set_column_for_insert(pos.column);
     for _ in 0..delete_count {
-        buffer.delete_char_before();
+        erase_one(buffer, state);
     }
-
-    // Clear inserted text
-    clear_input(state);
 }
 
 /// Insert a newline, carrying the autoindent onto the new line.
@@ -532,6 +579,7 @@ fn insert_newline(buffer: &mut Buffer, state: &mut InsertState, opts: &Options) 
     // "If there are no characters other than autoindent characters on the
     // line, all characters on the line shall be discarded" (121819-121820).
     let line_num = buffer.cursor().line;
+    let typed_indent = indent_before_cursor(buffer);
     let only_autoindent = state.ai_len > 0
         && buffer
             .line(line_num)
@@ -544,11 +592,10 @@ fn insert_newline(buffer: &mut Buffer, state: &mut InsertState, opts: &Options) 
     // The indent the *next* line derives from. Normally the line just
     // terminated; after `^^D` the source is preserved instead (121779-121780).
     let source = if state.ai_source_indent.is_empty() || state.ai_len > 0 {
-        let cur = current_autoindent(buffer, state);
-        if cur.is_empty() {
+        if typed_indent.is_empty() {
             state.ai_source_indent.clone()
         } else {
-            cur
+            typed_indent
         }
     } else {
         state.ai_source_indent.clone()
@@ -705,14 +752,16 @@ fn finalize_insert(buffer: &mut Buffer, state: &mut InsertState) {
 
     // Handle count > 1 (repeat inserted text)
     if state.count > 1 && !state.inserted_text.is_empty() {
-        for _ in 1..state.count {
-            for c in state.inserted_text.chars() {
-                if c == '\n' {
-                    buffer.insert_newline();
-                } else {
-                    buffer.insert_char(c);
-                }
+        for c in state.extra_copies().chars() {
+            if c == '\n' {
+                buffer.insert_newline();
+                continue;
             }
+            // `R`'s copies go on overwriting, as its input did.
+            if state.kind == InsertKind::Replace {
+                buffer.delete_char_at_insert();
+            }
+            buffer.insert_char(c);
         }
     }
 
@@ -818,9 +867,10 @@ mod tests {
 
     #[test]
     fn test_delete_char_before() {
+        // "lo" was typed from column 1: the session may erase it.
         let mut buf = Buffer::from_text("hello");
         buf.set_column(3);
-        let mut state = InsertState::new(InsertKind::Insert, buf.cursor(), 1);
+        let mut state = InsertState::new(InsertKind::Insert, Position::new(1, 1), 1);
         seed_input(&mut state, "lo");
 
         delete_char_before(&mut buf, &mut state).unwrap();

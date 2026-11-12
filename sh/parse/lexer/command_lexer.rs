@@ -167,8 +167,8 @@ impl<'s> SourceString<'s> {
             result.extend_from_slice(
                 &self.parts[start.current_part].text[start.current_part_char_iter.pos..],
             );
-            for part_idx in start.current_part + 1..end.current_part {
-                result.extend_from_slice(self.parts[part_idx].text.as_ref());
+            for part in &self.parts[start.current_part + 1..end.current_part] {
+                result.extend_from_slice(part.text.as_ref());
             }
             result.extend_from_slice(
                 &self.parts[end.current_part].text[..end.current_part_char_iter.pos],

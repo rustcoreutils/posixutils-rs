@@ -146,11 +146,13 @@ pub enum ExCommand {
     Set { args: String },
     /// Show file info (Ctrl-G, :f, :file).
     File { new_name: Option<String> },
-    /// Go to line (:number or just address).
-    Goto { line: usize },
-    /// Go to an address given on its own, when it is not a literal line number
-    /// (`:$`, `:.+2`, `:'a`, `:/re/`) and so needs the buffer to resolve.
+    /// Addresses with no command (`:2`, `:1,3`, `:/re/`).  POSIX 94553-94569:
+    /// in ex mode the implied command is print; in visual mode the current
+    /// line becomes the last address.
     GotoAddress { range: AddressRange },
+    /// An empty command line.  In ex mode, outside a global, it prints the
+    /// next line (POSIX 94566-94569); anywhere else it does nothing.
+    Empty,
     /// Mark line (:ma, :mark, :k).
     Mark { range: AddressRange, name: char },
     /// Shell command (:!, :shell).
@@ -303,11 +305,15 @@ pub enum ExCommand {
     ShiftLeft {
         range: AddressRange,
         count: Option<usize>,
+        /// How many `<` were typed: the shift is that many shiftwidths.
+        width: usize,
     },
     /// Shift right (:>).
     ShiftRight {
         range: AddressRange,
         count: Option<usize>,
+        /// How many `>` were typed: the shift is that many shiftwidths.
+        width: usize,
     },
     /// Write line number (:=).
     LineNumber { range: AddressRange },
@@ -335,8 +341,6 @@ pub enum ExCommand {
         range: AddressRange,
         flags: SubstituteFlags,
     },
-    /// No operation (empty command).
-    Nop,
 }
 
 /// Flags for substitute command.

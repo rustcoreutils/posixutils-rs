@@ -10,8 +10,8 @@
 //! Motion commands for cursor movement.
 
 use super::text_object::{
-    next_bigword_end, next_bigword_start, next_paragraph_start, next_word_end, next_word_start,
-    prev_bigword_start, prev_paragraph_start, prev_word_start,
+    next_bigword_end, next_bigword_start, next_word_end, next_word_start, prev_bigword_start,
+    prev_word_start,
 };
 use crate::buffer::{char_index_at_byte, Buffer, BufferMode, Position, Range};
 use crate::error::{Result, ViError};
@@ -142,11 +142,11 @@ pub fn move_right(buffer: &Buffer, count: usize) -> Result<MotionResult> {
 /// Move cursor down by count lines.
 pub fn move_down(buffer: &Buffer, count: usize) -> Result<MotionResult> {
     let pos = buffer.cursor();
-    if pos.line + count > buffer.line_count() {
+    let new_line = pos.line.saturating_add(count);
+    if new_line > buffer.line_count() {
         return Err(ViError::MotionFailed("Already at last line".to_string()));
     }
 
-    let new_line = pos.line + count;
     let new_pos = Position::new(new_line, pos.column);
     let range = Range::lines(pos, new_pos);
 
@@ -329,36 +329,6 @@ pub fn move_bigword_end(buffer: &Buffer, count: usize) -> Result<MotionResult> {
     Ok(move_forward_by(buffer, count, next_bigword_end)?.inclusive())
 }
 
-/// Move to next paragraph ({ command).
-pub fn move_paragraph_forward(buffer: &Buffer, count: usize) -> Result<MotionResult> {
-    let mut pos = buffer.cursor();
-
-    for _ in 0..count {
-        match next_paragraph_start(buffer, pos) {
-            Some(new_pos) => pos = new_pos,
-            None => break,
-        }
-    }
-
-    let range = Range::lines(buffer.cursor(), pos);
-    Ok(MotionResult::with_range(pos, range).linewise())
-}
-
-/// Move to previous paragraph (} command).
-pub fn move_paragraph_backward(buffer: &Buffer, count: usize) -> Result<MotionResult> {
-    let mut pos = buffer.cursor();
-
-    for _ in 0..count {
-        match prev_paragraph_start(buffer, pos) {
-            Some(new_pos) => pos = new_pos,
-            None => break,
-        }
-    }
-
-    let range = Range::lines(pos, buffer.cursor());
-    Ok(MotionResult::with_range(pos, range).linewise())
-}
-
 /// Compute the start position of every sentence in the buffer, in order.
 ///
 /// A sentence ends at `.`, `!`, or `?`, optionally followed by any number of
@@ -456,58 +426,131 @@ pub fn move_sentence_backward(buffer: &Buffer, count: usize) -> Result<MotionRes
     Ok(MotionResult::with_range(pos, range))
 }
 
-/// Move to next section boundary (]] command).
-pub fn move_section_forward(buffer: &Buffer, count: usize) -> Result<MotionResult> {
-    use super::text_object::is_section_boundary;
-
-    let mut pos = buffer.cursor();
-
-    for _ in 0..count {
-        // Search forward from next line
-        let mut found = false;
-        for line_num in (pos.line + 1)..=buffer.line_count() {
-            if is_section_boundary(buffer, line_num) {
-                pos = Position::new(line_num, 0);
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            // Move to last line if no section found
-            pos = Position::new(buffer.line_count(), 0);
-            break;
-        }
-    }
-
-    let range = Range::lines(buffer.cursor(), pos);
-    Ok(MotionResult::with_range(pos, range).linewise())
+/// The kind of boundary a `{ } [[ ]]` motion moves to, with the macro
+/// pairs (the `paragraphs` and `sections` options) that mark one.
+#[derive(Debug, Clone, Copy)]
+pub enum Boundary<'a> {
+    /// A section boundary (vi 120521-120533): a form feed or `{` first, a
+    /// `sections` macro, the first and last lines.
+    Section { sections: &'a str },
+    /// A paragraph boundary (120534-120542): a section boundary, a
+    /// `paragraphs` macro, or a run of blank lines.
+    Paragraph {
+        sections: &'a str,
+        paragraphs: &'a str,
+    },
 }
 
-/// Move to previous section boundary ([[ command).
-pub fn move_section_backward(buffer: &Buffer, count: usize) -> Result<MotionResult> {
-    use super::text_object::is_section_boundary;
+/// Whether `content` is a macro line naming one of the two-character
+/// `pairs`: a period, then the pair -- or, for a pair `X `, `.X` alone.
+fn is_macro_line(content: &str, pairs: &str) -> bool {
+    let Some(name) = content.strip_prefix('.') else {
+        return false;
+    };
+    let mut name_chars = name.chars();
+    let Some(a) = name_chars.next() else {
+        return false;
+    };
+    let b = name_chars.next().unwrap_or(' ');
+    let mut pairs = pairs.chars();
+    while let Some(x) = pairs.next() {
+        let y = pairs.next().unwrap_or(' ');
+        if x == a && y == b {
+            return true;
+        }
+    }
+    false
+}
 
-    let mut pos = buffer.cursor();
+fn is_blank_line(buffer: &Buffer, line_num: usize) -> bool {
+    buffer.line(line_num).is_some_and(|l| l.is_blank_line())
+}
 
-    for _ in 0..count {
-        // Search backward from previous line
-        let mut found = false;
-        for line_num in (1..pos.line).rev() {
-            if is_section_boundary(buffer, line_num) {
-                pos = Position::new(line_num, 0);
-                found = true;
+impl Boundary<'_> {
+    /// Whether a boundary starts at the beginning of line `n`.  A run of
+    /// blank lines is one boundary, starting at its first line.
+    fn starts_at(&self, buffer: &Buffer, n: usize) -> bool {
+        let content = buffer.line(n).map_or("", |l| l.content());
+        let section = |sections: &str| {
+            content.starts_with('\x0c')
+                || content.starts_with('{')
+                || is_macro_line(content, sections)
+        };
+        match *self {
+            Boundary::Section { sections } => section(sections),
+            Boundary::Paragraph {
+                sections,
+                paragraphs,
+            } => {
+                section(sections)
+                    || is_macro_line(content, paragraphs)
+                    || (is_blank_line(buffer, n) && (n == 1 || !is_blank_line(buffer, n - 1)))
+            }
+        }
+    }
+}
+
+/// Move to the start of the `count`th next (`]]`, `}`) or previous (`[[`,
+/// `{`) boundary (vi 120909-120947, 120983-120992).  Past the last
+/// boundary forward is the last line -- its last character unless it is
+/// empty -- and backward the first character of the buffer.
+///
+/// As an operator's motion: from the first character of a line, or from an
+/// empty line, to a boundary at the start of a line, the region is whole
+/// lines, through the boundary line; to the end of the buffer it runs
+/// through its last character; otherwise it stops just before the boundary.
+pub fn move_to_boundary(
+    buffer: &Buffer,
+    count: usize,
+    forward: bool,
+    boundary: Boundary<'_>,
+) -> Result<MotionResult> {
+    let start = buffer.cursor();
+    let last = buffer.line_count().max(1);
+    let mut line = start.line;
+    let mut at_end = false;
+    for pass in 0..count.max(1) {
+        let next = if forward {
+            (line + 1..=last).find(|&n| boundary.starts_at(buffer, n))
+        } else {
+            // A boundary at the start of the cursor's own line is before a
+            // cursor past that start.
+            let from = if pass == 0 && start.column > 0 {
+                line
+            } else {
+                line.saturating_sub(1)
+            };
+            (1..=from).rev().find(|&n| boundary.starts_at(buffer, n))
+        };
+        match next {
+            Some(n) => line = n,
+            None => {
+                line = if forward { last } else { 1 };
+                at_end = forward;
                 break;
             }
         }
-        if !found {
-            // Move to first line if no section found
-            pos = Position::new(1, 0);
-            break;
-        }
     }
-
-    let range = Range::lines(pos, buffer.cursor());
-    Ok(MotionResult::with_range(pos, range).linewise())
+    let end_col = if at_end {
+        buffer.line(line).map_or(0, |l| l.last_char_offset())
+    } else {
+        0
+    };
+    let pos = Position::new(line, end_col);
+    if pos == start {
+        return Err(ViError::MotionFailed("no boundary to move to".to_string()));
+    }
+    let from_line_start = start.column == 0 || buffer.line(start.line).is_none_or(|l| l.is_empty());
+    let result = MotionResult::pos(pos);
+    Ok(
+        if at_end && !buffer.line(line).is_none_or(|l| l.is_empty()) {
+            result.inclusive()
+        } else if from_line_start && end_col == 0 {
+            result.linewise()
+        } else {
+            result
+        },
+    )
 }
 
 /// Find character forward in line (f command).

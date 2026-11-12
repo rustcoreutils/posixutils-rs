@@ -15,10 +15,10 @@
 //! - Reading/writing ranges
 //! - Alternate file tracking
 
-use crate::buffer::{Buffer, Line};
+use crate::buffer::Buffer;
 use crate::error::{Result, ViError};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 /// File manager for the editor.
@@ -32,6 +32,9 @@ pub struct FileManager {
     arg_list: Vec<PathBuf>,
     /// Current index in argument list.
     arg_index: usize,
+    /// The reference is before the first file (after `-t`, 94465-94468):
+    /// the next file is the first.
+    before_first: bool,
     /// Whether current file is read-only.
     readonly: bool,
     /// Whether the current pathname was changed by `:f` or `:r` since the last
@@ -54,6 +57,7 @@ impl FileManager {
             alternate_file: None,
             arg_list: Vec::new(),
             arg_index: 0,
+            before_first: false,
             readonly: false,
             pathname_changed: false,
         }
@@ -61,6 +65,9 @@ impl FileManager {
 
     /// True when files after the current one remain in the argument list.
     pub fn has_more_files(&self) -> bool {
+        if self.before_first {
+            return !self.arg_list.is_empty();
+        }
         self.arg_index + 1 < self.arg_list.len()
     }
 
@@ -83,6 +90,14 @@ impl FileManager {
     pub fn set_args(&mut self, args: Vec<PathBuf>) {
         self.arg_list = args;
         self.arg_index = 0;
+        self.before_first = false;
+    }
+
+    /// Set the argument list with its reference before the first file, so
+    /// `:n` edits the first.
+    pub fn set_args_before_first(&mut self, args: Vec<PathBuf>) {
+        self.set_args(args);
+        self.before_first = true;
     }
 
     /// Get the argument list.
@@ -114,6 +129,16 @@ impl FileManager {
         self.current_file = path;
     }
 
+    /// Note a file argument to `:r`, `:w` or `:x` (94372-94377): it becomes
+    /// the current pathname if there is none, and otherwise the alternate.
+    pub fn note_file_argument(&mut self, path: &Path) {
+        if self.current_file.is_none() {
+            self.current_file = Some(path.to_path_buf());
+        } else {
+            self.alternate_file = Some(path.to_path_buf());
+        }
+    }
+
     /// Set read-only mode.
     pub fn set_readonly(&mut self, readonly: bool) {
         self.readonly = readonly;
@@ -136,17 +161,20 @@ impl FileManager {
         Ok(alt)
     }
 
-    /// Go to next file in argument list.
+    /// Go to next file in argument list.  Returns its path; the edit that
+    /// opens it makes it the current pathname.
     pub fn next_file(&mut self) -> Result<PathBuf> {
         if self.arg_list.is_empty() {
             return Err(ViError::NoFileName);
         }
-        if self.arg_index + 1 >= self.arg_list.len() {
+        if self.before_first {
+            self.before_first = false;
+        } else if self.arg_index + 1 >= self.arg_list.len() {
             return Err(ViError::InvalidCommand("No more files".to_string()));
+        } else {
+            self.arg_index += 1;
         }
-        self.arg_index += 1;
         let path = self.arg_list[self.arg_index].clone();
-        self.set_current_file(Some(path.clone()));
         Ok(path)
     }
 
@@ -155,12 +183,11 @@ impl FileManager {
         if self.arg_list.is_empty() {
             return Err(ViError::NoFileName);
         }
-        if self.arg_index == 0 {
+        if self.arg_index == 0 || self.before_first {
             return Err(ViError::InvalidCommand("Already at first file".to_string()));
         }
         self.arg_index -= 1;
         let path = self.arg_list[self.arg_index].clone();
-        self.set_current_file(Some(path.clone()));
         Ok(path)
     }
 
@@ -170,14 +197,16 @@ impl FileManager {
             return Err(ViError::NoFileName);
         }
         self.arg_index = 0;
+        self.before_first = false;
         let path = self.arg_list[0].clone();
-        self.set_current_file(Some(path.clone()));
         Ok(path)
     }
 
     /// Get count of remaining files.
     pub fn files_remaining(&self) -> usize {
-        if self.arg_list.is_empty() {
+        if self.before_first {
+            self.arg_list.len()
+        } else if self.arg_list.is_empty() {
             0
         } else {
             self.arg_list.len() - self.arg_index - 1
@@ -188,11 +217,12 @@ impl FileManager {
     pub fn format_args(&self) -> String {
         let mut result = String::new();
         for (i, path) in self.arg_list.iter().enumerate() {
-            if i == self.arg_index {
+            let current = i == self.arg_index && !self.before_first;
+            if current {
                 result.push('[');
             }
-            result.push_str(&path.display().to_string());
-            if i == self.arg_index {
+            result.push_str(&crate::bytes::from_path(path));
+            if current {
                 result.push(']');
             }
             if i + 1 < self.arg_list.len() {
@@ -204,50 +234,16 @@ impl FileManager {
 }
 
 /// Read a file into a buffer.
+///
+/// Only a file that is not there is a new, empty buffer. Any other failure is
+/// reported: `Path::exists` is false whenever `stat` fails, so testing it
+/// opened a file behind an unsearchable directory as an empty buffer.
 pub fn read_file(path: &Path) -> Result<Buffer> {
-    if !path.exists() {
-        // New file - return empty buffer
-        let buffer = Buffer::new();
-        return Ok(buffer);
+    match fs::read(path) {
+        Ok(bytes) => Ok(Buffer::from_text(&crate::bytes::decode(&bytes))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Buffer::new()),
+        Err(e) => Err(e.into()),
     }
-
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut content = String::new();
-
-    for line_result in reader.lines() {
-        let line = line_result?;
-        if !content.is_empty() {
-            content.push('\n');
-        }
-        content.push_str(&line);
-    }
-
-    // If file was empty, return buffer with one empty line
-    if content.is_empty() {
-        return Ok(Buffer::new());
-    }
-
-    Ok(Buffer::from_text(&content))
-}
-
-/// Read a file into buffer after a specific line.
-pub fn read_file_after(buffer: &mut Buffer, line_num: usize, path: &Path) -> Result<usize> {
-    if !path.exists() {
-        return Err(ViError::FileNotFound(path.display().to_string()));
-    }
-
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut count = 0;
-
-    for (i, line_result) in reader.lines().enumerate() {
-        let line = line_result?;
-        buffer.insert_line_after(line_num + i, Line::from(line.as_str()));
-        count += 1;
-    }
-
-    Ok(count)
 }
 
 /// Write buffer to a file.
@@ -264,8 +260,8 @@ pub fn write_file(buffer: &Buffer, path: &Path, append: bool) -> Result<WriteSta
 
     for line_num in 1..=lines {
         if let Some(line) = buffer.line(line_num) {
-            let content = line.content();
-            writer.write_all(content.as_bytes())?;
+            let content = crate::bytes::encode(line.content());
+            writer.write_all(&content)?;
             writer.write_all(b"\n")?;
             bytes += content.len() + 1;
         }
@@ -296,8 +292,8 @@ pub fn write_range(
 
     for line_num in start..=end {
         if let Some(line) = buffer.line(line_num) {
-            let content = line.content();
-            writer.write_all(content.as_bytes())?;
+            let content = crate::bytes::encode(line.content());
+            writer.write_all(&content)?;
             writer.write_all(b"\n")?;
             bytes += content.len() + 1;
             lines += 1;
@@ -356,7 +352,8 @@ pub fn write_shell_input(
     if let Some(stdin) = child.stdin.as_mut() {
         for line_num in start..=end {
             if let Some(line) = buffer.line(line_num) {
-                writeln!(stdin, "{}", line.content())?;
+                stdin.write_all(&crate::bytes::encode(line.content()))?;
+                stdin.write_all(b"\n")?;
             }
         }
     }
@@ -369,7 +366,7 @@ pub fn write_shell_input(
         ));
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok(crate::bytes::decode(&output.stdout))
 }
 
 /// Get file information.
@@ -435,6 +432,22 @@ mod tests {
         assert_eq!(buffer.line(1).unwrap().content(), "line one");
         assert_eq!(buffer.line(2).unwrap().content(), "line two");
         assert_eq!(buffer.line(3).unwrap().content(), "line three");
+    }
+
+    #[test]
+    fn test_read_file_unsearchable_dir_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root searches any directory
+        }
+        let dir = plib::tmp::tempdir().unwrap();
+        let sub = dir.path().join("locked");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("f"), "data\n").unwrap();
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = read_file(&sub.join("f"));
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err(), "an unreadable file must not open empty");
     }
 
     #[test]

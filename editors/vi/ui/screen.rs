@@ -9,7 +9,7 @@
 
 //! Screen buffer for efficient display updates.
 
-use super::display::truncate_to_width;
+use super::display::{char_width, push_glyph, truncate_to_width};
 use super::terminal::{Terminal, TerminalSize};
 use crate::buffer::Buffer;
 use crate::error::Result;
@@ -244,29 +244,17 @@ impl Screen {
                 break;
             }
 
-            match c {
-                '\t' => {
-                    let spaces = self.tabstop - (col % self.tabstop);
-                    let spaces = spaces.min(max_cols - col);
-                    for _ in 0..spaces {
-                        result.push(' ');
-                    }
-                    col += spaces;
-                }
-                c if c.is_control() => {
-                    // Display control chars as ^X
-                    if col + 2 <= max_cols {
-                        result.push('^');
-                        result.push((c as u8 ^ 0x40) as char);
-                        col += 2;
-                    } else {
-                        break;
-                    }
-                }
-                c => {
-                    result.push(c);
-                    col += 1;
-                }
+            let width = char_width(c, col, self.tabstop);
+            if c == '\t' {
+                // A tab is cut to what fits; anything else fits whole or
+                // not at all.
+                let spaces = width.min(max_cols - col);
+                result.extend(std::iter::repeat_n(' ', spaces));
+                col += spaces;
+            } else if col + width <= max_cols {
+                col += push_glyph(&mut result, c, col, self.tabstop);
+            } else {
+                break;
             }
         }
 
@@ -283,19 +271,15 @@ impl Screen {
         let mut col = 0;
 
         for c in line.chars() {
-            let char_width = match c {
-                '\t' => self.tabstop - (col % self.tabstop),
-                c if c.is_control() => 2,
-                _ => 1,
-            };
+            let width = char_width(c, col, self.tabstop);
 
             // If adding this character would exceed the line width, wrap
-            if col + char_width > max_cols && col > 0 {
+            if col + width > max_cols && col > 0 {
                 row_count += 1;
                 col = 0;
             }
 
-            col += char_width;
+            col += width;
         }
 
         // Count the final row
@@ -314,38 +298,17 @@ impl Screen {
         let mut col = 0;
 
         for c in line.chars() {
-            let char_width = match c {
-                '\t' => self.tabstop - (col % self.tabstop),
-                c if c.is_control() => 2, // ^X format
-                _ => 1,
-            };
+            let width = char_width(c, col, self.tabstop);
 
             // If adding this character would exceed the line width, wrap
-            if col + char_width > max_cols && col > 0 {
+            if col + width > max_cols && col > 0 {
                 wrapped_rows.push(current_row.clone());
                 current_row.clear();
                 col = 0;
             }
 
             // Add the character to the current row
-            match c {
-                '\t' => {
-                    let spaces = self.tabstop - (col % self.tabstop);
-                    for _ in 0..spaces {
-                        current_row.push(' ');
-                    }
-                    col += spaces;
-                }
-                c if c.is_control() => {
-                    current_row.push('^');
-                    current_row.push((c as u8 ^ 0x40) as char);
-                    col += 2;
-                }
-                c => {
-                    current_row.push(c);
-                    col += 1;
-                }
-            }
+            col += push_glyph(&mut current_row, c, col, self.tabstop);
         }
 
         // Add the final row if it has content
@@ -464,17 +427,7 @@ impl Screen {
             if byte_pos >= buffer_col {
                 break;
             }
-            match c {
-                '\t' => {
-                    display_col += self.tabstop - (display_col % self.tabstop);
-                }
-                c if c.is_control() => {
-                    display_col += 2; // ^X
-                }
-                _ => {
-                    display_col += 1;
-                }
-            }
+            display_col += char_width(c, display_col, self.tabstop);
             byte_pos += c.len_utf8();
         }
 
@@ -490,12 +443,7 @@ impl Screen {
             if current_display >= display_col {
                 break;
             }
-            let char_width = match c {
-                '\t' => self.tabstop - (current_display % self.tabstop),
-                c if c.is_control() => 2,
-                _ => 1,
-            };
-            current_display += char_width;
+            current_display += char_width(c, current_display, self.tabstop);
             byte_pos += c.len_utf8();
         }
 

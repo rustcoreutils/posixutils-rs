@@ -76,6 +76,8 @@ pub struct MotionCommand {
     pub motion: char,
     /// Extra character argument.
     pub char_arg: Option<char>,
+    /// Whether a count was given (`d3G` against `dG`).
+    pub has_count: bool,
 }
 
 impl MotionCommand {
@@ -84,6 +86,7 @@ impl MotionCommand {
             count: 1,
             motion,
             char_arg: None,
+            has_count: false,
         }
     }
 
@@ -97,6 +100,11 @@ impl MotionCommand {
         self
     }
 }
+
+/// The largest count the parser passes on.  Bigger counts mean "as many as
+/// there are" everywhere they are meaningful, and the cap keeps a count plus
+/// a line number from overflowing, on 32-bit targets too.
+pub const MAX_COUNT: usize = i32::MAX as usize;
 
 /// State of the command parser.
 #[derive(Debug, Clone, PartialEq)]
@@ -190,6 +198,18 @@ impl CommandParser {
                 return false;
             }
             Key::Char(c) => self.process_char(c),
+            // <carriage-return> is a command and a motion (`+`'s twin), and
+            // a character for `r`, `f` and the like.
+            Key::Enter => self.process_char('\r'),
+            Key::Tab => self.process_char('\t'),
+            // DEL: `^H`'s twin as a motion, itself where a character is
+            // awaited (`r<DEL>`).
+            Key::Backspace => match self.state {
+                ParserState::WaitingChar | ParserState::MotionWaitingChar => {
+                    self.process_char('\x7f')
+                }
+                _ => self.process_ctrl('h'),
+            },
             Key::Ctrl(c) => self.process_ctrl(c),
             _ => {
                 // Other keys are not valid in command mode
@@ -210,7 +230,11 @@ impl CommandParser {
                     self.state = ParserState::Register;
                 } else if c.is_ascii_digit() && (c != '0' || self.has_count1) {
                     // Count digit (0 alone is a command, not a count)
-                    self.count1 = self.count1 * 10 + (c as usize - '0' as usize);
+                    self.count1 = self
+                        .count1
+                        .saturating_mul(10)
+                        .saturating_add(c as usize - '0' as usize)
+                        .min(MAX_COUNT);
                     self.has_count1 = true;
                     self.state = ParserState::Count;
                 } else {
@@ -230,7 +254,11 @@ impl CommandParser {
             ParserState::Operator => {
                 // Waiting for motion after operator
                 if c.is_ascii_digit() && (c != '0' || self.has_count2) {
-                    self.count2 = self.count2 * 10 + (c as usize - '0' as usize);
+                    self.count2 = self
+                        .count2
+                        .saturating_mul(10)
+                        .saturating_add(c as usize - '0' as usize)
+                        .min(MAX_COUNT);
                     self.has_count2 = true;
                 } else {
                     self.motion = Some(c);
@@ -250,18 +278,28 @@ impl CommandParser {
     }
 
     /// Process a control character.
+    ///
+    /// The control characters that move the cursor are the motions they
+    /// equal -- `^H` is `h`, `^J` and `^N` are `j`, `^P` is `k`, `^M` is
+    /// <carriage-return> -- as commands and as an operator's motion.  The
+    /// rest (`^F`, `^D`, ...) are handled before the parser.  Where a
+    /// character is awaited (`r^H`), a control character is that character.
     fn process_ctrl(&mut self, c: char) {
-        // Control characters that are commands
-        let ctrl_commands = [
-            'b', 'd', 'e', 'f', 'g', 'h', 'j', 'l', 'm', 'n', 'p', 'r', 'u', 'y', '^', ']',
-        ];
-
-        if ctrl_commands.contains(&c) {
-            self.command = Some(c);
-            // Treat as simple command (no motion, no char arg)
-            self.state = ParserState::Complete;
-        } else {
-            self.state = ParserState::Error("Invalid control command".to_string());
+        if matches!(
+            self.state,
+            ParserState::WaitingChar | ParserState::MotionWaitingChar
+        ) {
+            if let Some(ch) = Key::Ctrl(c).literal_char() {
+                self.process_char(ch);
+                return;
+            }
+        }
+        match c {
+            'h' => self.process_char('h'),
+            'j' | 'n' => self.process_char('j'),
+            'p' => self.process_char('k'),
+            'm' => self.process_char('\r'),
+            _ => self.state = ParserState::Error("Invalid control command".to_string()),
         }
     }
 
@@ -279,7 +317,7 @@ impl CommandParser {
             'a', 'A', 'b', 'B', 'C', 'D', 'e', 'E', 'G', 'h', 'H', 'i', 'I', 'j', 'J', 'k', 'l',
             'L', 'M', 'n', 'N', 'o', 'O', 'p', 'P', 'Q', 'R', 's', 'S', 'u', 'U', 'w', 'W', 'x',
             'X', 'Y', '~', '.', ';', ',', '%', '^', '$', '|', '0', '-', '+', '_', '(', ')', '{',
-            '}', '&',
+            '}', '&', ' ', '\r',
         ];
 
         if operators.contains(&c) {
@@ -311,12 +349,13 @@ impl CommandParser {
         }
 
         // Motions that need a character argument
-        let char_motions = ['f', 'F', 't', 'T', '\'', '`'];
+        // (`[[` and `]]` wait for their second bracket.)
+        let char_motions = ['f', 'F', 't', 'T', '\'', '`', '[', ']'];
 
         // Valid motion commands
         let valid_motions = [
             'h', 'j', 'k', 'l', 'w', 'W', 'b', 'B', 'e', 'E', '0', '^', '$', 'G', 'H', 'L', 'M',
-            '%', '|', '(', ')', '{', '}', '[', ']', 'n', 'N', '/', '?', '+', '-', '_',
+            '%', '|', '(', ')', '{', '}', 'n', 'N', '/', '?', '+', '-', '_', ';', ',', ' ', '\r',
         ];
 
         if char_motions.contains(&c) {
@@ -339,7 +378,7 @@ impl CommandParser {
         let count = if has_count {
             let c1 = if self.has_count1 { self.count1 } else { 1 };
             let c2 = if self.has_count2 { self.count2 } else { 1 };
-            c1 * c2
+            c1.saturating_mul(c2).min(MAX_COUNT)
         } else {
             1
         };
@@ -358,6 +397,7 @@ impl CommandParser {
             // delete three.  The doubled forms (`dd`, `yy`, `cc`) read
             // `cmd.count` instead, which is why they were always right.
             let mut motion = MotionCommand::new(m).with_count(count);
+            motion.has_count = has_count;
             if let Some(c) = self.char_arg {
                 motion = motion.with_char(c);
             }
@@ -478,5 +518,23 @@ mod tests {
         assert!(parser.is_complete());
         let cmd = parser.get_command().unwrap();
         assert_eq!(cmd.count, 6); // 2 * 3
+    }
+
+    #[test]
+    fn test_control_motions_are_their_letters() {
+        for (ctrl, cmd) in [('h', 'h'), ('j', 'j'), ('n', 'j'), ('p', 'k')] {
+            let mut parser = CommandParser::new();
+            parser.process_key(Key::Ctrl(ctrl));
+            assert_eq!(
+                parser.get_command().map(|c| c.command),
+                Some(cmd),
+                "^{ctrl}"
+            );
+        }
+        let mut parser = CommandParser::new();
+        parser.process_key(Key::Char('d'));
+        parser.process_key(Key::Ctrl('n'));
+        let cmd = parser.get_command().unwrap();
+        assert_eq!(cmd.motion.map(|m| m.motion), Some('j'), "d^N is dj");
     }
 }

@@ -12,6 +12,15 @@
 //! These tests verify the ex binary works correctly in line-oriented mode,
 //! testing POSIX ex commands via stdin/stdout.
 
+mod addresses;
+mod argv;
+mod cmdline;
+mod fileio;
+mod global;
+mod marks;
+mod shell;
+mod signals;
+
 use plib::testing::{get_binary_path, run_test, TestPlan};
 use plib::tmp::{NamedTempFile, TempDir};
 use std::fs;
@@ -74,7 +83,7 @@ fn test_ex_insert_and_print() {
 fn test_ex_number_command() {
     ex_test(
         "a\nline one\nline two\n.\n1,$nu\nq!\n",
-        "     1\tline one\n     2\tline two\n",
+        "     1  line one\n     2  line two\n",
     );
 }
 
@@ -136,7 +145,7 @@ fn test_ex_move() {
 fn test_ex_goto_line() {
     ex_test(
         "a\nline one\nline two\nline three\n.\n2\np\nq!\n",
-        "line two\n",
+        "line two\nline two\n",
     );
 }
 
@@ -202,6 +211,7 @@ fn ex_run(content: &str, args: &[&str], script: &str) -> (i32, String, TempDir) 
     let mut child = Command::new(get_binary_path("ex"))
         .args(&argv)
         .current_dir(dir.path())
+        .env("TMPDIR", dir.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -340,7 +350,10 @@ fn test_ex_range_explicit() {
 
 #[test]
 fn test_ex_current_line_address() {
-    ex_test("a\nfirst\nsecond\nthird\n.\n2\n.p\nq!\n", "second\n");
+    ex_test(
+        "a\nfirst\nsecond\nthird\n.\n2\n.p\nq!\n",
+        "second\nsecond\n",
+    );
 }
 
 #[test]
@@ -445,7 +458,7 @@ fn test_ex_line_number_with_address() {
 fn test_ex_hash_command() {
     ex_test(
         "a\nfirst\nsecond\n.\n1,2#\nq!\n",
-        "     1\tfirst\n     2\tsecond\n",
+        "     1  first\n     2  second\n",
     );
 }
 
@@ -690,8 +703,13 @@ fn test_ex_tag_pop_and_tags() {
 
     // Move to line 3, jump to the tag on line 1, pop, and print: the current
     // line must be the one we left from.
+    // `3` prints line 3 (the implied print) before the tag jump.
     let out = run(b"3\ntag helper\npop\np\nq!\n");
-    assert_eq!(out.trim(), "last line", "pop must restore the origin line");
+    assert_eq!(
+        out.trim(),
+        "last line\nlast line",
+        "pop must restore the origin line"
+    );
 
     // :tags names the tag and the position pop would return to.
     let out = run(b"3\ntag helper\ntags\nq!\n");
@@ -792,7 +810,11 @@ fn test_ex_input_mode_does_not_abbreviate() {
 #[test]
 fn test_ex_address_search_strips_delimiter() {
     // /re/ must not include the trailing delimiter in the pattern.
-    ex_test("a\napple\nbanana\ncherry\n.\n/cherry/\np\nq!\n", "cherry\n");
+    // A lone address prints its line (POSIX 94561), then `p` again.
+    ex_test(
+        "a\napple\nbanana\ncherry\n.\n/cherry/\np\nq!\n",
+        "cherry\ncherry\n",
+    );
 }
 
 #[test]
@@ -877,7 +899,7 @@ fn test_ex_append_honors_non_literal_addresses() {
     ex_test_with_file(
         "L1\nL2\nL3\n",
         "2\n.a\nAFTER2\n.\n1,$p\nq!\n",
-        "L1\nL2\nAFTER2\nL3\n",
+        "L2\nL1\nL2\nAFTER2\nL3\n",
     );
 }
 
@@ -938,7 +960,7 @@ fn test_ex_substitute_number_and_list_flags() {
     ex_test_with_file(
         "aaa\nbbb\naaa\n",
         "1,$s/aaa/ZZZ/#\nq!\n",
-        "1\tZZZ\n3\tZZZ\n",
+        "     1  ZZZ\n     3  ZZZ\n",
     );
     ex_test_with_file("aaa\n", "1s/aaa/A\tB/l\nq!\n", "A\\tB$\n");
 }
@@ -951,7 +973,7 @@ fn test_ex_substitute_empty_pattern_reuses_last_regex() {
     ex_test_with_file(
         "aaa\nbbb\naaa\n",
         "/bbb/\ns//REPLACED/\n1,$p\nq!\n",
-        "aaa\nREPLACED\naaa\n",
+        "bbb\naaa\nREPLACED\naaa\n",
     );
 
     // And a substitute's own pattern becomes the last RE (#X28), so a later
@@ -1017,8 +1039,8 @@ fn test_ex_substitute_newline_splits_line() {
     // corruption.
     ex_test_with_file(
         "a-b\nc-d\n",
-        "1s/-/\\n/\n1,$nu\nq!\n",
-        "     1\ta\n     2\tb\n     3\tc-d\n",
+        "1s/-/\\\n/\n1,$nu\nq!\n",
+        "     1  a\n     2  b\n     3  c-d\n",
     );
 }
 
@@ -1032,8 +1054,8 @@ fn test_ex_substitute_newline_is_undoable() {
     // where no split ever happened.
     ex_test_with_file(
         "a-b\nc-d\n",
-        "1s/-/\\n/\n$=\nu\n$=\n1,$nu\nq!\n",
-        "3\n2\n     1\ta-b\n     2\tc-d\n",
+        "1s/-/\\\n/\n$=\nu\n$=\n1,$nu\nq!\n",
+        "3\n2\n     1  a-b\n     2  c-d\n",
     );
 }
 
@@ -1043,8 +1065,8 @@ fn test_ex_substitute_newline_over_a_range_visits_every_line() {
     // with it or the tail of the range gets skipped.
     ex_test_with_file(
         "a-b\nc-d\n",
-        "1,$s/-/\\n/\n1,$nu\nq!\n",
-        "     1\ta\n     2\tb\n     3\tc\n     4\td\n",
+        "1,$s/-/\\\n/\n1,$nu\nq!\n",
+        "     1  a\n     2  b\n     3  c\n     4  d\n",
     );
 }
 
@@ -1059,7 +1081,7 @@ fn test_ex_backslash_newline_continues_the_command() {
     ex_test_with_file(
         "a-b\nc-d\n",
         "1s/-/\\\n/\n1,$nu\nq!\n",
-        "     1\ta\n     2\tb\n     3\tc-d\n",
+        "     1  a\n     2  b\n     3  c-d\n",
     );
 }
 
@@ -1077,7 +1099,7 @@ fn test_ex_tilde_uses_last_regex_with_previous_replacement() {
     ex_test_with_file(
         "foo one\nbar two\nfoo three\n",
         "1s/foo/XX/\n/bar/\n2~\n1,$p\nq!\n",
-        "XX one\nXX two\nfoo three\n",
+        "bar two\nXX one\nXX two\nfoo three\n",
     );
 
     // `&` by contrast reuses the previous pattern, so it hits line 3.
@@ -1186,7 +1208,7 @@ fn test_ex_list_uses_posix_escapes() {
 fn test_ex_at_at_repeats_last_buffer() {
     // `@@` means "repeat the last executed buffer". The parser accepted '@'
     // as a buffer *name*, so it failed with `Buffer "@" is empty`.
-    ex_test_with_file("s/o/O/\nooo\n", "1y a\n2\n@a\n@@\n2p\nq!\n", "OOo\n");
+    ex_test_with_file("s/o/O/\nooo\n", "1y a\n2\n@a\n@@\n2p\nq!\n", "ooo\nOOo\n");
 }
 
 // ============================================================================
@@ -1367,10 +1389,11 @@ fn test_ex_edit_accepts_a_plus_command() {
     fs::write(&path, "one\ntwo\nthree\n").unwrap();
     let path = path.to_string_lossy().to_string();
 
-    // `+2` runs `:2`, so the current line is 2 and `.p` prints "two".
-    ex_test(&format!("e +2 {path}\n.p\nq!\n"), "two\n");
+    // `+2` runs `:2`, which prints line 2 (the implied print), and leaves
+    // it current, so `.p` prints "two" again.
+    ex_test(&format!("e +2 {path}\n.p\nq!\n"), "two\ntwo\n");
     // A bare `+` starts at the last line.
-    ex_test(&format!("e + {path}\n.p\nq!\n"), "three\n");
+    ex_test(&format!("e + {path}\n.p\nq!\n"), "three\nthree\n");
     // Without a +command the file still opens normally.
     ex_test(&format!("e {path}\n1,$p\nq!\n"), "one\ntwo\nthree\n");
 }
@@ -1419,7 +1442,7 @@ fn test_ex_next_replaces_the_argument_list() {
     // ...and a following `:n` walks to the second entry of that new list.
     ex_test(&format!("n {a} {b}\nn\n1,$p\nq!\n"), "BBB\n");
     // `:n` also takes a +command.
-    ex_test(&format!("n +$ {a} {b}\n.p\nq!\n"), "AAA\n");
+    ex_test(&format!("n +$ {a} {b}\n.p\nq!\n"), "AAA\nAAA\n");
 }
 
 #[test]
@@ -1700,16 +1723,48 @@ fn test_ex_bare_bang_without_a_terminal_is_refused() {
     );
 }
 
-// An argument that is not valid UTF-8 is reported, not a panic.
-#[test]
-fn ex_non_utf8_argument_is_reported() {
-    plib::testing::assert_non_utf8_argument_rejected("ex", &[]);
+/// A file operand that is not valid UTF-8 names that file: the editors take
+/// arguments as bytes (`vi_rs::bytes`), neither refusing nor panicking.
+fn assert_non_utf8_operand_edits(editor: &str) {
+    use plib::testing::os_bytes;
+    let dir = TempDir::new().unwrap();
+    let name = os_bytes(b"x\xff");
+    let Some(_) = plib::testing::create_non_utf8(dir.path(), b"x\xff", |p| fs::write(p, b"old\n"))
+    else {
+        return;
+    };
+    let mut child = Command::new(get_binary_path(editor))
+        .arg("-s")
+        .arg(&name)
+        .current_dir(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn editor");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"s/old/new/\nwq\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{editor}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(fs::read(dir.path().join(&name)).unwrap(), b"new\n");
 }
 
-// An argument that is not valid UTF-8 is reported, not a panic.
 #[test]
-fn vi_non_utf8_argument_is_reported() {
-    plib::testing::assert_non_utf8_argument_rejected("vi", &[]);
+fn ex_non_utf8_operand_edits_that_file() {
+    assert_non_utf8_operand_edits("ex");
+}
+
+#[test]
+fn vi_non_utf8_operand_edits_that_file() {
+    assert_non_utf8_operand_edits("vi");
 }
 
 // A program name that is not valid UTF-8 still selects ex by its ending;

@@ -1561,8 +1561,8 @@ mod tests {
             fx.func.blocks[0].children = vec![ids[0], ids[1]];
             fx.func.blocks[1].children = vec![ids[2]];
             fx.func.blocks[2].children = vec![ids[2]];
-            for b in 1..3 {
-                fx.func.blocks[b].parents = vec![BasicBlockId(0)];
+            for block in &mut fx.func.blocks[1..3] {
+                block.parents = vec![BasicBlockId(0)];
             }
             fx.func.blocks[3].parents = vec![ids[0], ids[1]];
             let t = fx.fresh();

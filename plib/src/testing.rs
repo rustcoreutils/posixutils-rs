@@ -25,20 +25,22 @@ pub fn get_binary_path(cmd: &str) -> PathBuf {
     binary_dir().join(format!("{cmd}{}", std::env::consts::EXE_SUFFIX))
 }
 
-/// The directory holding the workspace's built binaries: the running test
-/// executable's own directory, or its parent when that is `deps`.
+/// The directory holding the workspace's built binaries, `<target>/<profile>`:
+/// the parent of the `deps` directory the running test executable is in -- or,
+/// since Cargo 1.100, of the `build` directory it is under
+/// (`<profile>/build/<crate>/<hash>/out/<test>`) -- else the executable's own
+/// directory.
 fn binary_dir() -> PathBuf {
     let exe = std::env::current_exe().expect("locate the running test executable");
     let dir = exe
         .parent()
         .expect("test executable has a parent directory");
-    if dir.file_name().is_some_and(|name| name == "deps") {
-        dir.parent()
-            .expect("deps has a parent directory")
-            .to_path_buf()
-    } else {
-        dir.to_path_buf()
-    }
+    dir.ancestors()
+        .take(4)
+        .find(|p| p.file_name().is_some_and(|n| n == "deps" || n == "build"))
+        .and_then(|p| p.parent())
+        .unwrap_or(dir)
+        .to_path_buf()
 }
 
 /// Clear `cmd`'s environment, as `env -i` does, except for the variable that

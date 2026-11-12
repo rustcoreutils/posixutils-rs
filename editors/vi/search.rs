@@ -17,9 +17,11 @@
 //! - Pattern matching with BRE (Basic Regular Expressions)
 
 use crate::buffer::{floor_char_boundary, next_char_boundary, Buffer, Position};
+use crate::bytes::TextRegex;
 use crate::error::{Result, ViError};
+use crate::ex::command::CTRL_V;
 use crate::options::Options;
-use plib::regex::{Match, Regex, RegexFlags};
+use plib::regex::{Match, RegexFlags};
 
 /// Direction of search.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -46,7 +48,7 @@ pub struct SearchState {
     /// Last search pattern.
     pattern: Option<String>,
     /// Compiled regex.
-    regex: Option<Regex>,
+    regex: Option<TextRegex>,
     /// Last search direction.
     direction: SearchDirection,
     /// Whether search wraps at file boundaries.
@@ -96,15 +98,7 @@ impl SearchState {
             )));
         }
 
-        // Convert the vi pattern to a POSIX BRE for the libc engine.
-        let regex_pattern = self.convert_pattern(pattern)?;
-
-        let mut flags = RegexFlags::bre();
-        if self.ignorecase {
-            flags = flags.ignore_case();
-        }
-        let regex = Regex::new(&regex_pattern, flags)
-            .map_err(|e| ViError::InvalidPattern(e.to_string()))?;
+        let regex = compile_pattern(pattern, self.ignorecase, self.magic)?;
 
         self.pattern = Some(pattern.to_string());
         self.regex = Some(regex);
@@ -113,42 +107,9 @@ impl SearchState {
         Ok(())
     }
 
-    /// Convert a vi search pattern to a POSIX Basic Regular Expression for the
-    /// libc engine (`plib::regex`).
-    fn convert_pattern(&self, pattern: &str) -> Result<String> {
-        if self.magic {
-            // vi "magic" mode is exactly POSIX BRE — `. * ^ $ [ ] \` are
-            // special, `\( \) \{ \}` group/repeat, and `+ ? | ( ) { }` are
-            // literal — plus the `\<`/`\>` word-boundary escapes, which glibc
-            // BRE supports natively. So the pattern passes through unchanged.
-            Ok(pattern.to_string())
-        } else {
-            // "nomagic": only `^` and `$` keep their special meaning; every
-            // other BRE metacharacter must be escaped so libc treats it
-            // literally. Backslash escapes are preserved as-is (so `\(`, `\{`,
-            // `\<`, etc. remain special).
-            let mut result = String::new();
-            let mut chars = pattern.chars();
-
-            while let Some(c) = chars.next() {
-                match c {
-                    '\\' => {
-                        result.push('\\');
-                        if let Some(next) = chars.next() {
-                            result.push(next);
-                        }
-                    }
-                    '^' | '$' => result.push(c),
-                    // Make the BRE metacharacters literal.
-                    '.' | '*' | '[' | ']' => {
-                        result.push('\\');
-                        result.push(c);
-                    }
-                    _ => result.push(c),
-                }
-            }
-            Ok(result)
-        }
+    /// The compiled current pattern.
+    pub fn compiled(&self) -> Option<&TextRegex> {
+        self.regex.as_ref()
     }
 
     /// Get the current pattern.
@@ -315,8 +276,63 @@ impl SearchState {
     }
 }
 
+/// Compile a vi pattern as the editor's searches do: a POSIX BRE, with the
+/// `magic` and `ignorecase` edit options applied.  Every RE the editor
+/// matches -- searches, search addresses -- goes through here, so an option
+/// cannot hold for one and not another.
+pub fn compile_pattern(pattern: &str, ignorecase: bool, magic: bool) -> Result<TextRegex> {
+    let mut flags = RegexFlags::bre();
+    if ignorecase {
+        flags = flags.ignore_case();
+    }
+    TextRegex::new(&convert_pattern(pattern, magic), flags)
+        .map_err(|e| ViError::InvalidPattern(e.to_string()))
+}
+
+/// `pattern` as it reads under `nomagic`, spelled so that it reads the
+/// same whatever `magic` is.
+pub fn literal_pattern(pattern: &str) -> String {
+    convert_pattern(pattern, false)
+}
+
+/// Convert a vi pattern to a POSIX Basic Regular Expression for the libc
+/// engine (`plib::regex`).
+fn convert_pattern(pattern: &str, magic: bool) -> String {
+    if magic {
+        // vi "magic" mode is exactly POSIX BRE — `. * ^ $ [ ] \` are
+        // special, `\( \) \{ \}` group/repeat, and `+ ? | ( ) { }` are
+        // literal — plus the `\<`/`\>` word-boundary escapes, which glibc
+        // BRE supports natively. So the pattern passes through unchanged.
+        return pattern.to_string();
+    }
+    // "nomagic": only `^` and `$` keep their special meaning; every other
+    // BRE metacharacter must be escaped so libc treats it literally.
+    // Backslash escapes are preserved as-is (so `\(`, `\{`, `\<`, etc.
+    // remain special).
+    let mut result = String::new();
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                result.push('\\');
+                if let Some(next) = chars.next() {
+                    result.push(next);
+                }
+            }
+            '^' | '$' => result.push(c),
+            // Make the BRE metacharacters literal.
+            '.' | '*' | '[' | ']' => {
+                result.push('\\');
+                result.push(c);
+            }
+            _ => result.push(c),
+        }
+    }
+    result
+}
+
 /// Find the last match of a regex in a string.
-fn find_last_match(regex: &Regex, text: &str) -> Option<usize> {
+fn find_last_match(regex: &TextRegex, text: &str) -> Option<usize> {
     let mut last_pos = None;
     for mat in regex.find_iter(text) {
         last_pos = Some(mat.start);
@@ -329,7 +345,7 @@ fn find_last_match(regex: &Regex, text: &str) -> Option<usize> {
 ///
 /// There is no NOTBOL form of `find_iter`, so walk the slice by hand -- every
 /// step searches a remainder, which is never a beginning of line.
-fn find_last_match_notbol(regex: &Regex, text: &str) -> Option<usize> {
+fn find_last_match_notbol(regex: &TextRegex, text: &str) -> Option<usize> {
     let mut last_pos = None;
     let mut offset = 0usize;
     while offset <= text.len() {
@@ -371,10 +387,18 @@ enum CaseMode {
 /// Build a `:s` replacement string for one match from its capture groups.
 ///
 /// Supports `&` (whole match), `\1`-`\9` (back-references), `\&` (literal `&`),
-/// `\\` (literal backslash), the `\n`/`\t` vi conveniences, `~` (the previous
-/// replacement, passed in as `prev`), and the POSIX case escapes
-/// `\u \l \U \L \e \E` (ex.md §95726-95732).
-fn build_replacement(template: &str, input: &str, matches: &[Match], prev: &str) -> String {
+/// `\\` (literal backslash), `~` (the previous replacement, passed in as
+/// `prev`), the POSIX case escapes `\u \l \U \L \e \E` (ex.md
+/// §95726-95732), and a carriage return -- `\`-escaped, or `^V`-quoted in
+/// vi -- as a line split.  With `magic` off, `&` and `~` are literal and
+/// `\&` and `\~` are the special ones (95712-95714).
+fn build_replacement(
+    template: &str,
+    input: &str,
+    matches: &[Match],
+    prev: &str,
+    magic: bool,
+) -> String {
     let mut result = String::with_capacity(template.len() + 16);
     let mut chars = template.chars();
     // `sticky` is the \U/\L mode; `one_shot` is a pending \u/\l for one char.
@@ -404,6 +428,22 @@ fn build_replacement(template: &str, input: &str, matches: &[Match], prev: &str)
     };
 
     while let Some(c) = chars.next() {
+        // Under nomagic the escape is what makes `&` and `~` special, so
+        // `\&` reads as `&` would with magic, and `&` as `\&`.
+        let c = match c {
+            '\\' if !magic => match chars.clone().next() {
+                Some(k @ ('&' | '~')) => {
+                    chars.next();
+                    k
+                }
+                _ => c,
+            },
+            '&' | '~' if !magic => {
+                push(&mut result, &c.to_string(), &mut sticky, &mut one_shot);
+                continue;
+            }
+            _ => c,
+        };
         match c {
             '&' => {
                 let m = matches[0];
@@ -412,9 +452,22 @@ fn build_replacement(template: &str, input: &str, matches: &[Match], prev: &str)
             }
             // `~` stands for the previous replacement text (ex.md §95724).
             '~' => push(&mut result, prev, &mut sticky, &mut one_shot),
+            // POSIX 95369-95371: a carriage return entered in the
+            // replacement -- `^V^M` in open or vi mode, `\` and a newline in
+            // ex -- splits the line there, and is itself discarded.
+            '\r' => result.push('\n'),
+            // vi keeps a `^V` on the command line with the character it
+            // quotes; here it quotes that character, and a quoted carriage
+            // return is the split above.
+            CTRL_V => match chars.next() {
+                Some('\r') => result.push('\n'),
+                Some(q) => push(&mut result, &q.to_string(), &mut sticky, &mut one_shot),
+                None => {}
+            },
+            // POSIX 95724: after a backslash, any character but these is
+            // itself -- `\n` is `n`, `\t` is `t`.
             '\\' => match chars.next() {
-                Some('n') => result.push('\n'),
-                Some('t') => result.push('\t'),
+                Some('\r') | Some('\n') => result.push('\n'),
                 Some('&') => push(&mut result, "&", &mut sticky, &mut one_shot),
                 Some('~') => push(&mut result, "~", &mut sticky, &mut one_shot),
                 Some('\\') => push(&mut result, "\\", &mut sticky, &mut one_shot),
@@ -471,6 +524,8 @@ pub struct SubstituteConfig<'a> {
     pub count_only: bool,
     /// The `ignorecase` edit option.
     pub ignorecase: bool,
+    /// The `magic` edit option.
+    pub magic: bool,
     /// Previous replacement text, which `~` expands to (ex.md §95724).
     pub prev_replacement: &'a str,
 }
@@ -488,6 +543,7 @@ impl<'a> SubstituteConfig<'a> {
             number: false,
             count_only: false,
             ignorecase: false,
+            magic: true,
             prev_replacement: "",
         }
     }
@@ -513,7 +569,7 @@ impl<'a> SubstituteConfig<'a> {
 
 pub struct Substitutor {
     /// Pattern regex.
-    regex: Regex,
+    regex: TextRegex,
     /// Replacement string.
     replacement: String,
     /// Global flag (all matches on line).
@@ -530,18 +586,16 @@ pub struct Substitutor {
     count_only: bool,
     /// Previous replacement, for `~`.
     prev_replacement: String,
+    /// The `magic` edit option, for the replacement's `&` and `~`.
+    magic: bool,
 }
 
 impl Substitutor {
     /// Create a new substitutor.
     pub fn new(cfg: SubstituteConfig<'_>) -> Result<Self> {
-        // The :s pattern is a POSIX BRE (vi magic mode); compile via libc.
-        let mut flags = RegexFlags::bre();
-        if cfg.ignorecase {
-            flags = flags.ignore_case();
-        }
-        let regex =
-            Regex::new(cfg.pattern, flags).map_err(|e| ViError::InvalidPattern(e.to_string()))?;
+        // Compiled as every RE the editor matches is, `magic` and
+        // `ignorecase` applied.
+        let regex = compile_pattern(cfg.pattern, cfg.ignorecase, cfg.magic)?;
 
         Ok(Self {
             regex,
@@ -553,6 +607,7 @@ impl Substitutor {
             number: cfg.number,
             count_only: cfg.count_only,
             prev_replacement: cfg.prev_replacement.to_string(),
+            magic: cfg.magic,
         })
     }
 
@@ -560,7 +615,7 @@ impl Substitutor {
     /// Returns (new_line, substitution_count).
     pub fn substitute_line(&self, line: &str) -> (String, usize) {
         if self.count_only {
-            let count = self.regex.find_iter(line).count();
+            let count = self.regex.find_iter(line).len();
             return (line.to_string(), count);
         }
 
@@ -578,6 +633,7 @@ impl Substitutor {
                 line,
                 &caps,
                 &self.prev_replacement,
+                self.magic,
             ));
             last_end = me;
             count += 1;
@@ -651,6 +707,7 @@ impl Substitutor {
                     line,
                     &caps,
                     &self.prev_replacement,
+                    self.magic,
                 ));
                 count += 1;
             } else {

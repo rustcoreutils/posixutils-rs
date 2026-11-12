@@ -14,10 +14,10 @@
 //! while remaining part of the same `Editor` type.
 
 use super::Editor;
-use crate::buffer::{Line, Position, Range};
+use crate::buffer::{split_lines, Line, Position, Range};
 use crate::error::{Result, ViError};
 use crate::ex::address::{AddrCtx, Address};
-use crate::ex::command::SubstituteFlags;
+use crate::ex::command::{strip_line_terminator, SubstituteFlags};
 use crate::ex::AddressRange;
 
 impl Editor {
@@ -37,7 +37,9 @@ impl Editor {
             let cur = self.buffer.cursor().line;
             (cur, cur)
         };
-        let span_end = last.max(first + 1).max(first + count.unwrap_or(0));
+        let span_end = last
+            .max(first.saturating_add(1))
+            .max(first.saturating_add(count.unwrap_or(0)));
         self.splice_around(first, span_end.min(self.buffer.line_count()), |ed| {
             ed.execute_ex_join_inner(range, count, force)
         })
@@ -65,10 +67,10 @@ impl Editor {
             (current, current)
         };
         end = match count {
-            Some(c) if two_addrs => end + c.saturating_sub(1),
-            Some(c) => start + c,
+            Some(c) if two_addrs => end.saturating_add(c.saturating_sub(1)),
+            Some(c) => start.saturating_add(c),
             None if two_addrs => end,
-            None => start + 1,
+            None => start.saturating_add(1),
         };
         let end = end.min(self.buffer.line_count());
 
@@ -142,7 +144,7 @@ impl Editor {
         let content = self.registers.get(reg).ok_or(ViError::BufferEmpty(reg))?;
 
         // Insert lines after target
-        let lines: Vec<&str> = content.text.lines().collect();
+        let lines: Vec<&str> = split_lines(&content.text).collect();
         for (i, line_text) in lines.iter().enumerate() {
             self.buffer
                 .insert_line_after(target_line + i, Line::from(*line_text));
@@ -213,34 +215,8 @@ impl Editor {
             ));
         }
 
-        // Collect the lines to move
-        let mut lines_to_move = Vec::new();
-        for line_num in start..=end {
-            if let Some(line) = self.buffer.line(line_num) {
-                lines_to_move.push(line.content().to_string());
-            }
-        }
-
-        // Delete original lines (in reverse order)
-        for line_num in (start..=end).rev() {
-            self.buffer.delete_line(line_num);
-        }
-
-        // Adjust destination if it was after the deleted lines
-        let adjusted_dest = if dest > end {
-            dest - (end - start + 1)
-        } else {
-            dest
-        };
-
-        // Insert at new location
-        let insert_after = if adjusted_dest == 0 { 0 } else { adjusted_dest };
-        for (i, line_text) in lines_to_move.iter().enumerate() {
-            self.buffer
-                .insert_line_after(insert_after + i, Line::from(line_text.as_str()));
-        }
-
-        self.buffer.set_line(insert_after + lines_to_move.len());
+        let first = self.buffer.move_lines(start, end, dest);
+        self.buffer.set_line(first + (end - start));
 
         let move_count = end - start + 1;
         self.set_message(&format!("{} lines moved", move_count));
@@ -264,20 +240,22 @@ impl Editor {
 
         let path = file
             .map(|s| s.to_string())
-            .or_else(|| self.files.current_file().map(|p| p.display().to_string()))
+            .or_else(|| self.files.current_file().map(crate::bytes::from_path))
             .ok_or(ViError::NoFileName)?;
 
-        let content = std::fs::read_to_string(&path).map_err(ViError::Io)?;
-
-        let lines: Vec<&str> = content.lines().collect();
-        for (i, line_text) in lines.iter().enumerate() {
-            self.buffer
-                .insert_line_after(insert_after + i, Line::from(*line_text));
+        let raw = std::fs::read(crate::bytes::path(&path)).map_err(ViError::Io)?;
+        // 94372-94377: a file argument is the current pathname if there is
+        // none, and otherwise the alternate.
+        if let Some(f) = file {
+            self.files.note_file_argument(&crate::bytes::path(f));
         }
+        let content = crate::bytes::decode(&raw);
 
+        let lines: Vec<&str> = split_lines(&content).collect();
+        self.insert_lines_after(insert_after, &lines)?;
         self.buffer.set_line(insert_after + lines.len());
 
-        let bytes = content.len();
+        let bytes = raw.len();
         self.set_message(&format!(
             "\"{}\" {} lines, {} bytes",
             path,
@@ -291,12 +269,15 @@ impl Editor {
     pub(super) fn execute_ex_mark(&mut self, line: Option<usize>, name: char) -> Result<()> {
         let target_line = line.unwrap_or_else(|| self.buffer.cursor().line);
 
-        if !name.is_ascii_lowercase() {
-            return Err(ViError::MarkNotSet(name));
-        }
-
-        let idx = (name as u8 - b'a') as usize;
-        self.marks[idx] = Some(Position::new(target_line, 0));
+        // 95130-95132: a lowercase letter, `` ` `` or `'`.
+        let slot = crate::buffer::mark_slot(name).ok_or(ViError::MarkNotSet(name))?;
+        // 95135-95137: at the first non-blank, else the last character.
+        let column = self
+            .buffer
+            .line(target_line)
+            .map_or(0, |l| l.first_non_blank());
+        self.buffer
+            .set_mark(slot, Position::new(target_line, column));
         Ok(())
     }
 
@@ -430,20 +411,31 @@ impl Editor {
         &mut self,
         range: &AddressRange,
         count: Option<usize>,
+        width: usize,
     ) -> Result<()> {
-        let (first, last) = self.resolve_range(range)?;
+        // The count is a number of lines, as for any command; the width is
+        // how many `<`/`>` were typed (95628-95649).  The count used to
+        // multiply the width instead -- and overflow on a large one.
+        let (first, last) = self.counted_lines(range, count)?;
+        // "Lines to be shifted shall be copied into the unnamed buffer."
+        let _ = crate::command::yank(
+            &self.buffer,
+            Range::lines(Position::new(first, 0), Position::new(last, 0)),
+            &mut self.registers,
+            None,
+        );
         self.splice_around(first, last, |ed| {
-            ed.execute_ex_shift_left_inner(range, count)
+            ed.execute_ex_shift_left_inner(first, last, width)
         })
     }
 
     fn execute_ex_shift_left_inner(
         &mut self,
-        range: &AddressRange,
-        count: Option<usize>,
+        start: usize,
+        end: usize,
+        width: usize,
     ) -> Result<()> {
-        let (start, end) = self.resolve_range(range)?;
-        let shift_amount = count.unwrap_or(1) * self.options.shiftwidth;
+        let shift_amount = width.saturating_mul(self.options.shiftwidth);
 
         for line_num in start..=end {
             if let Some(line) = self.buffer.line(line_num) {
@@ -474,20 +466,31 @@ impl Editor {
         &mut self,
         range: &AddressRange,
         count: Option<usize>,
+        width: usize,
     ) -> Result<()> {
-        let (first, last) = self.resolve_range(range)?;
+        // The count is a number of lines, as for any command; the width is
+        // how many `<`/`>` were typed (95628-95649).  The count used to
+        // multiply the width instead -- and overflow on a large one.
+        let (first, last) = self.counted_lines(range, count)?;
+        // "Lines to be shifted shall be copied into the unnamed buffer."
+        let _ = crate::command::yank(
+            &self.buffer,
+            Range::lines(Position::new(first, 0), Position::new(last, 0)),
+            &mut self.registers,
+            None,
+        );
         self.splice_around(first, last, |ed| {
-            ed.execute_ex_shift_right_inner(range, count)
+            ed.execute_ex_shift_right_inner(first, last, width)
         })
     }
 
     fn execute_ex_shift_right_inner(
         &mut self,
-        range: &AddressRange,
-        count: Option<usize>,
+        start: usize,
+        end: usize,
+        width: usize,
     ) -> Result<()> {
-        let (start, end) = self.resolve_range(range)?;
-        let shift_amount = count.unwrap_or(1) * self.options.shiftwidth;
+        let shift_amount = width.saturating_mul(self.options.shiftwidth);
 
         for line_num in start..=end {
             if let Some(line) = self.buffer.line(line_num) {
@@ -553,8 +556,10 @@ impl Editor {
         for line_num in start..=end {
             self.buffer.set_line(line_num);
             // Execute each line of the buffer content as an ex command
-            for cmd_line in content.lines() {
-                let cmd_line = cmd_line.trim();
+            // Each line ends the way a sourced line does: `trim` also ate
+            // a `^V`-quoted `\r`, the end of `map Q :wq^V^M`.
+            for cmd_line in split_lines(&content) {
+                let cmd_line = strip_line_terminator(cmd_line).trim_start();
                 if !cmd_line.is_empty() {
                     self.execute_ex_input(cmd_line)?;
                 }
@@ -588,8 +593,12 @@ impl Editor {
         AddrCtx {
             buffer: &self.buffer,
             current,
-            marks: &self.marks,
+            marks: self.buffer.marks(),
             allow_zero: false,
+            last_regex: self.last_regex(),
+            ignorecase: self.options.ignorecase,
+            magic: self.options.magic,
+            wrapscan: self.options.wrapscan,
         }
     }
 
@@ -649,8 +658,7 @@ impl Editor {
         register: Option<char>,
         count: Option<usize>,
     ) -> Result<()> {
-        let (start, end) = self.resolve_range(range)?;
-        let last = end_from_count(start, end, count, self.buffer.line_count())?;
+        let (start, last) = self.counted_lines(range, count)?;
         self.splice_around(start, last, |ed| {
             ed.execute_ex_delete_inner(range, register, count)
         })
@@ -664,8 +672,7 @@ impl Editor {
     ) -> Result<()> {
         use crate::command::delete;
 
-        let (start, end) = self.resolve_range(range)?;
-        let end = end_from_count(start, end, count, self.buffer.line_count())?;
+        let (start, end) = self.counted_lines(range, count)?;
 
         let start_pos = Position::new(start, 0);
         let end_pos = Position::new(end, 0);
@@ -691,8 +698,7 @@ impl Editor {
     ) -> Result<()> {
         use crate::command::yank;
 
-        let (start, end) = self.resolve_range(range)?;
-        let end = end_from_count(start, end, count, self.buffer.line_count())?;
+        let (start, end) = self.counted_lines(range, count)?;
 
         let start_pos = Position::new(start, 0);
         let end_pos = Position::new(end, 0);
@@ -705,27 +711,6 @@ impl Editor {
 
         Ok(())
     }
-}
-
-/// Resolve the last line an ex command acts on when a trailing `count` was
-/// given: the range becomes `count` lines starting at `start`.
-///
-/// A count must be positive. Zero used to reach `start + count - 1` unguarded,
-/// which underflows for `start == 0` and otherwise silently addresses the line
-/// *before* `start`, so `:1d 0` walked off the front of the buffer.
-fn end_from_count(
-    start: usize,
-    end: usize,
-    count: Option<usize>,
-    last_line: usize,
-) -> Result<usize> {
-    let Some(c) = count else { return Ok(end) };
-    if c == 0 {
-        return Err(ViError::InvalidCommand(
-            "count must be positive".to_string(),
-        ));
-    }
-    Ok((start + c - 1).min(last_line))
 }
 
 /// Decrement `line` by `delta`, or fail as POSIX requires when the result

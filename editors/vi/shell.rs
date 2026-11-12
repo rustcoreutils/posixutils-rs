@@ -48,6 +48,16 @@ impl ShellExecutor {
         }
     }
 
+    /// Use `shell` as the program to run (the `shell` edit option, read
+    /// when a command runs, so `:set shell=` takes effect).  Empty means
+    /// `sh` (95905-95909).
+    pub fn set_program(&mut self, shell: &str) {
+        shell.clone_into(&mut self.shell);
+        if self.shell.is_empty() {
+            self.shell = "sh".to_string();
+        }
+    }
+
     /// Set the current filename for % expansion.
     pub fn set_current_file(&mut self, file: Option<String>) {
         self.current_file = file;
@@ -63,55 +73,15 @@ impl ShellExecutor {
         self.last_command.as_deref()
     }
 
-    /// Expand special characters in command string per POSIX.
-    ///
-    /// - `%` expands to current filename
-    /// - `#` expands to alternate filename
-    /// - `!` expands to previous command
-    /// - Backslash escapes these special characters
-    pub fn expand_command(&self, command: &str) -> Result<String> {
-        let mut result = String::with_capacity(command.len());
-        let mut chars = command.chars().peekable();
-
-        while let Some(c) = chars.next() {
-            match c {
-                '\\' => {
-                    // Check for escaped special chars
-                    if let Some(&next @ ('%' | '#' | '!')) = chars.peek() {
-                        result.push(next);
-                        chars.next();
-                    } else {
-                        result.push('\\');
-                    }
-                }
-                '%' => {
-                    // Expand to current filename
-                    let file = self.current_file.as_ref().ok_or(ViError::NoFileName)?;
-                    result.push_str(file);
-                }
-                '#' => {
-                    // Expand to alternate filename
-                    let file = self
-                        .alternate_file
-                        .as_ref()
-                        .ok_or(ViError::NoAlternateFile)?;
-                    result.push_str(file);
-                }
-                '!' => {
-                    // Expand to previous command
-                    let cmd = self
-                        .last_command
-                        .as_ref()
-                        .ok_or(ViError::NoPreviousCommand)?;
-                    result.push_str(cmd);
-                }
-                _ => {
-                    result.push(c);
-                }
-            }
-        }
-
-        Ok(result)
+    /// `command` with `%`, `#` and `!` expanded (see [`expand`]), and
+    /// whether anything was substituted.
+    pub fn expand_command(&self, command: &str) -> Result<(String, bool)> {
+        expand(
+            command,
+            self.current_file.as_deref(),
+            self.alternate_file.as_deref(),
+            Some(self.last_command.as_deref()),
+        )
     }
 
     /// Validate command before execution.
@@ -132,7 +102,7 @@ impl ShellExecutor {
     ///
     /// This is used for `:!command` - execute and display output.
     pub fn execute(&mut self, command: &str) -> Result<ShellOutput> {
-        let expanded = self.expand_command(command)?;
+        let (expanded, _) = self.expand_command(command)?;
         Self::validate_command(&expanded)?;
 
         // Save as last command
@@ -140,7 +110,7 @@ impl ShellExecutor {
 
         let output = Command::new(&self.shell)
             .arg("-c")
-            .arg(&expanded)
+            .arg(crate::bytes::to_os(&expanded))
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -151,7 +121,6 @@ impl ShellExecutor {
             success: output.success(),
             exit_code: output.code().unwrap_or(-1),
             stdout: Vec::new(), // Output went directly to terminal
-            stderr: Vec::new(),
         })
     }
 
@@ -159,7 +128,7 @@ impl ShellExecutor {
     ///
     /// This is used for `:r !command` - read output into buffer.
     pub fn execute_capture(&mut self, command: &str) -> Result<ShellOutput> {
-        let expanded = self.expand_command(command)?;
+        let (expanded, _) = self.expand_command(command)?;
         Self::validate_command(&expanded)?;
 
         // Save as last command
@@ -169,20 +138,38 @@ impl ShellExecutor {
         // "shall be set to the standard input of the ex program when it was
         // invoked", so inherit it rather than handing the child /dev/null --
         // that is what makes `:r !cat` and `:r !sed ...` work at all.
-        let output = Command::new(&self.shell)
+        // 95279-95280: its standard output *and standard error* go into
+        // the buffer -- one pipe for both, so they keep their order.
+        let (mut reader, writer) = std::io::pipe()
+            .map_err(|e| ViError::ShellError(format!("failed to make a pipe: {}", e)))?;
+        let err_writer = writer
+            .try_clone()
+            .map_err(|e| ViError::ShellError(format!("failed to make a pipe: {}", e)))?;
+        let mut command = Command::new(&self.shell);
+        command
             .arg("-c")
-            .arg(&expanded)
+            .arg(crate::bytes::to_os(&expanded))
             .stdin(Stdio::inherit())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
+            .stdout(writer)
+            .stderr(err_writer);
+        let mut child = command
+            .spawn()
             .map_err(|e| ViError::ShellError(format!("failed to execute command: {}", e)))?;
+        // The parent's copies of the write end go with `command`, so the
+        // read sees end of file when the child is done.
+        drop(command);
+        // Read it all, then reap the child -- reaped even if the read fails.
+        let mut stdout = Vec::new();
+        let read = std::io::Read::read_to_end(&mut reader, &mut stdout);
+        let status = child
+            .wait()
+            .map_err(|e| ViError::ShellError(format!("failed to wait for command: {}", e)))?;
+        read.map_err(|e| ViError::ShellError(format!("failed to read command output: {}", e)))?;
 
         Ok(ShellOutput {
-            success: output.status.success(),
-            exit_code: output.status.code().unwrap_or(-1),
-            stdout: output.stdout,
-            stderr: output.stderr,
+            success: status.success(),
+            exit_code: status.code().unwrap_or(-1),
+            stdout: fold_crlf(stdout),
         })
     }
 
@@ -190,20 +177,30 @@ impl ShellExecutor {
     ///
     /// This is used for `:[range]!command` - filter lines through command.
     pub fn filter(&mut self, command: &str, input: &str) -> Result<ShellOutput> {
-        let expanded = self.expand_command(command)?;
+        let (expanded, _) = self.expand_command(command)?;
         Self::validate_command(&expanded)?;
 
         // Save as last command
         self.last_command = Some(expanded.clone());
 
-        let mut child = Command::new(&self.shell)
+        // 95609-95610: standard output and standard error replace the
+        // lines -- one pipe for both, so they keep their order.
+        let (mut reader, writer) = std::io::pipe()
+            .map_err(|e| ViError::ShellError(format!("failed to make a pipe: {}", e)))?;
+        let err_writer = writer
+            .try_clone()
+            .map_err(|e| ViError::ShellError(format!("failed to make a pipe: {}", e)))?;
+        let mut command = Command::new(&self.shell);
+        command
             .arg("-c")
-            .arg(&expanded)
+            .arg(crate::bytes::to_os(&expanded))
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(writer)
+            .stderr(err_writer);
+        let mut child = command
             .spawn()
             .map_err(|e| ViError::ShellError(format!("failed to spawn command: {}", e)))?;
+        drop(command);
 
         // Feed stdin from a separate thread.  `wait_with_output` cannot start
         // draining the child's stdout until the write finishes, so writing
@@ -216,14 +213,18 @@ impl ShellExecutor {
         let _sigpipe = plib::io::SigPipeIgnored::new();
 
         let feeder = child.stdin.take().map(|mut stdin| {
-            let data = input.as_bytes().to_vec();
+            // The bytes the buffer stands for, escaped bytes as themselves.
+            let data = crate::bytes::encode(input);
             std::thread::spawn(move || stdin.write_all(&data))
         });
 
-        // Wait for completion and get output
-        let output = child
-            .wait_with_output()
-            .map_err(|e| ViError::ShellError(format!("failed to read command output: {}", e)))?;
+        // Read it all, then reap the child.
+        let mut stdout = Vec::new();
+        let read = std::io::Read::read_to_end(&mut reader, &mut stdout);
+        let status = child
+            .wait()
+            .map_err(|e| ViError::ShellError(format!("failed to wait for command: {}", e)))?;
+        read.map_err(|e| ViError::ShellError(format!("failed to read command output: {}", e)))?;
 
         if let Some(feeder) = feeder {
             match feeder.join() {
@@ -245,10 +246,9 @@ impl ShellExecutor {
         }
 
         Ok(ShellOutput {
-            success: output.status.success(),
-            exit_code: output.status.code().unwrap_or(-1),
-            stdout: output.stdout,
-            stderr: output.stderr,
+            success: status.success(),
+            exit_code: status.code().unwrap_or(-1),
+            stdout: fold_crlf(stdout),
         })
     }
 
@@ -256,7 +256,7 @@ impl ShellExecutor {
     ///
     /// This is used for `:w !command` - write buffer to command.
     pub fn write_to(&mut self, command: &str, input: &str) -> Result<ShellOutput> {
-        let expanded = self.expand_command(command)?;
+        let (expanded, _) = self.expand_command(command)?;
         Self::validate_command(&expanded)?;
 
         // Save as last command
@@ -264,7 +264,7 @@ impl ShellExecutor {
 
         let mut child = Command::new(&self.shell)
             .arg("-c")
-            .arg(&expanded)
+            .arg(crate::bytes::to_os(&expanded))
             .stdin(Stdio::piped())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -274,7 +274,7 @@ impl ShellExecutor {
         // Write input to stdin
         if let Some(mut stdin) = child.stdin.take() {
             stdin
-                .write_all(input.as_bytes())
+                .write_all(&crate::bytes::encode(input))
                 .map_err(|e| ViError::ShellError(format!("failed to write to command: {}", e)))?;
         }
 
@@ -287,7 +287,6 @@ impl ShellExecutor {
             success: status.success(),
             exit_code: status.code().unwrap_or(-1),
             stdout: Vec::new(),
-            stderr: Vec::new(),
         })
     }
 
@@ -320,9 +319,80 @@ impl ShellExecutor {
             success: status.success(),
             exit_code: status.code().unwrap_or(-1),
             stdout: Vec::new(),
-            stderr: Vec::new(),
         })
     }
+}
+
+/// Expand `text` per 94657-94672: unescaped `%` is the `current`
+/// pathname and `#` the `alternate` one -- an error if that is not set --
+/// and, when `last` is given (a shell command), `!` is the previous shell
+/// command.  `\` before one of them makes it the character, and in a file
+/// name (no `last`) so does `\` before `\`.
+/// Returns the text and whether anything was substituted.
+pub fn expand(
+    text: &str,
+    current: Option<&str>,
+    alternate: Option<&str>,
+    last: Option<Option<&str>>,
+) -> Result<(String, bool)> {
+    let mut out = String::with_capacity(text.len());
+    let mut changed = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.peek() {
+                Some(&next @ ('%' | '#')) => {
+                    out.push(next);
+                    chars.next();
+                }
+                // In a file name `\\` is a backslash; a shell command keeps
+                // it, for the shell to read.
+                Some('\\') if last.is_none() => {
+                    out.push('\\');
+                    chars.next();
+                }
+                Some('!') if last.is_some() => {
+                    out.push('!');
+                    chars.next();
+                }
+                _ => out.push('\\'),
+            },
+            '%' => {
+                out.push_str(current.ok_or(ViError::NoFileName)?);
+                changed = true;
+            }
+            '#' => {
+                out.push_str(alternate.ok_or(ViError::NoAlternateFile)?);
+                changed = true;
+            }
+            '!' if last.is_some() => {
+                let previous = last.flatten().ok_or(ViError::NoPreviousCommand)?;
+                out.push_str(previous);
+                changed = true;
+            }
+            _ => out.push(c),
+        }
+    }
+    Ok((out, changed))
+}
+
+/// A program's output with each <carriage-return><newline> pair made one
+/// <newline> (95283-95284, 95612-95614); a lone <carriage-return> stays.
+fn fold_crlf(bytes: Vec<u8>) -> Vec<u8> {
+    if !bytes.windows(2).any(|w| w == b"\r\n") {
+        return bytes;
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+            i += 1;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
 }
 
 /// Output from a shell command.
@@ -334,25 +404,15 @@ pub struct ShellOutput {
     pub exit_code: i32,
     /// Captured stdout (empty if not captured).
     pub stdout: Vec<u8>,
-    /// Captured stderr (empty if not captured).
-    pub stderr: Vec<u8>,
 }
 
 impl ShellOutput {
-    /// Get stdout as a string, lossy conversion.
+    /// Get stdout as editor text.
+    ///
+    /// Bytes that are not UTF-8 are escaped, not replaced, so the output can
+    /// go into the buffer and back out unchanged.
     pub fn stdout_string(&self) -> String {
-        String::from_utf8_lossy(&self.stdout).into_owned()
-    }
-
-    /// Get stderr as a string, lossy conversion.
-    pub fn stderr_string(&self) -> String {
-        String::from_utf8_lossy(&self.stderr).into_owned()
-    }
-
-    /// Get stdout as lines.
-    pub fn stdout_lines(&self) -> Vec<String> {
-        let s = self.stdout_string();
-        s.lines().map(|l| l.to_string()).collect()
+        crate::bytes::decode(&self.stdout)
     }
 }
 
@@ -363,7 +423,7 @@ mod tests {
     #[test]
     fn test_expand_command_no_special() {
         let exec = ShellExecutor::new("/bin/sh");
-        let result = exec.expand_command("echo hello").unwrap();
+        let result = exec.expand_command("echo hello").unwrap().0;
         assert_eq!(result, "echo hello");
     }
 
@@ -371,7 +431,7 @@ mod tests {
     fn test_expand_command_percent() {
         let mut exec = ShellExecutor::new("/bin/sh");
         exec.set_current_file(Some("test.txt".to_string()));
-        let result = exec.expand_command("cat %").unwrap();
+        let result = exec.expand_command("cat %").unwrap().0;
         assert_eq!(result, "cat test.txt");
     }
 
@@ -388,7 +448,7 @@ mod tests {
     fn test_expand_command_escaped() {
         let mut exec = ShellExecutor::new("/bin/sh");
         exec.set_current_file(Some("test.txt".to_string()));
-        let result = exec.expand_command("echo \\%").unwrap();
+        let result = exec.expand_command("echo \\%").unwrap().0;
         assert_eq!(result, "echo %");
     }
 
@@ -396,8 +456,26 @@ mod tests {
     fn test_expand_command_bang() {
         let mut exec = ShellExecutor::new("/bin/sh");
         exec.last_command = Some("ls -la".to_string());
-        let result = exec.expand_command("!").unwrap();
+        let result = exec.expand_command("!").unwrap().0;
         assert_eq!(result, "ls -la");
+    }
+
+    #[test]
+    fn test_expand_backslashes_in_file_names() {
+        // In a file name `\\%` is a backslash and then the name.
+        assert_eq!(
+            expand("d\\\\%", Some("f"), None, None).unwrap(),
+            ("d\\f".to_string(), true)
+        );
+        assert_eq!(
+            expand("d\\%", Some("f"), None, None).unwrap(),
+            ("d%".to_string(), false)
+        );
+        // A shell command keeps `\\` for the shell.
+        assert_eq!(
+            expand("d\\\\x", None, None, Some(None)).unwrap().0,
+            "d\\\\x"
+        );
     }
 
     #[test]

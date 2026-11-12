@@ -17,6 +17,7 @@ use clap::Parser;
 use gettextrs::gettext;
 use std::ffi::OsString;
 use std::io::{self, BufReader, BufWriter, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Global flag for SIGINT received
@@ -53,7 +54,7 @@ struct Args {
     silent: bool,
 
     #[arg(help = gettext("File to edit"))]
-    file: Option<String>,
+    file: Option<OsString>,
 }
 
 /// Spell the historic option `-` as `-s`.
@@ -154,14 +155,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load file if specified
     if let Some(ref path) = args.file {
-        match editor.load_file(path) {
+        match editor.load_file(path.as_bytes()) {
             Ok(bytes) => {
                 if !args.silent {
                     println!("{}", bytes);
                 }
             }
             Err(e) => {
-                eprintln!("{}: {}", path, plib::diag::error_text(&e));
+                // The pathname as given, bytes and all.
+                let mut err = io::stderr().lock();
+                let _ = err.write_all(path.as_bytes());
+                let _ = writeln!(err, ": {}", plib::diag::error_text(&e));
                 editor.error_occurred = true;
             }
         }

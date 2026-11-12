@@ -86,9 +86,11 @@ pub fn read_safe_exrc(path: &str) -> io::Result<Option<String>> {
         return Ok(None);
     }
 
-    let mut content = String::new();
-    file.read_to_string(&mut content)?;
-    Ok(Some(content))
+    // Bytes, escaped as editor text where they are not UTF-8, as for every
+    // ex command.
+    let mut content = Vec::new();
+    file.read_to_end(&mut content)?;
+    Ok(Some(crate::bytes::decode(&content)))
 }
 
 #[cfg(test)]

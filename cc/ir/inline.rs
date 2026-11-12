@@ -592,11 +592,7 @@ fn should_inline(
         .max(candidate.estimated_size)
         .max(LARGE_FUNCTION_INSNS);
     let limit = base + base * LARGE_FUNCTION_GROWTH / 100;
-    if new_size > limit && new_size > LARGE_FUNCTION_INSNS {
-        return false;
-    }
-
-    true
+    !(new_size > limit && new_size > LARGE_FUNCTION_INSNS)
 }
 
 /// Whether a `flatten` function splices a call to `candidate`, which is on

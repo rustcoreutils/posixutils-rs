@@ -15,10 +15,10 @@
 //! - Reading/writing ranges
 //! - Alternate file tracking
 
-use crate::buffer::{Buffer, Line};
+use crate::buffer::Buffer;
 use crate::error::{Result, ViError};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 /// File manager for the editor.
@@ -204,50 +204,16 @@ impl FileManager {
 }
 
 /// Read a file into a buffer.
+///
+/// Only a file that is not there is a new, empty buffer. Any other failure is
+/// reported: `Path::exists` is false whenever `stat` fails, so testing it
+/// opened a file behind an unsearchable directory as an empty buffer.
 pub fn read_file(path: &Path) -> Result<Buffer> {
-    if !path.exists() {
-        // New file - return empty buffer
-        let buffer = Buffer::new();
-        return Ok(buffer);
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Buffer::from_text(&text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Buffer::new()),
+        Err(e) => Err(e.into()),
     }
-
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut content = String::new();
-
-    for line_result in reader.lines() {
-        let line = line_result?;
-        if !content.is_empty() {
-            content.push('\n');
-        }
-        content.push_str(&line);
-    }
-
-    // If file was empty, return buffer with one empty line
-    if content.is_empty() {
-        return Ok(Buffer::new());
-    }
-
-    Ok(Buffer::from_text(&content))
-}
-
-/// Read a file into buffer after a specific line.
-pub fn read_file_after(buffer: &mut Buffer, line_num: usize, path: &Path) -> Result<usize> {
-    if !path.exists() {
-        return Err(ViError::FileNotFound(path.display().to_string()));
-    }
-
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut count = 0;
-
-    for (i, line_result) in reader.lines().enumerate() {
-        let line = line_result?;
-        buffer.insert_line_after(line_num + i, Line::from(line.as_str()));
-        count += 1;
-    }
-
-    Ok(count)
 }
 
 /// Write buffer to a file.
@@ -435,6 +401,22 @@ mod tests {
         assert_eq!(buffer.line(1).unwrap().content(), "line one");
         assert_eq!(buffer.line(2).unwrap().content(), "line two");
         assert_eq!(buffer.line(3).unwrap().content(), "line three");
+    }
+
+    #[test]
+    fn test_read_file_unsearchable_dir_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root searches any directory
+        }
+        let dir = plib::tmp::tempdir().unwrap();
+        let sub = dir.path().join("locked");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("f"), "data\n").unwrap();
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = read_file(&sub.join("f"));
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err(), "an unreadable file must not open empty");
     }
 
     #[test]

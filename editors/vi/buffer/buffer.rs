@@ -110,11 +110,7 @@ impl Buffer {
 
     /// Create a buffer from text content.
     pub fn from_text(text: &str) -> Self {
-        let lines: Vec<Line> = if text.is_empty() {
-            Vec::new()
-        } else {
-            text.lines().map(Line::from).collect()
-        };
+        let lines: Vec<Line> = split_lines(text).map(Line::from).collect();
 
         Self {
             lines,
@@ -733,11 +729,7 @@ impl Buffer {
 
     /// Replace all content with new text.
     pub fn set_text(&mut self, text: &str) {
-        self.lines = if text.is_empty() {
-            Vec::new()
-        } else {
-            text.lines().map(Line::from).collect()
-        };
+        self.lines = split_lines(text).map(Line::from).collect();
         self.push_edit(LineEdit::Reset);
         self.cursor = Position::start();
         self.modified = true;
@@ -756,6 +748,17 @@ impl std::fmt::Display for Buffer {
     }
 }
 
+/// Split text into lines on `\n` alone; a final `\n` ends the last line
+/// rather than starting an empty one, and empty text has no lines.
+///
+/// `str::lines` is not this: it also strips a `\r` before each `\n`, so a
+/// CRLF file came back from a write as LF, and callers that joined its
+/// pieces back with `\n` dropped leading and trailing blank lines.
+pub fn split_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.split_inclusive('\n')
+        .map(|line| line.strip_suffix('\n').unwrap_or(line))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -765,6 +768,16 @@ mod tests {
         let buf = Buffer::new();
         assert!(buf.is_empty());
         assert_eq!(buf.line_count(), 0);
+    }
+
+    #[test]
+    fn test_split_lines() {
+        let split = |t| split_lines(t).collect::<Vec<_>>();
+        assert!(split("").is_empty());
+        assert_eq!(split("\n"), [""]);
+        assert_eq!(split("\n\na\n"), ["", "", "a"]);
+        assert_eq!(split("a\n\n"), ["a", ""]);
+        assert_eq!(split("a\r\nb"), ["a\r", "b"]);
     }
 
     #[test]

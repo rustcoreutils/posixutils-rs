@@ -15,7 +15,7 @@
 //!
 //! This implementation provides a change-based undo stack.
 
-use crate::buffer::{Buffer, Line, Position};
+use crate::buffer::{split_lines, Buffer, Line, Position};
 use crate::error::{Result, ViError};
 
 /// A change record for undo/redo.
@@ -74,7 +74,7 @@ pub enum ChangeKind {
 impl Change {
     /// Create an insert change.
     pub fn insert(pos: Position, text: String, linewise: bool) -> Self {
-        let line_count = text.lines().count().max(1);
+        let line_count = split_lines(&text).count().max(1);
         Self {
             kind: ChangeKind::Insert,
             position: pos,
@@ -89,7 +89,7 @@ impl Change {
 
     /// Create a delete change.
     pub fn delete(pos: Position, text: String, linewise: bool) -> Self {
-        let line_count = text.lines().count().max(1);
+        let line_count = split_lines(&text).count().max(1);
         Self {
             kind: ChangeKind::Delete,
             position: pos,
@@ -104,7 +104,7 @@ impl Change {
 
     /// Create a replace change.
     pub fn replace(pos: Position, old_text: String, new_text: String, linewise: bool) -> Self {
-        let line_count = old_text.lines().count().max(1);
+        let line_count = split_lines(&old_text).count().max(1);
         Self {
             kind: ChangeKind::Replace,
             position: pos,
@@ -446,7 +446,7 @@ impl UndoManager {
                     buffer.set_cursor(change.position);
                     if change.linewise {
                         // Insert lines
-                        for (i, line) in text.lines().enumerate() {
+                        for (i, line) in split_lines(text).enumerate() {
                             buffer
                                 .insert_line_after(change.position.line - 1 + i, Line::from(line));
                         }
@@ -544,7 +544,7 @@ impl UndoManager {
                     buffer.set_line(change.position.line);
                     buffer.set_column_for_insert(change.position.column);
                     if change.linewise {
-                        for (i, line) in text.lines().enumerate() {
+                        for (i, line) in split_lines(text).enumerate() {
                             buffer
                                 .insert_line_after(change.position.line - 1 + i, Line::from(line));
                         }

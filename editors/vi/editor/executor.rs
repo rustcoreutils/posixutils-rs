@@ -14,10 +14,10 @@
 //! while remaining part of the same `Editor` type.
 
 use super::Editor;
-use crate::buffer::{Line, Position, Range};
+use crate::buffer::{split_lines, Line, Position, Range};
 use crate::error::{Result, ViError};
 use crate::ex::address::{AddrCtx, Address};
-use crate::ex::command::SubstituteFlags;
+use crate::ex::command::{strip_line_terminator, SubstituteFlags};
 use crate::ex::AddressRange;
 
 impl Editor {
@@ -142,7 +142,7 @@ impl Editor {
         let content = self.registers.get(reg).ok_or(ViError::BufferEmpty(reg))?;
 
         // Insert lines after target
-        let lines: Vec<&str> = content.text.lines().collect();
+        let lines: Vec<&str> = split_lines(&content.text).collect();
         for (i, line_text) in lines.iter().enumerate() {
             self.buffer
                 .insert_line_after(target_line + i, Line::from(*line_text));
@@ -269,12 +269,8 @@ impl Editor {
 
         let content = std::fs::read_to_string(&path).map_err(ViError::Io)?;
 
-        let lines: Vec<&str> = content.lines().collect();
-        for (i, line_text) in lines.iter().enumerate() {
-            self.buffer
-                .insert_line_after(insert_after + i, Line::from(*line_text));
-        }
-
+        let lines: Vec<&str> = split_lines(&content).collect();
+        self.insert_lines_after(insert_after, &lines)?;
         self.buffer.set_line(insert_after + lines.len());
 
         let bytes = content.len();
@@ -553,8 +549,10 @@ impl Editor {
         for line_num in start..=end {
             self.buffer.set_line(line_num);
             // Execute each line of the buffer content as an ex command
-            for cmd_line in content.lines() {
-                let cmd_line = cmd_line.trim();
+            // Each line ends the way a sourced line does: `trim` also ate
+            // a `^V`-quoted `\r`, the end of `map Q :wq^V^M`.
+            for cmd_line in split_lines(&content) {
+                let cmd_line = strip_line_terminator(cmd_line).trim_start();
                 if !cmd_line.is_empty() {
                     self.execute_ex_input(cmd_line)?;
                 }

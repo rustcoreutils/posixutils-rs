@@ -12,6 +12,8 @@
 //! These tests verify the ex binary works correctly in line-oriented mode,
 //! testing POSIX ex commands via stdin/stdout.
 
+mod fileio;
+
 use plib::testing::{get_binary_path, run_test, TestPlan};
 use plib::tmp::{NamedTempFile, TempDir};
 use std::fs;

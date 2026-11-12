@@ -154,11 +154,13 @@ impl Line {
         }
     }
 
-    /// Create a line from a string, stripping trailing newlines.
+    /// Create a line from a string, stripping one trailing newline.
+    ///
+    /// A `\r` is line content, not part of the terminator: stripping it made
+    /// every CRLF file come back from a write as LF.
     fn from_string_trimmed(s: &str) -> Self {
-        // Strip trailing newline if present
         let content = s.strip_suffix('\n').unwrap_or(s);
-        let content = content.strip_suffix('\r').unwrap_or(content);
+        debug_assert!(!content.contains('\n'), "a Line holds no newline");
         Self {
             content: content.to_string(),
         }
@@ -414,12 +416,12 @@ mod tests {
     }
 
     #[test]
-    fn test_from_str_strips_newline() {
+    fn test_from_str_strips_newline_keeps_cr() {
         let line = Line::from("hello\n");
         assert_eq!(line.content(), "hello");
 
         let line = Line::from("hello\r\n");
-        assert_eq!(line.content(), "hello");
+        assert_eq!(line.content(), "hello\r");
     }
 
     #[test]

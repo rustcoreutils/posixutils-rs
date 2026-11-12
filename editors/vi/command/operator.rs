@@ -12,7 +12,8 @@
 //! Operators work on text ranges defined by motions or text objects.
 
 use crate::buffer::{
-    char_index_at_byte, leading_blank_width, render_indent, Buffer, BufferMode, Position, Range,
+    char_index_at_byte, leading_blank_width, render_indent, split_lines, Buffer, BufferMode,
+    Position, Range,
 };
 use crate::error::{Result, ViError};
 use crate::register::{RegisterContent, Registers};
@@ -330,7 +331,7 @@ fn put_lines_after(buffer: &mut Buffer, text: &str, count: usize) -> Result<Posi
     let after_line = buffer.cursor().line;
 
     for _ in 0..count {
-        for (i, line) in text.lines().enumerate() {
+        for (i, line) in split_lines(text).enumerate() {
             let insert_at = after_line + i;
             buffer.insert_line_after(insert_at, crate::buffer::Line::from(line));
         }
@@ -348,7 +349,7 @@ fn put_lines_before(buffer: &mut Buffer, text: &str, count: usize) -> Result<Pos
     let before_line = buffer.cursor().line;
 
     for _ in 0..count {
-        for (i, line) in text.lines().enumerate() {
+        for (i, line) in split_lines(text).enumerate() {
             let insert_at = before_line + i - 1;
             buffer.insert_line_after(insert_at, crate::buffer::Line::from(line));
         }

@@ -16,7 +16,7 @@ mod executor;
 
 use std::sync::atomic::AtomicBool;
 
-use crate::buffer::{Buffer, BufferMode, Line, Position, Range};
+use crate::buffer::{split_lines, Buffer, BufferMode, Line, Position, Range};
 use crate::command::{CommandParser, ParserState};
 use crate::error::{Result, ViError};
 use crate::ex::command::{strip_line_terminator, MapMode, SubstituteFlags, CTRL_V};
@@ -2390,6 +2390,17 @@ impl Editor {
         Ok(result)
     }
 
+    /// Insert `lines` after line `after` (0: before line 1) as one undoable
+    /// change.
+    pub(super) fn insert_lines_after(&mut self, after: usize, lines: &[&str]) -> Result<()> {
+        self.splice_around(after + 1, after, |ed| {
+            for (i, text) in lines.iter().enumerate() {
+                ed.buffer.insert_line_after(after + i, Line::from(*text));
+            }
+            Ok(())
+        })
+    }
+
     /// Record what an operator removed, so `u` can put it back.
     ///
     /// Every operator that removes text must call this: `apply_inverse` rebuilds
@@ -3800,8 +3811,6 @@ impl Editor {
 
     /// Execute :r !command - read command output into buffer.
     fn execute_shell_read(&mut self, line: Option<usize>, command: &str) -> Result<()> {
-        use crate::buffer::Line;
-
         // #V18: the child inherits our stdin now (#X23), so it must not find
         // the terminal in raw mode. `execute_shell_command` already brackets
         // its child this way; this path did not.
@@ -3824,21 +3833,10 @@ impl Editor {
 
         // Insert output after specified line (or current line)
         let insert_line = line.unwrap_or_else(|| self.buffer.cursor().line);
-        let lines = output.stdout_lines();
-        let line_count = lines.len();
-
-        // Record for undo - record as insert of all the text
         let text = output.stdout_string();
-        self.undo.record_insert(
-            Position::new(insert_line + 1, 0),
-            &text,
-            true, // linewise
-        );
-
-        for (i, content) in lines.into_iter().enumerate() {
-            self.buffer
-                .insert_line_after(insert_line + i, Line::from(content.as_str()));
-        }
+        let lines: Vec<&str> = split_lines(&text).collect();
+        let line_count = lines.len();
+        self.insert_lines_after(insert_line, &lines)?;
 
         // Move cursor to first inserted line
         if line_count > 0 {
@@ -3852,8 +3850,6 @@ impl Editor {
 
     /// Execute :[range]!command - filter lines through command.
     fn execute_shell_filter(&mut self, range: &AddressRange, command: &str) -> Result<()> {
-        use crate::buffer::Line;
-
         // Resolve range
         let (start, end) = self.resolve_range(range)?;
 
@@ -3874,29 +3870,22 @@ impl Editor {
             return Ok(());
         }
 
-        // Record for undo - this is a replace operation
-        let new_text = output.stdout_string();
-        self.undo.record_replace(
-            Position::new(start, 0),
-            &input,
-            &new_text,
-            true, // linewise
-        );
-
-        // Delete original lines
-        for _ in start..=end {
-            self.buffer.delete_line(start);
-        }
-
-        // Insert filtered output
-        let lines = output.stdout_lines();
-
-        // Insert new lines (insert_line_after takes 0-based index for "before first line")
-        let insert_pos = start.saturating_sub(1);
-        for (i, content) in lines.into_iter().enumerate() {
-            self.buffer
-                .insert_line_after(insert_pos + i, Line::from(content.as_str()));
-        }
+        // Replace the range with the output as one whole-line change, so
+        // `u` swaps the lines back rather than rebuilding them character by
+        // character.
+        let text = output.stdout_string();
+        self.splice_around(start, end, |ed| {
+            for _ in start..=end {
+                ed.buffer.delete_line(start);
+            }
+            // `insert_line_after(0, ..)` inserts before the first line.
+            let insert_pos = start.saturating_sub(1);
+            for (i, line) in split_lines(&text).enumerate() {
+                ed.buffer
+                    .insert_line_after(insert_pos + i, Line::from(line));
+            }
+            Ok(())
+        })?;
 
         // Position cursor at first line of result
         self.buffer.set_line(start.max(1));

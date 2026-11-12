@@ -348,12 +348,6 @@ impl ShellOutput {
     pub fn stderr_string(&self) -> String {
         String::from_utf8_lossy(&self.stderr).into_owned()
     }
-
-    /// Get stdout as lines.
-    pub fn stdout_lines(&self) -> Vec<String> {
-        let s = self.stdout_string();
-        s.lines().map(|l| l.to_string()).collect()
-    }
 }
 
 #[cfg(test)]

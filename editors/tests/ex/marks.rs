@@ -72,6 +72,7 @@ fn ex_in_tag_dir(
         .args(args)
         .current_dir(dir.path())
         .env("HOME", dir.path())
+        .env("TMPDIR", dir.path())
         .env_remove("EXINIT")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

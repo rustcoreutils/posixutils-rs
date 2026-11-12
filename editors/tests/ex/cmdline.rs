@@ -122,6 +122,7 @@ fn test_initial_command_is_one_command_line() {
         .args(["-s", "-c", "set sw=3|map Q 1p\x16|2p", "f"])
         .current_dir(dir.path())
         .env("HOME", dir.path())
+        .env("TMPDIR", dir.path())
         .env_remove("EXINIT")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

@@ -15,6 +15,7 @@
 mod bytes;
 mod conformance;
 mod editing;
+mod excmd;
 mod maps_tags;
 
 use vi_rs::buffer::Position;

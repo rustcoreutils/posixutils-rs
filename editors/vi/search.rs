@@ -97,59 +97,13 @@ impl SearchState {
             )));
         }
 
-        // Convert the vi pattern to a POSIX BRE for the libc engine.
-        let regex_pattern = self.convert_pattern(pattern)?;
-
-        let mut flags = RegexFlags::bre();
-        if self.ignorecase {
-            flags = flags.ignore_case();
-        }
-        let regex = TextRegex::new(&regex_pattern, flags)
-            .map_err(|e| ViError::InvalidPattern(e.to_string()))?;
+        let regex = compile_pattern(pattern, self.ignorecase, self.magic)?;
 
         self.pattern = Some(pattern.to_string());
         self.regex = Some(regex);
         self.direction = direction;
 
         Ok(())
-    }
-
-    /// Convert a vi search pattern to a POSIX Basic Regular Expression for the
-    /// libc engine (`plib::regex`).
-    fn convert_pattern(&self, pattern: &str) -> Result<String> {
-        if self.magic {
-            // vi "magic" mode is exactly POSIX BRE — `. * ^ $ [ ] \` are
-            // special, `\( \) \{ \}` group/repeat, and `+ ? | ( ) { }` are
-            // literal — plus the `\<`/`\>` word-boundary escapes, which glibc
-            // BRE supports natively. So the pattern passes through unchanged.
-            Ok(pattern.to_string())
-        } else {
-            // "nomagic": only `^` and `$` keep their special meaning; every
-            // other BRE metacharacter must be escaped so libc treats it
-            // literally. Backslash escapes are preserved as-is (so `\(`, `\{`,
-            // `\<`, etc. remain special).
-            let mut result = String::new();
-            let mut chars = pattern.chars();
-
-            while let Some(c) = chars.next() {
-                match c {
-                    '\\' => {
-                        result.push('\\');
-                        if let Some(next) = chars.next() {
-                            result.push(next);
-                        }
-                    }
-                    '^' | '$' => result.push(c),
-                    // Make the BRE metacharacters literal.
-                    '.' | '*' | '[' | ']' => {
-                        result.push('\\');
-                        result.push(c);
-                    }
-                    _ => result.push(c),
-                }
-            }
-            Ok(result)
-        }
     }
 
     /// Get the current pattern.
@@ -314,6 +268,55 @@ impl SearchState {
         }
         matches
     }
+}
+
+/// Compile a vi pattern as the editor's searches do: a POSIX BRE, with the
+/// `magic` and `ignorecase` edit options applied.  Every RE the editor
+/// matches -- searches, search addresses -- goes through here, so an option
+/// cannot hold for one and not another.
+pub fn compile_pattern(pattern: &str, ignorecase: bool, magic: bool) -> Result<TextRegex> {
+    let mut flags = RegexFlags::bre();
+    if ignorecase {
+        flags = flags.ignore_case();
+    }
+    TextRegex::new(&convert_pattern(pattern, magic), flags)
+        .map_err(|e| ViError::InvalidPattern(e.to_string()))
+}
+
+/// Convert a vi pattern to a POSIX Basic Regular Expression for the libc
+/// engine (`plib::regex`).
+fn convert_pattern(pattern: &str, magic: bool) -> String {
+    if magic {
+        // vi "magic" mode is exactly POSIX BRE — `. * ^ $ [ ] \` are
+        // special, `\( \) \{ \}` group/repeat, and `+ ? | ( ) { }` are
+        // literal — plus the `\<`/`\>` word-boundary escapes, which glibc
+        // BRE supports natively. So the pattern passes through unchanged.
+        return pattern.to_string();
+    }
+    // "nomagic": only `^` and `$` keep their special meaning; every other
+    // BRE metacharacter must be escaped so libc treats it literally.
+    // Backslash escapes are preserved as-is (so `\(`, `\{`, `\<`, etc.
+    // remain special).
+    let mut result = String::new();
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                result.push('\\');
+                if let Some(next) = chars.next() {
+                    result.push(next);
+                }
+            }
+            '^' | '$' => result.push(c),
+            // Make the BRE metacharacters literal.
+            '.' | '*' | '[' | ']' => {
+                result.push('\\');
+                result.push(c);
+            }
+            _ => result.push(c),
+        }
+    }
+    result
 }
 
 /// Find the last match of a regex in a string.

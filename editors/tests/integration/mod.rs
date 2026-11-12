@@ -784,7 +784,7 @@ fn test_ex_global() {
 #[test]
 fn test_ex_line_number() {
     let cmd = ex::parse_ex_command("10").unwrap();
-    assert!(matches!(cmd, ExCommand::Goto { line: 10 }));
+    assert!(matches!(cmd, ExCommand::GotoAddress { .. }));
 }
 
 // ============================================================================

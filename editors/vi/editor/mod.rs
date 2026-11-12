@@ -39,30 +39,15 @@ use std::path::PathBuf;
 /// literal delimiter in the pattern. Any `+n`/`-n` after the closing delimiter
 /// is returned as a signed line offset (0 if absent).
 fn split_search(body: &str, delim: char) -> (String, i64) {
-    let mut pattern = String::new();
-    let mut chars = body.chars().peekable();
-    let mut rest: Option<String> = None;
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            if chars.peek() == Some(&delim) {
-                pattern.push(delim);
-                chars.next();
-                continue;
-            }
-            pattern.push('\\');
-        } else if c == delim {
-            rest = Some(chars.collect());
-            break;
-        } else {
-            pattern.push(c);
-        }
-    }
-    let offset = rest
-        .as_deref()
-        .map(str::trim)
-        .filter(|r| !r.is_empty())
-        .and_then(|r| r.parse::<i64>().ok())
-        .unwrap_or(0);
+    // The same scan as an ex search address, so one RE reads the same at
+    // the `/` prompt as after `:` -- `\\/` and `[/]` included.
+    let (pattern, rest) = crate::ex::address::scan_pattern(body, delim);
+    let rest = rest.trim();
+    let offset = if rest.is_empty() {
+        0
+    } else {
+        rest.parse::<i64>().unwrap_or(0)
+    };
     (pattern, offset)
 }
 
@@ -157,6 +142,10 @@ pub struct Editor {
     insert_state: Option<InsertState>,
     /// Ex command line input.
     ex_input: String,
+    /// The command-line prompt `ex_input` was opened with: `:` for an ex
+    /// command, `/` or `?` for a search.  The two share the line, and
+    /// `:/b/d` and `/b/d` read the same, so only this tells them apart.
+    ex_prompt: char,
     /// Editor options.
     options: Options,
     /// Register storage.
@@ -248,6 +237,8 @@ pub struct Editor {
     ex_insert_text: Vec<String>,
     /// Whether running in ex standalone mode (line-oriented).
     ex_standalone_mode: bool,
+    /// Whether a `:g`/`:v` command list is running.
+    in_global: bool,
     /// Silent/batch mode (suppress prompts and messages).
     silent_mode: bool,
 }
@@ -288,6 +279,7 @@ impl Editor {
             parser: CommandParser::new(),
             insert_state: None,
             ex_input: String::new(),
+            ex_prompt: ':',
             options,
             registers: Registers::new(),
             undo: UndoManager::new(),
@@ -320,6 +312,7 @@ impl Editor {
             ex_insert_indent: String::new(),
             ex_insert_text: Vec::new(),
             ex_standalone_mode: false,
+            in_global: false,
             silent_mode: false,
         })
     }
@@ -338,6 +331,7 @@ impl Editor {
             parser: CommandParser::new(),
             insert_state: None,
             ex_input: String::new(),
+            ex_prompt: ':',
             options,
             registers: Registers::new(),
             undo: UndoManager::new(),
@@ -370,6 +364,7 @@ impl Editor {
             ex_insert_indent: String::new(),
             ex_insert_text: Vec::new(),
             ex_standalone_mode: true,
+            in_global: false,
             silent_mode: true,
         })
     }
@@ -391,6 +386,7 @@ impl Editor {
             parser: CommandParser::new(),
             insert_state: None,
             ex_input: String::new(),
+            ex_prompt: ':',
             options,
             registers: Registers::new(),
             undo: UndoManager::new(),
@@ -423,6 +419,7 @@ impl Editor {
             ex_insert_indent: String::new(),
             ex_insert_text: Vec::new(),
             ex_standalone_mode: false,
+            in_global: false,
             silent_mode: false,
         }
     }
@@ -763,11 +760,16 @@ impl Editor {
                     }
                 }
                 Err(e) => {
-                    // Errors always go to stderr
+                    // Errors always go to stderr, and any error makes the
+                    // exit status non-zero (EXIT STATUS: ">0 An error
+                    // occurred").
                     crate::bytes::eprintln(&e.to_string());
-                    // In silent mode, errors are fatal
-                    if self.silent_mode {
-                        self.exit_code = 1;
+                    self.exit_code = 1;
+                    // POSIX 96009-96011: with standard input not a terminal,
+                    // an error ends the session -- no later write, no more
+                    // commands -- whether or not -s was given.  On a
+                    // terminal the user sees the message and goes on.
+                    if !stdin_is_tty {
                         self.should_quit = true;
                     }
                 }
@@ -1320,16 +1322,19 @@ impl Editor {
             match key {
                 Key::Char(':') => {
                     self.mode = Mode::Ex;
+                    self.ex_prompt = ':';
                     self.ex_input.clear();
                     return Ok(());
                 }
                 Key::Char('/') => {
                     self.mode = Mode::Ex;
+                    self.ex_prompt = '/';
                     self.ex_input = "/".to_string();
                     return Ok(());
                 }
                 Key::Char('?') => {
                     self.mode = Mode::Ex;
+                    self.ex_prompt = '?';
                     self.ex_input = "?".to_string();
                     return Ok(());
                 }
@@ -1515,7 +1520,15 @@ impl Editor {
                 // which prints and exits -- so letting `:q` on a modified
                 // buffer return `FileModified` here quit vi and discarded the
                 // very work the warning exists to protect.
-                if let Err(e) = self.execute_ex_input(&input) {
+                // A `/` or `?` prompt is a search; a `:` line is an ex
+                // command, where `/re/` is an address like any other.
+                let outcome = match (self.ex_prompt, input.chars().next()) {
+                    ('/', Some('/')) => self.ex_search(&input[1..], '/', SearchDirection::Forward),
+                    ('?', Some('?')) => self.ex_search(&input[1..], '?', SearchDirection::Backward),
+                    _ => self.execute_ex_input(&input),
+                };
+                self.ex_prompt = ':';
+                if let Err(e) = outcome {
                     self.set_error(&e.to_string());
                 }
             }
@@ -2142,7 +2155,11 @@ impl Editor {
             }
             // Repeat substitution
             '&' => {
-                self.repeat_substitution()?;
+                // A failure is a message on the status line: an error out of
+                // here unwinds out of the editor and ends the session.
+                if let Err(e) = self.repeat_substitution() {
+                    self.set_error(&e.to_string());
+                }
             }
             // Repeat last command
             '.' => {
@@ -2931,6 +2948,7 @@ impl Editor {
             // Store the range for later use and enter ex mode with ! prefix
             self.pending_filter = Some(format!("{},{}", start_line, end_line));
             self.mode = Mode::Ex;
+            self.ex_prompt = ':';
             self.ex_input = "!".to_string();
         }
         Ok(())
@@ -2969,15 +2987,27 @@ impl Editor {
     /// Run a `/`- or `?`-style search from an ex command line: set the pattern
     /// (up to the first unescaped delimiter), search, then apply any trailing
     /// `+n`/`-n` line offset.
+    /// Record `pattern` as a search in direction `delim` (`/` or `?`): the
+    /// pattern `n` repeats, the `/` register, and the last RE used, which
+    /// spans searches as well as substitutes (what `~` and `s//` reuse).
+    fn note_search(&mut self, pattern: &str, delim: char) -> Result<()> {
+        let dir = if delim == '/' {
+            SearchDirection::Forward
+        } else {
+            SearchDirection::Backward
+        };
+        self.search.update_options(&self.options);
+        self.search.set_pattern(pattern, dir)?;
+        self.registers.set_search(pattern);
+        self.set_last_regex(pattern);
+        Ok(())
+    }
+
     fn ex_search(&mut self, body: &str, delim: char, dir: SearchDirection) -> Result<()> {
         self.search.update_options(&self.options);
         let (pattern, offset) = split_search(body, delim);
         if !pattern.is_empty() {
-            self.search.set_pattern(&pattern, dir)?;
-            self.registers.set_search(&pattern);
-            // POSIX's "last RE used in the editor" spans searches as well as
-            // substitutes, which is what `~` and an empty `s//` pattern reuse.
-            self.set_last_regex(&pattern);
+            self.note_search(&pattern, delim)?;
         }
         self.search_next(dir)?;
         if offset != 0 {
@@ -2991,16 +3021,10 @@ impl Editor {
 
     /// Execute an ex command input string.
     fn execute_ex_input(&mut self, input: &str) -> Result<()> {
-        // Handle search patterns. The pattern runs up to the first unescaped
-        // delimiter (POSIX: a trailing delimiter is optional and may be
-        // followed by a +n/-n line offset).
-        if let Some(body) = input.strip_prefix('/') {
-            return self.ex_search(body, '/', SearchDirection::Forward);
-        }
-        if let Some(body) = input.strip_prefix('?') {
-            return self.ex_search(body, '?', SearchDirection::Backward);
-        }
-
+        // A leading `/re/` or `?re?` is an address, not a search: what
+        // follows it is the command to run there (`/b/d`).  Treating the
+        // whole line as a search dropped that command.  vi's own `/` and `?`
+        // prompts are searches, and are handled where the prompt ends.
         // Check if this is a filter command from vi ! operator
         let actual_input = if let Some(range) = self.pending_filter.take() {
             if let Some(shell_cmd) = input.strip_prefix('!') {
@@ -3015,6 +3039,20 @@ impl Editor {
 
         // Parse and execute ex command
         let cmd = parse_ex_command(&actual_input)?;
+
+        // A search address is a search: its RE becomes the last RE used,
+        // and the search pattern for `n`, before the command runs -- so the
+        // `s//X/` of `/b/s//X/` means `b`.  Only once the line has parsed:
+        // a command that is never run must not change them.
+        let (range, _) = crate::ex::address::parse_address_range(&actual_input);
+        let mut searches = range.search_patterns();
+        if let ExCommand::Copy { dest, .. } | ExCommand::Move { dest, .. } = &cmd {
+            searches.extend(dest.search_pattern());
+        }
+        for (pattern, delim) in searches {
+            self.note_search(&pattern, delim)?;
+        }
+
         let result = self.execute_ex(cmd)?;
 
         match result {
@@ -3030,7 +3068,7 @@ impl Editor {
                 self.set_message(&msg);
             }
             ExResult::Error(msg) => {
-                self.set_error(&msg);
+                return Err(ViError::InvalidCommand(msg));
             }
             ExResult::CommandOutput(lines) => {
                 if self.ex_standalone_mode {
@@ -3143,18 +3181,51 @@ impl Editor {
                 }
             }
             ExCommand::GotoAddress { range } => {
-                if let Some(line) = self.resolve_target_line(&range, false)? {
-                    let line = line.min(self.buffer.line_count()).max(1);
-                    self.buffer.set_line(line);
+                if !self.ex_standalone_mode {
+                    // Open or visual mode: the current line is set to the
+                    // last address (94555).  A line number past either end
+                    // goes to that end, as vi always has: `:0` and `:999`
+                    // are the usual ways to reach the first and last lines.
+                    let last = match (&range.end, &range.start) {
+                        (None, Some(crate::ex::address::Address::Line(n))) => {
+                            (*n).clamp(1, self.buffer.line_count().max(1))
+                        }
+                        _ => self.resolve_range(&range)?.1,
+                    };
+                    self.buffer.set_line(last.max(1));
                     self.buffer.move_to_first_non_blank();
+                    return Ok(ExResult::Continue);
                 }
-                Ok(ExResult::Continue)
-            }
-            ExCommand::Goto { line } => {
-                let line = line.min(self.buffer.line_count()).max(1);
-                self.buffer.set_line(line);
+                // POSIX 94561: the implied command is print, of every line
+                // addressed.  Resolved once: a search address searches.
+                let (first, last) = self.resolve_range(&range)?;
+                let lines = self.lines_for_output(first, last);
+                self.buffer.set_line(last.max(1));
                 self.buffer.move_to_first_non_blank();
-                Ok(ExResult::Continue)
+                Ok(ExResult::CommandOutput(lines))
+            }
+            ExCommand::Empty => {
+                // POSIX 94561-94569: in ex mode an empty command prints --
+                // the current line inside a global, the next line outside
+                // one, failing (and leaving the current line alone) past the
+                // end of the buffer.
+                if !self.ex_standalone_mode {
+                    return Ok(ExResult::Continue);
+                }
+                if self.in_global {
+                    let cur = self.buffer.cursor().line;
+                    return Ok(ExResult::CommandOutput(self.lines_for_output(cur, cur)));
+                }
+                let next = self.buffer.cursor().line + 1;
+                if next > self.buffer.line_count() {
+                    return Err(ViError::InvalidAddress(
+                        "no line after the last".to_string(),
+                    ));
+                }
+                let lines = self.lines_for_output(next, next);
+                self.buffer.set_line(next);
+                self.buffer.move_to_first_non_blank();
+                Ok(ExResult::CommandOutput(lines))
             }
             ExCommand::File { new_name } => {
                 if let Some(name) = new_name {
@@ -3468,7 +3539,6 @@ impl Editor {
                     Ok(ExResult::CommandOutput(printed))
                 }
             }
-            ExCommand::Nop => Ok(ExResult::Continue),
             ExCommand::Tag { tag, force } => {
                 // 95408: without `!`, replacing a modified buffer is an error.
                 if !force && self.buffer.is_modified() {
@@ -3968,6 +4038,11 @@ impl Editor {
             (current, current)
         };
 
+        Ok(self.lines_for_output(start, end))
+    }
+
+    /// Lines `start..=end` as `print` writes them.
+    fn lines_for_output(&self, start: usize, end: usize) -> Vec<String> {
         let mut lines = Vec::new();
         for line_num in start..=end {
             if let Some(line) = self.buffer.line(line_num) {
@@ -3978,7 +4053,7 @@ impl Editor {
                 }
             }
         }
-        Ok(lines)
+        lines
     }
 
     /// Get lines with line numbers for :nu (number) command output.
@@ -4080,6 +4155,7 @@ impl Editor {
         // `u` must reverse all of it -- not just the last line it touched.
         self.undo.begin_group();
         self.buffer.begin_line_tracking();
+        let was_in_global = std::mem::replace(&mut self.in_global, true);
         for idx in 0..pending.len() {
             let Some(line_num) = pending[idx] else {
                 continue;
@@ -4103,6 +4179,7 @@ impl Editor {
                 }
             }
         }
+        self.in_global = was_in_global;
         self.buffer.end_line_tracking();
         self.undo.end_group();
 
@@ -4324,7 +4401,13 @@ impl Editor {
         }
 
         if total_count == 0 {
-            self.set_error("Pattern not found");
+            // POSIX 95361: an error "if the substitution fails on every
+            // addressed line" -- except as one pass of a global, where, as in
+            // historical ex and nvi, a line without a match is no error and
+            // `g/foo/s/bar/baz/` goes on to the next line.
+            if !self.in_global {
+                return Err(ViError::PatternNotFound(pattern.to_string()));
+            }
         } else if sub.is_count_only() {
             self.set_message(&format!("{} matches", total_count));
         } else {

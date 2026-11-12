@@ -589,6 +589,10 @@ impl Editor {
             current,
             marks: &self.marks,
             allow_zero: false,
+            last_regex: self.last_regex(),
+            ignorecase: self.options.ignorecase,
+            magic: self.options.magic,
+            wrapscan: self.options.wrapscan,
         }
     }
 

@@ -14,7 +14,6 @@
 use crate::buffer::{Buffer, Position};
 use crate::bytes::TextRegex;
 use crate::error::{Result, ViError};
-use plib::regex::RegexFlags;
 
 /// Everything address resolution needs from the editor.
 ///
@@ -33,6 +32,15 @@ pub struct AddrCtx<'a> {
     /// Permit line 0. POSIX allows it for the commands that insert *after* an
     /// address (`a`, `i`, `r`, `put`), where 0 means "before the first line".
     pub allow_zero: bool,
+    /// The last RE used in the editor: what an empty `//` or `??` means.
+    pub last_regex: Option<&'a str>,
+    /// The `ignorecase` edit option.
+    pub ignorecase: bool,
+    /// The `magic` edit option.
+    pub magic: bool,
+    /// The `wrapscan` edit option: whether a search goes on past the end of
+    /// the buffer (POSIX 94492, 94504).
+    pub wrapscan: bool,
 }
 
 impl<'a> AddrCtx<'a> {
@@ -44,17 +52,31 @@ impl<'a> AddrCtx<'a> {
             current,
             marks: &NO_MARKS,
             allow_zero: false,
+            last_regex: None,
+            ignorecase: false,
+            magic: true,
+            wrapscan: true,
         }
+    }
+
+    /// Compile a search address's pattern, as a search would be compiled:
+    /// the editor's options apply, and an empty pattern is the last RE.
+    fn compile<'c>(&self, pattern: &str, cache: &'c RegexCache) -> Result<&'c TextRegex> {
+        if let Some(regex) = cache.get() {
+            return Ok(regex);
+        }
+        let pattern = if pattern.is_empty() {
+            self.last_regex.ok_or(ViError::NoPreviousSearch)?
+        } else {
+            pattern
+        };
+        let regex = crate::search::compile_pattern(pattern, self.ignorecase, self.magic)?;
+        Ok(cache.get_or_init(|| regex))
     }
 
     /// Same context, but resolving relative to a different current line.
     fn with_current(&self, current: usize) -> AddrCtx<'a> {
-        AddrCtx {
-            buffer: self.buffer,
-            current,
-            marks: self.marks,
-            allow_zero: self.allow_zero,
-        }
+        AddrCtx { current, ..*self }
     }
 }
 
@@ -68,18 +90,31 @@ pub enum Address {
     /// Absolute line number.
     Line(usize),
     /// Pattern search forward (/pattern/).
-    SearchForward { pattern: String, regex: TextRegex },
+    SearchForward {
+        pattern: String,
+        compiled: RegexCache,
+    },
     /// Pattern search backward (?pattern?).
-    SearchBackward { pattern: String, regex: TextRegex },
+    SearchBackward {
+        pattern: String,
+        compiled: RegexCache,
+    },
     /// Previous context (').
     Mark(char),
     /// Relative offset from current address (+n or -n).
-    Relative(i32),
+    Relative(i64),
     /// A base address with a trailing +n/-n offset (e.g. `.+2`, `/re/-1`).
-    Offset(Box<Address>, i32),
+    Offset(Box<Address>, i64),
 }
 
-// Custom PartialEq that ignores regex (compares only pattern strings)
+/// A search address's regex, compiled the first time it is resolved.  An
+/// address lives for one command, through which the editor's options and
+/// last RE stay what they were, so one compilation serves every resolve --
+/// a `:g` body resolves its addresses once per marked line.
+pub type RegexCache = std::cell::OnceCell<TextRegex>;
+
+// Equality is the pattern's: the compiled cache is not part of what an
+// address is.
 impl PartialEq for Address {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -120,8 +155,8 @@ impl Address {
                     Ok(*n)
                 }
             }
-            Address::SearchForward { pattern, regex } => {
-                // Search forward for pattern (using pre-compiled regex)
+            Address::SearchForward { pattern, compiled } => {
+                let regex = ctx.compile(pattern, compiled)?;
                 for line_num in (current + 1)..=buffer.line_count() {
                     if let Some(line) = buffer.line(line_num) {
                         if regex.is_match(line.content()) {
@@ -129,8 +164,9 @@ impl Address {
                         }
                     }
                 }
-                // Wrap around
-                for line_num in 1..current {
+                // Wrap around, if wrapscan allows
+                let wrap = if ctx.wrapscan { 1..current } else { 1..1 };
+                for line_num in wrap {
                     if let Some(line) = buffer.line(line_num) {
                         if regex.is_match(line.content()) {
                             return Ok(line_num);
@@ -139,8 +175,8 @@ impl Address {
                 }
                 Err(ViError::PatternNotFound(pattern.clone()))
             }
-            Address::SearchBackward { pattern, regex } => {
-                // Search backward for pattern (using pre-compiled regex)
+            Address::SearchBackward { pattern, compiled } => {
+                let regex = ctx.compile(pattern, compiled)?;
                 for line_num in (1..current).rev() {
                     if let Some(line) = buffer.line(line_num) {
                         if regex.is_match(line.content()) {
@@ -148,8 +184,13 @@ impl Address {
                         }
                     }
                 }
-                // Wrap around
-                for line_num in (current + 1..=buffer.line_count()).rev() {
+                // Wrap around, if wrapscan allows
+                let wrap = if ctx.wrapscan {
+                    current + 1..buffer.line_count() + 1
+                } else {
+                    1..1
+                };
+                for line_num in wrap.rev() {
                     if let Some(line) = buffer.line(line_num) {
                         if regex.is_match(line.content()) {
                             return Ok(line_num);
@@ -169,27 +210,60 @@ impl Address {
                     _ => Err(ViError::MarkNotSet(*c)),
                 }
             }
-            Address::Relative(offset) => {
-                let base = current as i32;
-                let result = base + offset;
-                if result < 1 || result > buffer.line_count() as i32 {
-                    Err(ViError::InvalidAddress(
-                        "relative address out of range".to_string(),
-                    ))
-                } else {
-                    Ok(result as usize)
-                }
-            }
+            Address::Relative(offset) => offset_line(current, *offset, buffer.line_count()),
             Address::Offset(base, offset) => {
-                let b = base.resolve(ctx)? as i32;
-                let result = b + offset;
-                if result < 1 || result > buffer.line_count() as i32 {
-                    Err(ViError::InvalidAddress("address out of range".to_string()))
-                } else {
-                    Ok(result as usize)
-                }
+                offset_line(base.resolve(ctx)?, *offset, buffer.line_count())
             }
         }
+    }
+}
+
+/// `line` moved by `offset`, if that is a line of a buffer of `last` lines.
+///
+/// Checked: an offset too large for the arithmetic is out of range, where
+/// the `i32` it used to be parsed into wrapped `+18446744073709551615` to
+/// `-1` and addressed the line before.
+fn offset_line(line: usize, offset: i64, last: usize) -> Result<usize> {
+    i64::try_from(line)
+        .ok()
+        .and_then(|l| l.checked_add(offset))
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|&n| n >= 1 && n <= last)
+        .ok_or_else(|| ViError::InvalidAddress("address out of range".to_string()))
+}
+
+impl Address {
+    /// This address's search pattern, with its direction, if it searches.
+    fn search(&self) -> Option<(&str, char)> {
+        match self {
+            Address::SearchForward { pattern, .. } => Some((pattern, '/')),
+            Address::SearchBackward { pattern, .. } => Some((pattern, '?')),
+            Address::Offset(base, _) => base.search(),
+            _ => None,
+        }
+    }
+}
+
+impl Address {
+    /// This address's search pattern and direction, if it is non-empty.
+    pub fn search_pattern(&self) -> Option<(String, char)> {
+        self.search()
+            .filter(|(p, _)| !p.is_empty())
+            .map(|(p, d)| (p.to_string(), d))
+    }
+}
+
+impl AddressRange {
+    /// The non-empty search patterns this range names, in order, with their
+    /// directions: each becomes the last RE used, as a search's would.
+    pub fn search_patterns(&self) -> Vec<(String, char)> {
+        [&self.start, &self.end]
+            .into_iter()
+            .flatten()
+            .filter_map(|a| a.search())
+            .filter(|(p, _)| !p.is_empty())
+            .map(|(p, d)| (p.to_string(), d))
+            .collect()
     }
 }
 
@@ -299,6 +373,71 @@ impl AddressRange {
     }
 }
 
+/// Scan a delimited RE that starts just after its opening `delim`: the
+/// pattern, with an escaped delimiter as the delimiter itself, and what
+/// follows the closing delimiter -- or the end of the line, where POSIX lets
+/// the trailing delimiter be omitted.
+///
+/// Neither `\delim` nor a delimiter inside a bracket expression ends the
+/// RE (95689-95695): `/x\/y/` and `/[/]/` are one pattern each.  Finding the
+/// first delimiter character, as before, split both.
+pub fn scan_pattern(input: &str, delim: char) -> (String, &str) {
+    let mut pattern = String::new();
+    let mut chars = input.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == delim {
+            return (pattern, &input[i + c.len_utf8()..]);
+        }
+        match c {
+            '\\' => match chars.next() {
+                // An escaped delimiter is that character, unescaped -- but
+                // kept escaped where unescaped it would mean something else
+                // to the RE.
+                Some((_, d)) if d == delim && !".[*^$".contains(d) => pattern.push(d),
+                Some((_, d)) => {
+                    pattern.push('\\');
+                    pattern.push(d);
+                }
+                None => pattern.push('\\'),
+            },
+            '[' => {
+                // A bracket expression runs to its `]`, which is literal as
+                // its first character (after any `^`); `[:class:]` and the
+                // like are inside it whole.
+                pattern.push('[');
+                let mut first = true;
+                if let Some(&(_, '^')) = chars.peek() {
+                    pattern.push('^');
+                    chars.next();
+                }
+                while let Some((_, b)) = chars.next() {
+                    pattern.push(b);
+                    if b == '[' {
+                        if let Some(&(_, k @ (':' | '.' | '='))) = chars.peek() {
+                            // `[:alpha:]`: copy through its closing `k]`.
+                            pattern.push(k);
+                            chars.next();
+                            let mut prev = '\0';
+                            for (_, x) in chars.by_ref() {
+                                pattern.push(x);
+                                if prev == k && x == ']' {
+                                    break;
+                                }
+                                prev = x;
+                            }
+                        }
+                    } else if b == ']' && !first {
+                        break;
+                    }
+                    first = false;
+                }
+            }
+            c => pattern.push(c),
+        }
+    }
+    (pattern, "")
+}
+
 /// Parse an address from a string.
 pub fn parse_address(input: &str) -> Option<(Address, &str)> {
     let input = input.trim_start();
@@ -312,22 +451,15 @@ pub fn parse_address(input: &str) -> Option<(Address, &str)> {
     match first {
         '.' => Some((Address::Current, &input[1..])),
         '$' => Some((Address::Last, &input[1..])),
-        '/' => {
-            // Forward search
-            let end = input[1..].find('/')?;
-            let pattern = input[1..end + 1].to_string();
-            let regex = TextRegex::new(&pattern, RegexFlags::bre()).ok()?;
-            Some((Address::SearchForward { pattern, regex }, &input[end + 2..]))
-        }
-        '?' => {
-            // Backward search
-            let end = input[1..].find('?')?;
-            let pattern = input[1..end + 1].to_string();
-            let regex = TextRegex::new(&pattern, RegexFlags::bre()).ok()?;
-            Some((
-                Address::SearchBackward { pattern, regex },
-                &input[end + 2..],
-            ))
+        '/' | '?' => {
+            let (pattern, rest) = scan_pattern(&input[1..], first);
+            let compiled = RegexCache::new();
+            let addr = if first == '/' {
+                Address::SearchForward { pattern, compiled }
+            } else {
+                Address::SearchBackward { pattern, compiled }
+            };
+            Some((addr, rest))
         }
         '\'' | '`' => {
             // Mark. Both `'x` and `` `x `` are accepted. Slice by char
@@ -369,7 +501,7 @@ fn parse_number(input: &str) -> Option<(usize, &str)> {
 }
 
 /// Parse a relative offset (+n or -n).
-fn parse_offset(input: &str) -> (i32, &str) {
+fn parse_offset(input: &str) -> (i64, &str) {
     let mut chars = input.chars().peekable();
     let sign = match chars.next() {
         Some('+') => 1,
@@ -378,8 +510,12 @@ fn parse_offset(input: &str) -> (i32, &str) {
     };
 
     let rest = &input[1..];
-    if let Some((num, remainder)) = parse_number(rest) {
-        (sign * num as i32, remainder)
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    if digits > 0 {
+        // Too large for an offset is as out of range as any offset past the
+        // buffer: saturate, and let resolving report it.
+        let num = rest[..digits].parse::<i64>().unwrap_or(i64::MAX);
+        (sign * num, &rest[digits..])
     } else {
         // +/- without number means +1/-1
         (sign, rest)

@@ -21,35 +21,21 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
     // the CR in `:map Q :wq^V^M` before the argument parser ever saw it.
     let input = input.trim_start();
     if input.is_empty() {
-        return Ok(ExCommand::Nop);
+        return Ok(ExCommand::Empty);
     }
 
     // Parse any address range
     let (range, rest) = parse_address_range(input);
     let rest = rest.trim_start();
 
-    // If only an address with no command, it's a goto
+    // Addresses and no command: the executor decides, by mode, between the
+    // implied print and moving the current line.
     if rest.is_empty() {
-        if range.explicit {
-            match (&range.start, &range.end) {
-                (Some(addr), None) => {
-                    // Single address - go to that line
-                    if let Address::Line(n) = addr {
-                        return Ok(ExCommand::Goto { line: *n });
-                    }
-                    // Anything else (`$`, `.+2`, `'a`, `/re/`) needs the buffer
-                    // to resolve, so hand the range to the executor rather than
-                    // refusing: `:$` on its own is a perfectly ordinary command.
-                    return Ok(ExCommand::GotoAddress { range });
-                }
-                (Some(_), Some(_)) => {
-                    // Range specified but no command
-                    return Err(ViError::InvalidCommand("no command specified".to_string()));
-                }
-                _ => return Ok(ExCommand::Nop),
-            };
-        }
-        return Ok(ExCommand::Nop);
+        return Ok(if range.explicit {
+            ExCommand::GotoAddress { range }
+        } else {
+            ExCommand::Empty
+        });
     }
 
     // Parse the command name

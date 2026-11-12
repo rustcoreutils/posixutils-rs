@@ -32,7 +32,7 @@ use crate::search::{SearchDirection, SearchState, SubstituteConfig, Substitutor}
 use crate::shell::ShellExecutor;
 use crate::ui::{Screen, Terminal, TerminalSize};
 use crate::undo::UndoManager;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Split a `/`- or `?`-style search body into `(pattern, offset)`.
 ///
@@ -61,6 +61,28 @@ pub struct LastSubstitution {
     pub replacement: String,
     /// Whether the substitution was global.
     pub global: bool,
+}
+
+/// File operands as paths.
+fn to_paths(files: &[String]) -> Vec<PathBuf> {
+    files.iter().map(|f| crate::bytes::path(f)).collect()
+}
+
+/// What an edit finds to recover (see `Editor::take_recovery`).
+enum Recovery {
+    /// Recovery was not asked for.
+    NotAsked,
+    /// The newest saved contents, the file holding them, and how many older
+    /// ones there are.
+    Found {
+        body: String,
+        info: crate::recover::RecoverInfo,
+        older: usize,
+    },
+    /// Nothing is saved for the file.
+    None,
+    /// Something is saved but cannot be read.
+    Failed(std::io::Error),
 }
 
 /// Stores the last f/F/t/T find command for ; and , repeat.
@@ -150,6 +172,15 @@ pub struct Editor {
     insert_state: Option<InsertState>,
     /// The command that began the insert session, for `.` to repeat.
     insert_origin: Option<crate::command::ParsedCommand>,
+    /// Files (as [`crate::recover::path_key`]s) to recover the first time
+    /// they are edited: `-r`'s operands (94444-94451), and `:recover`'s.
+    recover_pending: Vec<PathBuf>,
+    /// `-r -t`: recover the next file edited, the tag's.
+    recover_next_edit: bool,
+    /// `-c` commands, waiting for the first edit of a file that exists
+    /// (94452-94459), and the name to report their errors under.
+    initial_commands: Vec<String>,
+    initial_prog: &'static str,
     /// An operator waiting for the `/` or `?` prompt that is its motion.
     pending_search_op: Option<crate::command::ParsedCommand>,
     /// An operator's `/re/+n` search motion (motion `\0`): whether it goes
@@ -303,6 +334,10 @@ impl Editor {
             parser: CommandParser::new(),
             insert_state: None,
             insert_origin: None,
+            recover_pending: Vec::new(),
+            recover_next_edit: false,
+            initial_commands: Vec::new(),
+            initial_prog: "vi",
             pending_search_op: None,
             search_motion: None,
             ex_input: String::new(),
@@ -361,6 +396,10 @@ impl Editor {
             parser: CommandParser::new(),
             insert_state: None,
             insert_origin: None,
+            recover_pending: Vec::new(),
+            recover_next_edit: false,
+            initial_commands: Vec::new(),
+            initial_prog: "vi",
             pending_search_op: None,
             search_motion: None,
             ex_input: String::new(),
@@ -422,6 +461,10 @@ impl Editor {
             parser: CommandParser::new(),
             insert_state: None,
             insert_origin: None,
+            recover_pending: Vec::new(),
+            recover_next_edit: false,
+            initial_commands: Vec::new(),
+            initial_prog: "vi",
             pending_search_op: None,
             search_motion: None,
             ex_input: String::new(),
@@ -595,7 +638,30 @@ impl Editor {
         let path_buf = crate::bytes::path(path);
         // Read before anything is replaced, so a failure leaves the editor as
         // it was rather than half-switched to a file it could not open.
-        let new_buffer = read_file(&path_buf)?;
+        let mut new_buffer = read_file(&path_buf)?;
+        let exists = path_buf.exists();
+        // -r or :recover: saved contents in place of the file's, if any.
+        let recovered = self.take_recovery(&path_buf);
+        let mut recover_note = None;
+        let mut was_recovered = false;
+        match recovered {
+            Recovery::NotAsked => {}
+            Recovery::Found { body, info, older } => {
+                new_buffer = Buffer::from_text(&body);
+                crate::recover::remove(&info);
+                was_recovered = true;
+                let mut note = format!("Recovered {path}");
+                if older > 0 {
+                    note.push_str(&format!(
+                        "; {older} older version{} can be recovered too",
+                        if older == 1 { "" } else { "s" }
+                    ));
+                }
+                recover_note = Some(note);
+            }
+            Recovery::None => recover_note = Some(format!("No recovery information for {path}")),
+            Recovery::Failed(e) => recover_note = Some(format!("{path}: cannot recover: {e}")),
+        }
 
         // Capture the outgoing file *before* `set_current_file` replaces it:
         // reading it afterwards gave the file being opened, so `#` in a shell
@@ -626,7 +692,68 @@ impl Editor {
             self.set_context_mark(self.buffer.cursor());
         }
         self.undo.clear();
+        if was_recovered {
+            // Recovered contents are not the file's (94446-94447).
+            self.buffer.mark_modified();
+        }
+        if let Some(note) = recover_note {
+            self.set_message(&note);
+        }
+        // 94452-94459: the -c commands run in the first buffer loaded from
+        // an existing file (or recovered), from its last line.
+        if (exists || was_recovered) && !self.initial_commands.is_empty() {
+            let commands = std::mem::take(&mut self.initial_commands);
+            self.buffer.set_line(self.buffer.line_count().max(1));
+            self.buffer.move_to_first_non_blank();
+            for cmd in &commands {
+                if let Err(e) = self.execute_ex_input(cmd) {
+                    eprintln!("{}: {}", self.initial_prog, e);
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Whether the edit of `path` now starting is to recover it, and what
+    /// there is to recover.
+    fn take_recovery(&mut self, path: &Path) -> Recovery {
+        let key = crate::recover::path_key(path);
+        let before = self.recover_pending.len();
+        self.recover_pending.retain(|p| *p != key);
+        let asked =
+            std::mem::take(&mut self.recover_next_edit) || self.recover_pending.len() != before;
+        if !asked {
+            return Recovery::NotAsked;
+        }
+        let mut found = crate::recover::find_all_for(&self.options.directory, path).into_iter();
+        let Some(info) = found.next() else {
+            return Recovery::None;
+        };
+        match crate::recover::load_body(&info) {
+            Ok(body) => Recovery::Found {
+                body,
+                info,
+                older: found.count(),
+            },
+            Err(e) => Recovery::Failed(e),
+        }
+    }
+
+    /// `-r`: recover each of `files` the first time it is edited, and with
+    /// `tag`, the file the tag names.
+    pub fn recover_on_first_edit(&mut self, files: &[String], tag: bool) {
+        self.recover_pending = files
+            .iter()
+            .map(|f| crate::recover::path_key(&crate::bytes::path(f)))
+            .collect();
+        self.recover_next_edit = tag;
+    }
+
+    /// `-c`: commands to run in the first buffer loaded from a file that
+    /// exists; errors are reported as `prog`'s.
+    pub fn set_initial_commands(&mut self, prog: &'static str, commands: Vec<String>) {
+        self.initial_prog = prog;
+        self.initial_commands = commands;
     }
 
     /// Get current file as string for shell.
@@ -640,8 +767,7 @@ impl Editor {
             return Ok(());
         }
 
-        let path_bufs: Vec<PathBuf> = paths.iter().map(|p| crate::bytes::path(p)).collect();
-        self.files.set_args(path_bufs);
+        self.files.set_args(to_paths(&paths));
 
         // Open first file
         self.open(&paths[0])
@@ -913,32 +1039,17 @@ impl Editor {
         }
     }
 
-    /// Recover a buffer saved by a previous session. With `file`, recover the
-    /// newest recovery for that path; without, the newest recovery of any.
-    pub fn recover(&mut self, file: Option<&str>) -> Result<()> {
-        match crate::recover::find_for(&self.options.directory, file) {
-            Some(info) => {
-                let body = crate::recover::load_body(&info).map_err(ViError::Io)?;
-                self.replace_buffer(Buffer::from_text(&body));
-                // Recovered content is not yet written back to the file.
-                self.buffer.mark_modified();
-                if let Some(p) = &info.orig_path {
-                    self.files.set_current_file(Some(crate::bytes::path(p)));
-                }
-                self.buffer.set_line(1);
-                self.undo.clear();
-                crate::recover::remove(&info);
-                let msg = match &info.orig_path {
-                    Some(p) => format!("Recovered {}", p),
-                    None => "Recovered buffer".to_string(),
-                };
-                self.set_message(&msg);
-                Ok(())
+    /// After `-t`: the argument list is the file operands, with the tag's
+    /// file put first and current -- or, if the tag gave no file, the
+    /// reference before the first operand (94460-94469).
+    pub fn set_args_after_tag(&mut self, files: &[String]) {
+        let operands = to_paths(files);
+        match self.files.current_file().map(|p| p.to_path_buf()) {
+            Some(tag_file) => {
+                let args = std::iter::once(tag_file).chain(operands).collect();
+                self.files.set_args(args);
             }
-            None => Err(ViError::FileNotFound(
-                file.map(|f| f.to_string())
-                    .unwrap_or_else(|| "recovery file".to_string()),
-            )),
+            None => self.files.set_args_before_first(operands),
         }
     }
 
@@ -3537,8 +3648,7 @@ impl Editor {
                 } else {
                     // "Set the argument list to the specified filenames ... set
                     // the current pathname to the first filename specified."
-                    self.files
-                        .set_args(files.iter().map(|f| crate::bytes::path(f)).collect());
+                    self.files.set_args(to_paths(&files));
                     crate::bytes::path(&files[0])
                 };
                 self.open(&crate::bytes::from_path(&path))?;
@@ -3582,7 +3692,19 @@ impl Editor {
                 if !force && self.buffer.is_modified() {
                     return Err(ViError::FileModified);
                 }
-                self.recover(file.as_deref())?;
+                // 95295-95299: the named file, or the current one; edited as
+                // by `:e`, from its saved contents if there are any.
+                let path = match file {
+                    Some(f) => f.clone(),
+                    None => self
+                        .files
+                        .current_file()
+                        .map(crate::bytes::from_path)
+                        .ok_or(ViError::NoFileName)?,
+                };
+                self.recover_pending
+                    .push(crate::recover::path_key(&crate::bytes::path(&path)));
+                self.open(&path)?;
                 Ok(ExResult::Continue)
             }
             ExCommand::Version => Ok(ExResult::StatusMessage(format!(

@@ -32,6 +32,9 @@ pub struct FileManager {
     arg_list: Vec<PathBuf>,
     /// Current index in argument list.
     arg_index: usize,
+    /// The reference is before the first file (after `-t`, 94465-94468):
+    /// the next file is the first.
+    before_first: bool,
     /// Whether current file is read-only.
     readonly: bool,
     /// Whether the current pathname was changed by `:f` or `:r` since the last
@@ -54,6 +57,7 @@ impl FileManager {
             alternate_file: None,
             arg_list: Vec::new(),
             arg_index: 0,
+            before_first: false,
             readonly: false,
             pathname_changed: false,
         }
@@ -61,6 +65,9 @@ impl FileManager {
 
     /// True when files after the current one remain in the argument list.
     pub fn has_more_files(&self) -> bool {
+        if self.before_first {
+            return !self.arg_list.is_empty();
+        }
         self.arg_index + 1 < self.arg_list.len()
     }
 
@@ -83,6 +90,14 @@ impl FileManager {
     pub fn set_args(&mut self, args: Vec<PathBuf>) {
         self.arg_list = args;
         self.arg_index = 0;
+        self.before_first = false;
+    }
+
+    /// Set the argument list with its reference before the first file, so
+    /// `:n` edits the first.
+    pub fn set_args_before_first(&mut self, args: Vec<PathBuf>) {
+        self.set_args(args);
+        self.before_first = true;
     }
 
     /// Get the argument list.
@@ -141,10 +156,13 @@ impl FileManager {
         if self.arg_list.is_empty() {
             return Err(ViError::NoFileName);
         }
-        if self.arg_index + 1 >= self.arg_list.len() {
+        if self.before_first {
+            self.before_first = false;
+        } else if self.arg_index + 1 >= self.arg_list.len() {
             return Err(ViError::InvalidCommand("No more files".to_string()));
+        } else {
+            self.arg_index += 1;
         }
-        self.arg_index += 1;
         let path = self.arg_list[self.arg_index].clone();
         self.set_current_file(Some(path.clone()));
         Ok(path)
@@ -155,7 +173,7 @@ impl FileManager {
         if self.arg_list.is_empty() {
             return Err(ViError::NoFileName);
         }
-        if self.arg_index == 0 {
+        if self.arg_index == 0 || self.before_first {
             return Err(ViError::InvalidCommand("Already at first file".to_string()));
         }
         self.arg_index -= 1;
@@ -170,6 +188,7 @@ impl FileManager {
             return Err(ViError::NoFileName);
         }
         self.arg_index = 0;
+        self.before_first = false;
         let path = self.arg_list[0].clone();
         self.set_current_file(Some(path.clone()));
         Ok(path)
@@ -177,7 +196,9 @@ impl FileManager {
 
     /// Get count of remaining files.
     pub fn files_remaining(&self) -> usize {
-        if self.arg_list.is_empty() {
+        if self.before_first {
+            self.arg_list.len()
+        } else if self.arg_list.is_empty() {
             0
         } else {
             self.arg_list.len() - self.arg_index - 1
@@ -188,11 +209,12 @@ impl FileManager {
     pub fn format_args(&self) -> String {
         let mut result = String::new();
         for (i, path) in self.arg_list.iter().enumerate() {
-            if i == self.arg_index {
+            let current = i == self.arg_index && !self.before_first;
+            if current {
                 result.push('[');
             }
             result.push_str(&crate::bytes::from_path(path));
-            if i == self.arg_index {
+            if current {
                 result.push(']');
             }
             if i + 1 < self.arg_list.len() {

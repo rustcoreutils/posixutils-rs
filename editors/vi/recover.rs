@@ -291,7 +291,12 @@ fn now_secs() -> u64 {
 
 /// Write `text` to a new recovery file under `base` for the (optional) original
 /// path. Returns the path of the recovery file.
+///
+/// The original path is recorded as its [`path_key`], so `vi -r` finds it
+/// from any directory, through `..` or a symbolic link to its directory.
 pub fn preserve(orig: Option<&Path>, text: &str, base: &str) -> io::Result<PathBuf> {
+    let key = orig.map(path_key);
+    let orig = key.as_deref();
     let dir = recover_dir(base)?;
     let pid = std::process::id();
     let secs = now_secs();
@@ -481,15 +486,32 @@ pub fn load_body(info: &RecoverInfo) -> io::Result<String> {
     Ok(crate::bytes::decode(&body))
 }
 
-/// Find the newest recovery file under `base` for `orig` (or the newest of any).
-pub fn find_for(base: &str, orig: Option<&str>) -> Option<RecoverInfo> {
-    let all = list(base);
-    match orig {
-        Some(want) => all
-            .into_iter()
-            .find(|i| i.orig_path.as_deref() == Some(want)),
-        None => all.into_iter().next(),
+/// The name a recovery file records for `path`: absolute, with its
+/// directory resolved (`..`, symbolic links), so every spelling of one file
+/// gives the same name.  The last component stays as written: the file
+/// itself may not exist, or may be a link that is edited as such.
+pub fn path_key(path: &Path) -> PathBuf {
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    match (abs.parent(), abs.file_name()) {
+        (Some(dir), Some(name)) => std::fs::canonicalize(dir)
+            .map(|d| d.join(name))
+            .unwrap_or(abs),
+        _ => abs,
     }
+}
+
+/// Every recovery file under `base` for `orig`, newest first.  A file
+/// matches by its [`path_key`].
+pub fn find_all_for(base: &str, orig: &Path) -> Vec<RecoverInfo> {
+    let want = path_key(orig);
+    list(base)
+        .into_iter()
+        .filter(|i| {
+            i.orig_path
+                .as_deref()
+                .is_some_and(|p| path_key(&crate::bytes::path(p)) == want)
+        })
+        .collect()
 }
 
 /// Remove a recovery file (e.g. after a successful recovery).
@@ -560,7 +582,7 @@ mod tests {
         let rec = preserve(Some(&orig), text, base).unwrap();
         assert!(rec.exists());
 
-        let info = find_for(base, Some("/home/user/notes.txt")).expect("recoverable found");
+        let info = find_newest(base, "/home/user/notes.txt").expect("recoverable found");
         assert_eq!(info.orig_path.as_deref(), Some("/home/user/notes.txt"));
 
         assert_eq!(info.recovery_path, rec);
@@ -584,7 +606,7 @@ mod tests {
         let raw = fs::read(&rec).unwrap();
         assert!(raw.ends_with(b"---\na\xffb\n\xfe\n"));
         let want = crate::bytes::from_os(orig.as_os_str());
-        let info = find_for(base, Some(&want)).expect("found by its own name");
+        let info = find_newest(base, &want).expect("found by its own name");
         assert_eq!(load_body(&info).unwrap(), text);
         assert_eq!(crate::bytes::path(info.orig_path.as_deref().unwrap()), orig);
     }
@@ -603,7 +625,7 @@ mod tests {
             let orig = PathBuf::from(std::ffi::OsStr::from_bytes(name));
             preserve(Some(&orig), "body\n", base).unwrap();
             let want = crate::bytes::from_path(&orig);
-            let info = find_for(base, Some(&want)).expect("found by its own name");
+            let info = find_newest(base, &want).expect("found by its own name");
             assert_eq!(load_body(&info).unwrap(), "body\n", "{name:?}");
             remove(&info);
         }
@@ -702,5 +724,41 @@ mod tests {
 
         assert_eq!(recover_dir(base.to_str().unwrap()).unwrap().path, dir);
         assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
+    }
+}
+
+#[cfg(test)]
+fn find_newest(base: &str, orig: &str) -> Option<RecoverInfo> {
+    find_all_for(base, &crate::bytes::path(orig))
+        .into_iter()
+        .next()
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn test_dot_dot_spelling_is_the_same_file() {
+        let td = plib::tmp::tempdir().unwrap();
+        let base = td.path().to_str().unwrap();
+        let sub = td.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let via = td.path().join("sub/../f");
+        preserve(Some(&via), "x\n", base).unwrap();
+        let direct = crate::bytes::from_path(&td.path().join("f"));
+        assert!(find_newest(base, &direct).is_some());
+    }
+
+    #[test]
+    fn test_relative_name_is_found_by_its_absolute_form() {
+        let td = plib::tmp::tempdir().unwrap();
+        let base = td.path().to_str().unwrap();
+        preserve(Some(Path::new("rel-notes.txt")), "x\n", base).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let abs = crate::bytes::from_path(&cwd.join("rel-notes.txt"));
+        assert!(find_newest(base, &abs).is_some());
+        assert!(find_newest(base, "./rel-notes.txt").is_some());
+        assert!(find_newest(base, "other.txt").is_none());
     }
 }

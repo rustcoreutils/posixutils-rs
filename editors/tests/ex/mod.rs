@@ -13,6 +13,7 @@
 //! testing POSIX ex commands via stdin/stdout.
 
 mod addresses;
+mod argv;
 mod cmdline;
 mod fileio;
 mod global;

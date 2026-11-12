@@ -101,15 +101,30 @@ pub fn run_editor(invoked_as: InvokedAs, args: &[String]) -> i32 {
     signals::install_hangup_handlers();
     recover::cleanup_stale(&recover::default_base(), 14 * 24 * 60 * 60);
 
-    let mut opts = match parse_args(invoked_as, args) {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("{}: {}", invoked_as.name(), e);
-            return 1;
-        }
-    };
-
+    let mut opts = parse_args(invoked_as, args);
     let prog_name = invoked_as.name();
+
+    // -r with no file and no -t (94207-94209): every other option, EXINIT
+    // and .exrc are ignored; list what can be recovered and exit.
+    if opts.recover && opts.files.is_empty() && opts.tag.is_none() {
+        let recs = recover::list(&recover::default_base());
+        if recs.is_empty() {
+            println!("No files to recover");
+        } else {
+            println!("Recoverable files:");
+            for r in &recs {
+                bytes::println(&format!(
+                    "  {}",
+                    r.orig_path.as_deref().unwrap_or("(unnamed)")
+                ));
+            }
+        }
+        return 0;
+    }
+    if let Some(e) = &opts.error {
+        eprintln!("{}: {}", prog_name, e);
+        return 1;
+    }
 
     // POSIX: if standard input is not a terminal, behave as if -s was given.
     // That also means assuming a terminal that cannot support visual mode, so
@@ -149,52 +164,25 @@ pub fn run_editor(invoked_as: InvokedAs, args: &[String]) -> i32 {
         // Continue anyway - don't fail on config errors
     }
 
-    // Recovery mode (-r): list recoverable buffers (no operand) or recover
-    // the named file; otherwise open the operands normally.
+    // The first file to edit (94432-94443): the tag's, else the first
+    // operand.  With -r each file is recovered the first time it is edited
+    // (94444-94451); the -c commands run in the first buffer loaded from a
+    // file that exists, before the tag's movement (94452-94459).
+    editor.set_initial_commands(prog_name, std::mem::take(&mut opts.commands));
     if opts.recover {
-        if opts.files.is_empty() {
-            let recs = recover::list(&recover::default_base());
-            if recs.is_empty() {
-                println!("No files to recover");
-            } else {
-                println!("Recoverable files:");
-                for r in &recs {
-                    bytes::println(&format!(
-                        "  {}",
-                        r.orig_path.as_deref().unwrap_or("(unnamed)")
-                    ));
-                }
-            }
-            return 0;
-        }
-        if let Err(e) = editor.recover(opts.files.first().map(|s| s.as_str())) {
-            eprintln!("{}: {}", prog_name, e);
-            return 1;
-        }
-    } else if let Some(tag) = &opts.tag {
-        // -t: open the file containing the tag and jump to it.  A tag that
-        // cannot be found is a diagnostic, as for `:tag`; editing goes on.
+        editor.recover_on_first_edit(&opts.files, opts.tag.is_some());
+    }
+    if let Some(tag) = &opts.tag {
+        // A tag that cannot be found is a diagnostic, as for `:tag`;
+        // editing goes on.
         if let Err(e) = editor.tag(tag) {
             eprintln!("{}: {}", prog_name, e);
         }
+        editor.set_args_after_tag(&opts.files);
     } else if !opts.files.is_empty() {
         if let Err(e) = editor.open_files(opts.files) {
             eprintln!("{}: {}", prog_name, e);
             return 1;
-        }
-    }
-
-    // Execute initial command if specified.
-    //
-    // POSIX runs `-c`/`+command` against the first file that is actually
-    // edited, so it is skipped when no file was opened -- previously it ran
-    // unconditionally, against an empty buffer.
-    if let Some(cmd) = opts.command {
-        if editor.has_current_file() {
-            if let Err(e) = editor.execute_initial_command(&cmd) {
-                eprintln!("{}: {}", prog_name, e);
-                // Don't exit - continue with the editor
-            }
         }
     }
 
@@ -216,8 +204,8 @@ struct EditorOptions {
     silent_mode: bool,
     /// Read-only mode (-R).
     readonly: bool,
-    /// Initial command to execute (-c or +command).
-    command: Option<String>,
+    /// Initial commands to execute (-c or +command), in order (94196-94197).
+    commands: Vec<String>,
     /// Recover a previously-preserved buffer (-r).
     recover: bool,
     /// Tag to jump to at startup (-t).
@@ -226,92 +214,109 @@ struct EditorOptions {
     window: Option<usize>,
     /// Files to edit.
     files: Vec<String>,
+    /// The first command-line error, reported unless `-r` lists (which
+    /// ignores every other option, 94207-94209).
+    error: Option<String>,
 }
 
-/// Parse command-line arguments for the editor.
-fn parse_args(
-    invoked_as: InvokedAs,
-    args: &[String],
-) -> std::result::Result<EditorOptions, String> {
+/// Parse the command line as XBD 12.2 utility syntax (ex 94191-94192):
+/// options may be grouped (`-sR`), an option-argument attached (`-c1p`,
+/// `-w5`) or separate, `--` ends the options, and so does the first
+/// operand.  `+command` is `-c command` (`+` may delimit an option, and
+/// `+` alone goes to the last line), and `-`, whose meaning is
+/// unspecified, is the historical `-s`.
+fn parse_args(invoked_as: InvokedAs, args: &[String]) -> EditorOptions {
     let mut opts = EditorOptions {
         start_in_ex_mode: invoked_as == InvokedAs::Ex,
         silent_mode: false,
         readonly: false,
-        command: None,
+        commands: Vec::new(),
         recover: false,
         tag: None,
         window: None,
         files: Vec::new(),
+        error: None,
+    };
+    let fail = |opts: &mut EditorOptions, msg: String| {
+        opts.error.get_or_insert(msg);
     };
 
     let mut i = 1;
     while i < args.len() {
-        let arg = &args[i];
-        match arg.as_str() {
-            "-R" => {
-                opts.readonly = true;
-            }
-            "-r" => {
-                opts.recover = true;
-            }
-            "-c" => {
+        let arg = args[i].as_str();
+        match arg {
+            "--" => {
                 i += 1;
-                if i < args.len() {
-                    opts.command = Some(args[i].clone());
-                } else {
-                    return Err("-c requires an argument".to_string());
-                }
-            }
-            "-t" => {
-                i += 1;
-                if i < args.len() {
-                    opts.tag = Some(args[i].clone());
-                } else {
-                    return Err("-t requires a tagstring".to_string());
-                }
-            }
-            "-w" => {
-                i += 1;
-                if i < args.len() {
-                    // Apply the window size if it parses; ignore otherwise.
-                    if let Ok(n) = args[i].parse::<usize>() {
-                        opts.window = Some(n);
-                    }
-                } else {
-                    return Err("-w requires a size".to_string());
-                }
-            }
-            "-s" => {
-                // Silent/batch mode (ex only, but accept for both)
-                opts.silent_mode = true;
-            }
-            "-v" => {
-                // Start in visual mode (ex option to behave like vi)
-                opts.start_in_ex_mode = false;
+                break;
             }
             "--version" => {
                 println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
                 println!("{}", env!("CARGO_PKG_DESCRIPTION"));
                 process::exit(0);
             }
-            "--help" | "-h" => {
+            "--help" => {
                 print_usage(&args[0], invoked_as);
                 process::exit(0);
             }
-            s if s.starts_with('+') => {
-                opts.command = Some(s[1..].to_string());
+            "-" => opts.silent_mode = true,
+            "+" => opts.commands.push("$".to_string()),
+            _ if arg.starts_with('+') => opts.commands.push(arg[1..].to_string()),
+            _ if arg.starts_with('-') => {
+                // One or more options; one that takes an argument takes the
+                // rest of this word, or the next word.
+                for (at, c) in arg[1..].char_indices() {
+                    match c {
+                        'R' => opts.readonly = true,
+                        'r' => opts.recover = true,
+                        's' => opts.silent_mode = true,
+                        'v' => opts.start_in_ex_mode = false,
+                        'h' => {
+                            print_usage(&args[0], invoked_as);
+                            process::exit(0);
+                        }
+                        'c' | 't' | 'w' => {
+                            let rest = &arg[1 + at + 1..];
+                            let value = if !rest.is_empty() {
+                                rest.to_string()
+                            } else {
+                                i += 1;
+                                match args.get(i) {
+                                    Some(v) => v.clone(),
+                                    None => {
+                                        fail(
+                                            &mut opts,
+                                            format!("option requires an argument -- {c}"),
+                                        );
+                                        break;
+                                    }
+                                }
+                            };
+                            match c {
+                                'c' => opts.commands.push(value),
+                                // 94223-94224: one -t only.
+                                't' if opts.tag.is_some() => {
+                                    fail(&mut opts, "only one -t option is allowed".to_string())
+                                }
+                                't' => opts.tag = Some(value),
+                                _ => match value.parse::<usize>() {
+                                    Ok(size) => opts.window = Some(size),
+                                    Err(_) => {
+                                        fail(&mut opts, format!("invalid window size: {value}"))
+                                    }
+                                },
+                            }
+                            break;
+                        }
+                        _ => fail(&mut opts, format!("unknown option -- {c}")),
+                    }
+                }
             }
-            s if s.starts_with('-') => {
-                return Err(format!("unknown option: {}", s));
-            }
-            _ => {
-                opts.files.push(arg.clone());
-            }
+            _ => break,
         }
         i += 1;
     }
-
-    Ok(opts)
+    opts.files = args[i.min(args.len())..].to_vec();
+    opts
 }
 
 fn print_usage(program: &str, invoked_as: InvokedAs) {
@@ -328,6 +333,9 @@ fn print_usage(program: &str, invoked_as: InvokedAs) {
     println!("Options:");
     println!("  -R              Read-only mode");
     println!("  -c command      Execute command after opening");
+    println!("  -r [file...]    Recover files; with no file, list recoverable ones");
+    println!("  -t tagstring    Edit the file containing tagstring");
+    println!("  -w size         Set the window option");
     println!("  +command        Same as -c command");
 
     if invoked_as == InvokedAs::Ex {

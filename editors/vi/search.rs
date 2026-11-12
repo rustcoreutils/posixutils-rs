@@ -17,9 +17,10 @@
 //! - Pattern matching with BRE (Basic Regular Expressions)
 
 use crate::buffer::{floor_char_boundary, next_char_boundary, Buffer, Position};
+use crate::bytes::TextRegex;
 use crate::error::{Result, ViError};
 use crate::options::Options;
-use plib::regex::{Match, Regex, RegexFlags};
+use plib::regex::{Match, RegexFlags};
 
 /// Direction of search.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -46,7 +47,7 @@ pub struct SearchState {
     /// Last search pattern.
     pattern: Option<String>,
     /// Compiled regex.
-    regex: Option<Regex>,
+    regex: Option<TextRegex>,
     /// Last search direction.
     direction: SearchDirection,
     /// Whether search wraps at file boundaries.
@@ -103,7 +104,7 @@ impl SearchState {
         if self.ignorecase {
             flags = flags.ignore_case();
         }
-        let regex = Regex::new(&regex_pattern, flags)
+        let regex = TextRegex::new(&regex_pattern, flags)
             .map_err(|e| ViError::InvalidPattern(e.to_string()))?;
 
         self.pattern = Some(pattern.to_string());
@@ -316,7 +317,7 @@ impl SearchState {
 }
 
 /// Find the last match of a regex in a string.
-fn find_last_match(regex: &Regex, text: &str) -> Option<usize> {
+fn find_last_match(regex: &TextRegex, text: &str) -> Option<usize> {
     let mut last_pos = None;
     for mat in regex.find_iter(text) {
         last_pos = Some(mat.start);
@@ -329,7 +330,7 @@ fn find_last_match(regex: &Regex, text: &str) -> Option<usize> {
 ///
 /// There is no NOTBOL form of `find_iter`, so walk the slice by hand -- every
 /// step searches a remainder, which is never a beginning of line.
-fn find_last_match_notbol(regex: &Regex, text: &str) -> Option<usize> {
+fn find_last_match_notbol(regex: &TextRegex, text: &str) -> Option<usize> {
     let mut last_pos = None;
     let mut offset = 0usize;
     while offset <= text.len() {
@@ -513,7 +514,7 @@ impl<'a> SubstituteConfig<'a> {
 
 pub struct Substitutor {
     /// Pattern regex.
-    regex: Regex,
+    regex: TextRegex,
     /// Replacement string.
     replacement: String,
     /// Global flag (all matches on line).
@@ -540,8 +541,8 @@ impl Substitutor {
         if cfg.ignorecase {
             flags = flags.ignore_case();
         }
-        let regex =
-            Regex::new(cfg.pattern, flags).map_err(|e| ViError::InvalidPattern(e.to_string()))?;
+        let regex = TextRegex::new(cfg.pattern, flags)
+            .map_err(|e| ViError::InvalidPattern(e.to_string()))?;
 
         Ok(Self {
             regex,
@@ -560,7 +561,7 @@ impl Substitutor {
     /// Returns (new_line, substitution_count).
     pub fn substitute_line(&self, line: &str) -> (String, usize) {
         if self.count_only {
-            let count = self.regex.find_iter(line).count();
+            let count = self.regex.find_iter(line).len();
             return (line.to_string(), count);
         }
 

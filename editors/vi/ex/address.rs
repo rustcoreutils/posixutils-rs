@@ -12,8 +12,9 @@
 //! Addresses specify line numbers or patterns for ex commands.
 
 use crate::buffer::{Buffer, Position};
+use crate::bytes::TextRegex;
 use crate::error::{Result, ViError};
-use plib::regex::{Regex, RegexFlags};
+use plib::regex::RegexFlags;
 
 /// Everything address resolution needs from the editor.
 ///
@@ -67,9 +68,9 @@ pub enum Address {
     /// Absolute line number.
     Line(usize),
     /// Pattern search forward (/pattern/).
-    SearchForward { pattern: String, regex: Regex },
+    SearchForward { pattern: String, regex: TextRegex },
     /// Pattern search backward (?pattern?).
-    SearchBackward { pattern: String, regex: Regex },
+    SearchBackward { pattern: String, regex: TextRegex },
     /// Previous context (').
     Mark(char),
     /// Relative offset from current address (+n or -n).
@@ -315,14 +316,14 @@ pub fn parse_address(input: &str) -> Option<(Address, &str)> {
             // Forward search
             let end = input[1..].find('/')?;
             let pattern = input[1..end + 1].to_string();
-            let regex = Regex::new(&pattern, RegexFlags::bre()).ok()?;
+            let regex = TextRegex::new(&pattern, RegexFlags::bre()).ok()?;
             Some((Address::SearchForward { pattern, regex }, &input[end + 2..]))
         }
         '?' => {
             // Backward search
             let end = input[1..].find('?')?;
             let pattern = input[1..end + 1].to_string();
-            let regex = Regex::new(&pattern, RegexFlags::bre()).ok()?;
+            let regex = TextRegex::new(&pattern, RegexFlags::bre()).ok()?;
             Some((
                 Address::SearchBackward { pattern, regex },
                 &input[end + 2..],

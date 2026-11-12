@@ -1702,16 +1702,45 @@ fn test_ex_bare_bang_without_a_terminal_is_refused() {
     );
 }
 
-// An argument that is not valid UTF-8 is reported, not a panic.
-#[test]
-fn ex_non_utf8_argument_is_reported() {
-    plib::testing::assert_non_utf8_argument_rejected("ex", &[]);
+/// A file operand that is not valid UTF-8 names that file: the editors take
+/// arguments as bytes (`vi_rs::bytes`), neither refusing nor panicking.
+fn assert_non_utf8_operand_edits(editor: &str) {
+    use plib::testing::os_bytes;
+    let dir = TempDir::new().unwrap();
+    let name = os_bytes(b"x\xff");
+    fs::write(dir.path().join(&name), b"old\n").unwrap();
+    let mut child = Command::new(get_binary_path(editor))
+        .arg("-s")
+        .arg(&name)
+        .current_dir(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn editor");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"s/old/new/\nwq\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{editor}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(fs::read(dir.path().join(&name)).unwrap(), b"new\n");
 }
 
-// An argument that is not valid UTF-8 is reported, not a panic.
 #[test]
-fn vi_non_utf8_argument_is_reported() {
-    plib::testing::assert_non_utf8_argument_rejected("vi", &[]);
+fn ex_non_utf8_operand_edits_that_file() {
+    assert_non_utf8_operand_edits("ex");
+}
+
+#[test]
+fn vi_non_utf8_operand_edits_that_file() {
+    assert_non_utf8_operand_edits("vi");
 }
 
 // A program name that is not valid UTF-8 still selects ex by its ending;

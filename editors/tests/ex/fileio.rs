@@ -149,3 +149,139 @@ fn test_ex_read_file_is_undoable() {
     fs::write(dir.path().join("g"), b"b\nc\n").unwrap();
     assert_eq!(ex_on(dir.path(), "f", "r g\nu\nwq\n"), b"a\n");
 }
+
+/// `ex -s` in `dir` with raw `args` and a raw `script`: (stdout, status).
+fn ex_raw(dir: &Path, args: &[&std::ffi::OsStr], script: &[u8]) -> (Vec<u8>, i32) {
+    let mut child = Command::new(get_binary_path("ex"))
+        .arg("-s")
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ex");
+    child.stdin.as_mut().unwrap().write_all(script).unwrap();
+    let out = child.wait_with_output().expect("wait for ex");
+    (out.stdout, out.status.code().unwrap_or(-1))
+}
+
+/// `ex -s f` on a file holding `content`: (stdout, status, file after).
+fn ex_bytes(content: &[u8], script: &[u8]) -> (Vec<u8>, i32, Vec<u8>) {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("f"), content).unwrap();
+    let (out, code) = ex_raw(dir.path(), &[std::ffi::OsStr::new("f")], script);
+    (out, code, fs::read(dir.path().join("f")).unwrap())
+}
+
+#[test]
+fn test_ex_roundtrip_non_utf8() {
+    let content = b"a\xffb\n\xfe\xed\n\xc3\n";
+    let (_, code, file) = ex_bytes(content, b"wq\n");
+    assert_eq!((code, file.as_slice()), (0, &content[..]));
+}
+
+#[test]
+fn test_ex_roundtrip_reserved_private_use_characters() {
+    // The characters the escape scheme reserves, genuinely in a file.
+    let content = "x\u{10FF80}\u{10FFFF}y\n".as_bytes();
+    let (_, _, file) = ex_bytes(content, b"wq\n");
+    assert_eq!(file, content);
+}
+
+#[test]
+fn test_ex_print_and_list_non_utf8() {
+    let (out, _, _) = ex_bytes(b"a\xffb\n", b"p\nl\nq\n");
+    assert_eq!(out, b"a\xffb\na\\377b$\n");
+}
+
+#[test]
+fn test_ex_substitute_non_utf8_pattern() {
+    let (_, code, file) = ex_bytes(b"a\xffb\n", b"s/\xff/\xfe\xfe/\nwq\n");
+    assert_eq!((code, file.as_slice()), (0, &b"a\xfe\xfeb\n"[..]));
+}
+
+#[test]
+fn test_ex_read_and_filter_non_utf8() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("f"), b"\xf0\n").unwrap();
+    fs::write(dir.path().join("g"), b"\xff\n").unwrap();
+    ex_raw(
+        dir.path(),
+        &[std::ffi::OsStr::new("f")],
+        b"r g\nr !printf '\\376\\n'\n1,$!cat\nwq\n",
+    );
+    assert_eq!(
+        fs::read(dir.path().join("f")).unwrap(),
+        b"\xf0\n\xff\n\xfe\n"
+    );
+}
+
+#[test]
+fn test_ex_non_utf8_pathname_argument() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = TempDir::new().unwrap();
+    let name = std::ffi::OsStr::from_bytes(b"n\xffm");
+    fs::write(dir.path().join(name), b"old\n").unwrap();
+    let (_, code) = ex_raw(dir.path(), &[name], b"s/old/new/\nwq\n");
+    assert_eq!(code, 0);
+    assert_eq!(fs::read(dir.path().join(name)).unwrap(), b"new\n");
+}
+
+#[test]
+fn test_ex_write_to_non_utf8_pathname() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("f"), b"t\n").unwrap();
+    ex_raw(dir.path(), &[std::ffi::OsStr::new("f")], b"w o\xffut\nq\n");
+    let out = dir.path().join(std::ffi::OsStr::from_bytes(b"o\xffut"));
+    assert_eq!(fs::read(out).unwrap(), b"t\n");
+}
+
+#[test]
+fn test_ex_byte_locale_regex_over_bytes_and_multibyte() {
+    // In a byte locale `.` is one byte: it must match each byte that is not
+    // UTF-8 whole, and never panic inside a multibyte character.
+    let run = |content: &[u8], script: &[u8]| {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("f"), content).unwrap();
+        let mut child = Command::new(get_binary_path("ex"))
+            .args(["-s", "f"])
+            .env("LC_ALL", "C")
+            .current_dir(dir.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.as_mut().unwrap().write_all(script).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "ex: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        fs::read(dir.path().join("f")).unwrap()
+    };
+    assert_eq!(run(b"a\xffb\n", b"s/./X/g\nwq\n"), b"XXX\n");
+    assert_eq!(run(b"a\xffb\n", b"s/[\xff]/X/\nwq\n"), b"aXb\n");
+    assert_eq!(run(b"a\xffb\n", b"s/[^a]/X/g\nwq\n"), b"aXX\n");
+    // `é` is two bytes in this locale; no match may split it into a panic.
+    let out = run("caf\u{e9}\n".as_bytes(), b"s/./X/g\nwq\n");
+    assert!(out.starts_with(b"XXX"), "{out:?}");
+}
+
+#[test]
+fn test_ex_non_utf8_current_pathname_is_kept() {
+    // `:e!`, `:r`, `:n` and `%` all name the file being edited, bytes and all.
+    use std::os::unix::ffi::OsStrExt;
+    let dir = TempDir::new().unwrap();
+    let a = std::ffi::OsStr::from_bytes(b"a\xff");
+    let b = std::ffi::OsStr::from_bytes(b"b\xfe");
+    fs::write(dir.path().join(a), b"one\n").unwrap();
+    fs::write(dir.path().join(b), b"two\n").unwrap();
+    let (out, code) = ex_raw(dir.path(), &[a, b], b"e!\np\nr\n$p\nn!\np\n!cat %\nq\n");
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
+    // `:!` writes a blank line before the command's output.
+    assert_eq!(out, b"one\none\ntwo\n\ntwo\n");
+}

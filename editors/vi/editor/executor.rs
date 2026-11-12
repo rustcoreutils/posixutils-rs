@@ -264,16 +264,17 @@ impl Editor {
 
         let path = file
             .map(|s| s.to_string())
-            .or_else(|| self.files.current_file().map(|p| p.display().to_string()))
+            .or_else(|| self.files.current_file().map(crate::bytes::from_path))
             .ok_or(ViError::NoFileName)?;
 
-        let content = std::fs::read_to_string(&path).map_err(ViError::Io)?;
+        let raw = std::fs::read(crate::bytes::path(&path)).map_err(ViError::Io)?;
+        let content = crate::bytes::decode(&raw);
 
         let lines: Vec<&str> = split_lines(&content).collect();
         self.insert_lines_after(insert_after, &lines)?;
         self.buffer.set_line(insert_after + lines.len());
 
-        let bytes = content.len();
+        let bytes = raw.len();
         self.set_message(&format!(
             "\"{}\" {} lines, {} bytes",
             path,

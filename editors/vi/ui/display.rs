@@ -11,11 +11,58 @@
 
 /// Calculate the display width of a character.
 pub fn char_width(c: char, current_col: usize, tabstop: usize) -> usize {
-    match c {
-        '\t' => tabstop - (current_col % tabstop),
-        c if c.is_control() => 2, // ^X format
+    glyph(c, current_col, tabstop, None)
+}
+
+/// Append how `c` shows on screen at display column `col` to `out`, and
+/// return how many columns that is.
+pub fn push_glyph(out: &mut String, c: char, col: usize, tabstop: usize) -> usize {
+    glyph(c, col, tabstop, Some(out))
+}
+
+/// The one rule for how a character is drawn: its width, and its text when
+/// `out` is given.  Every width and every rendering goes through here, so a
+/// cursor column always lands where the character was drawn.
+///
+/// - a tab: spaces to the next `tabstop`;
+/// - a byte that is not UTF-8 (an escaped byte, `crate::bytes`): `\ooo`;
+/// - an ASCII control: `^X`, DEL `^?`;
+/// - any other control (C1): one `\ooo` per byte of its UTF-8 form --
+///   `c as u8 ^ 0x40` truncated those and drew an unrelated character;
+/// - anything else: itself, one column.
+fn glyph(c: char, col: usize, tabstop: usize, out: Option<&mut String>) -> usize {
+    use std::fmt::Write as _;
+    let ts = tabstop.max(1);
+    let escaped = crate::bytes::escaped_byte(c);
+    let width = match c {
+        '\t' => ts - (col % ts),
+        c if c.is_ascii_control() => 2,
+        _ if escaped.is_some() => 4,
+        c if c.is_control() => 4 * c.len_utf8(),
         _ => 1,
+    };
+    // Only a caller that draws pays for the text.
+    if let Some(out) = out {
+        match c {
+            '\t' => out.extend(std::iter::repeat_n(' ', width)),
+            '\x7f' => out.push_str("^?"),
+            c if c.is_ascii_control() => {
+                out.push('^');
+                out.push((c as u8 ^ 0x40) as char);
+            }
+            _ if escaped.is_some() => {
+                let _ = write!(out, "\\{:03o}", escaped.unwrap_or_default());
+            }
+            c if c.is_control() => {
+                let mut buf = [0u8; 4];
+                for b in c.encode_utf8(&mut buf).as_bytes() {
+                    let _ = write!(out, "\\{:03o}", b);
+                }
+            }
+            c => out.push(c),
+        }
     }
+    width
 }
 
 /// Calculate the display width of a string.
@@ -66,6 +113,11 @@ pub fn byte_offset_to_display_col(s: &str, byte_offset: usize, tabstop: usize) -
 }
 
 /// Truncate a string to fit within a given display width.
+///
+/// Drawn as the screen draws text (`push_glyph`): a control character or a
+/// byte that is not UTF-8 in a message -- from a file name, say -- must not
+/// reach the terminal raw, where it would be taken as part of an escape
+/// sequence.
 pub fn truncate_to_width(s: &str, max_width: usize, tabstop: usize) -> String {
     let mut result = String::new();
     let mut width = 0;
@@ -75,8 +127,7 @@ pub fn truncate_to_width(s: &str, max_width: usize, tabstop: usize) -> String {
         if width + char_w > max_width {
             break;
         }
-        result.push(c);
-        width += char_w;
+        width += push_glyph(&mut result, c, width, tabstop);
     }
 
     result
@@ -102,6 +153,11 @@ pub fn truncate_to_width(s: &str, max_width: usize, tabstop: usize) -> String {
 pub fn caret_notation(s: &str) -> String {
     let mut out = String::new();
     for c in s.chars() {
+        // A byte that is not UTF-8: its own octal escape.
+        if let Some(b) = crate::bytes::escaped_byte(c) {
+            out.push_str(&format!("\\{:03o}", b));
+            continue;
+        }
         match c {
             '\x7f' => out.push_str("^?"),
             c if c.is_ascii_control() => {
@@ -126,24 +182,7 @@ pub fn expand_for_display(s: &str, tabstop: usize) -> String {
     let mut col = 0;
 
     for c in s.chars() {
-        match c {
-            '\t' => {
-                let spaces = tabstop - (col % tabstop);
-                for _ in 0..spaces {
-                    result.push(' ');
-                }
-                col += spaces;
-            }
-            c if c.is_control() => {
-                result.push('^');
-                result.push((c as u8 ^ 0x40) as char);
-                col += 2;
-            }
-            c => {
-                result.push(c);
-                col += 1;
-            }
-        }
+        col += push_glyph(&mut result, c, col, tabstop);
     }
 
     result
@@ -159,6 +198,17 @@ mod tests {
         assert_eq!(char_width('\t', 0, 8), 8);
         assert_eq!(char_width('\t', 3, 8), 5);
         assert_eq!(char_width('\x01', 0, 8), 2); // Control char
+        assert_eq!(
+            char_width(crate::bytes::decode(b"\xff").chars().next().unwrap(), 0, 8),
+            4
+        );
+    }
+
+    #[test]
+    fn test_escaped_byte_draws_as_octal() {
+        let text = crate::bytes::decode(b"a\xffb");
+        assert_eq!(expand_for_display(&text, 8), "a\\377b");
+        assert_eq!(string_width(&text, 8), 6);
     }
 
     #[test]
@@ -185,6 +235,7 @@ mod tests {
     fn test_truncate_to_width() {
         assert_eq!(truncate_to_width("hello world", 5, 8), "hello");
         assert_eq!(truncate_to_width("a\tb", 4, 8), "a"); // Tab would exceed
+        assert_eq!(truncate_to_width("a\x1b[2Jb", 20, 8), "a^[[2Jb");
     }
 
     #[test]

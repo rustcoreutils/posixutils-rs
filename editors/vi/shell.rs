@@ -140,7 +140,7 @@ impl ShellExecutor {
 
         let output = Command::new(&self.shell)
             .arg("-c")
-            .arg(&expanded)
+            .arg(crate::bytes::to_os(&expanded))
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -171,7 +171,7 @@ impl ShellExecutor {
         // that is what makes `:r !cat` and `:r !sed ...` work at all.
         let output = Command::new(&self.shell)
             .arg("-c")
-            .arg(&expanded)
+            .arg(crate::bytes::to_os(&expanded))
             .stdin(Stdio::inherit())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -198,7 +198,7 @@ impl ShellExecutor {
 
         let mut child = Command::new(&self.shell)
             .arg("-c")
-            .arg(&expanded)
+            .arg(crate::bytes::to_os(&expanded))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -216,7 +216,8 @@ impl ShellExecutor {
         let _sigpipe = plib::io::SigPipeIgnored::new();
 
         let feeder = child.stdin.take().map(|mut stdin| {
-            let data = input.as_bytes().to_vec();
+            // The bytes the buffer stands for, escaped bytes as themselves.
+            let data = crate::bytes::encode(input);
             std::thread::spawn(move || stdin.write_all(&data))
         });
 
@@ -264,7 +265,7 @@ impl ShellExecutor {
 
         let mut child = Command::new(&self.shell)
             .arg("-c")
-            .arg(&expanded)
+            .arg(crate::bytes::to_os(&expanded))
             .stdin(Stdio::piped())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -274,7 +275,7 @@ impl ShellExecutor {
         // Write input to stdin
         if let Some(mut stdin) = child.stdin.take() {
             stdin
-                .write_all(input.as_bytes())
+                .write_all(&crate::bytes::encode(input))
                 .map_err(|e| ViError::ShellError(format!("failed to write to command: {}", e)))?;
         }
 
@@ -339,9 +340,12 @@ pub struct ShellOutput {
 }
 
 impl ShellOutput {
-    /// Get stdout as a string, lossy conversion.
+    /// Get stdout as editor text.
+    ///
+    /// Bytes that are not UTF-8 are escaped, not replaced, so the output can
+    /// go into the buffer and back out unchanged.
     pub fn stdout_string(&self) -> String {
-        String::from_utf8_lossy(&self.stdout).into_owned()
+        crate::bytes::decode(&self.stdout)
     }
 
     /// Get stderr as a string, lossy conversion.

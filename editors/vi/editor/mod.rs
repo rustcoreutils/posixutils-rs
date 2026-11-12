@@ -553,7 +553,7 @@ impl Editor {
 
     /// Open a file for editing.
     pub fn open(&mut self, path: &str) -> Result<()> {
-        let path_buf = PathBuf::from(path);
+        let path_buf = crate::bytes::path(path);
         // Read before anything is replaced, so a failure leaves the editor as
         // it was rather than half-switched to a file it could not open.
         let new_buffer = read_file(&path_buf)?;
@@ -566,7 +566,7 @@ impl Editor {
         self.buffer = new_buffer;
         self.files.set_current_file(Some(path_buf.clone()));
         self.shell
-            .set_current_file(Some(path_buf.to_string_lossy().into_owned()));
+            .set_current_file(Some(crate::bytes::from_path(&path_buf)));
         if old_current.is_some() {
             self.shell.set_alternate_file(old_current);
         }
@@ -587,9 +587,7 @@ impl Editor {
 
     /// Get current file as string for shell.
     fn shell_current_file(&self) -> Option<String> {
-        self.files
-            .current_file()
-            .map(|p| p.to_string_lossy().into_owned())
+        self.files.current_file().map(crate::bytes::from_path)
     }
 
     /// Open multiple files.
@@ -598,7 +596,7 @@ impl Editor {
             return Ok(());
         }
 
-        let path_bufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+        let path_bufs: Vec<PathBuf> = paths.iter().map(|p| crate::bytes::path(p)).collect();
         self.files.set_args(path_bufs);
 
         // Open first file
@@ -638,7 +636,7 @@ impl Editor {
 
     /// Run in ex (line) mode.
     fn run_ex_mode(&mut self) -> Result<i32> {
-        use std::io::{self, BufRead, IsTerminal, Write};
+        use std::io::{self, IsTerminal, Write};
 
         let stdin = io::stdin();
         let mut stdout = io::stdout();
@@ -655,7 +653,7 @@ impl Editor {
             if self.ex_insert_mode.is_some() {
                 // Read text lines until we see a line containing only "."
                 let mut line = String::new();
-                match stdin.lock().read_line(&mut line) {
+                match read_text_line(&stdin, &mut line) {
                     Ok(0) => {
                         // EOF - finalize pending input, preserve, and quit.
                         let _ = self.finalize_ex_insert();
@@ -683,7 +681,7 @@ impl Editor {
                     Ok(true) => {
                         if !self.silent_mode {
                             if let Some(msg) = &self.message {
-                                println!("{}", msg);
+                                crate::bytes::println(msg);
                             }
                         }
                         self.clear_message();
@@ -691,7 +689,7 @@ impl Editor {
                     Ok(false) => {}
                     Err(e) => {
                         if !self.silent_mode {
-                            eprintln!("{}", e);
+                            crate::bytes::eprintln(&e.to_string());
                         }
                         self.clear_message();
                     }
@@ -707,7 +705,7 @@ impl Editor {
 
             // Read a line of input
             let mut line = String::new();
-            match stdin.lock().read_line(&mut line) {
+            match read_text_line(&stdin, &mut line) {
                 Ok(0) => {
                     // EOF on the command stream: preserve unsaved work, then quit.
                     self.preserve_buffer();
@@ -743,7 +741,7 @@ impl Editor {
                 line.pop(); // drop the escaping backslash
                 line.push('\n');
                 let mut cont = String::new();
-                match stdin.lock().read_line(&mut cont) {
+                match read_text_line(&stdin, &mut cont) {
                     Ok(0) | Err(_) => break,
                     Ok(_) => line.push_str(cont.trim_end_matches(['\n', '\r'])),
                 }
@@ -760,13 +758,13 @@ impl Editor {
                     // Print any message
                     if !self.silent_mode {
                         if let Some(msg) = &self.message {
-                            println!("{}", msg);
+                            crate::bytes::println(msg);
                         }
                     }
                 }
                 Err(e) => {
                     // Errors always go to stderr
-                    eprintln!("{}", e);
+                    crate::bytes::eprintln(&e.to_string());
                     // In silent mode, errors are fatal
                     if self.silent_mode {
                         self.exit_code = 1;
@@ -876,7 +874,7 @@ impl Editor {
                 // Recovered content is not yet written back to the file.
                 self.buffer.mark_modified();
                 if let Some(p) = &info.orig_path {
-                    self.files.set_current_file(Some(PathBuf::from(p)));
+                    self.files.set_current_file(Some(crate::bytes::path(p)));
                 }
                 self.buffer.set_line(1);
                 self.undo.clear();
@@ -1304,7 +1302,7 @@ impl Editor {
                 if self.buffer.is_modified() {
                     self.set_error("No write since last change");
                 } else if let Some(alt) = self.files.alternate_file() {
-                    let path = alt.to_string_lossy().to_string();
+                    let path = crate::bytes::from_path(alt);
                     if let Err(e) = self.open(&path) {
                         self.set_error(&e.to_string());
                     }
@@ -3039,8 +3037,10 @@ impl Editor {
                     // In ex mode, print output directly to stdout
                     // Note: Output from :p, :nu, :l is NOT suppressed by -s
                     // (POSIX says -s suppresses "informational messages", not command output)
+                    // As the bytes the text stands for: an escaped byte
+                    // goes out as itself.
                     for line in &lines {
-                        println!("{}", line);
+                        crate::bytes::println(line);
                     }
                 } else {
                     // In visual mode, show as message
@@ -3158,7 +3158,7 @@ impl Editor {
             }
             ExCommand::File { new_name } => {
                 if let Some(name) = new_name {
-                    self.files.set_current_file(Some(PathBuf::from(name)));
+                    self.files.set_current_file(Some(crate::bytes::path(&name)));
                     // Write rule 5: a later `:w` with no operand must not
                     // clobber this newly-named file if it already exists.
                     self.files.mark_pathname_changed();
@@ -3195,10 +3195,10 @@ impl Editor {
                     // "Set the argument list to the specified filenames ... set
                     // the current pathname to the first filename specified."
                     self.files
-                        .set_args(files.iter().map(PathBuf::from).collect());
-                    PathBuf::from(&files[0])
+                        .set_args(files.iter().map(|f| crate::bytes::path(f)).collect());
+                    crate::bytes::path(&files[0])
                 };
-                self.open(&path.to_string_lossy())?;
+                self.open(&crate::bytes::from_path(&path))?;
                 self.run_plus_command(command.as_deref())?;
                 Ok(ExResult::Continue)
             }
@@ -3207,7 +3207,7 @@ impl Editor {
                     return Err(ViError::FileModified);
                 }
                 let path = self.files.prev_file()?;
-                self.open(&path.to_string_lossy())?;
+                self.open(&crate::bytes::from_path(&path))?;
                 Ok(ExResult::Continue)
             }
             ExCommand::Rewind { force } => {
@@ -3215,7 +3215,7 @@ impl Editor {
                     return Err(ViError::FileModified);
                 }
                 let path = self.files.rewind()?;
-                self.open(&path.to_string_lossy())?;
+                self.open(&crate::bytes::from_path(&path))?;
                 Ok(ExResult::Continue)
             }
             ExCommand::Args => Ok(ExResult::StatusMessage(self.files.format_args())),
@@ -3391,7 +3391,7 @@ impl Editor {
             }
             ExCommand::Pwd => {
                 let cwd = std::env::current_dir()
-                    .map(|p| p.display().to_string())
+                    .map(|p| crate::bytes::from_path(&p))
                     .unwrap_or_else(|_| "unknown".to_string());
                 Ok(ExResult::StatusMessage(cwd))
             }
@@ -3540,7 +3540,7 @@ impl Editor {
         if let Some(path) = file {
             self.open(path)?;
         } else if let Some(path) = self.files.current_file().map(|p| p.to_path_buf()) {
-            self.open(&path.to_string_lossy())?;
+            self.open(&crate::bytes::from_path(&path))?;
         }
         self.run_plus_command(command)
     }
@@ -3635,19 +3635,20 @@ impl Editor {
         use std::fs::File;
         use std::io::{BufRead, BufReader};
 
-        let file = File::open(file).map_err(ViError::Io)?;
+        let file = File::open(crate::bytes::path(file)).map_err(ViError::Io)?;
         let mut reader = BufReader::new(file);
 
         // Read to the `\n` and strip the terminator ourselves. `BufRead::lines`
         // removes a trailing `\r` as well, which would eat the quoted carriage
-        // return in a sourced `map Q :wq^V^M`.
-        let mut line = String::new();
+        // return in a sourced `map Q :wq^V^M`.  Bytes, escaped as editor text
+        // where they are not UTF-8, as for every ex command.
+        let mut raw = Vec::new();
         loop {
-            line.clear();
-            if reader.read_line(&mut line).map_err(ViError::Io)? == 0 {
+            raw.clear();
+            if reader.read_until(b'\n', &mut raw).map_err(ViError::Io)? == 0 {
                 break;
             }
-            self.execute_source_line(&line)?;
+            self.execute_source_line(&crate::bytes::decode(&raw))?;
         }
 
         Ok(())
@@ -3691,7 +3692,8 @@ impl Editor {
         // 1. Check EXINIT environment variable
         // Per POSIX: if EXINIT is set (even to empty), $HOME/.exrc is not sourced
         if let Some(exinit_os) = std::env::var_os("EXINIT") {
-            let exinit = exinit_os.to_string_lossy();
+            // As editor text, like every other source of ex commands.
+            let exinit = crate::bytes::from_os(&exinit_os);
             if !exinit.is_empty() {
                 // EXINIT uses '|' to separate multiple commands
                 for cmd in exinit.split('|') {
@@ -4044,7 +4046,7 @@ impl Editor {
         };
 
         // Compile the pattern as a POSIX BRE.
-        let regex = plib::regex::Regex::new(pattern, plib::regex::RegexFlags::bre())
+        let regex = crate::bytes::TextRegex::new(pattern, plib::regex::RegexFlags::bre())
             .map_err(|e| ViError::InvalidPattern(e.to_string()))?;
 
         // Collect matching line numbers first (to avoid mutation during iteration)
@@ -4110,12 +4112,12 @@ impl Editor {
     /// Execute :cd command - change directory.
     fn execute_ex_cd(&mut self, path: Option<&str>) -> Result<()> {
         let target = if let Some(p) = path {
-            std::path::PathBuf::from(p)
+            crate::bytes::path(p)
         } else {
             // Try to get home directory from environment
-            std::env::var("HOME")
+            std::env::var_os("HOME")
                 .map(std::path::PathBuf::from)
-                .map_err(|_| ViError::ShellError("Cannot determine home directory".to_string()))?
+                .ok_or_else(|| ViError::ShellError("Cannot determine home directory".to_string()))?
         };
 
         std::env::set_current_dir(&target).map_err(|e| {
@@ -4390,6 +4392,11 @@ impl Editor {
     fn list_form(s: &str) -> String {
         let mut out = String::with_capacity(s.len() + 1);
         for c in s.chars() {
+            // A byte that is not UTF-8: its own octal escape.
+            if let Some(b) = crate::bytes::escaped_byte(c) {
+                out.push_str(&format!("\\{:03o}", b));
+                continue;
+            }
             match c {
                 // XBD Table 5-1.
                 '\\' => out.push_str("\\\\"),
@@ -4440,7 +4447,7 @@ impl Editor {
         // Rule 4: no file operand means the current pathname; absent that, fail.
         let named = path.is_some();
         let path = path
-            .map(PathBuf::from)
+            .map(crate::bytes::path)
             .or_else(|| self.files.current_file().map(|p| p.to_path_buf()))
             .ok_or(ViError::NoFileName)?;
 
@@ -4750,7 +4757,7 @@ impl Editor {
 
         // File name
         if let Some(path) = self.files.current_file() {
-            status.push_str(&path.display().to_string());
+            status.push_str(&crate::bytes::from_path(path));
         } else {
             status.push_str("[No Name]");
         }
@@ -5116,7 +5123,7 @@ impl Editor {
         let origin = self
             .files
             .current_file()
-            .map(|p| (p.to_string_lossy().into_owned(), self.buffer.cursor()));
+            .map(|p| (crate::bytes::from_path(p), self.buffer.cursor()));
 
         // Switch to the tag's file unless it is already the current file.
         let already_open = origin
@@ -5155,7 +5162,7 @@ impl Editor {
                 self.buffer.move_to_first_non_blank();
             }
             crate::tags::TagAddress::Pattern(pat) => {
-                if let Ok(re) = plib::regex::Regex::new(&pat, plib::regex::RegexFlags::bre()) {
+                if let Ok(re) = crate::bytes::TextRegex::new(&pat, plib::regex::RegexFlags::bre()) {
                     let mut found = None;
                     for n in 1..=self.buffer.line_count() {
                         if let Some(line) = self.buffer.line(n) {
@@ -5190,7 +5197,7 @@ impl Editor {
         let same_file = self
             .files
             .current_file()
-            .map(|p| p.to_string_lossy() == file.as_str())
+            .map(|p| crate::bytes::from_path(p) == file.as_str())
             .unwrap_or(false);
 
         // Refuse before popping, so `:w` and a second `:pop` still work. This
@@ -5230,6 +5237,17 @@ impl Default for Editor {
 /// backslash is escaping whatever follows (here, the newline).
 fn ends_with_odd_backslash(s: &str) -> bool {
     s.chars().rev().take_while(|c| *c == '\\').count() % 2 == 1
+}
+
+/// Read one line of ex input as editor text, escaping any byte that is not
+/// UTF-8 (see [`crate::bytes`]) so that a command may name the bytes a file
+/// holds.  Returns the number of bytes read, 0 at end of input.
+fn read_text_line(stdin: &std::io::Stdin, line: &mut String) -> std::io::Result<usize> {
+    use std::io::BufRead;
+    let mut bytes = Vec::new();
+    let n = stdin.lock().read_until(b'\n', &mut bytes)?;
+    line.push_str(&crate::bytes::decode(&bytes));
+    Ok(n)
 }
 
 #[cfg(test)]

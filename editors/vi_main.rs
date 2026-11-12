@@ -20,7 +20,12 @@ fn main() {
     let invoked_as = InvokedAs::detect();
     plib::diag::init_locale(invoked_as.name());
 
-    let args = plib::optarg::args_utf8(invoked_as.name());
+    // As editor text, a byte that is not UTF-8 escaped (`vi_rs::bytes`): a
+    // file operand is a pathname, which may hold any byte, and so may a
+    // `-c` command that names text in such a file.
+    let args: Vec<String> = std::env::args_os()
+        .map(|a| vi_rs::bytes::from_os(&a))
+        .collect();
     let exit_code = run_editor(invoked_as, &args);
     process::exit(exit_code);
 }

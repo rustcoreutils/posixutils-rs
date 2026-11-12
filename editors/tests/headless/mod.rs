@@ -12,6 +12,8 @@
 //! These tests exercise the full editor functionality without requiring
 //! a real terminal, allowing us to test complete command sequences.
 
+mod bytes;
+
 use vi_rs::buffer::Position;
 use vi_rs::mode::Mode;
 use vi_rs::Editor;

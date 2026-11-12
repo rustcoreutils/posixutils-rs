@@ -325,14 +325,20 @@ pub fn preserve(orig: Option<&Path>, text: &str, base: &str) -> io::Result<PathB
     };
     let written = (|| -> io::Result<()> {
         writeln!(f, "{}", MAGIC)?;
-        match orig {
-            Some(p) => writeln!(f, "path: {}", p.display())?,
-            None => writeln!(f, "path:")?,
+        // The pathname as its bytes, so a name that is not UTF-8 recovers
+        // to the same file -- with `\` and newline escaped, so a name holding
+        // a newline cannot end the field or forge the `---` that starts the
+        // body.
+        f.write_all(b"path: ")?;
+        if let Some(p) = orig {
+            f.write_all(&escape_field(p.as_os_str().as_bytes()))?;
         }
+        f.write_all(b"\n")?;
         writeln!(f, "time: {}", secs)?;
         writeln!(f, "user: {}", std::env::var("USER").unwrap_or_default())?;
         writeln!(f, "---")?;
-        f.write_all(text.as_bytes())?;
+        // The buffer as the bytes it stands for (see `crate::bytes`).
+        f.write_all(&crate::bytes::encode(text))?;
         if !text.is_empty() && !text.ends_with('\n') {
             writeln!(f)?;
         }
@@ -347,13 +353,51 @@ pub fn preserve(orig: Option<&Path>, text: &str, base: &str) -> io::Result<PathB
     Ok(dir.path_of(&name))
 }
 
+/// A header field's bytes with `\` and newline escaped as `\\` and `\n`.
+fn escape_field(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    for &b in raw {
+        match b {
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b => out.push(b),
+        }
+    }
+    out
+}
+
+/// Undo [`escape_field`].
+fn unescape_field(field: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(field.len());
+    let mut bytes = field.iter();
+    while let Some(&b) = bytes.next() {
+        if b == b'\\' {
+            match bytes.next() {
+                Some(b'n') => out.push(b'\n'),
+                Some(&other) => out.push(other),
+                None => out.push(b'\\'),
+            }
+        } else {
+            out.push(b);
+        }
+    }
+    out
+}
+
 /// Parse the header of a recovery file into a [`RecoverInfo`].
 fn read_header(dir: &Rc<RecoverDir>, name: &CString) -> io::Result<RecoverInfo> {
     // The header is a few short lines; cap what is read so a huge file with
     // no newline is not pulled into memory just to be rejected.
     let mut r = BufReader::new(dir.open(name)?.take(64 * 1024));
+    let mut raw = Vec::new();
+    let mut next_line = |line: &mut String| -> io::Result<usize> {
+        raw.clear();
+        let n = r.read_until(b'\n', &mut raw)?;
+        *line = crate::bytes::decode(&raw);
+        Ok(n)
+    };
     let mut line = String::new();
-    r.read_line(&mut line)?;
+    next_line(&mut line)?;
     if line.trim_end() != MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -363,18 +407,25 @@ fn read_header(dir: &Rc<RecoverDir>, name: &CString) -> io::Result<RecoverInfo> 
     let mut orig_path = None;
     let mut modified = 0u64;
     loop {
-        line.clear();
-        if r.read_line(&mut line)? == 0 {
+        if next_line(&mut line)? == 0 {
             break;
         }
         let l = line.trim_end();
         if l == "---" {
             break;
         }
-        if let Some(v) = l.strip_prefix("path:") {
-            let v = v.trim();
+        if let Some(v) = line
+            .strip_suffix('\n')
+            .unwrap_or(&line)
+            .strip_prefix("path:")
+        {
+            // Exactly the one blank after the colon: the name's own leading
+            // or trailing blanks are part of it.
+            let v = v.strip_prefix(' ').unwrap_or(v);
             if !v.is_empty() {
-                orig_path = Some(v.to_string());
+                orig_path = Some(crate::bytes::decode(&unescape_field(
+                    &crate::bytes::encode(v),
+                )));
             }
         } else if let Some(v) = l.strip_prefix("time:") {
             modified = v.trim().parse().unwrap_or(0);
@@ -414,19 +465,20 @@ pub fn list(base: &str) -> Vec<RecoverInfo> {
 /// Read the buffer text (the body) from a recovery file.
 pub fn load_body(info: &RecoverInfo) -> io::Result<String> {
     let mut r = BufReader::new(info.dir.open(&info.name)?);
-    let mut line = String::new();
+    // Skip the header, which may name a path that is not UTF-8.
+    let mut line = Vec::new();
     loop {
         line.clear();
-        if r.read_line(&mut line)? == 0 {
+        if r.read_until(b'\n', &mut line)? == 0 {
             break;
         }
-        if line.trim_end() == "---" {
+        if line.trim_ascii_end() == b"---" {
             break;
         }
     }
-    let mut body = String::new();
-    r.read_to_string(&mut body)?;
-    Ok(body)
+    let mut body = Vec::new();
+    r.read_to_end(&mut body)?;
+    Ok(crate::bytes::decode(&body))
 }
 
 /// Find the newest recovery file under `base` for `orig` (or the newest of any).
@@ -518,6 +570,43 @@ mod tests {
 
         remove(&info);
         assert!(!rec.exists());
+    }
+
+    #[test]
+    fn test_preserve_and_load_non_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        let td = plib::tmp::tempdir().unwrap();
+        let base = td.path().to_str().unwrap();
+        let orig = PathBuf::from(std::ffi::OsStr::from_bytes(b"/x/n\xffm"));
+        let text = crate::bytes::decode(b"a\xffb\n\xfe\n");
+        let rec = preserve(Some(&orig), &text, base).unwrap();
+        // On disk, the bytes themselves.
+        let raw = fs::read(&rec).unwrap();
+        assert!(raw.ends_with(b"---\na\xffb\n\xfe\n"));
+        let want = crate::bytes::from_os(orig.as_os_str());
+        let info = find_for(base, Some(&want)).expect("found by its own name");
+        assert_eq!(load_body(&info).unwrap(), text);
+        assert_eq!(crate::bytes::path(info.orig_path.as_deref().unwrap()), orig);
+    }
+
+    #[test]
+    fn test_pathname_with_newline_and_blanks_recovers() {
+        use std::os::unix::ffi::OsStrExt;
+        let td = plib::tmp::tempdir().unwrap();
+        let base = td.path().to_str().unwrap();
+        for name in [
+            &b"/x/a\n---\nX"[..],
+            b"/x/notes ",
+            b" /x/lead",
+            b"/x/back\\slash",
+        ] {
+            let orig = PathBuf::from(std::ffi::OsStr::from_bytes(name));
+            preserve(Some(&orig), "body\n", base).unwrap();
+            let want = crate::bytes::from_path(&orig);
+            let info = find_for(base, Some(&want)).expect("found by its own name");
+            assert_eq!(load_body(&info).unwrap(), "body\n", "{name:?}");
+            remove(&info);
+        }
     }
 
     #[test]

@@ -191,7 +191,7 @@ impl FileManager {
             if i == self.arg_index {
                 result.push('[');
             }
-            result.push_str(&path.display().to_string());
+            result.push_str(&crate::bytes::from_path(path));
             if i == self.arg_index {
                 result.push(']');
             }
@@ -209,8 +209,8 @@ impl FileManager {
 /// reported: `Path::exists` is false whenever `stat` fails, so testing it
 /// opened a file behind an unsearchable directory as an empty buffer.
 pub fn read_file(path: &Path) -> Result<Buffer> {
-    match fs::read_to_string(path) {
-        Ok(text) => Ok(Buffer::from_text(&text)),
+    match fs::read(path) {
+        Ok(bytes) => Ok(Buffer::from_text(&crate::bytes::decode(&bytes))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Buffer::new()),
         Err(e) => Err(e.into()),
     }
@@ -230,8 +230,8 @@ pub fn write_file(buffer: &Buffer, path: &Path, append: bool) -> Result<WriteSta
 
     for line_num in 1..=lines {
         if let Some(line) = buffer.line(line_num) {
-            let content = line.content();
-            writer.write_all(content.as_bytes())?;
+            let content = crate::bytes::encode(line.content());
+            writer.write_all(&content)?;
             writer.write_all(b"\n")?;
             bytes += content.len() + 1;
         }
@@ -262,8 +262,8 @@ pub fn write_range(
 
     for line_num in start..=end {
         if let Some(line) = buffer.line(line_num) {
-            let content = line.content();
-            writer.write_all(content.as_bytes())?;
+            let content = crate::bytes::encode(line.content());
+            writer.write_all(&content)?;
             writer.write_all(b"\n")?;
             bytes += content.len() + 1;
             lines += 1;
@@ -322,7 +322,8 @@ pub fn write_shell_input(
     if let Some(stdin) = child.stdin.as_mut() {
         for line_num in start..=end {
             if let Some(line) = buffer.line(line_num) {
-                writeln!(stdin, "{}", line.content())?;
+                stdin.write_all(&crate::bytes::encode(line.content()))?;
+                stdin.write_all(b"\n")?;
             }
         }
     }
@@ -335,7 +336,7 @@ pub fn write_shell_input(
         ));
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok(crate::bytes::decode(&output.stdout))
 }
 
 /// Get file information.

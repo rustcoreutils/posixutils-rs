@@ -13,6 +13,7 @@
 //! the POSIX specification.
 
 pub mod buffer;
+pub mod bytes;
 pub mod command;
 pub mod config;
 pub mod editor;
@@ -158,7 +159,10 @@ pub fn run_editor(invoked_as: InvokedAs, args: &[String]) -> i32 {
             } else {
                 println!("Recoverable files:");
                 for r in &recs {
-                    println!("  {}", r.orig_path.as_deref().unwrap_or("(unnamed)"));
+                    bytes::println(&format!(
+                        "  {}",
+                        r.orig_path.as_deref().unwrap_or("(unnamed)")
+                    ));
                 }
             }
             return 0;

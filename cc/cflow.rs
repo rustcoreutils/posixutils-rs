@@ -142,10 +142,7 @@ impl CallGraph {
     }
 
     fn should_include(&self, name: &str) -> bool {
-        if name.starts_with('_') && !self.include_underscore {
-            return false;
-        }
-        true
+        self.include_underscore || !name.starts_with('_')
     }
 
     fn add_function(&mut self, info: FunctionInfo) {

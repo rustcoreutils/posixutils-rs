@@ -28,16 +28,18 @@ use posixutils_make::{
     Make,
 };
 
-const MAKEFILE_NAME: [&str; 2] = ["makefile", "Makefile"];
 const MAKEFILE_PATH: [&str; 2] = ["./makefile", "./Makefile"];
 
 /// How many times the makefiles are read again because an included file was
 /// remade.
 const MAX_RESTARTS: usize = 16;
 
-/// `MAKEFILE_PATH[i]` must stay `MAKEFILE_NAME[i]` prefixed with `./`; the two
-/// are spelled out separately rather than derived, so pin the invariant here.
+/// `MAKEFILE_PATH[i]` must stay the `i`th name `make` looks for, prefixed with
+/// `./`; they are spelled out rather than derived, so pin the invariant here.
+/// (The names live in this block, their one use: older compilers call a
+/// constant used only in a `const _` block dead.)
 const _: () = {
+    const MAKEFILE_NAME: [&str; 2] = ["makefile", "Makefile"];
     const fn is_dot_slash(path: &str, name: &str) -> bool {
         let (path, name) = (path.as_bytes(), name.as_bytes());
         if path.len() != name.len() + 2 || path[0] != b'.' || path[1] != b'/' {

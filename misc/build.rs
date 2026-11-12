@@ -27,7 +27,7 @@
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::Path;
 
 /// Names symlinked to the `test` binary.
 #[cfg(unix)]
@@ -42,13 +42,15 @@ fn main() {
 fn create_symlinks() {
     use std::os::unix::fs::symlink;
 
-    // OUT_DIR is <target_dir>/<profile>/build/<crate>-<hash>/out; the binaries
-    // land three levels up, in <target_dir>/<profile>.
+    // The binaries land in <target_dir>/<profile>: the parent of the `build`
+    // directory OUT_DIR is under.  OUT_DIR is <profile>/build/<crate>-<hash>/out,
+    // or since Cargo 1.100 <profile>/build/<crate>/<hash>/out, so it is found
+    // by name, not by counting levels.
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
-    let bin_dir = PathBuf::from(&out_dir)
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
+    let bin_dir = Path::new(&out_dir)
+        .ancestors()
+        .find(|p| p.file_name().is_some_and(|n| n == "build"))
+        .and_then(|build| build.parent())
         .map(|p| p.to_path_buf())
         .expect("Could not determine target directory from OUT_DIR");
 

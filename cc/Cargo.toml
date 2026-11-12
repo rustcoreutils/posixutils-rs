@@ -18,6 +18,9 @@ plib = { path = "../plib" }
 
 [dev-dependencies]
 
+[lints]
+workspace = true
+
 [features]
 # Enable full compile matrix (4 configs) instead of default single config (-O -g)
 test_matrix = []

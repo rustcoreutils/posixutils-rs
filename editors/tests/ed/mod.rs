@@ -12,6 +12,7 @@
 //! These tests verify the ed binary works correctly as a POSIX ed editor,
 //! testing commands via stdin/stdout.
 
+mod bytes;
 mod global;
 mod parse;
 mod shell;

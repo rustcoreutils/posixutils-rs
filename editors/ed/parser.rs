@@ -10,7 +10,6 @@
 //! Command parsing for the ed editor.
 
 use crate::ed::error::{EdError, EdResult};
-use std::iter;
 
 /// Token produced by the lexer.
 #[derive(Debug, PartialEq, Clone)]
@@ -19,139 +18,117 @@ pub enum Token {
     LastLine,
     Number(usize),
     Mark(char),
-    RegexForward(String),
-    RegexBack(String),
+    RegexForward(Vec<u8>),
+    RegexBack(Vec<u8>),
     Offset(isize),
     AddressSeparator(char),
     Command(char),
-    Rest(String),
+    Rest(Vec<u8>),
+}
+
+/// The decimal number of a run of ASCII digits, or None if it does not fit.
+fn parse_digits(digits: &[u8]) -> Option<usize> {
+    std::str::from_utf8(digits).ok()?.parse().ok()
 }
 
 /// Tokenize an ed command line.
-pub fn tokenize(input: &str) -> EdResult<Vec<Token>> {
+///
+/// Bytes, not text: patterns, replacements, pathnames and shell commands
+/// may hold any byte, as the text they act on does.
+pub fn tokenize(input: &[u8]) -> EdResult<Vec<Token>> {
     let mut tokens: Vec<Token> = Vec::new();
-    let mut iter = input.chars().peekable();
+    let mut i = 0;
 
-    while let Some(ch) = iter.next() {
-        match ch {
-            ch if ch.is_whitespace() => continue,
-            '.' => tokens.push(Token::CurrentLine),
-            '$' => tokens.push(Token::LastLine),
-            '0'..='9' => {
-                // Addresses are resolved in signed arithmetic, so parse as
-                // `isize`: a line number that does not fit is out of range,
-                // not a reason to abort the editor.
-                let digits: String = iter::once(ch)
-                    .chain(iter::from_fn(|| {
-                        iter.by_ref().next_if(|s| s.is_ascii_digit())
-                    }))
-                    .collect();
-                let n: isize = digits.parse().map_err(|_| EdError::AddressOutOfRange)?;
-                tokens.push(Token::Number(n as usize));
+    while i < input.len() {
+        let b = input[i];
+        i += 1;
+        match b {
+            b if b.is_ascii_whitespace() => continue,
+            b'.' => tokens.push(Token::CurrentLine),
+            b'$' => tokens.push(Token::LastLine),
+            b'0'..=b'9' => {
+                let start = i - 1;
+                while i < input.len() && input[i].is_ascii_digit() {
+                    i += 1;
+                }
+                // Addresses are resolved in signed arithmetic, so a line
+                // number must fit an `isize`: one that does not is out of
+                // range, not a reason to abort the editor.
+                let n = parse_digits(&input[start..i])
+                    .filter(|&n| n <= isize::MAX as usize)
+                    .ok_or(EdError::AddressOutOfRange)?;
+                tokens.push(Token::Number(n));
             }
-            '\'' => match iter.next() {
+            b'\'' => match input.get(i) {
+                Some(&m) if m.is_ascii_lowercase() => {
+                    i += 1;
+                    tokens.push(Token::Mark(m as char));
+                }
+                Some(&m) => {
+                    return Err(EdError::Syntax(format!(
+                        "invalid mark character: {}",
+                        String::from_utf8_lossy(&[m])
+                    )))
+                }
                 None => return Err(EdError::Syntax("missing mark character".to_string())),
-                Some(mark_ch) => {
-                    if mark_ch.is_ascii_lowercase() {
-                        tokens.push(Token::Mark(mark_ch));
-                    } else {
-                        return Err(EdError::Syntax(format!(
-                            "invalid mark character: {}",
-                            mark_ch
-                        )));
-                    }
-                }
             },
-            ',' | ';' => {
-                tokens.push(Token::AddressSeparator(ch));
-            }
-            '/' | '?' => {
-                let mut bre = String::new();
-                let mut escaped = false;
-                loop {
-                    let bre_ch_res = iter.next();
-                    if bre_ch_res.is_none() {
-                        // Unterminated is OK for search - uses previous pattern
-                        if ch == '/' {
-                            tokens.push(Token::RegexForward(bre));
-                        } else {
-                            tokens.push(Token::RegexBack(bre));
+            b',' | b';' => tokens.push(Token::AddressSeparator(b as char)),
+            b'/' | b'?' => {
+                // An escaped delimiter is the delimiter; any other escape is
+                // kept for the RE.  Unterminated is fine: the RE ends with
+                // the line.
+                let mut bre = Vec::new();
+                while i < input.len() && input[i] != b {
+                    if input[i] == b'\\' && i + 1 < input.len() {
+                        if input[i + 1] != b {
+                            bre.push(b'\\');
                         }
-                        break;
-                    }
-
-                    let bre_ch = bre_ch_res.unwrap();
-                    match bre_ch {
-                        '/' | '?' if bre_ch == ch => {
-                            if escaped {
-                                bre.push(bre_ch);
-                                escaped = false;
-                            } else {
-                                if ch == '/' {
-                                    tokens.push(Token::RegexForward(bre));
-                                } else {
-                                    tokens.push(Token::RegexBack(bre));
-                                }
-                                break;
-                            }
-                        }
-                        '\\' => {
-                            if escaped {
-                                bre.push('\\');
-                                escaped = false;
-                            } else {
-                                escaped = true;
-                            }
-                        }
-                        _ => {
-                            if escaped {
-                                bre.push('\\');
-                                escaped = false;
-                            }
-                            bre.push(bre_ch);
-                        }
+                        bre.push(input[i + 1]);
+                        i += 2;
+                    } else {
+                        bre.push(input[i]);
+                        i += 1;
                     }
                 }
-            }
-            '+' | '-' => {
-                let sign = ch;
-                let mut offset_str = String::new();
-                while let Some(&next_ch) = iter.peek() {
-                    if next_ch.is_ascii_digit() {
-                        offset_str.push(iter.next().unwrap());
-                    } else {
-                        break;
-                    }
-                }
-
-                let n: isize = if offset_str.is_empty() {
-                    if sign == '+' {
-                        1
-                    } else {
-                        -1
-                    }
+                i += 1; // the closing delimiter, if there was one
+                tokens.push(if b == b'/' {
+                    Token::RegexForward(bre)
                 } else {
-                    let unsigned: isize =
-                        offset_str.parse().map_err(|_| EdError::AddressOutOfRange)?;
-                    if sign == '-' {
-                        -unsigned
-                    } else {
-                        unsigned
-                    }
-                };
-
-                tokens.push(Token::Offset(n));
+                    Token::RegexBack(bre)
+                });
             }
-            'a'..='z' | 'A'..='Z' | '=' | '!' | '#' | '&' => {
-                // Command character - collect the rest of the line
-                let rest: String = iter.collect();
-                tokens.push(Token::Command(ch));
-                if !rest.is_empty() {
-                    tokens.push(Token::Rest(rest));
+            b'+' | b'-' => {
+                let start = i;
+                while i < input.len() && input[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let magnitude = if start == i {
+                    1
+                } else {
+                    parse_digits(&input[start..i])
+                        .filter(|&n| n <= isize::MAX as usize)
+                        .ok_or(EdError::AddressOutOfRange)? as isize
+                };
+                tokens.push(Token::Offset(if b == b'-' {
+                    -magnitude
+                } else {
+                    magnitude
+                }));
+            }
+            b'a'..=b'z' | b'A'..=b'Z' | b'=' | b'!' | b'#' | b'&' => {
+                // Command character - the rest of the line is its argument
+                tokens.push(Token::Command(b as char));
+                if i < input.len() {
+                    tokens.push(Token::Rest(input[i..].to_vec()));
                 }
                 break;
             }
-            _ => return Err(EdError::Syntax(format!("unrecognized character: {}", ch))),
+            _ => {
+                return Err(EdError::Syntax(format!(
+                    "unrecognized character: {}",
+                    String::from_utf8_lossy(&[b])
+                )))
+            }
         }
     }
 
@@ -166,8 +143,8 @@ pub enum AddressInfo {
     Last,
     Line(usize),
     Mark(char),
-    RegexForward(String),
-    RegexBack(String),
+    RegexForward(Vec<u8>),
+    RegexBack(Vec<u8>),
     Offset(isize),
 }
 
@@ -229,11 +206,14 @@ impl PrintFlags {
 /// POSIX (ed): "any command other than e, E, f, q, Q, r, w, and ! can be
 /// suffixed by a command from l, n, or p".  Anything else after the command
 /// is an error: ignoring it made `1dx` a delete and `fromstdin` an `f`.
-fn parse_suffix(rest: &str) -> EdResult<PrintFlags> {
+fn parse_suffix(rest: &[u8]) -> EdResult<PrintFlags> {
     let mut flags = PrintFlags::default();
-    for ch in rest.trim().chars() {
-        if !flags.add(ch) {
-            return Err(EdError::Syntax(format!("invalid command suffix: {}", rest)));
+    for &b in rest.trim_ascii() {
+        if !flags.add(b as char) {
+            return Err(EdError::Syntax(format!(
+                "invalid command suffix: {}",
+                String::from_utf8_lossy(rest)
+            )));
         }
     }
     Ok(flags)
@@ -256,13 +236,13 @@ pub enum Command {
     /// (.,.)d - delete lines
     Delete(Address, Address),
     /// e file - edit file
-    Edit(Option<String>, bool), // (filename, force)
+    Edit(Option<Vec<u8>>, bool), // (filename, force)
     /// f [file] - set/print filename
-    Filename(Option<String>),
+    Filename(Option<Vec<u8>>),
     /// (1,$)g/re/command-list - global
-    Global(Address, Address, String, String, bool), // (addr1, addr2, pattern, commands, interactive)
+    Global(Address, Address, Vec<u8>, Vec<u8>, bool), // (addr1, addr2, pattern, commands, interactive)
     /// (1,$)G/re/ - interactive global
-    GlobalInteractive(Address, Address, String),
+    GlobalInteractive(Address, Address, Vec<u8>),
     /// h - print last error
     Help,
     /// H - toggle help mode
@@ -282,30 +262,30 @@ pub enum Command {
     /// q - quit
     Quit(bool), // force
     /// ($)r [file] - read file
-    Read(Address, Option<String>),
+    Read(Address, Option<Vec<u8>>),
     /// (.,.)s/re/replacement/flags - substitute
-    Substitute(Address, Address, String, String, String), // pattern, replacement, flags
+    Substitute(Address, Address, Vec<u8>, Vec<u8>, String), // pattern, replacement, flags
     /// (.,.)t<addr> - copy lines
     Copy(Address, Address, Address),
     /// u - undo
     Undo,
     /// (1,$)v/re/command-list - global not matching
-    GlobalNot(Address, Address, String, String, bool),
+    GlobalNot(Address, Address, Vec<u8>, Vec<u8>, bool),
     /// (1,$)V/re/ - interactive global not matching
-    GlobalNotInteractive(Address, Address, String),
+    GlobalNotInteractive(Address, Address, Vec<u8>),
     /// (1,$)w [file] - write; `W` appends, and a `q` glued to either
     /// (`wq`, `Wq`) also quits.
     Write {
         addr1: Address,
         addr2: Address,
-        filename: Option<String>,
+        filename: Option<Vec<u8>>,
         append: bool,
         quit: bool,
     },
     /// ($)= - print line number
     LineNumber(Address),
     /// !command - shell escape
-    Shell(String),
+    Shell(Vec<u8>),
     /// (.+1)z[n] - scroll
     Scroll(Address, Option<usize>),
     /// (.)# - comment (null command for address)
@@ -402,7 +382,7 @@ fn normalize_addrvec(
 }
 
 /// Parse a command line into a command and its print suffix.
-pub fn parse(line: &str) -> EdResult<Parsed> {
+pub fn parse(line: &[u8]) -> EdResult<Parsed> {
     let tokens = tokenize(line)?;
     parse_tokens(tokens)
 }
@@ -491,10 +471,10 @@ pub fn parse_tokens(mut tokens: Vec<Token>) -> EdResult<Parsed> {
                         if let Token::Rest(s) = tokens.remove(0) {
                             s
                         } else {
-                            String::new()
+                            Vec::new()
                         }
                     } else {
-                        String::new()
+                        Vec::new()
                     };
 
                     return parse_command(cmd, rest, addrvec, separator);
@@ -540,30 +520,30 @@ fn no_address(addrvec: &[Address], separator: Option<char>) -> EdResult<()> {
 
 /// The pathname argument of `e E f r w W`: empty, or separated from the
 /// command by a blank.  `fromstdin` is not `f romstdin`.
-fn filename_arg(rest_raw: &str) -> EdResult<Option<String>> {
+fn filename_arg(rest_raw: &[u8]) -> EdResult<Option<Vec<u8>>> {
     if rest_raw.is_empty() {
         return Ok(None);
     }
-    if !rest_raw.starts_with([' ', '\t']) {
+    if !matches!(rest_raw[0], b' ' | b'\t') {
         return Err(EdError::Syntax(format!(
             "invalid command suffix: {}",
-            rest_raw
+            String::from_utf8_lossy(rest_raw)
         )));
     }
-    let name = rest_raw.trim();
-    Ok((!name.is_empty()).then(|| name.to_string()))
+    let name = rest_raw.trim_ascii();
+    Ok((!name.is_empty()).then(|| name.to_vec()))
 }
 
 /// Parse a specific command with its arguments.
 fn parse_command(
     cmd: char,
-    rest_raw: String,
+    rest_raw: Vec<u8>,
     mut addrvec: Vec<Address>,
     separator: Option<char>,
 ) -> EdResult<Parsed> {
     // Every command but `w`/`W` and the pathname commands wants the argument
     // with surrounding blanks removed.
-    let rest = rest_raw.trim().to_string();
+    let rest = rest_raw.trim_ascii().to_vec();
     let mut suffix = PrintFlags::default();
     let cmd = match cmd {
         'a' => {
@@ -592,7 +572,7 @@ fn parse_command(
         'g' | 'v' => {
             normalize_addrvec(&mut addrvec, 2, separator, get_default_addressing(cmd));
             // Leading blanks only: the list's last command may end in text.
-            let (pattern, commands) = parse_global_args(rest_raw.trim_start())?;
+            let (pattern, commands) = parse_global_args(rest_raw.trim_ascii_start())?;
             if cmd == 'g' {
                 Command::Global(
                     addrvec[0].clone(),
@@ -642,12 +622,12 @@ fn parse_command(
         }
         'k' => {
             normalize_addrvec(&mut addrvec, 1, separator, get_default_addressing('k'));
-            let mut chars = rest.chars();
-            let mark = chars
-                .next()
-                .filter(|c| c.is_ascii_lowercase())
+            let mark = rest
+                .first()
+                .filter(|b| b.is_ascii_lowercase())
                 .ok_or_else(|| EdError::Syntax("invalid mark".to_string()))?;
-            suffix = parse_suffix(chars.as_str())?;
+            let mark = *mark as char;
+            suffix = parse_suffix(&rest[1..])?;
             Command::Mark(addrvec[0].clone(), mark)
         }
         'l' | 'n' | 'p' => {
@@ -669,7 +649,10 @@ fn parse_command(
         'q' | 'Q' => {
             no_address(&addrvec, separator)?;
             if !rest.is_empty() {
-                return Err(EdError::Syntax(format!("invalid command suffix: {}", rest)));
+                return Err(EdError::Syntax(format!(
+                    "invalid command suffix: {}",
+                    String::from_utf8_lossy(&rest)
+                )));
             }
             Command::Quit(cmd == 'Q')
         }
@@ -692,9 +675,9 @@ fn parse_command(
             normalize_addrvec(&mut addrvec, 2, separator, get_default_addressing('w'));
             // A `q` immediately after the command letter is the write-quit
             // form; anything after a blank is a pathname, even a bare "q".
-            let (quit, args) = match rest_raw.strip_prefix('q') {
+            let (quit, args) = match rest_raw.strip_prefix(b"q") {
                 Some(after) => (true, after),
-                None => (false, rest_raw.as_str()),
+                None => (false, rest_raw.as_slice()),
             };
             Command::Write {
                 addr1: addrvec[0].clone(),
@@ -706,14 +689,13 @@ fn parse_command(
         }
         'z' => {
             normalize_addrvec(&mut addrvec, 1, separator, get_default_addressing('z'));
-            let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+            let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
             let count = if digits == 0 {
                 None
             } else {
                 Some(
-                    rest[..digits]
-                        .parse()
-                        .map_err(|_| EdError::Syntax("invalid count".to_string()))?,
+                    parse_digits(&rest[..digits])
+                        .ok_or_else(|| EdError::Syntax("invalid count".to_string()))?,
                 )
             };
             suffix = parse_suffix(&rest[digits..])?;
@@ -744,7 +726,7 @@ fn parse_command(
 }
 
 /// Parse the destination address of `m`/`t`, and the print suffix after it.
-fn parse_destination(s: &str) -> EdResult<(Address, PrintFlags)> {
+fn parse_destination(s: &[u8]) -> EdResult<(Address, PrintFlags)> {
     let mut addr = Address::new();
     let mut suffix = PrintFlags::default();
     let mut tokens = tokenize(s)?.into_iter();
@@ -765,11 +747,11 @@ fn parse_destination(s: &str) -> EdResult<(Address, PrintFlags)> {
             // The tokenizer ends at the first letter and hands back the rest
             // of the line, which is all suffix.
             Token::Command(ch) => {
-                let rest = match tokens.next() {
-                    Some(Token::Rest(r)) => r,
-                    _ => String::new(),
-                };
-                suffix = parse_suffix(&format!("{}{}", ch, rest.trim()))?;
+                let mut text = vec![ch as u8];
+                if let Some(Token::Rest(r)) = tokens.next() {
+                    text.extend_from_slice(r.trim_ascii());
+                }
+                suffix = parse_suffix(&text)?;
             }
             _ => return Err(EdError::Syntax("invalid destination".to_string())),
         }
@@ -785,7 +767,7 @@ fn parse_destination(s: &str) -> EdResult<(Address, PrintFlags)> {
 /// The flags are everything after the third delimiter, unsplit, so text
 /// after them (`s/a/b/g/x`) reaches the flag parser and is refused.  With the
 /// third delimiter missing, POSIX makes `s/s1/s2` mean `s/s1/s2/p`.
-fn parse_substitute_args(s: &str) -> EdResult<(String, String, String)> {
+fn parse_substitute_args(s: &[u8]) -> EdResult<(Vec<u8>, Vec<u8>, String)> {
     let (pattern, replacement, flags) = split_substitute(s)?;
     Ok((
         pattern,
@@ -800,7 +782,7 @@ fn parse_substitute_args(s: &str) -> EdResult<(String, String, String)> {
 /// arrives with its escaped newlines already turned into plain ones, so
 /// `g/x/s/a/b\<newline>c/` reaches the list as `s/a/b` and `c/`, and only
 /// joining them gives the substitute the newline it was asked to insert.
-pub fn continues_replacement(line: &str) -> bool {
+pub fn continues_replacement(line: &[u8]) -> bool {
     let mut tokens = match tokenize(line) {
         Ok(t) => t.into_iter(),
         Err(_) => return false,
@@ -817,25 +799,29 @@ pub fn continues_replacement(line: &str) -> bool {
 }
 
 /// Characters a BRE gives a meaning to unescaped.
-const BRE_SPECIAL: &str = ".[*^$";
+const BRE_SPECIAL: &[u8] = b".[*^$";
 /// Characters a replacement gives a meaning to unescaped.
-const REPLACEMENT_SPECIAL: &str = "&%";
+const REPLACEMENT_SPECIAL: &[u8] = b"&%";
 
-/// The delimiter that opens an `s`, `g`, `v`, `G` or `V` argument: any
-/// character but a blank, a newline or a backslash.
-fn take_delimiter(chars: &mut std::str::Chars) -> EdResult<char> {
-    match chars.next() {
+/// The delimiter that opens an `s`, `g`, `v`, `G` or `V` argument -- any
+/// one character but a blank, a newline or a backslash, multibyte ones
+/// included -- and the offset just past it.
+fn take_delimiter(s: &[u8]) -> EdResult<(&[u8], usize)> {
+    match s.first() {
         None => Err(EdError::Syntax("no pattern delimiter".to_string())),
-        Some(c) if c.is_whitespace() || c == '\\' => Err(EdError::Syntax(format!(
+        Some(&b) if b.is_ascii_whitespace() || b == b'\\' => Err(EdError::Syntax(format!(
             "invalid pattern delimiter: {:?}",
-            c
+            b as char
         ))),
-        Some(c) => Ok(c),
+        Some(_) => {
+            let end = plib::locale::next_char_offset(s, 0).unwrap_or(1);
+            Ok((&s[..end], end))
+        }
     }
 }
 
-/// One delimited field: its text and whether the closing delimiter was
-/// there.
+/// One delimited field of `s` from offset `i`: its bytes, whether the
+/// closing delimiter was there, and the offset just past the field.
 ///
 /// POSIX: an escaped delimiter is the delimiter as a literal character,
 /// "losing any special meaning".  Where the delimiter is a character the
@@ -843,57 +829,62 @@ fn take_delimiter(chars: &mut std::str::Chars) -> EdResult<char> {
 /// dropping the backslash would hand it that meaning back -- `s.a\.b.X.`
 /// matched `axb` -- so there the backslash stays.  Any other escape is kept
 /// for the RE or replacement to interpret.
-fn delimited_field(chars: &mut std::str::Chars, delim: char, special: &str) -> (String, bool) {
-    let mut text = String::new();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            match chars.next() {
-                Some(c) if c == delim && !special.contains(c) => text.push(c),
-                Some(c) => {
-                    text.push('\\');
-                    text.push(c);
+fn delimited_field(s: &[u8], mut i: usize, delim: &[u8], special: &[u8]) -> (Vec<u8>, bool, usize) {
+    let mut text = Vec::new();
+    while i < s.len() {
+        if s[i] == b'\\' {
+            if s[i + 1..].starts_with(delim) {
+                if delim.len() == 1 && special.contains(&delim[0]) {
+                    text.push(b'\\');
                 }
-                None => text.push('\\'),
+                text.extend_from_slice(delim);
+                i += 1 + delim.len();
+            } else if i + 1 < s.len() {
+                text.extend_from_slice(&s[i..i + 2]);
+                i += 2;
+            } else {
+                text.push(b'\\');
+                i += 1;
             }
-        } else if ch == delim {
-            return (text, true);
+        } else if s[i..].starts_with(delim) {
+            return (text, true, i + delim.len());
         } else {
-            text.push(ch);
+            text.push(s[i]);
+            i += 1;
         }
     }
-    (text, false)
+    (text, false, i)
 }
 
 /// Split `/pattern/replacement/flags`; the flags are `None` when the
 /// replacement's closing delimiter is missing.
-fn split_substitute(s: &str) -> EdResult<(String, String, Option<String>)> {
-    let mut chars = s.chars();
-    let delim = take_delimiter(&mut chars)?;
-    let (pattern, closed) = delimited_field(&mut chars, delim, BRE_SPECIAL);
+fn split_substitute(s: &[u8]) -> EdResult<(Vec<u8>, Vec<u8>, Option<String>)> {
+    let (delim, i) = take_delimiter(s)?;
+    let (pattern, closed, i) = delimited_field(s, i, delim, BRE_SPECIAL);
     if !closed {
         return Err(EdError::Syntax("missing pattern delimiter".to_string()));
     }
-    let (replacement, closed) = delimited_field(&mut chars, delim, REPLACEMENT_SPECIAL);
-    let flags = closed.then(|| chars.as_str().trim().to_string());
+    let (replacement, closed, i) = delimited_field(s, i, delim, REPLACEMENT_SPECIAL);
+    // The flags are ASCII letters and digits; anything else is refused by
+    // their parser, so a lossy view of them is enough.
+    let flags = closed.then(|| String::from_utf8_lossy(s[i..].trim_ascii()).into_owned());
     Ok((pattern, replacement, flags))
 }
 
 /// Parse global command pattern and command list.
-fn parse_global_args(s: &str) -> EdResult<(String, String)> {
-    let mut chars = s.chars();
-    let delim = take_delimiter(&mut chars)?;
-    let (pattern, _) = delimited_field(&mut chars, delim, BRE_SPECIAL);
-    let commands = chars.as_str();
+fn parse_global_args(s: &[u8]) -> EdResult<(Vec<u8>, Vec<u8>)> {
+    let (delim, i) = take_delimiter(s)?;
+    let (pattern, _, i) = delimited_field(s, i, delim, BRE_SPECIAL);
+    let commands = &s[i..];
     // An empty command list is `p`.
-    let commands = if commands.is_empty() { "p" } else { commands };
-    Ok((pattern, commands.to_string()))
+    let commands = if commands.is_empty() { b"p" } else { commands };
+    Ok((pattern, commands.to_vec()))
 }
 
 /// Parse global command pattern only.
-fn parse_global_pattern(s: &str) -> EdResult<String> {
-    let mut chars = s.chars();
-    let delim = take_delimiter(&mut chars)?;
-    Ok(delimited_field(&mut chars, delim, BRE_SPECIAL).0)
+fn parse_global_pattern(s: &[u8]) -> EdResult<Vec<u8>> {
+    let (delim, i) = take_delimiter(s)?;
+    Ok(delimited_field(s, i, delim, BRE_SPECIAL).0)
 }
 
 #[cfg(test)]
@@ -902,7 +893,7 @@ mod tests {
 
     #[test]
     fn test_tokenize_simple() {
-        let tokens = tokenize("1,5p").unwrap();
+        let tokens = tokenize(b"1,5p").unwrap();
         assert_eq!(tokens.len(), 4);
         assert_eq!(tokens[0], Token::Number(1));
         assert_eq!(tokens[1], Token::AddressSeparator(','));
@@ -912,19 +903,19 @@ mod tests {
 
     #[test]
     fn test_parse_quit() {
-        let cmd = parse("q").unwrap().cmd;
+        let cmd = parse(b"q").unwrap().cmd;
         assert_eq!(cmd, Command::Quit(false));
     }
 
     #[test]
     fn test_parse_force_quit() {
-        let cmd = parse("Q").unwrap().cmd;
+        let cmd = parse(b"Q").unwrap().cmd;
         assert_eq!(cmd, Command::Quit(true));
     }
 
     #[test]
     fn test_parse_print() {
-        let cmd = parse("1,5p").unwrap().cmd;
+        let cmd = parse(b"1,5p").unwrap().cmd;
         match cmd {
             Command::Print(a1, a2, flags) => {
                 assert_eq!(a1.info, AddressInfo::Line(1));
@@ -943,7 +934,7 @@ mod tests {
 
     #[test]
     fn test_parse_append() {
-        let cmd = parse("a").unwrap().cmd;
+        let cmd = parse(b"a").unwrap().cmd;
         match cmd {
             Command::Append(a) => {
                 assert_eq!(a.info, AddressInfo::Current);
@@ -954,13 +945,13 @@ mod tests {
 
     #[test]
     fn test_parse_substitute() {
-        let cmd = parse("1,5s/foo/bar/g").unwrap().cmd;
+        let cmd = parse(b"1,5s/foo/bar/g").unwrap().cmd;
         match cmd {
             Command::Substitute(a1, a2, pat, repl, flags) => {
                 assert_eq!(a1.info, AddressInfo::Line(1));
                 assert_eq!(a2.info, AddressInfo::Line(5));
-                assert_eq!(pat, "foo");
-                assert_eq!(repl, "bar");
+                assert_eq!(pat, b"foo");
+                assert_eq!(repl, b"bar");
                 assert_eq!(flags, "g");
             }
             _ => panic!("expected Substitute command"),
@@ -969,21 +960,21 @@ mod tests {
 
     #[test]
     fn test_parse_print_suffix() {
-        let parsed = parse("1dpn").unwrap();
+        let parsed = parse(b"1dpn").unwrap();
         assert!(matches!(parsed.cmd, Command::Delete(..)));
         assert!(parsed.suffix.print && parsed.suffix.number && !parsed.suffix.list);
-        assert!(parse("1dx").is_err());
+        assert!(parse(b"1dx").is_err());
     }
 
     #[test]
     fn test_parse_substitute_unterminated() {
-        let Command::Substitute(_, _, pat, repl, flags) = parse("s/a/b").unwrap().cmd else {
+        let Command::Substitute(_, _, pat, repl, flags) = parse(b"s/a/b").unwrap().cmd else {
             panic!("expected Substitute command");
         };
         assert_eq!(
-            (pat.as_str(), repl.as_str(), flags.as_str()),
-            ("a", "b", "p")
+            (pat.as_slice(), repl.as_slice(), flags.as_str()),
+            (&b"a"[..], &b"b"[..], "p")
         );
-        assert!(parse("s/a").is_err());
+        assert!(parse(b"s/a").is_err());
     }
 }

@@ -11,8 +11,11 @@
 
 use crate::ed::error::{EdError, EdResult};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 
 /// One line of the buffer and the identity it keeps while it exists.
 ///
@@ -24,7 +27,7 @@ use std::io::{self, BufRead, BufReader, Write};
 #[derive(Clone, Debug)]
 struct Line {
     id: u64,
-    text: String,
+    text: Vec<u8>,
 }
 
 /// The buffer's lines, held as a gap buffer: one array with a run of empty
@@ -175,7 +178,7 @@ pub struct UndoRecord {
 #[derive(Debug)]
 pub struct Buffer {
     /// The remembered filename
-    pub pathname: String,
+    pub pathname: Vec<u8>,
     /// Current line number (1-indexed, 0 means empty buffer)
     pub cur_line: usize,
     /// All lines in the buffer
@@ -216,7 +219,7 @@ impl Buffer {
     /// Create a new empty buffer.
     pub fn new() -> Buffer {
         Buffer {
-            pathname: String::new(),
+            pathname: Vec::new(),
             cur_line: 0,
             lines: LineStore::default(),
             next_id: 0,
@@ -250,11 +253,11 @@ impl Buffer {
     }
 
     /// Get a line by number (1-indexed).
-    pub fn get_line(&self, line_num: usize) -> Option<&String> {
+    pub fn get_line(&self, line_num: usize) -> Option<&[u8]> {
         line_num
             .checked_sub(1)
             .and_then(|i| self.lines.get(i))
-            .map(|l| &l.text)
+            .map(|l| l.text.as_slice())
     }
 
     /// The identity of line `line_num`, which it keeps through every edit
@@ -286,7 +289,7 @@ impl Buffer {
     }
 
     /// Fresh lines, each with a new identity.
-    fn new_lines(&mut self, texts: &[String]) -> Vec<Line> {
+    fn new_lines(&mut self, texts: &[Vec<u8>]) -> Vec<Line> {
         texts
             .iter()
             .map(|text| {
@@ -302,7 +305,7 @@ impl Buffer {
 
     /// Replace the whole buffer with `texts`, as a read does: nothing to
     /// undo, no marks.
-    fn reset_lines(&mut self, texts: &[String]) {
+    fn reset_lines(&mut self, texts: &[Vec<u8>]) {
         self.lines = LineStore::from_vec(self.new_lines(texts));
         self.cur_line = self.lines.len();
         self.modified = false;
@@ -429,7 +432,7 @@ impl Buffer {
     }
 
     /// Append lines after the current line (or at start if empty).
-    pub fn append(&mut self, at_line: usize, lines: &[String]) {
+    pub fn append(&mut self, at_line: usize, lines: &[Vec<u8>]) {
         self.save_undo();
 
         if !lines.is_empty() {
@@ -441,7 +444,7 @@ impl Buffer {
     }
 
     /// Insert lines before the specified line.
-    pub fn insert(&mut self, before_line: usize, lines: &[String]) {
+    pub fn insert(&mut self, before_line: usize, lines: &[Vec<u8>]) {
         self.append(before_line.saturating_sub(1), lines);
     }
 
@@ -471,7 +474,7 @@ impl Buffer {
 
         let mut byte_count = 0;
         for line in self.lines.range(start_line - 1, end_line) {
-            writer.write_all(line.text.as_bytes())?;
+            writer.write_all(&line.text)?;
             byte_count += line.text.len();
         }
         Ok(byte_count)
@@ -482,9 +485,9 @@ impl Buffer {
         &mut self,
         start_line: usize,
         end_line: usize,
-        pathname: &str,
+        pathname: &[u8],
     ) -> io::Result<usize> {
-        let mut file = fs::File::create(pathname)?;
+        let mut file = fs::File::create(as_path(pathname))?;
         let bytes = self.write_lines(start_line, end_line, &mut file)?;
 
         // If we wrote the whole buffer, mark as unmodified
@@ -495,73 +498,69 @@ impl Buffer {
         Ok(bytes)
     }
 
-    /// Read every line of `pathname`, and how many bytes that was.
-    fn read_lines(pathname: &str) -> io::Result<(Vec<String>, usize)> {
-        let file = fs::File::open(pathname)?;
-        let mut reader = BufReader::new(file);
+    /// Split everything `reader` holds into buffer lines, and say how many
+    /// bytes that was.
+    ///
+    /// Bytes, not text: ed edits any file, and reading it as UTF-8 refused
+    /// one byte that was not -- after `e` had already taken its name, so a
+    /// later `w` wrote an empty buffer over it.  A last line without a
+    /// newline gets one, as historical ed does, or text appended after it
+    /// would be glued onto it; the count is still of the bytes read.
+    fn split_lines<R: BufRead>(mut reader: R) -> io::Result<(Vec<Vec<u8>>, usize)> {
         let mut lines = Vec::new();
         let mut byte_count = 0;
-
         loop {
-            let mut line = String::new();
-            let rc = reader.read_line(&mut line)?;
-            if rc == 0 {
+            let mut line = Vec::new();
+            let n = reader.read_until(b'\n', &mut line)?;
+            if n == 0 {
                 break;
             }
-            byte_count += line.len();
+            byte_count += n;
+            if line.last() != Some(&b'\n') {
+                line.push(b'\n');
+            }
             lines.push(line);
         }
         Ok((lines, byte_count))
     }
 
+    /// Read every line of `pathname`, and how many bytes that was.
+    fn read_lines(pathname: &[u8]) -> io::Result<(Vec<Vec<u8>>, usize)> {
+        Self::split_lines(BufReader::new(fs::File::open(as_path(pathname))?))
+    }
+
     /// Read a file into the buffer, replacing contents.
-    pub fn read_file(&mut self, pathname: &str) -> io::Result<usize> {
+    pub fn read_file(&mut self, pathname: &[u8]) -> io::Result<usize> {
         // POSIX e: the remembered pathname is set to the file whether or not
         // it can be read, so a file that does not exist yet is the one `w`
         // writes.
-        self.pathname = String::from(pathname);
+        self.pathname = pathname.to_vec();
         let (lines, byte_count) = Self::read_lines(pathname)?;
         self.reset_lines(&lines);
         Ok(byte_count)
     }
 
-    /// Split command output into buffer lines, each ending in `\n` (one is
-    /// supplied for a last line without).  `str::lines` is not this: it also
-    /// drops a `\r` before each `\n`, so CRLF output lost bytes.
-    fn split_output(content: &str) -> Vec<String> {
-        content
-            .split_inclusive('\n')
-            .map(|l| {
-                let mut line = l.to_string();
-                if !line.ends_with('\n') {
-                    line.push('\n');
-                }
-                line
-            })
-            .collect()
-    }
-
-    /// Load buffer from a string (for shell command output).
+    /// Load buffer from command output (`e !command`).
     /// Does not set pathname.
-    pub fn load_from_string(&mut self, content: &str) {
-        let lines = Self::split_output(content);
+    pub fn load_from_bytes(&mut self, content: &[u8]) {
+        let (lines, _) = Self::split_lines(content).unwrap_or_default();
         self.reset_lines(&lines);
     }
 
-    /// Append content from a string after a line (for shell command output).
-    pub fn append_from_string(&mut self, after_line: usize, content: &str) {
-        let lines = Self::split_output(content);
+    /// Append command output after a line (`r !command`).
+    pub fn append_from_bytes(&mut self, after_line: usize, content: &[u8]) {
+        let (lines, _) = Self::split_lines(content).unwrap_or_default();
         if !lines.is_empty() {
             self.append(after_line, &lines);
         }
     }
 
     /// Read a file and append after a line.
-    pub fn read_file_at(&mut self, pathname: &str, after_line: usize) -> io::Result<usize> {
+    pub fn read_file_at(&mut self, pathname: &[u8], after_line: usize) -> io::Result<usize> {
         // POSIX r: the file becomes the remembered pathname when none is,
         // whether or not it can be read.
         if self.pathname.is_empty() {
-            self.pathname = String::from(pathname);
+            self.pathname = pathname.to_vec();
         }
         let (lines, byte_count) = Self::read_lines(pathname)?;
         if !lines.is_empty() {
@@ -594,11 +593,11 @@ impl Buffer {
             return Ok(());
         }
 
-        let mut joined = String::new();
+        let mut joined = Vec::new();
         for line in self.lines.range(start - 1, end) {
-            joined.push_str(line.text.trim_end_matches('\n'));
+            joined.extend_from_slice(body(&line.text));
         }
-        joined.push('\n');
+        joined.push(b'\n');
 
         // The joined text is a new line, so marks on any of the joined lines
         // go with the originals -- matching historical ed, which allocates a
@@ -637,7 +636,7 @@ impl Buffer {
         self.check_dest(dest)?;
 
         // The copies are new lines: the original keeps its mark.
-        let texts: Vec<String> = self
+        let texts: Vec<Vec<u8>> = self
             .lines
             .range(start - 1, end)
             .map(|l| l.text.clone())
@@ -647,7 +646,7 @@ impl Buffer {
     }
 
     /// Change lines (delete and prepare for insert).
-    pub fn change(&mut self, start: usize, end: usize, new_lines: &[String]) -> EdResult<()> {
+    pub fn change(&mut self, start: usize, end: usize, new_lines: &[Vec<u8>]) -> EdResult<()> {
         self.check_range(start, end)?;
 
         self.save_undo();
@@ -668,6 +667,16 @@ impl Buffer {
 
         Ok(())
     }
+}
+
+/// A line without its newline.
+pub fn body(line: &[u8]) -> &[u8] {
+    line.strip_suffix(b"\n").unwrap_or(line)
+}
+
+/// A pathname held as the bytes it was given as.
+pub fn as_path(name: &[u8]) -> &Path {
+    Path::new(OsStr::from_bytes(name))
 }
 
 impl Default for Buffer {
@@ -691,7 +700,7 @@ mod tests {
     #[test]
     fn test_append() {
         let mut buf = Buffer::new();
-        buf.append(0, &["line 1\n".to_string(), "line 2\n".to_string()]);
+        buf.append(0, &[b"line 1\n".to_vec(), b"line 2\n".to_vec()]);
         assert_eq!(buf.line_count(), 2);
         assert_eq!(buf.cur_line, 2);
         assert!(buf.modified);
@@ -700,11 +709,11 @@ mod tests {
     #[test]
     fn test_insert() {
         let mut buf = Buffer::new();
-        buf.append(0, &["line 2\n".to_string()]);
-        buf.insert(1, &["line 1\n".to_string()]);
+        buf.append(0, &[b"line 2\n".to_vec()]);
+        buf.insert(1, &[b"line 1\n".to_vec()]);
         assert_eq!(buf.line_count(), 2);
-        assert_eq!(buf.get_line(1), Some(&"line 1\n".to_string()));
-        assert_eq!(buf.get_line(2), Some(&"line 2\n".to_string()));
+        assert_eq!(buf.get_line(1), Some(&b"line 1\n"[..]));
+        assert_eq!(buf.get_line(2), Some(&b"line 2\n"[..]));
     }
 
     #[test]
@@ -713,21 +722,21 @@ mod tests {
         buf.append(
             0,
             &[
-                "line 1\n".to_string(),
-                "line 2\n".to_string(),
-                "line 3\n".to_string(),
+                b"line 1\n".to_vec(),
+                b"line 2\n".to_vec(),
+                b"line 3\n".to_vec(),
             ],
         );
         buf.delete(2, 2).unwrap();
         assert_eq!(buf.line_count(), 2);
-        assert_eq!(buf.get_line(1), Some(&"line 1\n".to_string()));
-        assert_eq!(buf.get_line(2), Some(&"line 3\n".to_string()));
+        assert_eq!(buf.get_line(1), Some(&b"line 1\n"[..]));
+        assert_eq!(buf.get_line(2), Some(&b"line 3\n"[..]));
     }
 
     #[test]
     fn test_undo() {
         let mut buf = Buffer::new();
-        buf.append(0, &["line 1\n".to_string()]);
+        buf.append(0, &[b"line 1\n".to_vec()]);
         assert_eq!(buf.line_count(), 1);
 
         buf.delete(1, 1).unwrap();
@@ -742,7 +751,7 @@ mod tests {
             ids.iter()
                 .map(|&id| Line {
                     id,
-                    text: format!("{id}\n"),
+                    text: format!("{id}\n").into_bytes(),
                 })
                 .collect(),
         )
@@ -781,9 +790,9 @@ mod tests {
     #[test]
     fn test_join() {
         let mut buf = Buffer::new();
-        buf.append(0, &["hello\n".to_string(), "world\n".to_string()]);
+        buf.append(0, &[b"hello\n".to_vec(), b"world\n".to_vec()]);
         buf.join(1, 2).unwrap();
         assert_eq!(buf.line_count(), 1);
-        assert_eq!(buf.get_line(1), Some(&"helloworld\n".to_string()));
+        assert_eq!(buf.get_line(1), Some(&b"helloworld\n"[..]));
     }
 }

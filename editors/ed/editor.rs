@@ -9,7 +9,7 @@
 
 //! Main editor logic for ed.
 
-use crate::ed::buffer::Buffer;
+use crate::ed::buffer::{as_path, body, Buffer};
 use crate::ed::error::{EdError, EdResult};
 use crate::ed::parser::{
     continues_replacement, parse, Address, AddressInfo, Command, Parsed, PrintFlags,
@@ -23,7 +23,7 @@ use std::sync::atomic::Ordering;
 struct GlobalCommand {
     parsed: Parsed,
     /// For a/i/c: the input text lines
-    input_lines: Vec<String>,
+    input_lines: Vec<Vec<u8>>,
 }
 
 /// Whether a command is one of the input-taking commands (`a`, `i`, `c`).
@@ -36,32 +36,48 @@ fn is_input(cmd: &Command) -> bool {
 
 /// Parse a global command list into its commands, every one before any
 /// runs: a bad command fails the global before it has changed anything.
-fn parse_global_command_list(commands: &str) -> EdResult<Vec<GlobalCommand>> {
-    let lines: Vec<&str> = commands.split('\n').collect();
+fn parse_global_command_list(commands: &[u8]) -> EdResult<Vec<GlobalCommand>> {
+    let lines: Vec<&[u8]> = commands.split(|&b| b == b'\n').collect();
     let mut result = Vec::new();
     let mut i = 0;
 
     while i < lines.len() {
         // Leading blanks only: trailing ones can be text (the end of an
         // unterminated `s` replacement), as they are outside a global.
-        let line = lines[i].trim_start();
+        let line = lines[i].trim_ascii_start();
         i += 1;
         if line.is_empty() {
             continue;
         }
 
-        let mut command = line.to_string();
+        let mut command = line.to_vec();
         // An `s` whose replacement runs onto the next line takes that
         // line, newline included, as the rest of its replacement, as
         // historical eds read it.  That is a line split, which POSIX
         // forbids inside `g`/`v`, so the substitute then fails with `?`
         // rather than quietly running half of what was typed.
         while continues_replacement(&command) && i < lines.len() {
-            command.push('\n');
-            command.push_str(lines[i]);
+            command.push(b'\n');
+            command.extend_from_slice(lines[i]);
             i += 1;
         }
         let parsed = parse(&command)?;
+        // POSIX: g, G, v, V and ! may not appear in a command list.  Asking
+        // the parsed command, not guessing from its characters: skipping
+        // "address-looking" characters to find the letter mistook a pattern
+        // for a command and missed any command but the first.
+        if matches!(
+            parsed.cmd,
+            Command::Global(..)
+                | Command::GlobalNot(..)
+                | Command::GlobalInteractive(..)
+                | Command::GlobalNotInteractive(..)
+                | Command::Shell(_)
+        ) {
+            return Err(EdError::Generic(
+                "g, G, v, V and ! are not allowed in a global command list".to_string(),
+            ));
+        }
 
         // a/i/c take the lines up to `.` (or the end of the list) as text.
         // Classifying by "first alphabetic character" mistook part of an
@@ -71,10 +87,12 @@ fn parse_global_command_list(commands: &str) -> EdResult<Vec<GlobalCommand>> {
             while i < lines.len() {
                 let input_line = lines[i];
                 i += 1;
-                if input_line == "." {
+                if input_line == b"." {
                     break;
                 }
-                input_lines.push(format!("{}\n", input_line));
+                let mut text = input_line.to_vec();
+                text.push(b'\n');
+                input_lines.push(text);
             }
         }
         result.push(GlobalCommand {
@@ -117,17 +135,17 @@ pub struct Editor<R: BufRead, W: Write> {
     /// Last error message
     pub last_error: Option<String>,
     /// Last search pattern
-    pub last_pattern: Option<String>,
+    pub last_pattern: Option<Vec<u8>>,
     /// Last substitute pattern
-    pub last_sub_pattern: Option<String>,
+    pub last_sub_pattern: Option<Vec<u8>>,
     /// Last substitute replacement
-    pub last_sub_replacement: Option<String>,
+    pub last_sub_replacement: Option<Vec<u8>>,
     /// Last substitute flags
     pub last_sub_flags: Option<String>,
     /// Last shell command (for !! repetition)
-    last_shell_command: Option<String>,
+    last_shell_command: Option<Vec<u8>>,
     /// Lines being collected for input mode
-    input_lines: Vec<String>,
+    input_lines: Vec<Vec<u8>>,
     /// Whether we're in input mode
     in_input_mode: bool,
     /// The command that initiated input mode, and its print suffix
@@ -137,7 +155,7 @@ pub struct Editor<R: BufRead, W: Write> {
     /// Quit warning given (for modified buffer)
     quit_warning_given: bool,
     /// Previous command for & in interactive global (G/V)
-    last_interactive_cmd: Option<String>,
+    last_interactive_cmd: Option<Vec<u8>>,
     /// Whether any command/file error occurred (POSIX: exit status > 0).
     pub error_occurred: bool,
 }
@@ -211,7 +229,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
     /// input and error, and only its output is read.  Its exit status says
     /// nothing about whether that output is wanted -- `diff` and `grep` exit
     /// 1 as a normal answer -- so it is not an error.
-    fn shell_read(&mut self, command: &str) -> io::Result<(String, usize)> {
+    fn shell_read(&mut self, command: &[u8]) -> io::Result<Vec<u8>> {
         use std::os::unix::process::ExitStatusExt;
         use std::process::Stdio;
         let output = self
@@ -234,14 +252,13 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             )));
         }
 
-        let content = String::from_utf8_lossy(&output.stdout).to_string();
-        let bytes = content.len();
-        Ok((content, bytes))
+        // Byte for byte: decoding it as text changed bytes that were not.
+        Ok(output.stdout)
     }
 
     /// Execute a shell command with input piped to its stdin.
     /// Used for `w !command`. Returns bytes written.
-    fn shell_write(&mut self, command: &str, start: usize, end: usize) -> io::Result<usize> {
+    fn shell_write(&mut self, command: &[u8], start: usize, end: usize) -> io::Result<usize> {
         use std::process::Stdio;
 
         let mut child = self.shell(command)?.stdin(Stdio::piped()).spawn()?;
@@ -260,11 +277,12 @@ impl<R: BufRead, W: Write> Editor<R, W> {
     /// terminal comes after it.  SIGQUIT goes back to its default in the
     /// child: ed ignores it, and an ignored signal stays ignored across exec,
     /// so `^\` could not stop a runaway command.
-    fn shell(&mut self, command: &str) -> io::Result<std::process::Command> {
+    fn shell(&mut self, command: &[u8]) -> io::Result<std::process::Command> {
+        use std::os::unix::ffi::OsStrExt;
         use std::os::unix::process::CommandExt;
         self.writer.flush()?;
         let mut cmd = std::process::Command::new("sh");
-        cmd.arg("-c").arg(command);
+        cmd.arg("-c").arg(std::ffi::OsStr::from_bytes(command));
         // SAFETY: only signal(2), which is async-signal-safe, runs between
         // fork and exec.
         unsafe {
@@ -300,7 +318,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         if let Some(mut stdin) = child.stdin.take() {
             for i in start..=end {
                 if let Some(line) = self.buf.get_line(i) {
-                    stdin.write_all(line.as_bytes())?;
+                    stdin.write_all(line)?;
                     bytes += line.len();
                 }
             }
@@ -377,15 +395,16 @@ impl<R: BufRead, W: Write> Editor<R, W> {
     /// RE encountered" -- by an address, a g/v or an s alike, so every one of
     /// them resolves here.  A pattern becomes the remembered RE only once it
     /// compiles: an invalid one must not replace a good one.
-    fn compile_re(&mut self, pattern: &str) -> EdResult<(String, Regex)> {
+    fn compile_re(&mut self, pattern: &[u8]) -> EdResult<(Vec<u8>, Regex)> {
         let pat = if pattern.is_empty() {
             self.last_pattern
                 .clone()
                 .ok_or(EdError::NoPreviousPattern)?
         } else {
-            pattern.to_string()
+            pattern.to_vec()
         };
-        let re = Regex::new(&pat, RegexFlags::bre()).map_err(|e| EdError::Syntax(e.to_string()))?;
+        let re = Regex::new_bytes(&pat, RegexFlags::bre())
+            .map_err(|e| EdError::Syntax(e.to_string()))?;
         self.last_pattern = Some(pat.clone());
         Ok((pat, re))
     }
@@ -403,7 +422,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         for i in 1..=total {
             let line_num = ((start + i - 1) % total) + 1;
             if let Some(line) = self.buf.get_line(line_num) {
-                if re.is_match(line.trim_end_matches('\n')) {
+                if re.is_match_bytes(body(line)) {
                     return Ok(line_num);
                 }
             }
@@ -431,7 +450,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 continue;
             }
             if let Some(line) = self.buf.get_line(line_num) {
-                if re.is_match(line.trim_end_matches('\n')) {
+                if re.is_match_bytes(body(line)) {
                     return Ok(line_num);
                 }
             }
@@ -441,9 +460,12 @@ impl<R: BufRead, W: Write> Editor<R, W> {
     }
 
     /// Read a line from input.
-    pub fn read_line(&mut self) -> io::Result<Option<String>> {
-        let mut line = String::new();
-        match self.reader.read_line(&mut line) {
+    ///
+    /// Bytes: input text and command arguments may be anything the file
+    /// being edited holds.
+    pub fn read_line(&mut self) -> io::Result<Option<Vec<u8>>> {
+        let mut line = Vec::new();
+        match self.reader.read_until(b'\n', &mut line) {
             Ok(0) => Ok(None),
             Ok(_) => Ok(Some(line)),
             Err(e) => Err(e),
@@ -452,31 +474,24 @@ impl<R: BufRead, W: Write> Editor<R, W> {
 
     /// Check if a line has a continuation (ends with unescaped backslash).
     /// Returns (trimmed_line_without_backslash, needs_continuation).
-    fn check_line_continuation(line: &str) -> (String, bool) {
-        let trimmed = line.trim_end_matches('\n');
+    fn check_line_continuation(line: &[u8]) -> (Vec<u8>, bool) {
+        let trimmed = body(line);
 
         // Count trailing backslashes
-        let mut backslash_count = 0;
-        for ch in trimmed.chars().rev() {
-            if ch == '\\' {
-                backslash_count += 1;
-            } else {
-                break;
-            }
-        }
+        let backslash_count = trimmed.iter().rev().take_while(|&&b| b == b'\\').count();
 
         // Odd number of trailing backslashes = continuation
         if backslash_count > 0 && backslash_count % 2 == 1 {
             // Remove the trailing backslash and indicate continuation needed
             let without_backslash = &trimmed[..trimmed.len() - 1];
-            (without_backslash.to_string(), true)
+            (without_backslash.to_vec(), true)
         } else {
-            (trimmed.to_string(), false)
+            (trimmed.to_vec(), false)
         }
     }
 
     /// Process a line of input.
-    pub fn process_line(&mut self, line: &str) -> io::Result<bool> {
+    pub fn process_line(&mut self, line: &[u8]) -> io::Result<bool> {
         if self.in_input_mode {
             return self.process_input_line(line);
         }
@@ -489,8 +504,8 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             while let Some(next_line) = self.read_line()? {
                 let (part, more) = Self::check_line_continuation(&next_line);
                 // Join with embedded newline (the backslash-newline becomes \n in content)
-                accumulated.push('\n');
-                accumulated.push_str(&part);
+                accumulated.push(b'\n');
+                accumulated.extend_from_slice(&part);
                 if !more {
                     break;
                 }
@@ -525,9 +540,9 @@ impl<R: BufRead, W: Write> Editor<R, W> {
     }
 
     /// Process a line during input mode.
-    fn process_input_line(&mut self, line: &str) -> io::Result<bool> {
+    fn process_input_line(&mut self, line: &[u8]) -> io::Result<bool> {
         // Check for end of input marker
-        if line == ".\n" || line == "." {
+        if body(line) == b"." {
             self.in_input_mode = false;
             if let Some(pending) = self.pending_input.take() {
                 let lines = std::mem::take(&mut self.input_lines);
@@ -537,9 +552,9 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             }
         } else {
             // Ensure line ends with newline
-            let mut l = line.to_string();
-            if !l.ends_with('\n') {
-                l.push('\n');
+            let mut l = line.to_vec();
+            if l.last() != Some(&b'\n') {
+                l.push(b'\n');
             }
             self.input_lines.push(l);
         }
@@ -550,14 +565,14 @@ impl<R: BufRead, W: Write> Editor<R, W> {
     fn finish_input_command(
         &mut self,
         (pending, suffix): (PendingInput, PrintFlags),
-        lines: Vec<String>,
+        lines: Vec<Vec<u8>>,
     ) -> EdResult<()> {
         self.apply_input(pending, &lines)?;
         self.print_suffix(suffix)
     }
 
     /// Put input text where an `a`, `i` or `c` said.
-    fn apply_input(&mut self, pending: PendingInput, lines: &[String]) -> EdResult<()> {
+    fn apply_input(&mut self, pending: PendingInput, lines: &[Vec<u8>]) -> EdResult<()> {
         match pending {
             PendingInput::Append(line) => self.buf.append(line, lines),
             PendingInput::Insert(line) => self.buf.insert(line.max(1), lines),
@@ -632,45 +647,43 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         let Some(line) = self.buf.get_line(n) else {
             return Ok(());
         };
-        let content = line.strip_suffix('\n').unwrap_or(line);
+        let content = body(line);
         let w = &mut self.writer;
         if flags.number {
             write!(w, "{}\t", n)?;
         }
         if !flags.list {
-            w.write_all(content.as_bytes())?;
+            w.write_all(content)?;
             return w.write_all(b"\n");
         }
         // POSIX: show non-printable characters unambiguously -- the C escapes
-        // for \\ \a \b \f \r \t \v, three-digit octal for any other byte, `$`
-        // escaped in the text and marking the end of the line -- and fold
-        // long lines with a `\` before the newline.
+        // for \\ \a \b \f \r \t \v, three-digit octal for any other byte that
+        // is not printable ASCII, `$` escaped in the text and marking the end
+        // of the line -- and fold long lines with a `\` before the newline.
         const FOLD_WIDTH: usize = 72;
         let mut col = 0;
-        for ch in content.chars() {
-            let mut utf8 = [0u8; 4];
-            let mut octal = [0u8; 16];
-            let escaped: &[u8] = match ch {
-                '\\' => b"\\\\",
-                '\x07' => b"\\a",
-                '\x08' => b"\\b",
-                '\x0c' => b"\\f",
-                '\r' => b"\\r",
-                '\t' => b"\\t",
-                '\x0b' => b"\\v",
-                '$' => b"\\$",
-                c if c.is_control() || !c.is_ascii() => {
-                    let mut len = 0;
-                    for b in c.encode_utf8(&mut utf8).bytes() {
-                        octal[len] = b'\\';
-                        octal[len + 1] = b'0' + (b >> 6);
-                        octal[len + 2] = b'0' + ((b >> 3) & 7);
-                        octal[len + 3] = b'0' + (b & 7);
-                        len += 4;
-                    }
-                    &octal[..len]
+        for &b in content {
+            let octal;
+            let plain = [b];
+            let escaped: &[u8] = match b {
+                b'\\' => b"\\\\",
+                0x07 => b"\\a",
+                0x08 => b"\\b",
+                0x0c => b"\\f",
+                b'\r' => b"\\r",
+                b'\t' => b"\\t",
+                0x0b => b"\\v",
+                b'$' => b"\\$",
+                b' '..=b'~' => &plain,
+                _ => {
+                    octal = [
+                        b'\\',
+                        b'0' + (b >> 6),
+                        b'0' + ((b >> 3) & 7),
+                        b'0' + (b & 7),
+                    ];
+                    &octal
                 }
-                c => c.encode_utf8(&mut utf8).as_bytes(),
             };
             // Fold before a character that would not fit.
             if col + escaped.len() > FOLD_WIDTH {
@@ -708,12 +721,12 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 let path = path.clone();
 
                 // POSIX: If path starts with !, execute as shell command
-                if let Some(command) = path.strip_prefix('!') {
-                    let (content, bytes) = self.shell_read(command)?;
+                if let Some(command) = path.strip_prefix(b"!") {
+                    let content = self.shell_read(command)?;
                     // Load content into buffer
-                    self.buf.load_from_string(&content);
+                    self.buf.load_from_bytes(&content);
                     // Don't set pathname for shell commands
-                    self.print_bytes(bytes)?;
+                    self.print_bytes(content.len())?;
                 } else {
                     let bytes = self.buf.read_file(&path)?;
                     self.print_bytes(bytes)?;
@@ -724,7 +737,8 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 if let Some(f) = filename {
                     self.buf.pathname = f;
                 }
-                writeln!(self.writer, "{}", self.buf.pathname)?;
+                self.writer.write_all(&self.buf.pathname)?;
+                self.writer.write_all(b"\n")?;
                 Ok(())
             }
             Command::Global(addr1, addr2, pattern, commands, _interactive) => {
@@ -793,10 +807,10 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 let path = path.clone();
 
                 // POSIX: If path starts with !, execute as shell command
-                if let Some(command) = path.strip_prefix('!') {
-                    let (content, bytes) = self.shell_read(command)?;
-                    self.buf.append_from_string(after_line, &content);
-                    self.print_bytes(bytes)?;
+                if let Some(command) = path.strip_prefix(b"!") {
+                    let content = self.shell_read(command)?;
+                    self.buf.append_from_bytes(after_line, &content);
+                    self.print_bytes(content.len())?;
                 } else {
                     let bytes = self.buf.read_file_at(&path, after_line)?;
                     self.print_bytes(bytes)?;
@@ -857,7 +871,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 let path = path.clone();
 
                 // POSIX: If path starts with !, execute as shell command
-                if let Some(command) = path.strip_prefix('!') {
+                if let Some(command) = path.strip_prefix(b"!") {
                     let bytes = self.shell_write(command, start, end)?;
                     self.print_bytes(bytes)?;
                 } else if append {
@@ -865,7 +879,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                     let mut file = std::fs::OpenOptions::new()
                         .create(true)
                         .append(true)
-                        .open(&path)?;
+                        .open(as_path(&path))?;
                     let bytes = self.buf.write_lines(start, end, &mut file)?;
                     self.print_bytes(bytes)?;
                 } else {
@@ -893,9 +907,11 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 let mut modified = false;
 
                 // POSIX: If '!' appears as first character, replace with previous shell command
-                if final_cmd.starts_with('!') {
+                if final_cmd.first() == Some(&b'!') {
                     if let Some(ref prev) = self.last_shell_command {
-                        final_cmd = format!("{}{}", prev, &final_cmd[1..]);
+                        let mut expanded = prev.clone();
+                        expanded.extend_from_slice(&final_cmd[1..]);
+                        final_cmd = expanded;
                         modified = true;
                     } else {
                         return Err(EdError::Generic("no previous command".to_string()));
@@ -903,29 +919,21 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 }
 
                 // POSIX: Replace unescaped '%' with remembered pathname
-                if final_cmd.contains('%') {
+                if final_cmd.contains(&b'%') {
                     if self.buf.pathname.is_empty() {
                         return Err(EdError::NoFilename);
                     }
-                    let mut result = String::new();
-                    let mut chars = final_cmd.chars().peekable();
-                    while let Some(ch) = chars.next() {
-                        if ch == '\\' {
-                            if let Some(&next) = chars.peek() {
-                                if next == '%' {
-                                    result.push('%');
-                                    chars.next();
-                                } else {
-                                    result.push('\\');
-                                }
-                            } else {
-                                result.push('\\');
-                            }
-                        } else if ch == '%' {
-                            result.push_str(&self.buf.pathname);
+                    let mut result = Vec::new();
+                    let mut bytes = final_cmd.iter().peekable();
+                    while let Some(&b) = bytes.next() {
+                        if b == b'\\' && bytes.peek() == Some(&&b'%') {
+                            result.push(b'%');
+                            bytes.next();
+                        } else if b == b'%' {
+                            result.extend_from_slice(&self.buf.pathname);
                             modified = true;
                         } else {
-                            result.push(ch);
+                            result.push(b);
                         }
                     }
                     final_cmd = result;
@@ -933,7 +941,8 @@ impl<R: BufRead, W: Write> Editor<R, W> {
 
                 // POSIX: If any replacements were performed, write modified line before execution
                 if modified {
-                    writeln!(self.writer, "{}", final_cmd)?;
+                    self.writer.write_all(&final_cmd)?;
+                    self.writer.write_all(b"\n")?;
                 }
 
                 // Save for !! repetition
@@ -966,7 +975,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 if start > 0 && start <= self.buf.last_line() {
                     for i in start..=end {
                         if let Some(line) = self.buf.get_line(i) {
-                            write!(self.writer, "{}", line)?;
+                            self.writer.write_all(line)?;
                         }
                     }
                     self.buf.set_cur_line(end)?;
@@ -986,7 +995,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 self.buf.set_cur_line(line)?;
                 // Print the line
                 if let Some(content) = self.buf.get_line(line) {
-                    write!(self.writer, "{}", content)?;
+                    self.writer.write_all(content)?;
                 }
                 Ok(())
             }
@@ -1013,32 +1022,29 @@ impl<R: BufRead, W: Write> Editor<R, W> {
     /// matches. Supports `&` (whole match), `\1`-`\9` (back-references),
     /// `\&` (literal `&`), `\\` (literal backslash), and `\<newline>` (line
     /// split). Any other `\c` yields the literal character `c`.
-    fn build_ed_replacement(template: &str, input: &str, matches: &[Match]) -> String {
-        let mut result = String::with_capacity(template.len() + 16);
-        let mut chars = template.chars();
+    fn build_ed_replacement(template: &[u8], input: &[u8], matches: &[Match]) -> Vec<u8> {
+        let mut result = Vec::with_capacity(template.len() + 16);
+        let mut bytes = template.iter();
 
-        while let Some(c) = chars.next() {
-            match c {
-                '&' => {
+        while let Some(&b) = bytes.next() {
+            match b {
+                b'&' => {
                     let m = matches[0];
-                    result.push_str(&input[m.start..m.end]);
+                    result.extend_from_slice(&input[m.start..m.end]);
                 }
-                '\\' => match chars.next() {
-                    Some(d @ '1'..='9') => {
-                        let idx = d as usize - '0' as usize;
-                        if let Some(m) = matches.get(idx) {
+                b'\\' => match bytes.next() {
+                    Some(&d @ b'1'..=b'9') => {
+                        if let Some(m) = matches.get(usize::from(d - b'0')) {
                             if m.end > m.start {
-                                result.push_str(&input[m.start..m.end]);
+                                result.extend_from_slice(&input[m.start..m.end]);
                             }
                         }
                     }
-                    Some('&') => result.push('&'),
-                    Some('\\') => result.push('\\'),
-                    Some('\n') => result.push('\n'),
-                    Some(other) => result.push(other),
-                    None => result.push('\\'),
+                    // `\&`, `\\`, `\<newline>` and any other `\c`: the byte.
+                    Some(&other) => result.push(other),
+                    None => result.push(b'\\'),
                 },
-                _ => result.push(c),
+                _ => result.push(b),
             }
         }
 
@@ -1052,21 +1058,36 @@ impl<R: BufRead, W: Write> Editor<R, W> {
     /// embedded newlines when the replacement used `\<newline>`.
     fn substitute_line(
         re: &Regex,
-        body: &str,
-        repl: &str,
+        body: &[u8],
+        repl: &[u8],
         global: bool,
         count: Option<usize>,
-    ) -> Option<String> {
+    ) -> Option<Vec<u8>> {
         let start_idx = count.map(|n| n.saturating_sub(1)).unwrap_or(0);
-        let mut result = String::new();
+        let mut result = Vec::new();
         let mut last_end = 0usize;
         let mut pos = 0usize;
         let mut occurrence = 0usize;
         let mut matched = false;
+        // Where the last non-empty match ended: an empty match right there
+        // is not a new occurrence (`s/b*$/X/g` on `ab` is `aX`, not `aXX`).
+        let mut nonempty_end = None;
 
-        while let Some(caps) = re.captures_at(body, pos) {
+        while let Some(caps) = re.captures_at_bytes(body, pos) {
             let m = caps[0];
             let (ms, me) = (m.start, m.end);
+            if ms == me && nonempty_end == Some(ms) {
+                match plib::locale::next_char_offset(body, me) {
+                    Some(next) => {
+                        pos = next;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            if me > ms {
+                nonempty_end = Some(me);
+            }
             let idx = occurrence;
             occurrence += 1;
 
@@ -1079,21 +1100,17 @@ impl<R: BufRead, W: Write> Editor<R, W> {
 
             if replace_this {
                 matched = true;
-                result.push_str(&body[last_end..ms]);
-                result.push_str(&Self::build_ed_replacement(repl, body, &caps));
+                result.extend_from_slice(&body[last_end..ms]);
+                result.extend_from_slice(&Self::build_ed_replacement(repl, body, &caps));
                 last_end = me;
             }
 
-            // Advance past this match; guard against zero-width matches and
-            // keep `pos` on a UTF-8 char boundary for the next captures_at.
+            // Advance past this match; past one whole character, in the
+            // locale's encoding, after a zero-width one.
             let next = if me > ms {
                 me
             } else {
-                body[me..]
-                    .chars()
-                    .next()
-                    .map(|c| me + c.len_utf8())
-                    .unwrap_or(me + 1)
+                plib::locale::next_char_offset(body, me).unwrap_or(me + 1)
             };
             if next > body.len() {
                 break;
@@ -1107,7 +1124,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         }
 
         if matched {
-            result.push_str(&body[last_end..]);
+            result.extend_from_slice(&body[last_end..]);
             Some(result)
         } else {
             None
@@ -1119,8 +1136,8 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         &mut self,
         addr1: &Address,
         addr2: &Address,
-        pattern: &str,
-        replacement: &str,
+        pattern: &[u8],
+        replacement: &[u8],
         flags: &str,
     ) -> EdResult<()> {
         let (start, end) = self.resolve_range(addr1, addr2)?;
@@ -1133,13 +1150,13 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         } = Self::parse_substitute_suffix(flags)?;
 
         // Handle % as sole replacement character (use previous replacement)
-        let repl = if replacement == "%" {
+        let repl = if replacement == b"%" {
             self.last_sub_replacement
                 .as_ref()
                 .ok_or(EdError::Generic("no previous substitution".to_string()))?
                 .clone()
         } else {
-            replacement.to_string()
+            replacement.to_vec()
         };
 
         // A null RE is the last RE of any command, not just of an `s`.
@@ -1183,7 +1200,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         re: &Regex,
         start: usize,
         end: usize,
-        repl: &str,
+        repl: &[u8],
         global: bool,
         count: Option<usize>,
     ) -> EdResult<(bool, usize)> {
@@ -1199,8 +1216,8 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             let Some(line) = self.buf.get_line(actual_line) else {
                 continue;
             };
-            let line_content = line.clone();
-            let body = line_content.strip_suffix('\n').unwrap_or(&line_content);
+            let line_content = line.to_vec();
+            let body = body(&line_content);
 
             // A match — even one whose replacement yields identical text —
             // counts as a substitution: the line is rewritten (and the buffer
@@ -1210,7 +1227,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             };
             any_match = true;
 
-            if new_body.contains('\n') {
+            if new_body.contains(&b'\n') {
                 // POSIX: line splitting via \<newline> is not allowed in g/v.
                 if self.buf.is_in_global() {
                     return Err(EdError::Generic(
@@ -1218,14 +1235,18 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                     ));
                 }
 
-                let lines: Vec<String> = new_body.split('\n').map(|s| format!("{}\n", s)).collect();
+                let lines: Vec<Vec<u8>> = new_body
+                    .split(|&b| b == b'\n')
+                    .map(|piece| [piece, b"\n"].concat())
+                    .collect();
                 let num_new_lines = lines.len();
                 self.buf.change(actual_line, actual_line, &lines)?;
                 last_matched_line = actual_line + num_new_lines - 1;
                 offset += num_new_lines - 1;
             } else {
-                self.buf
-                    .change(actual_line, actual_line, &[format!("{}\n", new_body)])?;
+                let mut line = new_body;
+                line.push(b'\n');
+                self.buf.change(actual_line, actual_line, &[line])?;
                 last_matched_line = actual_line;
             }
         }
@@ -1290,75 +1311,22 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         Ok(out)
     }
 
-    /// Check if a command string contains forbidden commands for global.
-    /// POSIX: The commands g, G, v, V, and ! cannot be used in the command-list.
-    fn check_global_commands(&self, commands: &str) -> EdResult<()> {
-        let cmd_str = commands.trim();
-        if cmd_str.is_empty() {
-            return Ok(());
-        }
-
-        // Get the command character (skip any leading address)
-        let cmd_chars: Vec<char> = cmd_str.chars().collect();
-        for (i, &ch) in cmd_chars.iter().enumerate() {
-            // Skip digits, dots, dollars, and address characters
-            if ch.is_ascii_digit()
-                || ch == '.'
-                || ch == '$'
-                || ch == '+'
-                || ch == '-'
-                || ch == ','
-                || ch == ';'
-                || ch == '\''
-                || ch == '/'
-                || ch == '?'
-            {
-                continue;
-            }
-            // Found a potential command character
-            match ch {
-                'g' | 'G' | 'v' | 'V' => {
-                    // Check if this is actually the command (not part of pattern)
-                    // For g/v, they'd be followed by a delimiter
-                    if i + 1 < cmd_chars.len() {
-                        let next = cmd_chars[i + 1];
-                        if !next.is_alphanumeric() && next != ' ' {
-                            return Err(EdError::Generic(
-                                "cannot nest g, G, v, or V commands".to_string(),
-                            ));
-                        }
-                    }
-                    // Single g/G/v/V at end is also forbidden
-                    if i + 1 >= cmd_chars.len() {
-                        return Err(EdError::Generic(
-                            "cannot nest g, G, v, or V commands".to_string(),
-                        ));
-                    }
-                }
-                '!' => {
-                    return Err(EdError::Generic(
-                        "cannot use ! command within global".to_string(),
-                    ));
-                }
-                _ => break, // Found a different command, stop checking
-            }
-        }
-        Ok(())
-    }
-
     /// Execute a global command.
     fn execute_global(
         &mut self,
         addr1: Address,
         addr2: Address,
-        pattern: &str,
-        commands: &str,
+        pattern: &[u8],
+        commands: &[u8],
         invert: bool,
     ) -> EdResult<()> {
-        // POSIX: Check for forbidden commands
-        self.check_global_commands(commands)?;
-
+        // Marking first compiles the RE, so an invalid one is what is
+        // reported and a valid one is remembered whatever the list holds.
         let marked = self.mark_matches(&addr1, &addr2, pattern, invert)?;
+
+        // Parsed before anything is changed: a bad or forbidden command
+        // fails the global as a whole.
+        let global_commands = parse_global_command_list(commands)?;
 
         // POSIX: If there were no matching lines, the current line number shall not be changed
         if marked.is_empty() {
@@ -1372,7 +1340,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         // "inside a global", which silently disabled undo for the rest of
         // the session.
         self.buf.begin_global();
-        let outcome = self.run_global_commands(commands, &marked);
+        let outcome = self.run_global_commands(&global_commands, &marked);
         self.buf.end_global();
         outcome
     }
@@ -1387,7 +1355,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         &mut self,
         addr1: &Address,
         addr2: &Address,
-        pattern: &str,
+        pattern: &[u8],
         invert: bool,
     ) -> EdResult<Vec<u64>> {
         let (start, end) = self.resolve_range(addr1, addr2)?;
@@ -1395,7 +1363,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         let mut marked = Vec::new();
         for i in start..=end {
             if let Some(line) = self.buf.get_line(i) {
-                if re.is_match(line.trim_end_matches('\n')) != invert {
+                if re.is_match_bytes(body(line)) != invert {
                     marked.extend(self.buf.line_id(i));
                 }
             }
@@ -1404,10 +1372,11 @@ impl<R: BufRead, W: Write> Editor<R, W> {
     }
 
     /// Run a `g`/`v` command list against each marked line still there.
-    fn run_global_commands(&mut self, commands: &str, marked: &[u64]) -> EdResult<()> {
-        // Parsed up front: a bad command fails the global before any change.
-        let global_commands = parse_global_command_list(commands)?;
-
+    fn run_global_commands(
+        &mut self,
+        global_commands: &[GlobalCommand],
+        marked: &[u64],
+    ) -> EdResult<()> {
         // POSIX: when g completes, the current line is the one the last
         // command assigned.
         let mut last_line = self.buf.cur_line;
@@ -1420,7 +1389,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             hint = line;
             self.buf.set_cur_line(line)?;
 
-            for gc in &global_commands {
+            for gc in global_commands {
                 // a/i/c take their text from the command list, so run them
                 // here even when that text is empty.  POSIX lets the `.` be
                 // omitted when it would be the last line of the list, which
@@ -1451,7 +1420,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         &mut self,
         addr1: Address,
         addr2: Address,
-        pattern: &str,
+        pattern: &[u8],
         invert: bool,
     ) -> EdResult<()> {
         let marked = self.mark_matches(&addr1, &addr2, pattern, invert)?;
@@ -1489,7 +1458,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             // Show the line the command will act on; it is the current line
             // from now, whatever is typed -- a null command included.
             if let Some(line) = self.buf.get_line(line_num) {
-                write!(self.writer, "{}", line)?;
+                self.writer.write_all(line)?;
             }
             self.writer.flush()?;
             self.buf.set_cur_line(line_num)?;
@@ -1500,7 +1469,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 None => break, // EOF
             };
 
-            let trimmed = cmd_line.trim_end_matches('\n');
+            let trimmed = body(&cmd_line);
 
             // Empty line = skip, no action
             if trimmed.is_empty() {
@@ -1508,13 +1477,13 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             }
 
             // & = repeat previous command
-            let cmd_str = if trimmed == "&" {
+            let cmd_str = if trimmed == b"&" {
                 self.last_interactive_cmd
                     .clone()
                     .ok_or_else(|| EdError::Generic("no previous command".to_string()))?
             } else {
-                self.last_interactive_cmd = Some(trimmed.to_string());
-                trimmed.to_string()
+                self.last_interactive_cmd = Some(trimmed.to_vec());
+                trimmed.to_vec()
             };
 
             // A command that fails ends the G, as in historical ed: going on
@@ -1575,9 +1544,10 @@ impl<R: BufRead, W: Write> Editor<R, W> {
     /// Save buffer to ed.hup file per POSIX requirements.
     /// Tries current directory first, then $HOME.
     fn save_hup_file(&mut self) {
+        use std::os::unix::ffi::OsStrExt;
         let paths_to_try = [
-            Some("ed.hup".to_string()),
-            std::env::var("HOME").ok().map(|h| format!("{}/ed.hup", h)),
+            Some(b"ed.hup".to_vec()),
+            std::env::var_os("HOME").map(|h| [h.as_bytes(), b"/ed.hup"].concat()),
         ];
 
         for path_opt in paths_to_try.iter().flatten() {
@@ -1675,7 +1645,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
     }
 
     /// Load a file into the buffer.
-    pub fn load_file(&mut self, path: &str) -> EdResult<usize> {
+    pub fn load_file(&mut self, path: &[u8]) -> EdResult<usize> {
         let bytes = self.buf.read_file(path)?;
         Ok(bytes)
     }
@@ -1705,27 +1675,26 @@ mod tests {
         let mut editor = create_test_editor("");
         editor
             .buf
-            .append(0, &["hello\n".to_string(), "world\n".to_string()]);
+            .append(0, &[b"hello\n".to_vec(), b"world\n".to_vec()]);
         assert_eq!(editor.buf.line_count(), 2);
     }
 
     #[test]
     fn test_delete() {
         let mut editor = create_test_editor("");
-        editor.buf.append(
-            0,
-            &["a\n".to_string(), "b\n".to_string(), "c\n".to_string()],
-        );
-        editor.process_line("2d\n").unwrap();
+        editor
+            .buf
+            .append(0, &[b"a\n".to_vec(), b"b\n".to_vec(), b"c\n".to_vec()]);
+        editor.process_line(b"2d\n").unwrap();
         assert_eq!(editor.buf.line_count(), 2);
-        assert_eq!(editor.buf.get_line(1), Some(&"a\n".to_string()));
-        assert_eq!(editor.buf.get_line(2), Some(&"c\n".to_string()));
+        assert_eq!(editor.buf.get_line(1), Some(&b"a\n"[..]));
+        assert_eq!(editor.buf.get_line(2), Some(&b"c\n"[..]));
     }
 
     #[test]
     fn test_quit() {
         let mut editor = create_test_editor("");
-        editor.process_line("q\n").unwrap();
+        editor.process_line(b"q\n").unwrap();
         assert!(editor.should_quit);
     }
 
@@ -1736,15 +1705,15 @@ mod tests {
         assert!(!editor.show_prompt);
 
         // Toggle on
-        editor.process_line("P\n").unwrap();
+        editor.process_line(b"P\n").unwrap();
         assert!(editor.show_prompt, "P should toggle prompt ON");
 
         // Toggle off
-        editor.process_line("P\n").unwrap();
+        editor.process_line(b"P\n").unwrap();
         assert!(!editor.show_prompt, "P should toggle prompt OFF");
 
         // Toggle on again
-        editor.process_line("P\n").unwrap();
+        editor.process_line(b"P\n").unwrap();
         assert!(editor.show_prompt, "P should toggle prompt ON again");
     }
 }

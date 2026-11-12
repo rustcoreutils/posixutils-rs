@@ -157,22 +157,29 @@ fn open_dir(path: PathBuf) -> io::Result<Rc<RecoverDir>> {
     let fd = match open_raw(&cpath, flags) {
         Ok(fd) => fd,
         Err(e) if e.raw_os_error() == Some(libc::EACCES) => {
-            // Ours but unreadable (0300, 0000): repair it through a
-            // search-only descriptor, then open it for real and make sure it
-            // is still the directory that was repaired.
+            // Ours but unreadable (0300, 0000): repair it, then open it for
+            // real and make sure it is still the directory that was
+            // repaired.
             let search = open_raw(
                 &cpath,
                 plib::madefs::SEARCH_ONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-            .map_err(|_| e)?;
-            let st = plib::madefs::fstat(search.as_raw_fd())?;
-            if st.st_uid != euid {
-                return refuse("recovery directory not owned by the current user");
-            }
-            plib::madefs::chmod_fd(search.as_raw_fd(), 0o700)?;
+            );
+            let repaired = match search {
+                Ok(search) => {
+                    let st = plib::madefs::fstat(search.as_raw_fd())?;
+                    if st.st_uid != euid {
+                        return refuse("recovery directory not owned by the current user");
+                    }
+                    plib::madefs::chmod_fd(search.as_raw_fd(), 0o700)?;
+                    (st.st_dev as u64, st.st_ino as u64)
+                }
+                // macOS's O_SEARCH needs search permission, which 0000 does
+                // not give (Linux's O_PATH needs none): repair it by name.
+                Err(_) => repair_by_name(&path, &cpath, euid).map_err(|_| e)?,
+            };
             let fd = open_raw(&cpath, flags)?;
             let again = plib::madefs::fstat(fd.as_raw_fd())?;
-            if (again.st_dev, again.st_ino) != (st.st_dev, st.st_ino) {
+            if (again.st_dev as u64, again.st_ino as u64) != repaired {
                 return refuse("recovery directory changed while it was repaired");
             }
             fd
@@ -200,6 +207,35 @@ fn open_dir(path: PathBuf) -> io::Result<Rc<RecoverDir>> {
         }
     }
     Ok(Rc::new(RecoverDir { path, fd }))
+}
+
+/// Make the directory at `path` (`cpath`) 0700 by name, for when no
+/// descriptor can be had for it: only if it is a directory, not a link, and
+/// owned by `euid`, and through `fchmodat(AT_SYMLINK_NOFOLLOW)`, so a link
+/// put in its place since is not followed.  Returns its device and inode,
+/// for the caller to check it opens the same directory after.
+fn repair_by_name(path: &Path, cpath: &CStr, euid: libc::uid_t) -> io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let md = fs::symlink_metadata(path)?;
+    if !md.is_dir() {
+        return refuse("recovery path is not a directory");
+    }
+    if md.uid() != euid {
+        return refuse("recovery directory not owned by the current user");
+    }
+    // SAFETY: a NUL-terminated path, relative to the working directory.
+    let rc = unsafe {
+        libc::fchmodat(
+            libc::AT_FDCWD,
+            cpath.as_ptr(),
+            0o700,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((md.dev(), md.ino()))
 }
 
 impl RecoverDir {
@@ -694,6 +730,26 @@ mod tests {
             assert_eq!(recover_dir(td.path().to_str().unwrap()).unwrap().path, dir);
             assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
         }
+    }
+
+    #[test]
+    fn test_repair_by_name_makes_an_unsearchable_directory_private() {
+        // The path macOS takes for mode 0000; run here too.
+        let td = plib::tmp::tempdir().unwrap();
+        let dir = dir_path(td.path().to_str().unwrap());
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+        let c = CString::new(dir.as_os_str().as_bytes()).unwrap();
+        let euid = unsafe { libc::geteuid() };
+        let (dev, ino) = repair_by_name(&dir, &c, euid).unwrap();
+        let md = fs::metadata(&dir).unwrap();
+        assert_eq!(md.mode() & 0o777, 0o700);
+        assert_eq!((md.dev(), md.ino()), (dev, ino));
+        // A link in its place is refused, not followed.
+        let link = td.path().join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let c = CString::new(link.as_os_str().as_bytes()).unwrap();
+        assert!(repair_by_name(&link, &c, euid).is_err());
     }
 
     #[test]

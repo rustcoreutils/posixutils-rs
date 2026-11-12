@@ -525,16 +525,32 @@ impl Buffer {
         Ok(byte_count)
     }
 
+    /// Split command output into buffer lines, each ending in `\n` (one is
+    /// supplied for a last line without).  `str::lines` is not this: it also
+    /// drops a `\r` before each `\n`, so CRLF output lost bytes.
+    fn split_output(content: &str) -> Vec<String> {
+        content
+            .split_inclusive('\n')
+            .map(|l| {
+                let mut line = l.to_string();
+                if !line.ends_with('\n') {
+                    line.push('\n');
+                }
+                line
+            })
+            .collect()
+    }
+
     /// Load buffer from a string (for shell command output).
     /// Does not set pathname.
     pub fn load_from_string(&mut self, content: &str) {
-        let lines: Vec<String> = content.lines().map(|l| format!("{}\n", l)).collect();
+        let lines = Self::split_output(content);
         self.reset_lines(&lines);
     }
 
     /// Append content from a string after a line (for shell command output).
     pub fn append_from_string(&mut self, after_line: usize, content: &str) {
-        let lines: Vec<String> = content.lines().map(|l| format!("{}\n", l)).collect();
+        let lines = Self::split_output(content);
         if !lines.is_empty() {
             self.append(after_line, &lines);
         }

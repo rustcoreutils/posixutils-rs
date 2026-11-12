@@ -14,6 +14,7 @@
 
 mod global;
 mod parse;
+mod shell;
 mod state;
 
 use plib::testing::{run_test, TestPlan};

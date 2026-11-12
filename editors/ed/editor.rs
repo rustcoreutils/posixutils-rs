@@ -206,16 +206,32 @@ impl<R: BufRead, W: Write> Editor<R, W> {
 
     /// Execute a shell command and return its stdout as a string.
     /// Used for `e !command` and `r !command`.
-    fn shell_read(&self, command: &str) -> io::Result<(String, usize)> {
-        let output = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .output()?;
+    ///
+    /// popen(3) semantics, as historical ed: the command shares ed's standard
+    /// input and error, and only its output is read.  Its exit status says
+    /// nothing about whether that output is wanted -- `diff` and `grep` exit
+    /// 1 as a normal answer -- so it is not an error.
+    fn shell_read(&mut self, command: &str) -> io::Result<(String, usize)> {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::Stdio;
+        let output = self
+            .shell(command)?
+            .stdin(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .output();
+        self.after_shell();
+        let output = output?;
 
-        if !output.status.success() {
-            return Err(io::Error::other(
-                String::from_utf8_lossy(&output.stderr).to_string(),
-            ));
+        // A command that never ran (126, 127) or was killed, and wrote
+        // nothing, is a failure, not an empty answer: `e !typo` must not
+        // quietly replace the buffer with nothing.
+        let failed =
+            matches!(output.status.code(), Some(126 | 127)) || output.status.signal().is_some();
+        if failed && output.stdout.is_empty() {
+            return Err(io::Error::other(format!(
+                "command failed: {}",
+                output.status
+            )));
         }
 
         let content = String::from_utf8_lossy(&output.stdout).to_string();
@@ -225,18 +241,55 @@ impl<R: BufRead, W: Write> Editor<R, W> {
 
     /// Execute a shell command with input piped to its stdin.
     /// Used for `w !command`. Returns bytes written.
-    fn shell_write(&self, command: &str, start: usize, end: usize) -> io::Result<usize> {
-        use std::io::Write as _;
-        use std::process::{Command, Stdio};
+    fn shell_write(&mut self, command: &str, start: usize, end: usize) -> io::Result<usize> {
+        use std::process::Stdio;
 
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()?;
+        let mut child = self.shell(command)?.stdin(Stdio::piped()).spawn()?;
+        let written = self.feed_child(&mut child, start, end);
+        let waited = child.wait();
+        self.after_shell();
+        let bytes = written?;
+        waited?;
+        Ok(bytes)
+    }
 
+    /// `sh -c command`, its standard streams ed's own until the caller says
+    /// otherwise, as system(3) and popen(3) run it.
+    ///
+    /// ed's buffered output is flushed first, so a child writing to the same
+    /// terminal comes after it.  SIGQUIT goes back to its default in the
+    /// child: ed ignores it, and an ignored signal stays ignored across exec,
+    /// so `^\` could not stop a runaway command.
+    fn shell(&mut self, command: &str) -> io::Result<std::process::Command> {
+        use std::os::unix::process::CommandExt;
+        self.writer.flush()?;
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(command);
+        // SAFETY: only signal(2), which is async-signal-safe, runs between
+        // fork and exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+                Ok(())
+            });
+        }
+        Ok(cmd)
+    }
+
+    /// After a shell command: an interrupt typed while it ran was the
+    /// command's (system(3) ignores SIGINT in the caller meanwhile), not one
+    /// to report as ed's own `?` afterwards.
+    fn after_shell(&self) {
+        crate::SIGINT_RECEIVED.store(false, Ordering::SeqCst);
+    }
+
+    /// Write lines `start..=end` to a `w !command` child; the bytes written.
+    fn feed_child(
+        &self,
+        child: &mut std::process::Child,
+        start: usize,
+        end: usize,
+    ) -> io::Result<usize> {
         // The command may exit without reading it all (`w !head -1`). That
         // closes the pipe we own the far end of, and the default disposition
         // would kill ed -- losing the buffer -- instead of letting the write
@@ -244,7 +297,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         let _sigpipe = plib::io::SigPipeIgnored::new();
 
         let mut bytes = 0;
-        if let Some(ref mut stdin) = child.stdin {
+        if let Some(mut stdin) = child.stdin.take() {
             for i in start..=end {
                 if let Some(line) = self.buf.get_line(i) {
                     stdin.write_all(line.as_bytes())?;
@@ -252,8 +305,6 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 }
             }
         }
-
-        child.wait()?;
         Ok(bytes)
     }
 
@@ -888,13 +939,13 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 // Save for !! repetition
                 self.last_shell_command = Some(final_cmd.clone());
 
-                // Execute shell command
-                let output = std::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(&final_cmd)
-                    .output()?;
-                self.writer.write_all(&output.stdout)?;
-                self.writer.write_all(&output.stderr)?;
+                // Run it on ed's own standard input, output and error, so an
+                // interactive command (`!sh`) works and diagnostics stay on
+                // stderr.  What ed has written so far must reach the
+                // terminal first.
+                let status = self.shell(&final_cmd)?.status();
+                self.after_shell();
+                status?;
 
                 // POSIX: Write "!" on completion unless -s option
                 if !self.silent {

@@ -305,11 +305,15 @@ pub enum ExCommand {
     ShiftLeft {
         range: AddressRange,
         count: Option<usize>,
+        /// How many `<` were typed: the shift is that many shiftwidths.
+        width: usize,
     },
     /// Shift right (:>).
     ShiftRight {
         range: AddressRange,
         count: Option<usize>,
+        /// How many `>` were typed: the shift is that many shiftwidths.
+        width: usize,
     },
     /// Write line number (:=).
     LineNumber { range: AddressRange },

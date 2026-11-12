@@ -13,6 +13,7 @@
 //! It parses and executes ex commands per POSIX specification.
 
 pub mod address;
+pub mod cmdline;
 pub mod command;
 pub mod parser;
 

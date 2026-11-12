@@ -37,7 +37,9 @@ impl Editor {
             let cur = self.buffer.cursor().line;
             (cur, cur)
         };
-        let span_end = last.max(first + 1).max(first + count.unwrap_or(0));
+        let span_end = last
+            .max(first.saturating_add(1))
+            .max(first.saturating_add(count.unwrap_or(0)));
         self.splice_around(first, span_end.min(self.buffer.line_count()), |ed| {
             ed.execute_ex_join_inner(range, count, force)
         })
@@ -65,10 +67,10 @@ impl Editor {
             (current, current)
         };
         end = match count {
-            Some(c) if two_addrs => end + c.saturating_sub(1),
-            Some(c) => start + c,
+            Some(c) if two_addrs => end.saturating_add(c.saturating_sub(1)),
+            Some(c) => start.saturating_add(c),
             None if two_addrs => end,
-            None => start + 1,
+            None => start.saturating_add(1),
         };
         let end = end.min(self.buffer.line_count());
 
@@ -427,20 +429,31 @@ impl Editor {
         &mut self,
         range: &AddressRange,
         count: Option<usize>,
+        width: usize,
     ) -> Result<()> {
-        let (first, last) = self.resolve_range(range)?;
+        // The count is a number of lines, as for any command; the width is
+        // how many `<`/`>` were typed (95628-95649).  The count used to
+        // multiply the width instead -- and overflow on a large one.
+        let (first, last) = self.counted_lines(range, count)?;
+        // "Lines to be shifted shall be copied into the unnamed buffer."
+        let _ = crate::command::yank(
+            &self.buffer,
+            Range::lines(Position::new(first, 0), Position::new(last, 0)),
+            &mut self.registers,
+            None,
+        );
         self.splice_around(first, last, |ed| {
-            ed.execute_ex_shift_left_inner(range, count)
+            ed.execute_ex_shift_left_inner(first, last, width)
         })
     }
 
     fn execute_ex_shift_left_inner(
         &mut self,
-        range: &AddressRange,
-        count: Option<usize>,
+        start: usize,
+        end: usize,
+        width: usize,
     ) -> Result<()> {
-        let (start, end) = self.resolve_range(range)?;
-        let shift_amount = count.unwrap_or(1) * self.options.shiftwidth;
+        let shift_amount = width.saturating_mul(self.options.shiftwidth);
 
         for line_num in start..=end {
             if let Some(line) = self.buffer.line(line_num) {
@@ -471,20 +484,31 @@ impl Editor {
         &mut self,
         range: &AddressRange,
         count: Option<usize>,
+        width: usize,
     ) -> Result<()> {
-        let (first, last) = self.resolve_range(range)?;
+        // The count is a number of lines, as for any command; the width is
+        // how many `<`/`>` were typed (95628-95649).  The count used to
+        // multiply the width instead -- and overflow on a large one.
+        let (first, last) = self.counted_lines(range, count)?;
+        // "Lines to be shifted shall be copied into the unnamed buffer."
+        let _ = crate::command::yank(
+            &self.buffer,
+            Range::lines(Position::new(first, 0), Position::new(last, 0)),
+            &mut self.registers,
+            None,
+        );
         self.splice_around(first, last, |ed| {
-            ed.execute_ex_shift_right_inner(range, count)
+            ed.execute_ex_shift_right_inner(first, last, width)
         })
     }
 
     fn execute_ex_shift_right_inner(
         &mut self,
-        range: &AddressRange,
-        count: Option<usize>,
+        start: usize,
+        end: usize,
+        width: usize,
     ) -> Result<()> {
-        let (start, end) = self.resolve_range(range)?;
-        let shift_amount = count.unwrap_or(1) * self.options.shiftwidth;
+        let shift_amount = width.saturating_mul(self.options.shiftwidth);
 
         for line_num in start..=end {
             if let Some(line) = self.buffer.line(line_num) {
@@ -652,8 +676,7 @@ impl Editor {
         register: Option<char>,
         count: Option<usize>,
     ) -> Result<()> {
-        let (start, end) = self.resolve_range(range)?;
-        let last = end_from_count(start, end, count, self.buffer.line_count())?;
+        let (start, last) = self.counted_lines(range, count)?;
         self.splice_around(start, last, |ed| {
             ed.execute_ex_delete_inner(range, register, count)
         })
@@ -667,8 +690,7 @@ impl Editor {
     ) -> Result<()> {
         use crate::command::delete;
 
-        let (start, end) = self.resolve_range(range)?;
-        let end = end_from_count(start, end, count, self.buffer.line_count())?;
+        let (start, end) = self.counted_lines(range, count)?;
 
         let start_pos = Position::new(start, 0);
         let end_pos = Position::new(end, 0);
@@ -694,8 +716,7 @@ impl Editor {
     ) -> Result<()> {
         use crate::command::yank;
 
-        let (start, end) = self.resolve_range(range)?;
-        let end = end_from_count(start, end, count, self.buffer.line_count())?;
+        let (start, end) = self.counted_lines(range, count)?;
 
         let start_pos = Position::new(start, 0);
         let end_pos = Position::new(end, 0);
@@ -708,27 +729,6 @@ impl Editor {
 
         Ok(())
     }
-}
-
-/// Resolve the last line an ex command acts on when a trailing `count` was
-/// given: the range becomes `count` lines starting at `start`.
-///
-/// A count must be positive. Zero used to reach `start + count - 1` unguarded,
-/// which underflows for `start == 0` and otherwise silently addresses the line
-/// *before* `start`, so `:1d 0` walked off the front of the buffer.
-fn end_from_count(
-    start: usize,
-    end: usize,
-    count: Option<usize>,
-    last_line: usize,
-) -> Result<usize> {
-    let Some(c) = count else { return Ok(end) };
-    if c == 0 {
-        return Err(ViError::InvalidCommand(
-            "count must be positive".to_string(),
-        ));
-    }
-    Ok((start + c - 1).min(last_line))
 }
 
 /// Decrement `line` by `delta`, or fail as POSIX requires when the result

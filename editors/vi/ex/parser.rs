@@ -9,12 +9,28 @@
 
 //! Ex command parser.
 
-use super::address::{parse_address_range, parse_address_with_offset, Address, AddressRange};
+use super::address::{
+    parse_address_range, parse_address_with_offset, scan_pattern, Address, AddressRange,
+};
+use super::cmdline::{command_name, count_and_flags, ExFlags};
 use super::command::{ExCommand, MapMode, SubstituteFlags, CTRL_V};
 use crate::error::{Result, ViError};
 
 /// Parse an ex command string.
 pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
+    parse_ex_line(input).map(|(cmd, _)| cmd)
+}
+
+/// Parse one ex command, and the print flags that followed it (`1d#`,
+/// `s/a/b/p`, `2,3j+`): what the executor writes once the command has run.
+pub fn parse_ex_line(input: &str) -> Result<(ExCommand, ExFlags)> {
+    let mut flags = ExFlags::default();
+    let cmd = parse_command(input, &mut flags)?;
+    Ok((cmd, flags))
+}
+
+/// `parse_ex_line`, with the flags filled in as they are found.
+fn parse_command(input: &str, flags: &mut ExFlags) -> Result<ExCommand> {
     // Only the leading <blank>s go unconditionally. Trailing ones depend on the
     // command: `map`, `unmap`, `abbreviate` and `unabbreviate` can have a
     // <control>-V-escaped <blank> at the very end, and trimming here would eat
@@ -38,19 +54,55 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         });
     }
 
-    // Parse the command name
-    let (cmd_name, force, raw_args) = split_command(rest);
-    let cmd_name = cmd_name.to_lowercase();
+    // The command name (POSIX 94572-94600): a prefix of a command's name,
+    // ambiguities resolved as the standard's table says; `ka`, `dp` and `sg`
+    // split as 94575-94587 say.
+    let name =
+        command_name(rest).ok_or_else(|| ViError::InvalidCommand(first_word(rest).to_string()))?;
+    let cmd_name = name.canon.to_string();
+    let (force, after_bang) = match name.rest.strip_prefix('!') {
+        // `!` is the command itself, not a modifier, for `!`.
+        Some(after) if name.canon != "!" => (true, after),
+        _ => (false, name.rest),
+    };
+    let joined;
+    let raw_args = if name.split_flags {
+        *flags = ExFlags::parse(name.split_off)
+            .ok_or_else(|| ViError::InvalidCommand(name.split_off.to_string()))?;
+        after_bang
+    } else if name.split_off.is_empty() {
+        after_bang
+    } else {
+        joined = format!("{} {}", name.split_off, after_bang);
+        joined.as_str()
+    };
     // Now the trailing <blank>s, by the rule this command follows. POSIX
     // 94657-94659 gives <control>-V escaping to these four commands and
     // <backslash> escaping to every other, so only these four may keep a
     // trailing <blank> -- and only a quoted one.
     let args = raw_args.trim_start();
     let args = match cmd_name.as_str() {
-        "map" | "unm" | "unmap" | "ab" | "abbreviate" | "una" | "unabbreviate" => {
-            trim_end_unquoted(args)
-        }
+        "map" | "unmap" | "abbreviate" | "unabbreviate" => trim_end_unquoted(args),
         _ => args.trim_end(),
+    };
+
+    // `[count][flags]` (94650: no blank needed, `d22p`), for the commands
+    // whose synopsis ends in them.  What is left over is an error, not
+    // ignored: `1p x` is not `1p`.
+    let mut count_flags = |args: &str| -> Result<Option<usize>> {
+        let (count, f, rest) = count_and_flags(args);
+        if !rest.is_empty() {
+            return Err(ViError::InvalidCommand(format!(
+                "{cmd_name}: unexpected {rest}"
+            )));
+        }
+        let mut merged = *flags;
+        merged.number |= f.number;
+        merged.list |= f.list;
+        merged.print |= f.print;
+        merged.offset += f.offset;
+        *flags = merged;
+        Ok(count)
     };
 
     if force && !accepts_force(&cmd_name) {
@@ -59,15 +111,15 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
 
     match cmd_name.as_str() {
         // Write commands
-        "w" | "write" => parse_write(range, args, force),
+        "write" => parse_write(range, args, force),
         "wq" => parse_write_quit(range, args, force, false),
-        "x" | "xit" => parse_write_quit(range, args, force, true),
+        "xit" => parse_write_quit(range, args, force, true),
 
         // Quit commands
-        "q" | "quit" => Ok(ExCommand::Quit { force }),
+        "quit" => Ok(ExCommand::Quit { force }),
 
         // Edit commands: `e[dit][!][+command][file]` (94946).
-        "e" | "edit" => {
+        "edit" => {
             let (command, file) = split_plus_command(args);
             Ok(ExCommand::Edit {
                 file: if file.is_empty() {
@@ -87,7 +139,7 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         // as a program to run rather than a file to read, whether or not a
         // <blank> separates it from the command name. A <backslash> escape
         // suppresses that meaning (95285-95286).
-        "r" | "read" => {
+        "read" => {
             let shell_command = if force {
                 Some(args)
             } else {
@@ -118,9 +170,10 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
             }
         }
 
-        // Delete command
-        "d" | "delete" => {
-            let (register, count) = parse_register_and_count(args);
+        // Delete command: `d[elete][ buffer][count][flags]`.
+        "delete" => {
+            let (register, rest) = take_buffer(args);
+            let count = count_flags(rest)?;
             Ok(ExCommand::Delete {
                 range,
                 register,
@@ -128,9 +181,16 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
             })
         }
 
-        // Yank command
-        "y" | "yank" => {
-            let (register, count) = parse_register_and_count(args);
+        // Yank command: `ya[nk][ buffer][count]` -- no flags.
+        "yank" => {
+            let (register, rest) = take_buffer(args);
+            let (count, f, rest) = count_and_flags(rest);
+            if f.any() || !rest.is_empty() {
+                return Err(ViError::InvalidCommand(format!(
+                    "yank: unexpected {}",
+                    rest
+                )));
+            }
             Ok(ExCommand::Yank {
                 range,
                 register,
@@ -139,58 +199,64 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         }
 
         // Put command
-        "pu" | "put" => {
+        "put" => {
             let register = args.chars().next().filter(|c| c.is_ascii_alphabetic());
             Ok(ExCommand::Put { range, register })
         }
 
         // Copy command
-        "co" | "copy" | "t" => {
-            let dest = parse_destination(args)?;
+        // `co[py] 1addr [flags]`, `m[ove] 1addr [flags]`: no count.
+        "copy" | "t" => {
+            let (dest, rest) = parse_destination(args)?;
+            if count_flags(rest)?.is_some() {
+                return Err(ViError::InvalidCommand("copy takes no count".to_string()));
+            }
             Ok(ExCommand::Copy { range, dest })
         }
 
-        // Move command
-        "m" | "move" => {
-            let dest = parse_destination(args)?;
+        "move" => {
+            let (dest, rest) = parse_destination(args)?;
+            if count_flags(rest)?.is_some() {
+                return Err(ViError::InvalidCommand("move takes no count".to_string()));
+            }
             Ok(ExCommand::Move { range, dest })
         }
 
         // Substitute command
-        "s" | "substitute" => parse_substitute(range, args),
+        "substitute" => parse_substitute(range, args),
 
         // Global commands. `g!` is the invert form, the same as `v`.
-        "g" | "global" => parse_global(range, args, force),
-        "v" | "vglobal" => parse_global(range, args, true),
+        "global" => parse_global(range, args, force),
+        "v" => parse_global(range, args, true),
 
         // Print commands
-        "p" | "print" => Ok(ExCommand::Print {
+        "print" => Ok(ExCommand::Print {
             range,
-            count: parse_optional_count(args),
+            count: count_flags(args)?,
         }),
-        "nu" | "number" => Ok(ExCommand::Number {
+        "number" => Ok(ExCommand::Number {
             range,
-            count: parse_optional_count(args),
+            count: count_flags(args)?,
         }),
-        "l" | "list" => Ok(ExCommand::List {
+        "list" => Ok(ExCommand::List {
             range,
-            count: parse_optional_count(args),
+            count: count_flags(args)?,
         }),
 
         // Join command
-        "j" | "join" => Ok(ExCommand::Join {
+        "join" => Ok(ExCommand::Join {
             range,
-            count: parse_optional_count(args),
+            count: count_flags(args)?,
             force,
         }),
 
         // Set command
-        "se" | "set" => Ok(ExCommand::Set {
+        "set" => Ok(ExCommand::Set {
             args: args.to_string(),
         }),
 
         // File info
-        "f" | "file" => Ok(ExCommand::File {
+        "file" => Ok(ExCommand::File {
             new_name: if args.is_empty() {
                 None
             } else {
@@ -199,7 +265,7 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         }),
 
         // Mark command
-        "ma" | "mark" | "k" => {
+        "mark" | "k" => {
             let name = args
                 .chars()
                 .next()
@@ -222,12 +288,12 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
                 })
             }
         }
-        "sh" | "shell" => Ok(ExCommand::Shell {
+        "shell" => Ok(ExCommand::Shell {
             command: String::new(),
         }),
 
         // Directory commands
-        "cd" | "chd" | "chdir" => Ok(ExCommand::Cd {
+        "chdir" => Ok(ExCommand::Cd {
             path: if args.is_empty() {
                 None
             } else {
@@ -240,7 +306,7 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         // Arg list commands: `n[ext][!][+command][file ...]` (95177). The file
         // list, when given, replaces the argument list (95181-95184); it used
         // to be discarded entirely, so `:n a b` was a plain `:n`.
-        "n" | "next" => {
+        "next" => {
             let (command, rest) = split_plus_command(args);
             Ok(ExCommand::Next {
                 force,
@@ -248,18 +314,18 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
                 command,
             })
         }
-        "prev" | "previous" => Ok(ExCommand::Previous { force }),
-        "rew" | "rewind" => Ok(ExCommand::Rewind { force }),
-        "ar" | "args" => Ok(ExCommand::Args),
+        "previous" => Ok(ExCommand::Previous { force }),
+        "rewind" => Ok(ExCommand::Rewind { force }),
+        "args" => Ok(ExCommand::Args),
 
         // Undo/Redo
-        "u" | "undo" => Ok(ExCommand::Undo),
-        "red" | "redo" => Ok(ExCommand::Redo),
+        "undo" => Ok(ExCommand::Undo),
+        "redo" => Ok(ExCommand::Redo),
 
         // Mapping commands. Here `!` selects text input mode rather than
         // forcing anything (95090-95092).
         "map" => parse_map(args, MapMode::for_bang(force)),
-        "unm" | "unmap" => {
+        "unmap" => {
             let (lhs, _) = take_ctrlv_field(args);
             if lhs.is_empty() {
                 // 95456: `unm[ap][!] lhs` -- the operand is not optional.
@@ -272,7 +338,7 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         }
 
         // Abbreviations
-        "ab" | "abbreviate" => match split_ctrlv_pair(args) {
+        "abbreviate" => match split_ctrlv_pair(args) {
             // 94864: "If lhs and rhs are not specified, write the current list
             // of abbreviations and do nothing more."
             None => Ok(ExCommand::AbbrevList),
@@ -282,7 +348,7 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
             ))),
             Some((lhs, rhs)) => Ok(ExCommand::Abbreviate { lhs, rhs }),
         },
-        "una" | "unabbreviate" => {
+        "unabbreviate" => {
             let (lhs, _) = take_ctrlv_field(args);
             if lhs.is_empty() {
                 // 95435: `una[bbrev] lhs` -- the operand is not optional.
@@ -294,20 +360,20 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         }
 
         // Tag commands
-        "ta" | "tag" => Ok(ExCommand::Tag {
+        "tag" => Ok(ExCommand::Tag {
             tag: args.to_string(),
             force,
         }),
-        "po" | "pop" => Ok(ExCommand::Pop),
+        "pop" => Ok(ExCommand::Pop),
         "tags" => Ok(ExCommand::Tags),
 
         // Info commands
-        "ve" | "version" => Ok(ExCommand::Version),
-        "h" | "help" => Ok(ExCommand::Help),
+        "version" => Ok(ExCommand::Version),
+        "help" => Ok(ExCommand::Help),
 
         // Recovery
-        "pre" | "preserve" => Ok(ExCommand::Preserve),
-        "rec" | "recover" => Ok(ExCommand::Recover {
+        "preserve" => Ok(ExCommand::Preserve),
+        "recover" => Ok(ExCommand::Recover {
             file: if args.is_empty() {
                 None
             } else {
@@ -317,7 +383,7 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         }),
 
         // Source file
-        "so" | "source" => {
+        "source" => {
             if args.is_empty() {
                 Err(ViError::InvalidCommand(
                     "source requires a filename".to_string(),
@@ -331,15 +397,15 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
 
         // Text input commands. `!` toggles the autoindent edit option for the
         // duration of the command (94894-94896, 94910-94912, 95034-95036).
-        "a" | "append" => Ok(ExCommand::Append {
+        "append" => Ok(ExCommand::Append {
             range,
             toggle_autoindent: force,
         }),
-        "i" | "insert" => Ok(ExCommand::Insert {
+        "insert" => Ok(ExCommand::Insert {
             range,
             toggle_autoindent: force,
         }),
-        "c" | "change" => Ok(ExCommand::Change {
+        "change" => Ok(ExCommand::Change {
             range,
             count: parse_optional_count(args),
             toggle_autoindent: force,
@@ -353,12 +419,12 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         // knows which mode is current, so the arguments are carried through
         // unparsed rather than guessed at here — `+` is both a `+command`
         // introducer and a window type character.
-        "vi" | "visual" => Ok(ExCommand::Visual {
+        "visual" => Ok(ExCommand::Visual {
             range,
             force,
             args: args.to_string(),
         }),
-        "o" | "open" => {
+        "open" => {
             let pattern = parse_open_pattern(args);
             Ok(ExCommand::Open { range, pattern })
         }
@@ -376,17 +442,33 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         }
 
         // Shift left/right
-        "<" => Ok(ExCommand::ShiftLeft {
-            range,
-            count: parse_optional_count(args),
-        }),
-        ">" => Ok(ExCommand::ShiftRight {
-            range,
-            count: parse_optional_count(args),
-        }),
+        // `<[< ...][count][flags]`: each further `<` adds a shiftwidth; the
+        // count is how many lines (95628-95649).
+        "<" | ">" => {
+            let ch = if cmd_name == "<" { '<' } else { '>' };
+            let more = args.chars().take_while(|&c| c == ch).count();
+            let count = count_flags(&args[more..])?;
+            let width = 1 + more;
+            Ok(if ch == '<' {
+                ExCommand::ShiftLeft {
+                    range,
+                    count,
+                    width,
+                }
+            } else {
+                ExCommand::ShiftRight {
+                    range,
+                    count,
+                    width,
+                }
+            })
+        }
 
         // Write line number
-        "=" => Ok(ExCommand::LineNumber { range }),
+        "=" => {
+            count_flags(args)?;
+            Ok(ExCommand::LineNumber { range })
+        }
 
         // Execute buffer
         "@" | "*" => {
@@ -399,7 +481,7 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         }
 
         // Suspend
-        "su" | "sus" | "suspend" | "st" | "stop" => Ok(ExCommand::Suspend { force }),
+        "suspend" | "stop" => Ok(ExCommand::Suspend { force }),
 
         // Repeat substitute (&)
         "&" => {
@@ -421,56 +503,11 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         // Print with line numbers (#) - alias for number
         "#" => Ok(ExCommand::Number {
             range,
-            count: parse_optional_count(args),
+            count: count_flags(args)?,
         }),
 
         _ => Err(ViError::InvalidCommand(cmd_name)),
     }
-}
-
-/// Split a command name from its arguments, pulling off a trailing `!`.
-///
-/// POSIX spells the bang as part of each synopsis that accepts it
-/// (`a[ppend][!]`, `w[rite][!]`, `z[!]`, ...) and states the general rule at
-/// 94854-94857: "a character that can be appended to the command name to modify
-/// its operation ... the '!' character shall only act as a modifier if there is
-/// no <blank> between it and the command name". Returning it separately is what
-/// enforces the adjacency rule in one place; treating it as part of the *name*
-/// meant every forced form needed its own literal match arm — `"w!"`, `"q!"`,
-/// `"e!"`, `"j!"`, ... — and the commands never given one silently swallowed the
-/// bang instead of honouring or rejecting it.
-fn split_command(input: &str) -> (&str, bool, &str) {
-    // Special case: single-character commands
-    let first_char = input.chars().next();
-    match first_char {
-        Some('!') => return ("!", false, input[1..].trim_start()),
-        Some('<') => return ("<", false, input[1..].trim_start()),
-        Some('>') => return (">", false, input[1..].trim_start()),
-        Some('=') => return ("=", false, input[1..].trim_start()),
-        Some('@') => return ("@", false, input[1..].trim_start()),
-        Some('*') => return ("*", false, input[1..].trim_start()),
-        Some('&') => return ("&", false, input[1..].trim_start()),
-        Some('~') => return ("~", false, input[1..].trim_start()),
-        Some('#') => return ("#", false, input[1..].trim_start()),
-        _ => {}
-    }
-
-    // Find end of command name (letters only)
-    let name_end = input
-        .char_indices()
-        .find(|(_, c)| !c.is_ascii_alphabetic())
-        .map(|(i, _)| i)
-        .unwrap_or(input.len());
-
-    let cmd = &input[..name_end];
-    let rest = &input[name_end..];
-    let (force, rest) = match rest.strip_prefix('!') {
-        Some(after) => (true, after),
-        None => (false, rest),
-    };
-    // Returned untrimmed: `z` has to be able to tell whether a <blank>
-    // separated its type argument from the command name (95554-95555).
-    (cmd, force, rest)
 }
 
 /// Whether `cmd` accepts a `!` modifier.
@@ -479,50 +516,30 @@ fn split_command(input: &str) -> (&str, bool, &str) {
 /// `prev[ious]` extension this editor already supported. Anything else with a
 /// bang is a syntax error rather than a silently-ignored modifier.
 fn accepts_force(cmd: &str) -> bool {
+    // Canonical names: `command_name` has already resolved what was typed.
     matches!(
         cmd,
-        "a" | "append"
-            | "c"
+        "append"
             | "change"
-            | "cd"
             | "chdir"
-            | "chd"
-            | "e"
             | "edit"
-            | "g"
             | "global"
-            | "i"
             | "insert"
-            | "j"
             | "join"
             | "map"
-            | "n"
             | "next"
-            | "prev"
             | "previous"
-            | "q"
             | "quit"
-            | "r"
             | "read"
-            | "rec"
             | "recover"
-            | "rew"
             | "rewind"
-            | "st"
             | "stop"
-            | "su"
-            | "sus"
             | "suspend"
-            | "ta"
             | "tag"
-            | "unm"
             | "unmap"
-            | "vi"
             | "visual"
-            | "w"
             | "write"
             | "wq"
-            | "x"
             | "xit"
             | "z"
     )
@@ -686,12 +703,13 @@ fn parse_substitute(range: AddressRange, args: &str) -> Result<ExCommand> {
         });
     }
 
+    // The pattern and replacement end at an unescaped delimiter -- not at an
+    // escaped one, nor (in the pattern) one inside a bracket expression
+    // (95689-95695, 95358-95361).  Splitting at every delimiter character
+    // made `s/x/a\/b/` substitute `a\` and drop `b` as flags.
     let delim = args.chars().next().unwrap();
-    let parts: Vec<&str> = args[delim.len_utf8()..].split(delim).collect();
-
-    let pattern = parts.first().unwrap_or(&"").to_string();
-    let replacement = parts.get(1).unwrap_or(&"").to_string();
-    let trailing = parts.get(2).unwrap_or(&"");
+    let (pattern, rest) = scan_pattern(&args[delim.len_utf8()..], delim);
+    let (replacement, trailing) = scan_replacement(rest, delim);
     let (flags_str, line_count) = split_subst_flags(trailing);
     let mut flags = SubstituteFlags::parse(&flags_str);
     flags.line_count = line_count;
@@ -702,6 +720,34 @@ fn parse_substitute(range: AddressRange, args: &str) -> Result<ExCommand> {
         replacement,
         flags,
     })
+}
+
+/// An `s` replacement starting at `input`, up to its unescaped closing
+/// `delim`, and what follows.  An escaped delimiter is the delimiter as a
+/// literal; it keeps its backslash where it would otherwise mean something
+/// to a replacement (`&`, `~`).  Any other escape is kept for the
+/// replacement to interpret.
+fn scan_replacement(input: &str, delim: char) -> (String, &str) {
+    let mut out = String::new();
+    let mut chars = input.char_indices();
+    while let Some((i, c)) = chars.next() {
+        if c == delim {
+            return (out, &input[i + c.len_utf8()..]);
+        }
+        if c == '\\' {
+            match chars.next() {
+                Some((_, d)) if d == delim && !matches!(d, '&' | '~') => out.push(d),
+                Some((_, d)) => {
+                    out.push('\\');
+                    out.push(d);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    (out, "")
 }
 
 /// Split a substitute suffix into its flag letters and a trailing numeric
@@ -730,24 +776,16 @@ fn parse_global(range: AddressRange, args: &str, invert: bool) -> Result<ExComma
         ));
     }
 
-    // The delimiter is any character, so step over it by its encoded width --
-    // `[1..]` slices through a multi-byte delimiter and panics.
+    // The pattern ends at an unescaped delimiter outside any bracket
+    // expression; the commands are everything after it.  With no closing
+    // delimiter there are no commands, which print (95011-95012).
     let delim = args.chars().next().unwrap();
-    let rest = &args[delim.len_utf8()..];
-
-    // Find end of pattern
-    let pattern_end = rest.find(delim).unwrap_or(rest.len());
-    let pattern = rest[..pattern_end].to_string();
-    let command = if pattern_end < rest.len() {
-        rest[pattern_end + delim.len_utf8()..].to_string()
-    } else {
-        "p".to_string() // Default command is print
-    };
+    let (pattern, command) = scan_pattern(&args[delim.len_utf8()..], delim);
 
     Ok(ExCommand::Global {
         range,
         pattern,
-        command,
+        command: command.to_string(),
         invert,
     })
 }
@@ -766,23 +804,6 @@ fn parse_map(args: &str, mode: MapMode) -> Result<ExCommand> {
     }
 }
 
-/// Parse register and count from args.
-fn parse_register_and_count(args: &str) -> (Option<char>, Option<usize>) {
-    let args = args.trim();
-    if args.is_empty() {
-        return (None, None);
-    }
-
-    let first = args.chars().next().unwrap();
-    if first.is_ascii_alphabetic() {
-        let count = args[1..].trim().parse().ok();
-        (Some(first), count)
-    } else {
-        let count = args.parse().ok();
-        (None, count)
-    }
-}
-
 /// Parse optional count.
 fn parse_optional_count(args: &str) -> Option<usize> {
     args.trim().parse().ok()
@@ -794,20 +815,30 @@ fn parse_optional_count(args: &str) -> Option<usize> {
 /// mark and a search are all valid.  Parsing it as a bare integer rejected
 /// everything but a decimal literal -- `:1m$` answered "invalid line number".
 /// It stays unresolved until execution, since `$` depends on the buffer.
-fn parse_destination(args: &str) -> Result<Address> {
+fn parse_destination(args: &str) -> Result<(Address, &str)> {
     let trimmed = args.trim();
     if trimmed.is_empty() {
         return Err(ViError::InvalidAddress(
             "missing destination address".to_string(),
         ));
     }
-    match parse_address_with_offset(trimmed) {
-        Some((addr, rest)) if rest.trim().is_empty() => Ok(addr),
-        _ => Err(ViError::InvalidAddress(format!(
-            "invalid destination: {}",
-            trimmed
-        ))),
+    // The destination, then whatever `[flags]` follow it.
+    parse_address_with_offset(trimmed)
+        .ok_or_else(|| ViError::InvalidAddress(format!("invalid destination: {}", trimmed)))
+}
+
+/// A `[ buffer]` operand: a buffer name, and what follows.
+fn take_buffer(args: &str) -> (Option<char>, &str) {
+    let args = args.trim_start();
+    match args.chars().next() {
+        Some(c) if c.is_ascii_alphabetic() => (Some(c), &args[1..]),
+        _ => (None, args),
     }
+}
+
+/// The first word of `input`, for a diagnostic.
+fn first_word(input: &str) -> &str {
+    input.split_whitespace().next().unwrap_or(input)
 }
 
 /// Split a leading `+command` argument from `args`.
@@ -884,13 +915,9 @@ fn parse_open_pattern(args: &str) -> Option<String> {
     if matches!(delim, '\\' | '|' | '"' | '\n') || delim.is_whitespace() {
         return None;
     }
-    let rest = &args[delim.len_utf8()..];
-    let pattern = match rest.find(delim) {
-        Some(end) => &rest[..end],
-        // "The trailing delimiter can be omitted ... at the end of the command
-        // line."
-        None => rest,
-    };
+    // To the unescaped closing delimiter, or the end of the line, where
+    // "the trailing delimiter can be omitted".
+    let (pattern, _) = scan_pattern(&args[delim.len_utf8()..], delim);
     // "If pattern is empty (for example, "//") ... the last regular expression
     // used in the editor shall be used", which the executor signals with None.
     if pattern.is_empty() {

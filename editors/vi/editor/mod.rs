@@ -19,8 +19,9 @@ use std::sync::atomic::AtomicBool;
 use crate::buffer::{split_lines, Buffer, BufferMode, Line, Position, Range};
 use crate::command::{CommandParser, ParserState};
 use crate::error::{Result, ViError};
+use crate::ex::cmdline::ExFlags;
 use crate::ex::command::{strip_line_terminator, MapMode, SubstituteFlags, CTRL_V};
-use crate::ex::{parse_ex_command, AddressRange, ExCommand, ExResult};
+use crate::ex::{AddressRange, ExCommand, ExResult};
 use crate::file::{read_file, write_file, write_range, FileManager};
 use crate::input::{InputQueue, InputReader, Key, KeySource, QueuedKey};
 use crate::maps::{keys_from_text, MapMatch};
@@ -239,6 +240,12 @@ pub struct Editor {
     ex_standalone_mode: bool,
     /// Whether a `:g`/`:v` command list is running.
     in_global: bool,
+    /// The print flags of the ex command running now, for print, number
+    /// and list to fold into their output.
+    pending_flags: ExFlags,
+    /// The flags an implied print uses (number, list): set by the last
+    /// print, number or list command, or the last flags given (94561).
+    remembered_print: (bool, bool),
     /// Silent/batch mode (suppress prompts and messages).
     silent_mode: bool,
 }
@@ -313,6 +320,8 @@ impl Editor {
             ex_insert_text: Vec::new(),
             ex_standalone_mode: false,
             in_global: false,
+            pending_flags: ExFlags::default(),
+            remembered_print: (false, false),
             silent_mode: false,
         })
     }
@@ -365,6 +374,8 @@ impl Editor {
             ex_insert_text: Vec::new(),
             ex_standalone_mode: true,
             in_global: false,
+            pending_flags: ExFlags::default(),
+            remembered_print: (false, false),
             silent_mode: true,
         })
     }
@@ -420,6 +431,8 @@ impl Editor {
             ex_insert_text: Vec::new(),
             ex_standalone_mode: false,
             in_global: false,
+            pending_flags: ExFlags::default(),
+            remembered_print: (false, false),
             silent_mode: false,
         }
     }
@@ -3021,10 +3034,6 @@ impl Editor {
 
     /// Execute an ex command input string.
     fn execute_ex_input(&mut self, input: &str) -> Result<()> {
-        // A leading `/re/` or `?re?` is an address, not a search: what
-        // follows it is the command to run there (`/b/d`).  Treating the
-        // whole line as a search dropped that command.  vi's own `/` and `?`
-        // prompts are searches, and are handled where the prompt ends.
         // Check if this is a filter command from vi ! operator
         let actual_input = if let Some(range) = self.pending_filter.take() {
             if let Some(shell_cmd) = input.strip_prefix('!') {
@@ -3037,14 +3046,40 @@ impl Editor {
             input.to_string()
         };
 
-        // Parse and execute ex command
-        let cmd = parse_ex_command(&actual_input)?;
+        // One line, any number of commands (POSIX 94545-94646): `|`
+        // separates them, by rules that depend on the command.  An error
+        // stops the rest of the line.
+        let mut after_bar = false;
+        for seg in crate::ex::cmdline::split_line(&actual_input) {
+            if seg.comment {
+                break;
+            }
+            // 94557: an empty command after a `|` runs nothing.
+            if after_bar && seg.command.trim().is_empty() {
+                break;
+            }
+            after_bar = seg.ended_by_bar;
+            self.execute_one_ex_command(&seg.command, seg.text.as_deref())?;
+            if self.should_quit {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Run one ex command; `text` is the input text an `a`, `c` or `i`
+    /// took from the rest of its line.
+    fn execute_one_ex_command(&mut self, command: &str, text: Option<&str>) -> Result<()> {
+        // A leading `/re/` or `?re?` is an address, not a search: what
+        // follows it is the command to run there (`/b/d`).  vi's own `/` and
+        // `?` prompts are searches, and are handled where the prompt ends.
+        let (cmd, flags) = crate::ex::parser::parse_ex_line(command)?;
 
         // A search address is a search: its RE becomes the last RE used,
         // and the search pattern for `n`, before the command runs -- so the
         // `s//X/` of `/b/s//X/` means `b`.  Only once the line has parsed:
         // a command that is never run must not change them.
-        let (range, _) = crate::ex::address::parse_address_range(&actual_input);
+        let (range, _) = crate::ex::address::parse_address_range(command);
         let mut searches = range.search_patterns();
         if let ExCommand::Copy { dest, .. } | ExCommand::Move { dest, .. } = &cmd {
             searches.extend(dest.search_pattern());
@@ -3053,8 +3088,65 @@ impl Editor {
             self.note_search(&pattern, delim)?;
         }
 
-        let result = self.execute_ex(cmd)?;
+        // Which of print, number and list this is: they write their lines
+        // with the flags folded in, where any other command writes the
+        // current line after it has run.
+        let print_kind = match &cmd {
+            ExCommand::Print { .. } => Some((false, false)),
+            ExCommand::Number { .. } => Some((true, false)),
+            ExCommand::List { .. } => Some((false, true)),
+            _ => None,
+        };
 
+        self.pending_flags = flags;
+        let result = self.execute_ex(cmd);
+        self.pending_flags = ExFlags::default();
+        self.apply_ex_result(result?)?;
+
+        // 94640-94642: the rest of the line is the text of an `a`, `c` or
+        // `i`, as if typed, and ends it.
+        if let Some(text) = text {
+            if self.ex_insert_mode.is_some() {
+                self.accept_ex_insert_line(text)?;
+                self.finalize_ex_insert()?;
+            }
+        }
+
+        // 94561-94564: print, number and list set the flags a later implied
+        // print uses -- to nothing, `#` and `l`, plus their own flags; any
+        // other command's #, p and l flags are remembered too.
+        let print_cmd = print_kind.is_some();
+        if let Some((number, list)) = print_kind {
+            self.remembered_print = (number || flags.number, list || flags.list);
+        } else if flags.any() {
+            self.remembered_print = (flags.number, flags.list);
+        }
+        // Print, number and list wrote their lines with the flags folded in;
+        // a `+`/`-` still moves on from there and writes where it lands.
+        if (!print_cmd && flags.any()) || flags.offset != 0 {
+            // The flags: move the current line by the `+`/`-` count, then
+            // write it.
+            let cur = self.buffer.cursor().line as i64;
+            let target = cur
+                .checked_add(flags.offset)
+                .filter(|&n| n >= 1 && n <= self.buffer.line_count() as i64)
+                .ok_or_else(|| ViError::InvalidAddress("address out of range".to_string()))?
+                as usize;
+            self.buffer.set_line(target);
+            self.buffer.move_to_first_non_blank();
+            let lines = self.format_lines(
+                target,
+                target,
+                flags.number || self.options.number,
+                flags.list || self.options.list,
+            );
+            self.apply_ex_result(ExResult::CommandOutput(lines))?;
+        }
+        Ok(())
+    }
+
+    /// Act on what an ex command returned.
+    fn apply_ex_result(&mut self, result: ExResult) -> Result<()> {
         match result {
             ExResult::Continue => {}
             ExResult::Quit(code) => {
@@ -3103,7 +3195,6 @@ impl Editor {
                 self.ex_standalone_mode = false;
             }
         }
-
         Ok(())
     }
 
@@ -3403,18 +3494,9 @@ impl Editor {
                 self.execute_ex_yank(&range, register, count)?;
                 Ok(ExResult::Continue)
             }
-            ExCommand::Print { range, count } => {
-                let lines = self.get_lines_for_output(&range, count)?;
-                Ok(ExResult::CommandOutput(lines))
-            }
-            ExCommand::Number { range, count } => {
-                let lines = self.get_lines_with_numbers(&range, count)?;
-                Ok(ExResult::CommandOutput(lines))
-            }
-            ExCommand::List { range, count } => {
-                let lines = self.get_lines_for_list(&range, count)?;
-                Ok(ExResult::CommandOutput(lines))
-            }
+            ExCommand::Print { range, count } => self.print_command(&range, count, false, false),
+            ExCommand::Number { range, count } => self.print_command(&range, count, true, false),
+            ExCommand::List { range, count } => self.print_command(&range, count, false, true),
             ExCommand::Join {
                 range,
                 count,
@@ -3493,12 +3575,20 @@ impl Editor {
                 let output = self.execute_ex_z(line, ztype, type_count, count, full_screen)?;
                 Ok(ExResult::CommandOutput(output))
             }
-            ExCommand::ShiftLeft { range, count } => {
-                self.execute_ex_shift_left(&range, count)?;
+            ExCommand::ShiftLeft {
+                range,
+                count,
+                width,
+            } => {
+                self.execute_ex_shift_left(&range, count, width)?;
                 Ok(ExResult::Continue)
             }
-            ExCommand::ShiftRight { range, count } => {
-                self.execute_ex_shift_right(&range, count)?;
+            ExCommand::ShiftRight {
+                range,
+                count,
+                width,
+            } => {
+                self.execute_ex_shift_right(&range, count, width)?;
                 Ok(ExResult::Continue)
             }
             ExCommand::LineNumber { range } => {
@@ -3765,14 +3855,11 @@ impl Editor {
             // As editor text, like every other source of ex commands.
             let exinit = crate::bytes::from_os(&exinit_os);
             if !exinit.is_empty() {
-                // EXINIT uses '|' to separate multiple commands
-                for cmd in exinit.split('|') {
-                    let cmd = cmd.trim();
-                    if !cmd.is_empty() {
-                        // Ignore errors from individual commands
-                        let _ = self.execute_ex_input(cmd);
-                    }
-                }
+                // One command line: `|` separates its commands by the usual
+                // rules, so a `map` or `g` in EXINIT keeps its `|`s --
+                // splitting at every `|` broke both.  An error ends it
+                // (94684-94687).
+                let _ = self.execute_ex_input(&exinit);
             }
         } else {
             // EXINIT not set — check $HOME/.exrc
@@ -4021,88 +4108,82 @@ impl Editor {
         }
     }
 
-    /// Get lines for :p (print) command output.
-    fn get_lines_for_output(
-        &self,
-        range: &AddressRange,
-        count: Option<usize>,
-    ) -> Result<Vec<String>> {
+    /// The lines a `[2addr] cmd [count]` command acts on.  POSIX: with a
+    /// count, `count` lines starting at the last line addressed -- `1p 2` is
+    /// lines 1 and 2 (the count used to be ignored whenever an address was
+    /// given).
+    fn counted_lines(&self, range: &AddressRange, count: Option<usize>) -> Result<(usize, usize)> {
         let current = self.buffer.cursor().line;
         let (start, end) = if range.explicit {
             range.resolve(&self.addr_ctx_at(current))?
-        } else if let Some(c) = count {
-            // If count given without range, start at current line
-            (current, (current + c - 1).min(self.buffer.line_count()))
         } else {
-            // No range, no count: print current line
             (current, current)
         };
-
-        Ok(self.lines_for_output(start, end))
+        Ok(match count {
+            Some(0) => {
+                return Err(ViError::InvalidCommand(
+                    "count must be positive".to_string(),
+                ))
+            }
+            Some(c) => (end, end.saturating_add(c - 1).min(self.buffer.line_count())),
+            None => (start, end),
+        })
     }
 
-    /// Lines `start..=end` as `print` writes them.
+    /// Run `print`, `number` or `list` (`number`/`list` say which): write
+    /// the lines as the command, its flags and the `number` and `list`
+    /// options make them, and leave the current line on the last.
+    fn print_command(
+        &mut self,
+        range: &AddressRange,
+        count: Option<usize>,
+        number: bool,
+        list: bool,
+    ) -> Result<ExResult> {
+        let (start, end) = self.counted_lines(range, count)?;
+        let flags = self.pending_flags;
+        let lines = self.format_lines(
+            start,
+            end,
+            number || flags.number || self.options.number,
+            list || flags.list || self.options.list,
+        );
+        self.buffer.set_line(end.max(1));
+        Ok(ExResult::CommandOutput(lines))
+    }
+
+    /// Lines `start..=end` as `print` writes them, with the `number` and
+    /// `list` edit options -- or, with no command of its own, the remembered
+    /// print flags (POSIX 94561-94564).
     fn lines_for_output(&self, start: usize, end: usize) -> Vec<String> {
+        let (number, list) = self.remembered_print;
+        self.format_lines(
+            start,
+            end,
+            number || self.options.number,
+            list || self.options.list,
+        )
+    }
+
+    /// Lines `start..=end`: numbered as `"%6d  "` (POSIX 95236) and listed
+    /// unambiguously as the flags ask.
+    fn format_lines(&self, start: usize, end: usize, number: bool, list: bool) -> Vec<String> {
         let mut lines = Vec::new();
         for line_num in start..=end {
             if let Some(line) = self.buffer.line(line_num) {
-                if self.options.number {
-                    lines.push(format!("{:6}\t{}", line_num, line.content()));
+                let text = if list {
+                    Self::list_form(line.content())
                 } else {
-                    lines.push(line.content().to_string());
-                }
+                    line.content().to_string()
+                };
+                lines.push(if number {
+                    format!("{:6}  {}", line_num, text)
+                } else {
+                    text
+                });
             }
         }
         lines
-    }
-
-    /// Get lines with line numbers for :nu (number) command output.
-    fn get_lines_with_numbers(
-        &self,
-        range: &AddressRange,
-        count: Option<usize>,
-    ) -> Result<Vec<String>> {
-        let current = self.buffer.cursor().line;
-        let (start, end) = if range.explicit {
-            range.resolve(&self.addr_ctx_at(current))?
-        } else if let Some(c) = count {
-            (current, (current + c - 1).min(self.buffer.line_count()))
-        } else {
-            (current, current)
-        };
-
-        let mut lines = Vec::new();
-        for line_num in start..=end {
-            if let Some(line) = self.buffer.line(line_num) {
-                lines.push(format!("{:6}\t{}", line_num, line.content()));
-            }
-        }
-        Ok(lines)
-    }
-
-    /// Get lines in list format for :l (list) command output.
-    /// This shows non-printable characters.
-    fn get_lines_for_list(
-        &self,
-        range: &AddressRange,
-        count: Option<usize>,
-    ) -> Result<Vec<String>> {
-        let current = self.buffer.cursor().line;
-        let (start, end) = if range.explicit {
-            range.resolve(&self.addr_ctx_at(current))?
-        } else if let Some(c) = count {
-            (current, (current + c - 1).min(self.buffer.line_count()))
-        } else {
-            (current, current)
-        };
-
-        let mut lines = Vec::new();
-        for line_num in start..=end {
-            if let Some(line) = self.buffer.line(line_num) {
-                lines.push(Self::list_form(line.content()));
-            }
-        }
-        Ok(lines)
     }
 
     /// Execute :global command - execute command on matching lines.
@@ -4327,6 +4408,9 @@ impl Editor {
             end = (start + n - 1).min(self.buffer.line_count());
         }
         let mut total_count = 0;
+        // The last line a substitution changed: the current line afterwards
+        // (95396), so `1s/a/X/|p` prints the changed line.
+        let mut last_changed = None;
         let mut printed: Vec<String> = Vec::new();
         // `\n` in the replacement inserts lines mid-iteration, so walk the
         // range with an explicit cursor rather than a fixed `for` range.
@@ -4369,6 +4453,7 @@ impl Editor {
                         // until the process is killed.
                         end += parts.len() - 1;
                         total_count += count;
+                        last_changed = Some(line_num + parts.len() - 1);
                         line_num += parts.len();
                         continue;
                     }
@@ -4379,25 +4464,27 @@ impl Editor {
                         false,
                     );
                     self.buffer.replace_line(line_num, &new_content)?;
+                    last_changed = Some(line_num);
 
                     // `p`, `l` and `#` echo each changed line; `l` uses the
                     // unambiguous form and `#` prefixes the line number.
                     if sub.should_print() || sub.should_list() || sub.should_number() {
-                        let body = if sub.should_list() {
-                            Self::list_form(&new_content)
-                        } else {
-                            new_content.clone()
-                        };
-                        printed.push(if sub.should_number() {
-                            format!("{}\t{}", line_num, body)
-                        } else {
-                            body
-                        });
+                        printed.extend(self.format_lines(
+                            line_num,
+                            line_num,
+                            sub.should_number(),
+                            sub.should_list(),
+                        ));
                     }
                 }
                 total_count += count;
             }
             line_num += 1;
+        }
+
+        if let Some(line) = last_changed {
+            self.buffer.set_line(line);
+            self.buffer.move_to_first_non_blank();
         }
 
         if total_count == 0 {

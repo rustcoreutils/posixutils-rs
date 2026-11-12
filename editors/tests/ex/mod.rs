@@ -13,6 +13,7 @@
 //! testing POSIX ex commands via stdin/stdout.
 
 mod addresses;
+mod cmdline;
 mod fileio;
 
 use plib::testing::{get_binary_path, run_test, TestPlan};
@@ -77,7 +78,7 @@ fn test_ex_insert_and_print() {
 fn test_ex_number_command() {
     ex_test(
         "a\nline one\nline two\n.\n1,$nu\nq!\n",
-        "     1\tline one\n     2\tline two\n",
+        "     1  line one\n     2  line two\n",
     );
 }
 
@@ -451,7 +452,7 @@ fn test_ex_line_number_with_address() {
 fn test_ex_hash_command() {
     ex_test(
         "a\nfirst\nsecond\n.\n1,2#\nq!\n",
-        "     1\tfirst\n     2\tsecond\n",
+        "     1  first\n     2  second\n",
     );
 }
 
@@ -953,7 +954,7 @@ fn test_ex_substitute_number_and_list_flags() {
     ex_test_with_file(
         "aaa\nbbb\naaa\n",
         "1,$s/aaa/ZZZ/#\nq!\n",
-        "1\tZZZ\n3\tZZZ\n",
+        "     1  ZZZ\n     3  ZZZ\n",
     );
     ex_test_with_file("aaa\n", "1s/aaa/A\tB/l\nq!\n", "A\\tB$\n");
 }
@@ -1033,7 +1034,7 @@ fn test_ex_substitute_newline_splits_line() {
     ex_test_with_file(
         "a-b\nc-d\n",
         "1s/-/\\n/\n1,$nu\nq!\n",
-        "     1\ta\n     2\tb\n     3\tc-d\n",
+        "     1  a\n     2  b\n     3  c-d\n",
     );
 }
 
@@ -1048,7 +1049,7 @@ fn test_ex_substitute_newline_is_undoable() {
     ex_test_with_file(
         "a-b\nc-d\n",
         "1s/-/\\n/\n$=\nu\n$=\n1,$nu\nq!\n",
-        "3\n2\n     1\ta-b\n     2\tc-d\n",
+        "3\n2\n     1  a-b\n     2  c-d\n",
     );
 }
 
@@ -1059,7 +1060,7 @@ fn test_ex_substitute_newline_over_a_range_visits_every_line() {
     ex_test_with_file(
         "a-b\nc-d\n",
         "1,$s/-/\\n/\n1,$nu\nq!\n",
-        "     1\ta\n     2\tb\n     3\tc\n     4\td\n",
+        "     1  a\n     2  b\n     3  c\n     4  d\n",
     );
 }
 
@@ -1074,7 +1075,7 @@ fn test_ex_backslash_newline_continues_the_command() {
     ex_test_with_file(
         "a-b\nc-d\n",
         "1s/-/\\\n/\n1,$nu\nq!\n",
-        "     1\ta\n     2\tb\n     3\tc-d\n",
+        "     1  a\n     2  b\n     3  c-d\n",
     );
 }
 

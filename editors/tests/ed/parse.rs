@@ -18,7 +18,7 @@ use std::process::{Command, Stdio};
 
 /// Run `ed -s f` on a file holding `content`, with `script` on stdin.
 /// Returns (stdout, exit code, the file afterwards).
-fn ed(content: &str, script: &str) -> (String, i32, String) {
+pub(super) fn ed(content: &str, script: &str) -> (String, i32, String) {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("f");
     fs::write(&path, content).unwrap();
@@ -45,7 +45,7 @@ fn ed(content: &str, script: &str) -> (String, i32, String) {
 }
 
 /// The script's stdout, asserting a clean exit.
-fn ok(content: &str, script: &str) -> String {
+pub(super) fn ok(content: &str, script: &str) -> String {
     let (out, code, _) = ed(content, script);
     assert_eq!(code, 0, "ed failed; stdout: {out:?}");
     out

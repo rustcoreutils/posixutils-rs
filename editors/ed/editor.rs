@@ -276,20 +276,12 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             AddressInfo::Line(n) => *n as isize,
             AddressInfo::Mark(c) => self.buf.get_mark(*c).ok_or(EdError::InvalidAddress)? as isize,
             AddressInfo::RegexForward(pat) => {
-                let result = self.search_forward_from(pat, base_line)?;
-                // POSIX: Save pattern for subsequent null RE references
-                if !pat.is_empty() {
-                    self.last_pattern = Some(pat.clone());
-                }
-                result as isize
+                let (_, re) = self.compile_re(pat)?;
+                self.search_forward_from(&re, base_line)? as isize
             }
             AddressInfo::RegexBack(pat) => {
-                let result = self.search_backward_from(pat, base_line)?;
-                // POSIX: Save pattern for subsequent null RE references
-                if !pat.is_empty() {
-                    self.last_pattern = Some(pat.clone());
-                }
-                result as isize
+                let (_, re) = self.compile_re(pat)?;
+                self.search_backward_from(&re, base_line)? as isize
             }
             AddressInfo::Offset(off) => (base_line as isize).saturating_add(*off),
         };
@@ -329,19 +321,26 @@ impl<R: BufRead, W: Write> Editor<R, W> {
         Ok((start, end))
     }
 
-    /// Search forward for a pattern from a specific starting line.
-    fn search_forward_from(&self, pattern: &str, from_line: usize) -> EdResult<usize> {
+    /// The RE `pattern` names, compiled, and its text: the remembered RE when
+    /// `pattern` is null.  POSIX: "A null RE shall be equivalent to the last
+    /// RE encountered" -- by an address, a g/v or an s alike, so every one of
+    /// them resolves here.  A pattern becomes the remembered RE only once it
+    /// compiles: an invalid one must not replace a good one.
+    fn compile_re(&mut self, pattern: &str) -> EdResult<(String, Regex)> {
         let pat = if pattern.is_empty() {
             self.last_pattern
-                .as_ref()
-                .ok_or(EdError::NoPreviousPattern)?
                 .clone()
+                .ok_or(EdError::NoPreviousPattern)?
         } else {
             pattern.to_string()
         };
-
         let re = Regex::new(&pat, RegexFlags::bre()).map_err(|e| EdError::Syntax(e.to_string()))?;
+        self.last_pattern = Some(pat.clone());
+        Ok((pat, re))
+    }
 
+    /// Search forward for a pattern from a specific starting line.
+    fn search_forward_from(&self, re: &Regex, from_line: usize) -> EdResult<usize> {
         // Search from starting line + 1 to end, then wrap to start
         let start = from_line;
         let total = self.buf.line_count();
@@ -363,18 +362,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
     }
 
     /// Search backward for a pattern from a specific starting line.
-    fn search_backward_from(&self, pattern: &str, from_line: usize) -> EdResult<usize> {
-        let pat = if pattern.is_empty() {
-            self.last_pattern
-                .as_ref()
-                .ok_or(EdError::NoPreviousPattern)?
-                .clone()
-        } else {
-            pattern.to_string()
-        };
-
-        let re = Regex::new(&pat, RegexFlags::bre()).map_err(|e| EdError::Syntax(e.to_string()))?;
-
+    fn search_backward_from(&self, re: &Regex, from_line: usize) -> EdResult<usize> {
         let start = from_line;
         let total = self.buf.line_count();
 
@@ -768,7 +756,13 @@ impl<R: BufRead, W: Write> Editor<R, W> {
                 self.execute_substitute(&addr1, &addr2, &pattern, &replacement, &flags)
             }
             Command::RepeatSubstitute(addr1, addr2) => {
-                let pattern = self.last_sub_pattern.clone().unwrap_or_default();
+                // With no earlier `s` there is nothing to repeat: an empty
+                // pattern here would be the null RE and substitute with
+                // whatever address RE came last.
+                let pattern = self
+                    .last_sub_pattern
+                    .clone()
+                    .ok_or_else(|| EdError::Generic("no previous substitution".to_string()))?;
                 let replacement = self.last_sub_replacement.clone().unwrap_or_default();
                 let flags = self.last_sub_flags.clone().unwrap_or_default();
                 self.execute_substitute(&addr1, &addr2, &pattern, &replacement, &flags)
@@ -1069,15 +1063,12 @@ impl<R: BufRead, W: Write> Editor<R, W> {
     ) -> EdResult<()> {
         let (start, end) = self.resolve_range(addr1, addr2)?;
 
-        // Use previous pattern if empty
-        let pat = if pattern.is_empty() {
-            self.last_sub_pattern
-                .as_ref()
-                .ok_or(EdError::NoPreviousPattern)?
-                .clone()
-        } else {
-            pattern.to_string()
-        };
+        // Everything that can fail is checked before anything is remembered.
+        let SubstituteSuffix {
+            count,
+            global,
+            print,
+        } = Self::parse_substitute_suffix(flags)?;
 
         // Handle % as sole replacement character (use previous replacement)
         let repl = if replacement == "%" {
@@ -1089,19 +1080,13 @@ impl<R: BufRead, W: Write> Editor<R, W> {
             replacement.to_string()
         };
 
+        // A null RE is the last RE of any command, not just of an `s`.
+        let (pat, re) = self.compile_re(pattern)?;
+
         // Save for repeat
         self.last_sub_pattern = Some(pat.clone());
         self.last_sub_replacement = Some(repl.clone());
         self.last_sub_flags = Some(flags.to_string());
-        self.last_pattern = Some(pat.clone());
-
-        let re = Regex::new(&pat, RegexFlags::bre()).map_err(|e| EdError::Syntax(e.to_string()))?;
-
-        let SubstituteSuffix {
-            count,
-            global,
-            print,
-        } = Self::parse_substitute_suffix(flags)?;
 
         // POSIX (ed, `u`): one `s` is one command however many lines it
         // rewrote.  Every `buf.change()` below snapshots for undo, so without
@@ -1313,19 +1298,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
 
         let (start, end) = self.resolve_range(&addr1, &addr2)?;
 
-        // Use previous pattern if empty
-        let pat = if pattern.is_empty() {
-            self.last_pattern
-                .as_ref()
-                .ok_or(EdError::NoPreviousPattern)?
-                .clone()
-        } else {
-            pattern.to_string()
-        };
-
-        self.last_pattern = Some(pat.clone());
-
-        let re = Regex::new(&pat, RegexFlags::bre()).map_err(|e| EdError::Syntax(e.to_string()))?;
+        let (_, re) = self.compile_re(pattern)?;
 
         // Collect matching lines first (POSIX: mark every line that matches)
         let mut matching_lines = Vec::new();
@@ -1452,19 +1425,7 @@ impl<R: BufRead, W: Write> Editor<R, W> {
     ) -> EdResult<()> {
         let (start, end) = self.resolve_range(&addr1, &addr2)?;
 
-        // Use previous pattern if empty
-        let pat = if pattern.is_empty() {
-            self.last_pattern
-                .as_ref()
-                .ok_or(EdError::NoPreviousPattern)?
-                .clone()
-        } else {
-            pattern.to_string()
-        };
-
-        self.last_pattern = Some(pat.clone());
-
-        let re = Regex::new(&pat, RegexFlags::bre()).map_err(|e| EdError::Syntax(e.to_string()))?;
+        let (_, re) = self.compile_re(pattern)?;
 
         // Collect matching lines first
         let mut matching_lines = Vec::new();

@@ -13,6 +13,7 @@
 //! testing commands via stdin/stdout.
 
 mod parse;
+mod state;
 
 use plib::testing::{run_test, TestPlan};
 use plib::tmp::NamedTempFile;

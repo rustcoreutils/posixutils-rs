@@ -129,6 +129,16 @@ impl FileManager {
         self.current_file = path;
     }
 
+    /// Note a file argument to `:r`, `:w` or `:x` (94372-94377): it becomes
+    /// the current pathname if there is none, and otherwise the alternate.
+    pub fn note_file_argument(&mut self, path: &Path) {
+        if self.current_file.is_none() {
+            self.current_file = Some(path.to_path_buf());
+        } else {
+            self.alternate_file = Some(path.to_path_buf());
+        }
+    }
+
     /// Set read-only mode.
     pub fn set_readonly(&mut self, readonly: bool) {
         self.readonly = readonly;
@@ -151,7 +161,8 @@ impl FileManager {
         Ok(alt)
     }
 
-    /// Go to next file in argument list.
+    /// Go to next file in argument list.  Returns its path; the edit that
+    /// opens it makes it the current pathname.
     pub fn next_file(&mut self) -> Result<PathBuf> {
         if self.arg_list.is_empty() {
             return Err(ViError::NoFileName);
@@ -164,7 +175,6 @@ impl FileManager {
             self.arg_index += 1;
         }
         let path = self.arg_list[self.arg_index].clone();
-        self.set_current_file(Some(path.clone()));
         Ok(path)
     }
 
@@ -178,7 +188,6 @@ impl FileManager {
         }
         self.arg_index -= 1;
         let path = self.arg_list[self.arg_index].clone();
-        self.set_current_file(Some(path.clone()));
         Ok(path)
     }
 
@@ -190,7 +199,6 @@ impl FileManager {
         self.arg_index = 0;
         self.before_first = false;
         let path = self.arg_list[0].clone();
-        self.set_current_file(Some(path.clone()));
         Ok(path)
     }
 

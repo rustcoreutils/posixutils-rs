@@ -677,17 +677,12 @@ impl Editor {
             Recovery::Failed(e) => recover_note = Some(format!("{path}: cannot recover: {e}")),
         }
 
-        // Capture the outgoing file *before* `set_current_file` replaces it:
-        // reading it afterwards gave the file being opened, so `#` in a shell
-        // command expanded to the same thing as `%`.
-        let old_current = self.shell_current_file();
-
         self.replace_buffer(new_buffer);
-        self.files.set_current_file(Some(path_buf.clone()));
-        self.shell
-            .set_current_file(Some(crate::bytes::from_path(&path_buf)));
-        if old_current.is_some() {
-            self.shell.set_alternate_file(old_current);
+        // 94361-94363: a new file is the current pathname, the outgoing one
+        // the alternate (`#`); editing the same file again (`:e!`) leaves
+        // both as they were.
+        if self.files.current_file() != Some(path_buf.as_path()) {
+            self.files.set_current_file(Some(path_buf.clone()));
         }
         // POSIX: ex starts on the *last* line of the edit buffer, vi on the
         // first.  Starting ex on line 1 made every command with a relative or
@@ -770,9 +765,102 @@ impl Editor {
         self.initial_commands = commands;
     }
 
-    /// Get current file as string for shell.
-    fn shell_current_file(&self) -> Option<String> {
-        self.files.current_file().map(crate::bytes::from_path)
+    /// The shell executor, set up for a command now: the `shell` option as
+    /// it is now, and `%` and `#` as the current and alternate pathnames
+    /// are now (`:f name` included).
+    fn shell(&mut self) -> &mut ShellExecutor {
+        self.shell.set_program(&self.options.shell);
+        self.shell
+            .set_current_file(self.files.current_file().map(crate::bytes::from_path));
+        self.shell
+            .set_alternate_file(self.files.alternate_file().map(crate::bytes::from_path));
+        &mut self.shell
+    }
+
+    /// `arg`, a file argument, with unescaped `%` and `#` replaced by the
+    /// current and alternate pathnames; `\%`, `\#` and `\\` are the
+    /// characters (see [`crate::shell::expand`]).
+    /// An error if a name it needs is not set (94666-94669).
+    fn expand_file_arg(&self, arg: &str) -> Result<String> {
+        let current = self.files.current_file().map(crate::bytes::from_path);
+        let alternate = self.files.alternate_file().map(crate::bytes::from_path);
+        Ok(crate::shell::expand(arg, current.as_deref(), alternate.as_deref(), None)?.0)
+    }
+
+    /// `cmd` with `%` and `#` expanded in its file arguments.
+    fn expand_file_args(&self, cmd: ExCommand) -> Result<ExCommand> {
+        let one = |f: Option<String>| f.map(|f| self.expand_file_arg(&f)).transpose();
+        Ok(match cmd {
+            ExCommand::Write {
+                range,
+                file,
+                append,
+                force,
+            } => ExCommand::Write {
+                range,
+                file: one(file)?,
+                append,
+                force,
+            },
+            ExCommand::WriteQuit {
+                range,
+                file,
+                force,
+                xit,
+            } => ExCommand::WriteQuit {
+                range,
+                file: one(file)?,
+                force,
+                xit,
+            },
+            ExCommand::Edit {
+                file,
+                force,
+                command,
+            } => ExCommand::Edit {
+                file: one(file)?,
+                force,
+                command,
+            },
+            ExCommand::Read { range, file } => ExCommand::Read {
+                range,
+                file: one(file)?,
+            },
+            ExCommand::Next {
+                force,
+                files,
+                command,
+            } => ExCommand::Next {
+                force,
+                files: files
+                    .iter()
+                    .map(|f| self.expand_file_arg(f))
+                    .collect::<Result<_>>()?,
+                command,
+            },
+            ExCommand::File { new_name } => ExCommand::File {
+                new_name: one(new_name)?,
+            },
+            ExCommand::Recover { file, force } => ExCommand::Recover {
+                file: one(file)?,
+                force,
+            },
+            ExCommand::Source { file } => ExCommand::Source {
+                file: self.expand_file_arg(&file)?,
+            },
+            // In open or visual mode `:vi` is `:e` (95472-95474), and its
+            // arguments end in a file name.
+            ExCommand::Visual { range, force, args } if !self.ex_standalone_mode => {
+                let (command, file) = crate::ex::parser::split_plus_command(args.trim());
+                let file = self.expand_file_arg(file)?;
+                let args = match command {
+                    Some(c) => format!("+{} {file}", c.replace(' ', "\\ ")),
+                    None => file,
+                };
+                ExCommand::Visual { range, force, args }
+            }
+            other => other,
+        })
     }
 
     /// Open multiple files.
@@ -3580,6 +3668,7 @@ impl Editor {
 
     /// Execute a parsed ex command.
     fn execute_ex(&mut self, cmd: ExCommand) -> Result<ExResult> {
+        let cmd = self.expand_file_args(cmd)?;
         match cmd {
             ExCommand::Quit { force } => {
                 // POSIX: quit warns while more files remain in the argument
@@ -4324,19 +4413,35 @@ impl Editor {
         self.terminal.disable_raw_mode()?;
 
         if warn {
-            println!();
+            if was_raw {
+                println!();
+            }
             println!("[No write since last change]");
         }
+        // 95600-95601: a command `%`, `#` or `!` changed is shown, after a
+        // `!`, as it will run.
+        if !command.is_empty() && self.ex_standalone_mode && !self.silent_mode {
+            if let Ok((expanded, true)) = self.shell().expand_command(command) {
+                crate::bytes::println(&format!("!{expanded}"));
+            }
+        }
 
+        // A blank line before the output on the screen; not in ex, where it
+        // would be a stray line of output.
+        if was_raw {
+            println!();
+        }
         let result = if command.is_empty() {
             // :shell - start interactive shell
-            println!(); // Blank line before shell
-            self.shell.interactive()
+            self.shell().interactive()
         } else {
             // :!command - execute command
-            println!(); // Blank line before output
-            self.shell.execute(command)
+            self.shell().execute(command)
         };
+        // 95616: once a program has run -- not after `:sh`.
+        if result.is_ok() && !command.is_empty() {
+            self.ex_bang_done();
+        }
 
         // Wait for the user to read the output before the screen is redrawn.
         //
@@ -4346,11 +4451,11 @@ impl Editor {
         // the `q` of a following `q!`, leaving a bare `!`, which starts an
         // interactive shell and hangs the session.
         if was_raw && result.is_ok() {
-            use std::io::{self, Read, Write};
+            use std::io::{self, Write};
             print!("\nPress ENTER or type command to continue");
             io::stdout().flush()?;
             let mut buf = [0u8; 1];
-            let _ = io::stdin().read(&mut buf);
+            let _ = crate::input::lines::read_some(&mut buf);
         }
 
         // Restore raw mode only if it was raw before.
@@ -4375,6 +4480,14 @@ impl Editor {
         }
     }
 
+    /// 95616: in ex mode, a `!` once the program of a `!` command is done --
+    /// an informational message, so not under `-s`.
+    fn ex_bang_done(&self) {
+        if self.ex_standalone_mode && !self.silent_mode {
+            println!("!");
+        }
+    }
+
     /// Execute :r !command - read command output into buffer.
     fn execute_shell_read(&mut self, line: Option<usize>, command: &str) -> Result<()> {
         // #V18: the child inherits our stdin now (#X23), so it must not find
@@ -4386,16 +4499,14 @@ impl Editor {
         // delivering whole lines.
         let was_raw = self.terminal.is_raw_mode();
         self.terminal.disable_raw_mode()?;
-        let output = self.shell.execute_capture(command);
+        let output = self.shell().execute_capture(command);
         if was_raw {
             let _ = self.terminal.enable_raw_mode();
         }
         let output = output?;
-
-        if !output.success {
-            self.set_error(&format!("shell returned {}", output.exit_code));
-            return Ok(());
-        }
+        // The output goes in whatever the exit status (95279-95280); a
+        // failure is reported, after it.
+        let failed = (!output.success).then(|| format!("shell returned {}", output.exit_code));
 
         // Insert output after specified line (or current line)
         let insert_line = line.unwrap_or_else(|| self.buffer.cursor().line);
@@ -4404,13 +4515,22 @@ impl Editor {
         let line_count = lines.len();
         self.insert_lines_after(insert_line, &lines)?;
 
-        // Move cursor to first inserted line
+        // 95287-95289: the first line read in visual or open mode, the
+        // last in ex.
         if line_count > 0 {
-            self.buffer.set_line(insert_line + 1);
+            let at = if self.ex_standalone_mode {
+                insert_line + line_count
+            } else {
+                insert_line + 1
+            };
+            self.buffer.set_line(at);
             self.buffer.move_to_first_non_blank();
         }
 
-        self.set_message(&format!("{} lines", line_count));
+        match failed {
+            Some(msg) => self.set_error(&msg),
+            None => self.set_message(&format!("{} lines", line_count)),
+        }
         Ok(())
     }
 
@@ -4429,17 +4549,21 @@ impl Editor {
         }
 
         // Run filter
-        let output = self.shell.filter(command, &input)?;
-
-        if !output.success {
-            self.set_error(&format!("shell returned {}", output.exit_code));
-            return Ok(());
-        }
+        let output = self.shell().filter(command, &input)?;
+        self.ex_bang_done();
+        // The output replaces the lines whatever the exit status
+        // (95609-95610); a failure is reported, after.
+        let failed = (!output.success).then(|| format!("shell returned {}", output.exit_code));
 
         // Replace the range with the output as one whole-line change, so
         // `u` swaps the lines back rather than rebuilding them character by
         // character.
+        // 95614-95615: the lines replaced go to the unnamed buffer, in
+        // line mode.
+        self.registers
+            .set_unnamed(RegisterContent::new(input.clone(), true));
         let text = output.stdout_string();
+        let read_in = split_lines(&text).count();
         self.splice_around(start, end, |ed| {
             for _ in start..=end {
                 ed.buffer.delete_line(start);
@@ -4453,12 +4577,22 @@ impl Editor {
             Ok(())
         })?;
 
-        // Position cursor at first line of result
-        self.buffer.set_line(start.max(1));
+        // 95620-95625: the last line read in; with none, the line before
+        // the range, or the first line.
+        let line = if read_in > 0 {
+            start + read_in - 1
+        } else {
+            start.saturating_sub(1).max(1)
+        };
+        self.buffer
+            .set_line(line.min(self.buffer.line_count().max(1)));
         self.buffer.move_to_first_non_blank();
 
         let filtered = end - start + 1;
-        self.set_message(&format!("{} lines filtered", filtered));
+        match failed {
+            Some(msg) => self.set_error(&msg),
+            None => self.set_message(&format!("{} lines filtered", filtered)),
+        }
         Ok(())
     }
 
@@ -4480,20 +4614,22 @@ impl Editor {
         // was raw: ex never is, and re-enabling unconditionally left it raw.
         let was_raw = self.terminal.is_raw_mode();
         self.terminal.disable_raw_mode()?;
-        println!(); // Blank line before output
+        if was_raw {
+            println!(); // Blank line before output, on the screen
+        }
 
-        let result = self.shell.write_to(command, &text);
+        let result = self.shell().write_to(command, &text);
 
         // Wait for the user to read the output before the screen is redrawn --
         // visual mode only.  In ex there is no redraw and no user, and the
         // read consumes a byte of the *command stream*: see
         // `execute_shell_command`.
         if was_raw && result.is_ok() {
-            use std::io::{self, Read, Write};
+            use std::io::{self, Write};
             print!("\nPress ENTER or type command to continue");
             io::stdout().flush()?;
             let mut buf = [0u8; 1];
-            let _ = io::stdin().read(&mut buf);
+            let _ = crate::input::lines::read_some(&mut buf);
         }
 
         if was_raw {
@@ -5169,8 +5305,10 @@ impl Editor {
         }
         self.files.clear_pathname_changed();
 
-        if self.files.current_file().is_none() {
-            self.files.set_current_file(Some(path.clone()));
+        // 94372-94377: a file argument is the current pathname if there is
+        // none, and otherwise the alternate.
+        if named {
+            self.files.note_file_argument(&path);
         }
 
         self.set_message(&stats.message(&path));

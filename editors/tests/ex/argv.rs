@@ -19,7 +19,7 @@ use std::process::{Command, Stdio};
 
 /// Run ex in `dir` with `args`, `script` on stdin; HOME and TMPDIR are
 /// `dir`, so recovery files and `.exrc` stay inside it.
-fn run(dir: &Path, args: &[&str], script: &str) -> (String, String, i32) {
+pub(super) fn run(dir: &Path, args: &[&str], script: &str) -> (String, String, i32) {
     let mut child = Command::new(get_binary_path("ex"))
         .args(args)
         .current_dir(dir)

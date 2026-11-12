@@ -92,12 +92,15 @@ fn test_ex_yank_put_keeps_cr() {
 }
 
 #[test]
-fn test_ex_read_shell_output_keeps_cr() {
+fn test_ex_read_shell_output_folds_crlf() {
+    // 95283-95284: a <carriage-return><newline> pair in program output is
+    // one <newline>; a lone <carriage-return> is text.  (A file `:r` reads
+    // keeps its CRs: see above.)
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("f"), b"x\n").unwrap();
     assert_eq!(
-        ex_on(dir.path(), "f", "r !printf 'a\\r\\n'\nwq\n"),
-        b"x\na\r\n"
+        ex_on(dir.path(), "f", "r !printf 'a\\r\\nb\\rc\\n'\nwq\n"),
+        b"x\na\nb\rc\n"
     );
 }
 
@@ -282,6 +285,5 @@ fn test_ex_non_utf8_current_pathname_is_kept() {
     fs::write(dir.path().join(b), b"two\n").unwrap();
     let (out, code) = ex_raw(dir.path(), &[a, b], b"e!\np\nr\n$p\nn!\np\n!cat %\nq\n");
     assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
-    // `:!` writes a blank line before the command's output.
-    assert_eq!(out, b"one\none\ntwo\n\ntwo\n");
+    assert_eq!(out, b"one\none\ntwo\ntwo\n");
 }

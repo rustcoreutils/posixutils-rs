@@ -1445,7 +1445,7 @@ fn test_line_first_non_blank() {
 fn test_shell_executor_expand_percent() {
     let mut exec = ShellExecutor::new("/bin/sh");
     exec.set_current_file(Some("test.txt".to_string()));
-    let result = exec.expand_command("cat %").unwrap();
+    let result = exec.expand_command("cat %").unwrap().0;
     assert_eq!(result, "cat test.txt");
 }
 
@@ -1454,7 +1454,7 @@ fn test_shell_executor_expand_hash() {
     let mut exec = ShellExecutor::new("/bin/sh");
     exec.set_current_file(Some("current.txt".to_string()));
     exec.set_alternate_file(Some("alternate.txt".to_string()));
-    let result = exec.expand_command("diff % #").unwrap();
+    let result = exec.expand_command("diff % #").unwrap().0;
     assert_eq!(result, "diff current.txt alternate.txt");
 }
 
@@ -1462,7 +1462,7 @@ fn test_shell_executor_expand_hash() {
 fn test_shell_executor_expand_escaped() {
     let mut exec = ShellExecutor::new("/bin/sh");
     exec.set_current_file(Some("test.txt".to_string()));
-    let result = exec.expand_command("echo \\%").unwrap();
+    let result = exec.expand_command("echo \\%").unwrap().0;
     assert_eq!(result, "echo %");
 }
 
@@ -1499,7 +1499,7 @@ fn test_shell_executor_last_command() {
     assert_eq!(exec.last_command(), Some("echo test"));
 
     // ! should expand to last command
-    let result = exec.expand_command("!").unwrap();
+    let result = exec.expand_command("!").unwrap().0;
     assert_eq!(result, "echo test");
 }
 

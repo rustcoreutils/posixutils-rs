@@ -851,7 +851,7 @@ pub(crate) fn split_plus_command(args: &str) -> (Option<String>, &str) {
     let Some(body) = args.strip_prefix('+') else {
         return (None, args);
     };
-    let (mut cmd, rest) = take_escaped_field(body);
+    let (mut cmd, rest) = take_escaped_field(body, false);
     // A bare `+` is the historical "start at the last line".
     if cmd.is_empty() {
         cmd.push('$');
@@ -863,12 +863,21 @@ pub(crate) fn split_plus_command(args: &str) -> (Option<String>, &str) {
 /// <backslash> escapes that protect a <blank> from ending it (94954-94955).
 ///
 /// Returns the unescaped field and the remainder with leading <blank>s removed.
-fn take_escaped_field(s: &str) -> (String, &str) {
+/// A `file_name` field keeps its `\%`, `\#` and `\\` for the editor's `%`
+/// and `#` expansion.
+fn take_escaped_field(s: &str, file_name: bool) -> (String, &str) {
     let mut field = String::new();
     let mut escaped = false;
     let mut end = s.len();
     for (i, c) in s.char_indices() {
         if escaped {
+            // `\%` and `\#` stay escaped: the editor expands the field's
+            // unescaped `%` and `#` (94666-94669) when it runs.
+            // (`\\` too, so `\\%` -- a backslash, then the name -- stays
+            // apart from `\%`.)
+            if file_name && matches!(c, '%' | '#' | '\\') {
+                field.push('\\');
+            }
             field.push(c);
             escaped = false;
         } else if c == '\\' {
@@ -893,7 +902,7 @@ fn split_escaped_fields(s: &str) -> Vec<String> {
     let mut fields = Vec::new();
     let mut rest = s.trim_start();
     while !rest.is_empty() {
-        let (field, tail) = take_escaped_field(rest);
+        let (field, tail) = take_escaped_field(rest, true);
         if !field.is_empty() {
             fields.push(field);
         }

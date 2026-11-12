@@ -18,6 +18,7 @@ mod cmdline;
 mod fileio;
 mod global;
 mod marks;
+mod shell;
 mod signals;
 
 use plib::testing::{get_binary_path, run_test, TestPlan};

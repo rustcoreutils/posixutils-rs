@@ -244,6 +244,11 @@ impl Editor {
             .ok_or(ViError::NoFileName)?;
 
         let raw = std::fs::read(crate::bytes::path(&path)).map_err(ViError::Io)?;
+        // 94372-94377: a file argument is the current pathname if there is
+        // none, and otherwise the alternate.
+        if let Some(f) = file {
+            self.files.note_file_argument(&crate::bytes::path(f));
+        }
         let content = crate::bytes::decode(&raw);
 
         let lines: Vec<&str> = split_lines(&content).collect();

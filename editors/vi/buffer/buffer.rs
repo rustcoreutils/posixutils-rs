@@ -551,6 +551,20 @@ impl Buffer {
         }
     }
 
+    /// Delete the character at the cursor and leave the column where it is,
+    /// as text input mode needs (its cursor may sit past the last
+    /// character, where `delete_char` would clamp it).
+    pub fn delete_char_at_insert(&mut self) -> Option<char> {
+        let col = self.cursor.column;
+        let line = self.lines.get_mut(self.cursor.line.checked_sub(1)?)?;
+        if col >= line.len() {
+            return None;
+        }
+        let gone = line.delete_char(col);
+        self.modified = true;
+        gone
+    }
+
     /// Delete the character before the cursor (backspace).
     pub fn delete_char_before(&mut self) -> Option<char> {
         if self.is_empty() {

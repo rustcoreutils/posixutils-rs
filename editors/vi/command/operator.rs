@@ -12,7 +12,7 @@
 //! Operators work on text ranges defined by motions or text objects.
 
 use crate::buffer::{
-    char_index_at_byte, leading_blank_width, render_indent, split_lines, Buffer, BufferMode,
+    leading_blank_width, prev_char_boundary, render_indent, split_lines, Buffer, BufferMode,
     Position, Range,
 };
 use crate::error::{Result, ViError};
@@ -369,14 +369,11 @@ fn put_chars_after(buffer: &mut Buffer, text: &str, count: usize) -> Result<Posi
     // Move cursor right one position (put after)
     if let Some(line) = buffer.line(pos.line) {
         if !line.is_empty() {
-            let content = line.content();
-            let chars: Vec<(usize, char)> = content.char_indices().collect();
-            let idx = char_index_at_byte(content, pos.column);
-            if idx + 1 < chars.len() {
-                buffer.set_column(chars[idx + 1].0);
-            } else {
-                buffer.set_column(content.len());
-            }
+            // Past the last character is a text-input position:
+            // `set_column` would clamp it back onto that character, and the
+            // text would go in before it.
+            let at = line.next_char_offset(pos.column).unwrap_or(line.len());
+            buffer.set_column_for_insert(at);
         }
     }
 
@@ -387,8 +384,10 @@ fn put_chars_after(buffer: &mut Buffer, text: &str, count: usize) -> Result<Posi
 
     // Position on last inserted character
     let new_pos = buffer.cursor();
-    if new_pos.column > 0 {
-        buffer.set_column(new_pos.column.saturating_sub(1));
+    if let Some(line) = buffer.line(new_pos.line) {
+        if let Some(col) = prev_char_boundary(line.content(), new_pos.column) {
+            buffer.set_column(col);
+        }
     }
 
     Ok(buffer.cursor())

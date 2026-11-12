@@ -1148,3 +1148,19 @@ fn test_ex_global_copy_to_last_line() {
     editor.execute_keys(":g/X/t$\n").unwrap();
     assert_eq!(editor.get_buffer_text(), "X1\na\nX2\nb\nX1\nX2\n");
 }
+
+#[test]
+fn test_put_after_last_character_goes_after_it() {
+    // `p` with the cursor on the last character puts the text after it,
+    // and the cursor lands on the last character put.
+    let mut e = Editor::new_headless();
+    e.set_buffer_text("abc\n");
+    e.execute_keys("lD$p").unwrap();
+    assert_eq!(e.get_buffer_text(), "abc\n");
+    assert_eq!(e.get_cursor().column, 2);
+    let mut e = Editor::new_headless();
+    e.set_buffer_text("x\u{e9}\n");
+    e.execute_keys("ly$P$p").unwrap();
+    assert_eq!(e.get_buffer_text(), "x\u{e9}\u{e9}\u{e9}\n");
+    assert_eq!(e.get_cursor().column, 5);
+}

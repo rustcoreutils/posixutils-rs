@@ -101,6 +101,13 @@ pub enum LastCommand {
     },
     /// Parsed command (delete, change, yank, etc.).
     Parsed(crate::command::ParsedCommand),
+    /// A command that entered text input mode (`c`, `C`, `s`, `3i`, ...)
+    /// and the text typed there: `.` runs the command again and types the
+    /// text.
+    Input {
+        cmd: crate::command::ParsedCommand,
+        text: String,
+    },
     /// Simple command that doesn't go through the parser (x, X, J, etc.).
     Simple {
         command: char,
@@ -141,6 +148,8 @@ pub struct Editor {
     parser: CommandParser,
     /// Insert mode state.
     insert_state: Option<InsertState>,
+    /// The command that began the insert session, for `.` to repeat.
+    insert_origin: Option<crate::command::ParsedCommand>,
     /// Ex command line input.
     ex_input: String,
     /// The command-line prompt `ex_input` was opened with: `:` for an ex
@@ -288,6 +297,7 @@ impl Editor {
             mode: Mode::Command,
             parser: CommandParser::new(),
             insert_state: None,
+            insert_origin: None,
             ex_input: String::new(),
             ex_prompt: ':',
             options,
@@ -343,6 +353,7 @@ impl Editor {
             mode: Mode::Command,
             parser: CommandParser::new(),
             insert_state: None,
+            insert_origin: None,
             ex_input: String::new(),
             ex_prompt: ':',
             options,
@@ -401,6 +412,7 @@ impl Editor {
             mode: Mode::Command,
             parser: CommandParser::new(),
             insert_state: None,
+            insert_origin: None,
             ex_input: String::new(),
             ex_prompt: ':',
             options,
@@ -1380,53 +1392,6 @@ impl Editor {
                     self.ex_input = "?".to_string();
                     return Ok(());
                 }
-                Key::Char('i') => {
-                    self.enter_insert(InsertKind::Insert);
-                    return Ok(());
-                }
-                Key::Char('a') => {
-                    self.enter_insert(InsertKind::Append);
-                    return Ok(());
-                }
-                Key::Char('I') => {
-                    self.enter_insert(InsertKind::InsertBol);
-                    return Ok(());
-                }
-                Key::Char('A') => {
-                    self.enter_insert(InsertKind::AppendEol);
-                    return Ok(());
-                }
-                Key::Char('o') => {
-                    self.enter_insert(InsertKind::OpenBelow);
-                    return Ok(());
-                }
-                Key::Char('O') => {
-                    self.enter_insert(InsertKind::OpenAbove);
-                    return Ok(());
-                }
-                Key::Char('R') => {
-                    self.mode = Mode::Replace;
-                    self.insert_state = Some(InsertState::new(
-                        InsertKind::Insert,
-                        self.buffer.cursor(),
-                        1,
-                    ));
-                    return Ok(());
-                }
-                Key::Char('C') => {
-                    // Change to end of line. `delete_to_end_of_line` returns
-                    // what it removed; recomputing it here would slice by
-                    // character where the buffer slices by byte.
-                    let at = self.buffer.cursor();
-                    self.undo.begin_group();
-                    let removed = self.buffer.delete_to_end_of_line();
-                    if !removed.is_empty() {
-                        self.undo.note_dropped(self.buffer.take_dropped_marks());
-                        self.undo.record_delete(at, &removed, false);
-                    }
-                    self.enter_insert(InsertKind::Append);
-                    return Ok(());
-                }
                 _ => {}
             }
         }
@@ -1442,12 +1407,28 @@ impl Editor {
         Ok(())
     }
 
+    /// Run `f` as one undo group, closed whether or not it fails.  An insert
+    /// session `f` opens holds the group open itself until its ESC, so the
+    /// operator and the text typed are one `u` (and no group leaks).
+    fn grouped(&mut self, f: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+        self.undo.begin_group();
+        let result = f(self);
+        self.undo.end_group();
+        result
+    }
+
     /// Enter insert mode.
     fn enter_insert(&mut self, kind: InsertKind) {
-        // An insert session is one command. When an operator opened a group
-        // already (c/s/S/C), this call is a no-op and the operator's removal
-        // and the typed text end up in the same group, so one `u` reverses
-        // the whole change.
+        self.enter_insert_counted(kind, 1);
+    }
+
+    /// Enter insert mode for a command given `count`: on ESC the input is
+    /// repeated to make `count` copies.
+    fn enter_insert_counted(&mut self, kind: InsertKind, count: usize) {
+        // An insert session is one command.  When an operator opened a group
+        // already (c/s/S/C), this nests inside it: the operator closes its
+        // level, and ESC closes this one and with it the group, so one `u`
+        // reverses the removal and the typed text together.
         self.undo.begin_group();
 
         // `o` and `O` create their line inside `enter_insert_mode`, which used
@@ -1470,7 +1451,12 @@ impl Editor {
             state.erase_char = self.terminal.erase_char();
             state.kill_char = self.terminal.kill_char();
             state.previous_insert = self.previous_insert.clone();
-            self.mode = Mode::Insert(kind);
+            state.count = count.max(1);
+            self.mode = if kind == InsertKind::Replace {
+                Mode::Replace
+            } else {
+                Mode::Insert(kind)
+            };
             self.insert_state = Some(state);
         } else {
             // Nothing will close the group otherwise, and a leaked group
@@ -1497,26 +1483,19 @@ impl Editor {
                 if !state.inserted_text.is_empty() {
                     self.previous_insert = state.inserted_text.clone();
                 }
-                // Record for undo
-                if !state.inserted_text.is_empty() {
-                    self.undo.note_dropped(self.buffer.take_dropped_marks());
-                    self.undo
-                        .record_insert(state.start_pos, &state.inserted_text, false);
-                }
+                self.record_insert_session(&state);
                 self.undo.end_group();
-                // Save for . (dot) repeat
-                self.last_command = Some(LastCommand::Insert {
-                    kind: state.kind,
-                    text: state.inserted_text.clone(),
-                    count: state.count,
+                // Save for . (dot) repeat: the command that began the
+                // session, if one did, so `.` repeats its change as well.
+                let text = state.inserted_text.clone();
+                self.last_command = Some(match self.insert_origin.take() {
+                    Some(cmd) => LastCommand::Input { cmd, text },
+                    None => LastCommand::Insert {
+                        kind: state.kind,
+                        text,
+                        count: state.count,
+                    },
                 });
-                // Handle repeat count
-                if state.count > 1 {
-                    let text = state.inserted_text.clone();
-                    for _ in 1..state.count {
-                        self.buffer.insert_str(&text);
-                    }
-                }
             } else {
                 // Stay in insert mode
                 self.insert_state = Some(state);
@@ -1524,6 +1503,26 @@ impl Editor {
         }
 
         Ok(())
+    }
+
+    /// Record an insert session for undo: the line it began on, against
+    /// the lines that became of it -- whatever it typed, erased, overwrote
+    /// (`R`) or repeated (a count), and however many lines it split into.
+    fn record_insert_session(&mut self, state: &InsertState) {
+        let first = state.first_line;
+        let last = self.buffer.cursor().line.max(first);
+        let new: Vec<String> = (first..=last)
+            .filter_map(|n| self.buffer.line(n))
+            .map(|l| l.content().to_string())
+            .collect();
+        if new.len() != 1 || new[0] != state.orig_line {
+            self.undo.note_dropped(self.buffer.take_dropped_marks());
+            self.undo.record_replace_lines(
+                Position::new(first, state.start_pos.column),
+                std::slice::from_ref(&state.orig_line),
+                &new,
+            );
+        }
     }
 
     /// Handle a key in ex mode.
@@ -1777,7 +1776,14 @@ impl Editor {
         let line_only = match cmd.command {
             '\'' | 'G' | 'H' | 'L' | 'M' | 'z' => true,
             '%' | '(' | ')' | '{' | '}' | '[' | ']' | '`' | 'n' | 'N' => false,
-            _ => return self.execute_command_inner(cmd),
+            _ => {
+                let was_inserting = self.insert_state.is_some();
+                let result = self.execute_command_inner(cmd);
+                if !was_inserting && self.insert_state.is_some() {
+                    self.insert_origin = Some(cmd.clone());
+                }
+                return result;
+            }
         };
         // Set once the command has moved the cursor -- not before, or `''`
         // would read back the position it was about to leave.
@@ -2009,6 +2015,23 @@ impl Editor {
             // keys were already in the command parser's table.
             's' | 'S' => {
                 self.execute_substitute_command(cmd)?;
+            }
+            // Text input: a count repeats the input (121196, 121355, 121426,
+            // 121510).  `A` is `$[count]a`, `I` is `^[count]i`.
+            'i' => self.enter_insert_counted(InsertKind::Insert, count),
+            'a' => self.enter_insert_counted(InsertKind::Append, count),
+            'I' => self.enter_insert_counted(InsertKind::InsertBol, count),
+            'A' => self.enter_insert_counted(InsertKind::AppendEol, count),
+            'o' => self.enter_insert_counted(InsertKind::OpenBelow, count),
+            'O' => self.enter_insert_counted(InsertKind::OpenAbove, count),
+            'R' => self.enter_insert_counted(InsertKind::Replace, count),
+            // `[buffer][count] C` is `[buffer][count] c$` (121252-121254).
+            'C' => {
+                let mut change = cmd.clone();
+                change.command = 'c';
+                change.count = 1;
+                change.motion = Some(crate::command::MotionCommand::new('$').with_count(cmd.count));
+                self.execute_change(&change)?;
             }
             // Put commands
             'p' => {
@@ -2276,9 +2299,10 @@ impl Editor {
     /// value of the last repeatable command." So `.` after a map that deleted a
     /// line repeats whatever the user last did by hand, not the map's `dd`.
     ///
-    /// The exception is not needed here: every command that enters text input
-    /// mode records through `LastCommand::Insert` when the session ends, which
-    /// is a different path.
+    /// The exception is not needed here: a command that enters text input
+    /// mode is recorded when its session ends, as `LastCommand::Input` (or
+    /// `LastCommand::Insert` for a session no vi command began), which is a
+    /// different path.
     fn save_last_command(&mut self, cmd: &crate::command::ParsedCommand) {
         if Self::is_repeatable_command(cmd) && !self.input.is_expanding() {
             self.last_command = Some(LastCommand::Parsed(cmd.clone()));
@@ -2294,37 +2318,28 @@ impl Editor {
                     text,
                     count: orig_count,
                 } => {
-                    // Repeat insert: enter insert mode, insert saved text, exit
+                    // Repeat insert: the same session again, typed from the
+                    // saved text, with a new count if one was given.
                     let repeat_count = if count > 1 { count } else { orig_count };
-                    self.enter_insert(kind);
-                    // Insert the text
-                    for _ in 0..repeat_count {
-                        self.buffer.insert_str(&text);
-                    }
-                    // Exit insert mode and record for undo
-                    if let Some(state) = self.insert_state.take() {
-                        self.mode = Mode::Command;
-                        if !text.is_empty() {
-                            self.undo.note_dropped(self.buffer.take_dropped_marks());
-                            self.undo.record_insert(
-                                state.start_pos,
-                                &text.repeat(repeat_count),
-                                false,
-                            );
+                    self.enter_insert_counted(kind, repeat_count);
+                    self.type_input(&text)?;
+                }
+                LastCommand::Input { mut cmd, text } => {
+                    // A count replaces the command's (and its motion's).
+                    if count > 1 {
+                        cmd.count = count;
+                        if let Some(ref mut mot) = cmd.motion {
+                            mot.count = count;
                         }
-                        // `enter_insert` opened a group and this path never
-                        // closed it, so every later change joined that stale
-                        // group and one `u` reversed the rest of the session.
-                        self.undo.end_group();
                     }
-                    // Clamp cursor to valid position
-                    let pos = self.buffer.cursor();
-                    if pos.column > 0 {
-                        if let Some(line) = self.buffer.line(pos.line) {
-                            if !line.is_empty() && pos.column >= line.len() {
-                                self.buffer.set_column(line.last_char_offset());
-                            }
-                        }
+                    // The command may fail before input begins; then it must
+                    // not replace what `.` repeats.
+                    let save = self.last_command.take();
+                    self.execute_command(&cmd)?;
+                    if self.insert_state.is_some() {
+                        self.type_input(&text)?;
+                    } else {
+                        self.last_command = save;
                     }
                 }
                 LastCommand::Parsed(mut cmd) => {
@@ -2364,6 +2379,26 @@ impl Editor {
             }
         }
         Ok(())
+    }
+
+    /// Type `text` into the open insert session as it was first entered, and
+    /// end it with ESC.  Every character goes in as text: a control
+    /// character or the erase or kill character in it was entered after a
+    /// `^V`, and is entered that way again.
+    fn type_input(&mut self, text: &str) -> Result<()> {
+        let erase = self.terminal.erase_char();
+        let kill = self.terminal.kill_char();
+        for c in text.chars() {
+            if c == '\n' {
+                self.handle_insert_key(Key::Enter)?;
+                continue;
+            }
+            if (c.is_control() && c != '\t') || Some(c) == erase || Some(c) == kill {
+                self.handle_insert_key(Key::Ctrl('v'))?;
+            }
+            self.handle_insert_key(Key::Char(c))?;
+        }
+        self.handle_insert_key(Key::Escape)
     }
 
     /// Execute a macro (register contents as commands).
@@ -2605,22 +2640,24 @@ impl Editor {
             Range::chars(cursor, Position::new(cursor.line, end_col))
         };
 
-        self.undo.begin_group();
         // Snapshot rather than `record_removal`, for the reason given in the
         // `cc` branch: `S` empties its lines instead of removing them.
         let register = cmd.register;
-        let result = self.splice_around(range.start.line, range.end.line, |ed| {
-            change(&mut ed.buffer, range, &mut ed.registers, register)
-        })?;
-        self.buffer.set_cursor(result.cursor);
-        if result.enter_insert {
-            self.enter_insert(if cmd.command == 'S' {
-                InsertKind::Change
-            } else {
-                InsertKind::Insert
-            });
-        }
-        Ok(())
+        let kind = if cmd.command == 'S' {
+            InsertKind::Change
+        } else {
+            InsertKind::Insert
+        };
+        self.grouped(|ed| {
+            let result = ed.splice_around(range.start.line, range.end.line, |ed| {
+                change(&mut ed.buffer, range, &mut ed.registers, register)
+            })?;
+            ed.buffer.set_cursor(result.cursor);
+            if result.enter_insert {
+                ed.enter_insert(kind);
+            }
+            Ok(())
+        })
     }
 
     fn execute_change(&mut self, cmd: &crate::command::ParsedCommand) -> Result<()> {
@@ -2636,19 +2673,21 @@ impl Editor {
                 let range = Range::lines(start, end);
                 // The operator and the insert session it opens are one command,
                 // so a single `u` reverses both.
-                self.undo.begin_group();
                 // A snapshot, not `record_removal`: `change_lines` *empties*
                 // the first line rather than removing it, so recording a
                 // linewise delete made `u` re-insert the original lines and
                 // leave the emptied one behind as a stray blank.
                 let register = cmd.register;
-                let result = self.splice_around(start_line, end_line, |ed| {
-                    change(&mut ed.buffer, range, &mut ed.registers, register)
+                self.grouped(|ed| {
+                    let result = ed.splice_around(start_line, end_line, |ed| {
+                        change(&mut ed.buffer, range, &mut ed.registers, register)
+                    })?;
+                    ed.buffer.set_cursor(result.cursor);
+                    if result.enter_insert {
+                        ed.enter_insert(InsertKind::Change);
+                    }
+                    Ok(())
                 })?;
-                self.buffer.set_cursor(result.cursor);
-                if result.enter_insert {
-                    self.enter_insert(InsertKind::Change);
-                }
             } else {
                 // c + motion
                 let start = self.buffer.cursor();
@@ -2669,25 +2708,36 @@ impl Editor {
                     self.execute_motion(mot)
                 };
                 if let Some(range) = self.operator_region(start, mot, res.as_ref()) {
-                    self.undo.begin_group();
                     // Snapshot, not `record_removal`: the region can now be
                     // line-wise (`cj`, `c'a`, `cH`), and `change_lines` empties
                     // the first line instead of removing it -- so a linewise
                     // delete record makes `u` restore the lines *and* leave the
                     // emptied one behind.  Same reasoning as the `cc` arm.
                     let register = cmd.register;
-                    let result =
-                        self.splice_around(range.start_line(), range.end_line(), |ed| {
-                            change(&mut ed.buffer, range, &mut ed.registers, register)
-                        })?;
-                    // Use set_column_for_insert to allow cursor at end of line
-                    // The change operation's cursor may be clamped, so use range.start
-                    // which is where we want to insert (the start of the deleted text)
-                    self.buffer.set_line(range.start.line);
-                    self.buffer.set_column_for_insert(range.start.column);
-                    if result.enter_insert {
-                        self.enter_insert(InsertKind::Change);
-                    }
+                    self.grouped(|ed| {
+                        let result =
+                            ed.splice_around(range.start_line(), range.end_line(), |ed| {
+                                change(&mut ed.buffer, range, &mut ed.registers, register)
+                            })?;
+                        // The change's cursor may be clamped; text goes in
+                        // where the deleted text began, which may be past
+                        // the end of the line.
+                        ed.buffer.set_line(range.start.line);
+                        ed.buffer.set_column_for_insert(range.start.column);
+                        if result.enter_insert {
+                            ed.enter_insert(InsertKind::Change);
+                        }
+                        Ok(())
+                    })?;
+                } else if mot.motion == '$'
+                    && self
+                        .buffer
+                        .line(self.buffer.cursor().line)
+                        .is_none_or(|l| l.is_empty())
+                {
+                    // `c$` (so `C`) on an empty line has no region, and
+                    // still changes it: text input begins where it stands.
+                    self.enter_insert(InsertKind::Change);
                 }
             }
         }

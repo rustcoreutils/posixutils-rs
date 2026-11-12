@@ -14,6 +14,7 @@
 
 mod bytes;
 mod conformance;
+mod counts;
 mod editing;
 mod excmd;
 mod maps_tags;

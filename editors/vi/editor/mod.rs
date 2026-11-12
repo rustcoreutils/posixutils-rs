@@ -150,6 +150,11 @@ pub struct Editor {
     insert_state: Option<InsertState>,
     /// The command that began the insert session, for `.` to repeat.
     insert_origin: Option<crate::command::ParsedCommand>,
+    /// An operator waiting for the `/` or `?` prompt that is its motion.
+    pending_search_op: Option<crate::command::ParsedCommand>,
+    /// An operator's `/re/+n` search motion (motion `\0`): whether it goes
+    /// the remembered search direction, and its line offset.
+    search_motion: Option<(bool, i64)>,
     /// Ex command line input.
     ex_input: String,
     /// The command-line prompt `ex_input` was opened with: `:` for an ex
@@ -298,6 +303,8 @@ impl Editor {
             parser: CommandParser::new(),
             insert_state: None,
             insert_origin: None,
+            pending_search_op: None,
+            search_motion: None,
             ex_input: String::new(),
             ex_prompt: ':',
             options,
@@ -354,6 +361,8 @@ impl Editor {
             parser: CommandParser::new(),
             insert_state: None,
             insert_origin: None,
+            pending_search_op: None,
+            search_motion: None,
             ex_input: String::new(),
             ex_prompt: ':',
             options,
@@ -413,6 +422,8 @@ impl Editor {
             parser: CommandParser::new(),
             insert_state: None,
             insert_origin: None,
+            pending_search_op: None,
+            search_motion: None,
             ex_input: String::new(),
             ex_prompt: ':',
             options,
@@ -1257,38 +1268,43 @@ impl Editor {
         // snapshot for free.
         self.undo.sync_line_original(&self.buffer);
 
-        // Handle control key commands first
+        // Handle control key commands first.  The scrolling ones take the
+        // count typed before them (a count left in the parser would
+        // otherwise go to the next command); in the middle of any other
+        // command they are an error.
+        if matches!(
+            key,
+            Key::Ctrl('b' | 'f' | 'd' | 'u' | 'e' | 'y') | Key::PageUp | Key::PageDown
+        ) {
+            let has_count = matches!(self.parser.state(), ParserState::Count);
+            if !self.parser.is_ready() && !has_count {
+                self.parser.reset();
+                let _ = self.terminal.bell();
+                return Ok(());
+            }
+            let count = self.parser.get_count().max(1);
+            self.parser.reset();
+            match key {
+                // A count of screens or lines; ^D and ^U make it the new
+                // `scroll` amount.
+                Key::Ctrl('b') | Key::PageUp => self.repeat_scroll(count, Self::page_up)?,
+                Key::Ctrl('f') | Key::PageDown => self.repeat_scroll(count, Self::page_down)?,
+                Key::Ctrl('d') | Key::Ctrl('u') => {
+                    if has_count {
+                        self.options.scroll = count;
+                    }
+                    if key == Key::Ctrl('d') {
+                        self.scroll_down()?;
+                    } else {
+                        self.scroll_up()?;
+                    }
+                }
+                Key::Ctrl('e') => self.repeat_scroll(count, Self::scroll_line_down)?,
+                _ => self.repeat_scroll(count, Self::scroll_line_up)?,
+            }
+            return Ok(());
+        }
         match key {
-            Key::Ctrl('b') | Key::PageUp => {
-                // Page backward
-                self.page_up()?;
-                return Ok(());
-            }
-            Key::Ctrl('f') | Key::PageDown => {
-                // Page forward
-                self.page_down()?;
-                return Ok(());
-            }
-            Key::Ctrl('d') => {
-                // Scroll down half page
-                self.scroll_down()?;
-                return Ok(());
-            }
-            Key::Ctrl('u') => {
-                // Scroll up half page
-                self.scroll_up()?;
-                return Ok(());
-            }
-            Key::Ctrl('e') => {
-                // Scroll forward by line
-                self.scroll_line_down()?;
-                return Ok(());
-            }
-            Key::Ctrl('y') => {
-                // Scroll backward by line
-                self.scroll_line_up()?;
-                return Ok(());
-            }
             Key::Ctrl('g') => {
                 // Display file info
                 let info = self.file_info();
@@ -1566,6 +1582,10 @@ impl Editor {
                 // A `/` or `?` prompt is a search; a `:` line is an ex
                 // command, where `/re/` is an address like any other.
                 let before = self.buffer.cursor();
+                if let Some(op) = self.pending_search_op.take() {
+                    self.search_as_motion(op, &input);
+                    return Ok(());
+                }
                 let outcome = match (self.ex_prompt, input.chars().next()) {
                     ('/', Some('/')) => self.ex_search(&input[1..], '/', SearchDirection::Forward),
                     ('?', Some('?')) => self.ex_search(&input[1..], '?', SearchDirection::Backward),
@@ -1587,10 +1607,22 @@ impl Editor {
             Key::Escape => {
                 self.ex_input.clear();
                 self.ex_pending_literal = false;
+                self.pending_search_op = None;
+                self.ex_prompt = ':';
                 self.mode = Mode::Command;
             }
             Key::Backspace | Key::Delete => {
-                if self.ex_input.is_empty() {
+                // Erasing the prompt itself -- nothing for `:`, the `/` or
+                // `?` a search line starts with -- leaves the line.
+                let at_prompt = if self.ex_prompt == ':' {
+                    self.ex_input.is_empty()
+                } else {
+                    self.ex_input.chars().count() <= 1
+                };
+                if at_prompt {
+                    self.ex_input.clear();
+                    self.pending_search_op = None;
+                    self.ex_prompt = ':';
                     self.mode = Mode::Command;
                 } else {
                     // A quoted character is two chars in the buffer but one
@@ -1607,6 +1639,46 @@ impl Editor {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Run operator `op` over the search typed at its `/` or `?` prompt
+    /// (`input`, with the prompt character first): from the cursor to the
+    /// match, exclusive -- or, with a line offset, whole lines to the line
+    /// it names.  The search sets the pattern `n` repeats; the operator is
+    /// recorded as `op` with the motion `n`, so `.` searches again.
+    fn search_as_motion(&mut self, mut op: crate::command::ParsedCommand, input: &str) {
+        let delim = self.ex_prompt;
+        self.ex_prompt = ':';
+        let Some(body) = input.strip_prefix(delim) else {
+            return;
+        };
+        let dir = if delim == '/' {
+            SearchDirection::Forward
+        } else {
+            SearchDirection::Backward
+        };
+        let start = self.buffer.cursor();
+        let (_, offset) = split_search(body, delim);
+        let outcome = self.ex_search(body, delim, dir);
+        self.buffer.set_cursor(start);
+        if let Err(e) = outcome {
+            self.set_error(&e.to_string());
+            return;
+        }
+        // An empty pattern reuses the last one but not its direction: the
+        // prompt says which way, so the motion is `N` if that differs.
+        let same_way = self.search.direction() == dir;
+        if let Some(mot) = op.motion.as_mut() {
+            if offset == 0 {
+                mot.motion = if same_way { 'n' } else { 'N' };
+            } else {
+                mot.motion = '\0';
+                self.search_motion = Some((same_way, offset));
+            }
+        }
+        if let Err(e) = self.execute_command(&op) {
+            self.set_error(&e.to_string());
+        }
     }
 
     /// Enter ex text input mode, seeding the first input line's autoindent.
@@ -1777,6 +1849,12 @@ impl Editor {
             '\'' | 'G' | 'H' | 'L' | 'M' | 'z' => true,
             '%' | '(' | ')' | '{' | '}' | '[' | ']' | '`' | 'n' | 'N' => false,
             _ => {
+                // An operator's f/F/t/T is the last find too (`dt,` then `;`).
+                if let Some(mot) = &cmd.motion {
+                    if let (Some(c), 'f' | 'F' | 't' | 'T') = (mot.char_arg, mot.motion) {
+                        self.last_find = Some(FindCommand::new(mot.motion, c));
+                    }
+                }
                 let was_inserting = self.insert_state.is_some();
                 let result = self.execute_command_inner(cmd);
                 if !was_inserting && self.insert_state.is_some() {
@@ -1803,99 +1881,25 @@ impl Editor {
     }
 
     fn execute_command_inner(&mut self, cmd: &crate::command::ParsedCommand) -> Result<()> {
-        use crate::command::motion;
-
         let count = cmd.count;
 
+        // An operator whose motion is a search reads it at the `/` or `?`
+        // prompt first; the operator runs when the search is entered.
+        if let Some(m @ ('/' | '?')) = cmd.motion.as_ref().map(|m| m.motion) {
+            self.pending_search_op = Some(cmd.clone());
+            self.mode = Mode::Ex;
+            self.ex_prompt = m;
+            self.ex_input = m.to_string();
+            return Ok(());
+        }
+
         match cmd.command {
-            // Motion commands
-            'h' => {
-                if let Ok(res) = motion::move_left(&self.buffer, count) {
-                    self.buffer.set_cursor(res.position);
-                }
-            }
-            'l' => {
-                if let Ok(res) = motion::move_right(&self.buffer, count) {
-                    self.buffer.set_cursor(res.position);
-                }
-            }
-            'j' => {
-                if let Ok(res) = motion::move_down(&self.buffer, count) {
-                    self.buffer.set_cursor(res.position);
-                }
-            }
-            'k' => {
-                if let Ok(res) = motion::move_up(&self.buffer, count) {
-                    self.buffer.set_cursor(res.position);
-                }
-            }
-            'w' => {
-                if let Ok(res) = motion::move_word_forward(&self.buffer, count) {
-                    self.buffer.set_cursor(res.position);
-                }
-            }
-            'b' => {
-                if let Ok(res) = motion::move_word_backward(&self.buffer, count) {
-                    self.buffer.set_cursor(res.position);
-                }
-            }
-            'e' => {
-                if let Ok(res) = motion::move_word_end(&self.buffer, count) {
-                    self.buffer.set_cursor(res.position);
-                }
-            }
-            '0' => {
-                if let Ok(res) = motion::move_to_line_start(&self.buffer) {
-                    self.buffer.set_cursor(res.position);
-                }
-            }
-            '^' => {
-                if let Ok(res) = motion::move_to_first_non_blank(&self.buffer) {
-                    self.buffer.set_cursor(res.position);
-                }
-            }
-            '$' => {
-                if let Ok(res) = motion::move_to_line_end(&self.buffer, count) {
-                    self.buffer.set_cursor(res.position);
-                }
-            }
-            'G' => {
-                let line = if cmd.has_count { Some(count) } else { None };
-                if let Ok(res) = motion::move_to_line(&self.buffer, line) {
-                    self.buffer.set_cursor(res.position);
-                }
-            }
-            // Screen position commands
-            'H' => {
-                // Move to top of screen
-                let line = self.screen.top_line() + count - 1;
-                let target = line.min(self.buffer.line_count());
-                self.buffer.set_line(target);
-                self.buffer.move_to_first_non_blank();
-            }
-            'M' => {
-                // Move to middle of screen
-                let size = self.terminal.size();
-                let top = self.screen.top_line();
-                let middle = top + (size.rows as usize / 2);
-                let target = middle.min(self.buffer.line_count());
-                self.buffer.set_line(target);
-                self.buffer.move_to_first_non_blank();
-            }
-            'L' => {
-                // Move to bottom of screen, `count` lines up from it.
-                let size = self.terminal.size();
-                let top = self.screen.top_line();
-                // -2 for the status line.  Saturating: a count larger than the
-                // window used to underflow, which aborts in debug and wraps to
-                // a huge line number in release.
-                let bottom = top + (size.rows as usize).saturating_sub(2);
-                let target = bottom
-                    .saturating_sub(count.saturating_sub(1))
-                    .max(top)
-                    .min(self.buffer.line_count());
-                self.buffer.set_line(target);
-                self.buffer.move_to_first_non_blank();
+            // Cursor motions: one table, `motion`, shared with the
+            // operators' motions.
+            'h' | 'l' | ' ' | 'j' | 'k' | 'w' | 'W' | 'b' | 'B' | 'e' | 'E' | '0' | '^' | '$'
+            | 'G' | 'H' | 'M' | 'L' | '%' | 'f' | 'F' | 't' | 'T' | ';' | ',' | 'n' | 'N'
+            | '\'' | '`' | '[' | ']' | '{' | '}' | '(' | ')' | '_' | '|' | '+' | '-' | '\r' => {
+                self.move_cursor(cmd);
             }
             // Enter ex mode (Q = leave visual, enter line-oriented ex mode)
             'Q' => {
@@ -1909,43 +1913,6 @@ impl Editor {
                     self.redraw_window(arg, count)?;
                 }
             }
-            '%' => {
-                if let Ok(res) = motion::find_matching_bracket(&self.buffer) {
-                    self.buffer.set_cursor(res.position);
-                }
-            }
-            'f' => {
-                if let Some(c) = cmd.char_arg {
-                    if let Ok(res) = motion::find_char_forward(&self.buffer, c, count) {
-                        self.buffer.set_cursor(res.position);
-                        self.last_find = Some(FindCommand::new('f', c));
-                    }
-                }
-            }
-            'F' => {
-                if let Some(c) = cmd.char_arg {
-                    if let Ok(res) = motion::find_char_backward(&self.buffer, c, count) {
-                        self.buffer.set_cursor(res.position);
-                        self.last_find = Some(FindCommand::new('F', c));
-                    }
-                }
-            }
-            't' => {
-                if let Some(c) = cmd.char_arg {
-                    if let Ok(res) = motion::till_char_forward(&self.buffer, c, count) {
-                        self.buffer.set_cursor(res.position);
-                        self.last_find = Some(FindCommand::new('t', c));
-                    }
-                }
-            }
-            'T' => {
-                if let Some(c) = cmd.char_arg {
-                    if let Ok(res) = motion::till_char_backward(&self.buffer, c, count) {
-                        self.buffer.set_cursor(res.position);
-                        self.last_find = Some(FindCommand::new('T', c));
-                    }
-                }
-            }
             // Delete commands
             'x' => {
                 // Snapshot the line rather than record a flat delete: with a
@@ -1957,8 +1924,9 @@ impl Editor {
                 self.splice_around(line, line, |ed| {
                     let mut deleted = String::new();
                     for _ in 0..count {
-                        if let Some(c) = ed.buffer.delete_char() {
-                            deleted.push(c);
+                        match ed.buffer.delete_char() {
+                            Some(c) => deleted.push(c),
+                            None => break,
                         }
                     }
                     if !deleted.is_empty() {
@@ -2090,13 +2058,6 @@ impl Editor {
                     );
                 }
             }
-            // Search
-            'n' => {
-                let _ = self.search_next(self.search.direction());
-            }
-            'N' => {
-                let _ = self.search_next(self.search.direction().opposite());
-            }
             // Mark
             'm' => {
                 // 95130-95134: a lowercase letter, `` ` `` or `'`.
@@ -2104,30 +2065,10 @@ impl Editor {
                     self.buffer.set_mark(slot, self.buffer.cursor());
                 }
             }
-            '\'' | '`' => {
-                if let Some(name) = cmd.char_arg {
-                    let _ = self.goto_mark(name, cmd.command == '\'');
-                }
-            }
             // ZZ - write and quit
             'Z' => {
                 if cmd.char_arg == Some('Z') {
                     self.write_and_quit()?;
-                }
-            }
-            // Section motions
-            '[' => {
-                if cmd.char_arg == Some('[') {
-                    if let Ok(res) = motion::move_section_backward(&self.buffer, count) {
-                        self.buffer.set_cursor(res.position);
-                    }
-                }
-            }
-            ']' => {
-                if cmd.char_arg == Some(']') {
-                    if let Ok(res) = motion::move_section_forward(&self.buffer, count) {
-                        self.buffer.set_cursor(res.position);
-                    }
                 }
             }
             // Replace char
@@ -2148,6 +2089,8 @@ impl Editor {
                     // line is an error, and the line is unchanged.
                     if count > remaining {
                         self.set_error("Not enough characters on the line");
+                    } else if c == '\r' || c == '\n' {
+                        self.replace_with_newlines(count)?;
                     } else {
                         self.undo.begin_group();
                         for i in 0..count {
@@ -2172,7 +2115,11 @@ impl Editor {
                 // character was its own change, so `2~` needed two `u`s.
                 self.undo.begin_group();
                 for _ in 0..count {
+                    let before = self.buffer.cursor();
                     self.toggle_case();
+                    if self.buffer.cursor() == before {
+                        break;
+                    }
                 }
                 self.undo.end_group();
             }
@@ -2196,53 +2143,6 @@ impl Editor {
             // Filter through shell (! operator)
             '!' => {
                 self.execute_filter_operator(cmd)?;
-            }
-            // Repeat last f/F/t/T command
-            ';' => {
-                if let Some(find) = self.last_find {
-                    let _ = self.execute_find(find.command, find.target, count);
-                }
-            }
-            // Reverse last f/F/t/T command
-            ',' => {
-                if let Some(find) = self.last_find {
-                    let _ = self.execute_find(find.reverse(), find.target, count);
-                }
-            }
-            // Paragraph motions
-            '{' => {
-                if let Ok(res) = motion::move_paragraph_backward(&self.buffer, count) {
-                    self.buffer.set_cursor(res.position);
-                }
-            }
-            '}' => {
-                if let Ok(res) = motion::move_paragraph_forward(&self.buffer, count) {
-                    self.buffer.set_cursor(res.position);
-                }
-            }
-            // Sentence motions
-            '(' => {
-                if let Ok(res) = motion::move_sentence_backward(&self.buffer, count) {
-                    self.buffer.set_cursor(res.position);
-                }
-            }
-            ')' => {
-                if let Ok(res) = motion::move_sentence_forward(&self.buffer, count) {
-                    self.buffer.set_cursor(res.position);
-                }
-            }
-            // Go to first non-blank, count-1 lines down (_ command)
-            '_' => {
-                let target =
-                    (self.buffer.cursor().line + count.max(1) - 1).min(self.buffer.line_count());
-                self.buffer.set_line(target.max(1));
-                self.buffer.move_to_first_non_blank();
-            }
-            // Go to column
-            '|' => {
-                if let Ok(res) = motion::move_to_column(&self.buffer, count, self.options.tabstop) {
-                    self.buffer.set_cursor(res.position);
-                }
             }
             // Yank line (alias for yy)
             'Y' => {
@@ -2328,8 +2228,10 @@ impl Editor {
                     // A count replaces the command's (and its motion's).
                     if count > 1 {
                         cmd.count = count;
+                        cmd.has_count = true;
                         if let Some(ref mut mot) = cmd.motion {
                             mot.count = count;
+                            mot.has_count = true;
                         }
                     }
                     // The command may fail before input begins; then it must
@@ -2346,11 +2248,13 @@ impl Editor {
                     // Override count if specified
                     if count > 1 {
                         cmd.count = count;
+                        cmd.has_count = true;
                         if let Some(ref mut mot) = cmd.motion {
                             // The motion now carries the full count, so the
                             // repeat has to overwrite it rather than reset it
                             // to 1 and rely on cmd.count.
                             mot.count = count;
+                            mot.has_count = true;
                         }
                     }
                     // Execute the saved command (but don't save it again)
@@ -2853,7 +2757,7 @@ impl Editor {
         let top = self.screen.top_line();
         let rows = self.terminal.size().rows as usize;
         let target = match which {
-            'H' => top + count.saturating_sub(1),
+            'H' => top.saturating_add(count.saturating_sub(1)),
             'M' => top + rows / 2,
             // -2 for the status line, `count` lines up from the bottom.
             _ => (top + rows.saturating_sub(2))
@@ -2872,92 +2776,184 @@ impl Editor {
         &self,
         mot: &crate::command::MotionCommand,
     ) -> Option<crate::command::motion::MotionResult> {
-        use crate::command::motion;
+        self.motion(mot.motion, mot.count, mot.has_count, mot.char_arg)
+            .ok()
+    }
 
-        match mot.motion {
-            'h' => motion::move_left(&self.buffer, mot.count).ok(),
-            'l' => motion::move_right(&self.buffer, mot.count).ok(),
-            'j' => motion::move_down(&self.buffer, mot.count).ok(),
-            'k' => motion::move_up(&self.buffer, mot.count).ok(),
-            'w' => motion::move_word_forward(&self.buffer, mot.count).ok(),
-            'W' => motion::move_bigword_forward(&self.buffer, mot.count).ok(),
-            'b' => motion::move_word_backward(&self.buffer, mot.count).ok(),
-            'B' => motion::move_bigword_backward(&self.buffer, mot.count).ok(),
-            'e' => motion::move_word_end(&self.buffer, mot.count).ok(),
-            'E' => motion::move_bigword_end(&self.buffer, mot.count).ok(),
-            '0' => motion::move_to_line_start(&self.buffer).ok(),
-            '^' => motion::move_to_first_non_blank(&self.buffer).ok(),
-            '$' => motion::move_to_line_end(&self.buffer, mot.count).ok(),
-            'G' => motion::move_to_line(&self.buffer, Some(self.buffer.line_count())).ok(),
-            'f' => mot
-                .char_arg
-                .and_then(|c| motion::find_char_forward(&self.buffer, c, mot.count).ok()),
-            'F' => mot
-                .char_arg
-                .and_then(|c| motion::find_char_backward(&self.buffer, c, mot.count).ok()),
-            't' => mot
-                .char_arg
-                .and_then(|c| motion::till_char_forward(&self.buffer, c, mot.count).ok()),
-            'T' => mot
-                .char_arg
-                .and_then(|c| motion::till_char_backward(&self.buffer, c, mot.count).ok()),
-            '{' => motion::move_paragraph_backward(&self.buffer, mot.count).ok(),
-            '}' => motion::move_paragraph_forward(&self.buffer, mot.count).ok(),
-            '(' => motion::move_sentence_backward(&self.buffer, mot.count).ok(),
-            ')' => motion::move_sentence_forward(&self.buffer, mot.count).ok(),
-            '|' => motion::move_to_column(&self.buffer, mot.count, self.options.tabstop).ok(),
-            '%' => motion::find_matching_bracket(&self.buffer).ok(),
-            // Screen-relative: line-wise, and the cursor settles on the first
-            // non-blank (POSIX, vi, "Move to Top/Middle/Bottom of Screen").
-            'H' | 'M' | 'L' => {
-                let line = self.screen_relative_line(mot.motion, mot.count);
-                Some(
-                    motion::MotionResult::pos(Position::new(line, 0))
-                        .linewise()
-                        .with_first_non_blank(),
-                )
-            }
-            // Line-wise, to the first non-blank (POSIX, vi, "Move to
-            // First Non-Blank on Next/Previous Line", and `_` for the
-            // current line).
-            '+' | '\r' | '\n' => {
-                let line = (self.buffer.cursor().line + mot.count).min(self.buffer.line_count());
-                Some(
-                    motion::MotionResult::pos(Position::new(line, 0))
-                        .linewise()
-                        .with_first_non_blank(),
-                )
-            }
-            '-' => {
-                let line = self.buffer.cursor().line.saturating_sub(mot.count).max(1);
-                Some(
-                    motion::MotionResult::pos(Position::new(line, 0))
-                        .linewise()
-                        .with_first_non_blank(),
-                )
-            }
-            '_' => {
-                let line = (self.buffer.cursor().line + mot.count.saturating_sub(1))
-                    .min(self.buffer.line_count());
-                Some(
-                    motion::MotionResult::pos(Position::new(line, 0))
-                        .linewise()
-                        .with_first_non_blank(),
-                )
-            }
-            // A mark: `'` addresses the line and is line-wise, `` ` ``
-            // addresses the character and is exclusive.
-            '\'' | '`' => {
-                let pos = mot.char_arg.and_then(|name| self.mark_position(name))?;
-                Some(if mot.motion == '\'' {
-                    motion::MotionResult::pos(Position::new(pos.line, 0))
-                        .linewise()
-                        .with_first_non_blank()
+    /// The one table of vi motions: where motion `m` (with `count`, and
+    /// `char_arg` for `f`, a mark, ...) takes the cursor, and how an
+    /// operator treats the region.  Both the commands and the operators'
+    /// motions come here, so a motion behaves the same either way.  An
+    /// `Err` is the motion's error: it cannot move as asked.
+    fn motion(
+        &self,
+        m: char,
+        count: usize,
+        has_count: bool,
+        char_arg: Option<char>,
+    ) -> Result<crate::command::motion::MotionResult> {
+        use crate::command::motion::{self, Boundary, MotionResult};
+
+        let buf = &self.buffer;
+        let cur = buf.cursor();
+        let last = buf.line_count().max(1);
+        // Line-wise, to the first non-blank.
+        let to_line = |line: usize| {
+            MotionResult::pos(Position::new(line, 0))
+                .linewise()
+                .with_first_non_blank()
+        };
+        let failed = |what: &str| ViError::MotionFailed(what.to_string());
+        let arg = || char_arg.ok_or_else(|| failed("missing character"));
+        let paragraph = Boundary::Paragraph {
+            sections: &self.options.sections,
+            paragraphs: &self.options.paragraphs,
+        };
+        let section = Boundary::Section {
+            sections: &self.options.sections,
+        };
+        let find = |kind: char, c: char| match kind {
+            'f' => motion::find_char_forward(buf, c, count),
+            'F' => motion::find_char_backward(buf, c, count),
+            't' => motion::till_char_forward(buf, c, count),
+            _ => motion::till_char_backward(buf, c, count),
+        };
+        Ok(match m {
+            'h' => motion::move_left(buf, count)?,
+            'l' | ' ' => motion::move_right(buf, count)?,
+            'j' => motion::move_down(buf, count)?,
+            'k' => motion::move_up(buf, count)?,
+            'w' => motion::move_word_forward(buf, count)?,
+            'W' => motion::move_bigword_forward(buf, count)?,
+            'b' => motion::move_word_backward(buf, count)?,
+            'B' => motion::move_bigword_backward(buf, count)?,
+            'e' => motion::move_word_end(buf, count)?,
+            'E' => motion::move_bigword_end(buf, count)?,
+            '0' => motion::move_to_line_start(buf)?,
+            '^' => motion::move_to_first_non_blank(buf)?,
+            '$' => motion::move_to_line_end(buf, count)?,
+            // `G` alone is the last line; with a count, that line.
+            'G' => motion::move_to_line(buf, Some(if has_count { count } else { last }))?,
+            'f' | 'F' | 't' | 'T' => find(m, arg()?)?,
+            // Repeat the last f/F/t/T, the same way (`;`) or reversed (`,`).
+            ';' | ',' => {
+                let last_find = self.last_find.ok_or_else(|| failed("no previous find"))?;
+                let kind = if m == ';' {
+                    last_find.command
                 } else {
-                    motion::MotionResult::pos(pos)
-                })
+                    last_find.reverse()
+                };
+                find(kind, last_find.target)?
             }
-            _ => None,
+            '{' => motion::move_to_boundary(buf, count, false, paragraph)?,
+            '}' => motion::move_to_boundary(buf, count, true, paragraph)?,
+            '[' | ']' if char_arg != Some(m) => return Err(failed("not [[ or ]]")),
+            '[' => motion::move_to_boundary(buf, count, false, section)?,
+            ']' => motion::move_to_boundary(buf, count, true, section)?,
+            '(' => motion::move_sentence_backward(buf, count)?,
+            ')' => motion::move_sentence_forward(buf, count)?,
+            '|' => motion::move_to_column(buf, count, self.options.tabstop)?,
+            '%' => motion::find_matching_bracket(buf)?,
+            // Screen-relative: line-wise, to the first non-blank.
+            'H' | 'M' | 'L' => to_line(self.screen_relative_line(m, count)),
+            // `count` lines down (`+`, <CR>) or up (`-`); too few is an
+            // error.
+            '+' | '\r' => match cur.line.checked_add(count) {
+                Some(line) if line <= last => to_line(line),
+                _ => return Err(failed("not that many lines below")),
+            },
+            '-' => match cur.line.checked_sub(count) {
+                Some(line) if line >= 1 => to_line(line),
+                _ => return Err(failed("not that many lines above")),
+            },
+            // The current line and `count - 1` below it.
+            '_' => match cur.line.checked_add(count - 1) {
+                Some(line) if line <= last => to_line(line),
+                _ => return Err(failed("not that many lines below")),
+            },
+            // A mark: `'` its line, line-wise; `` ` `` the character,
+            // exclusive.
+            '\'' | '`' => {
+                let name = arg()?;
+                let pos = self.mark_position(name).ok_or(ViError::MarkNotSet(name))?;
+                if m == '\'' {
+                    to_line(pos.line)
+                } else {
+                    MotionResult::pos(pos)
+                }
+            }
+            // The last search again, `count` times, the same way (`n`) or
+            // the other (`N`).
+            'n' | 'N' => {
+                let step = |pos| {
+                    if m == 'n' {
+                        self.search.search(buf, pos)
+                    } else {
+                        self.search.search_opposite(buf, pos)
+                    }
+                };
+                // With wrapscan the matches cycle: once back at the first
+                // match, only the remainder of the count is left to go.
+                let mut pos = step(cur)?;
+                let first = pos;
+                let mut left = count - 1;
+                let mut cycle = 0usize;
+                while left > 0 {
+                    pos = step(pos)?;
+                    left -= 1;
+                    cycle += 1;
+                    if pos == first {
+                        left %= cycle;
+                    }
+                }
+                MotionResult::pos(pos)
+            }
+            // An operator's search motion with a line offset: whole lines
+            // to the line it names (see `search_as_motion`).
+            '\0' => {
+                let (same_way, offset) = self
+                    .search_motion
+                    .ok_or_else(|| failed("no search to repeat"))?;
+                let found = if same_way {
+                    self.search.search(buf, cur)?
+                } else {
+                    self.search.search_opposite(buf, cur)?
+                };
+                let line = i64::try_from(found.line)
+                    .unwrap_or(i64::MAX)
+                    .saturating_add(offset);
+                match usize::try_from(line) {
+                    Ok(line) if (1..=last).contains(&line) => {
+                        MotionResult::pos(Position::new(line, 0)).linewise()
+                    }
+                    _ => return Err(failed("offset past the buffer")),
+                }
+            }
+            _ => return Err(ViError::InvalidCommand(format!("not a motion: {m}"))),
+        })
+    }
+
+    /// Move the cursor by the motion command `cmd`, as a command rather
+    /// than an operator's motion; a motion that cannot move is an error.
+    fn move_cursor(&mut self, cmd: &crate::command::ParsedCommand) {
+        self.search.update_options(&self.options);
+        match self.motion(cmd.command, cmd.count, cmd.has_count, cmd.char_arg) {
+            Ok(res) => {
+                self.buffer.set_cursor(res.position);
+                if res.first_non_blank {
+                    self.buffer.move_to_first_non_blank();
+                }
+                if let (Some(c), 'f' | 'F' | 't' | 'T') = (cmd.char_arg, cmd.command) {
+                    self.last_find = Some(FindCommand::new(cmd.command, c));
+                }
+                if matches!(cmd.command, 'n' | 'N') {
+                    self.screen.scroll_to_line(res.position.line, &self.buffer);
+                }
+            }
+            Err(e) => {
+                let _ = self.terminal.bell();
+                self.set_error(&e.to_string());
+            }
         }
     }
 
@@ -4577,18 +4573,6 @@ impl Editor {
         self.buffer.set_mark(crate::buffer::CONTEXT_MARK, pos);
     }
 
-    /// Go to a mark.
-    fn goto_mark(&mut self, name: char, first_non_blank: bool) -> Result<()> {
-        let pos = self.mark_position(name).ok_or(ViError::MarkNotSet(name))?;
-
-        self.buffer.set_cursor(pos);
-        if first_non_blank {
-            self.buffer.move_to_first_non_blank();
-        }
-
-        Ok(())
-    }
-
     /// Perform substitution.
     fn substitute(
         &mut self,
@@ -5288,13 +5272,25 @@ impl Editor {
         Ok(())
     }
 
+    /// Scroll by `step` up to `count` times, stopping once it goes nowhere.
+    fn repeat_scroll(&mut self, count: usize, step: fn(&mut Self) -> Result<()>) -> Result<()> {
+        for _ in 0..count {
+            let before = (self.buffer.cursor(), self.screen.top_line());
+            step(self)?;
+            if (self.buffer.cursor(), self.screen.top_line()) == before {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Page down (Ctrl-F).
     fn page_down(&mut self) -> Result<()> {
         let window = self.options.window.max(3);
         let scroll = window.saturating_sub(2);
         let current = self.buffer.cursor().line;
         let max_line = self.buffer.line_count();
-        let new_line = (current + scroll).min(max_line);
+        let new_line = current.saturating_add(scroll).min(max_line);
         self.buffer.set_line(new_line);
         self.buffer.move_to_first_non_blank();
         Ok(())
@@ -5305,7 +5301,7 @@ impl Editor {
         let scroll = self.options.scroll.max(1);
         let current = self.buffer.cursor().line;
         let max_line = self.buffer.line_count();
-        let new_line = (current + scroll).min(max_line);
+        let new_line = current.saturating_add(scroll).min(max_line);
         self.buffer.set_line(new_line);
         self.buffer.move_to_first_non_blank();
         Ok(())
@@ -5359,6 +5355,45 @@ impl Editor {
             ed.replace_char_inner(c);
             Ok(())
         });
+    }
+
+    /// `[count] r<CR>`: the `count` characters at the cursor become `count`
+    /// new lines, all empty but the last, which takes the rest of the line
+    /// -- autoindented like it if `autoindent` is set (121498-121506).
+    fn replace_with_newlines(&mut self, count: usize) -> Result<()> {
+        let cursor = self.buffer.cursor();
+        let Some(content) = self
+            .buffer
+            .line(cursor.line)
+            .map(|l| l.content().to_string())
+        else {
+            return Ok(());
+        };
+        let col = cursor.column.min(content.len());
+        let rest_at = content[col..]
+            .char_indices()
+            .nth(count)
+            .map_or(content.len(), |(i, _)| col + i);
+        let indent = if self.options.autoindent {
+            leading_blanks(&content)
+        } else {
+            ""
+        };
+        let mut lines = vec![content[..col].to_string()];
+        lines.extend(std::iter::repeat_n(String::new(), count - 1));
+        lines.push(format!("{indent}{}", &content[rest_at..]));
+        let line = cursor.line;
+        self.splice_around(line, line, |ed| {
+            ed.buffer.replace_line(line, &lines[0])?;
+            for (i, text) in lines[1..].iter().enumerate() {
+                ed.buffer
+                    .insert_line_after(line + i, Line::from(text.as_str()));
+            }
+            Ok(())
+        })?;
+        self.buffer.set_line(line + count);
+        self.buffer.move_to_first_non_blank();
+        Ok(())
     }
 
     fn replace_char_inner(&mut self, c: char) {
@@ -5431,22 +5466,6 @@ impl Editor {
                 }
             }
         }
-    }
-
-    /// Execute a find command (f/F/t/T).
-    fn execute_find(&mut self, command: char, target: char, count: usize) -> Result<()> {
-        use crate::command::motion;
-        let result = match command {
-            'f' => motion::find_char_forward(&self.buffer, target, count),
-            'F' => motion::find_char_backward(&self.buffer, target, count),
-            't' => motion::till_char_forward(&self.buffer, target, count),
-            'T' => motion::till_char_backward(&self.buffer, target, count),
-            _ => return Ok(()),
-        };
-        if let Ok(res) = result {
-            self.buffer.set_cursor(res.position);
-        }
-        Ok(())
     }
 
     /// Repeat last substitution (& command).

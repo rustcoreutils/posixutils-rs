@@ -98,8 +98,10 @@ fn test_the_error_flag_does_not_outlive_its_message() {
     editor.execute_keys(":unmap nosuch\n").unwrap();
     assert!(editor.is_error_message(), "the failure is reported");
 
-    // Any subsequent keystroke discards the message; the flag must go with it.
-    editor.execute_keys("j").unwrap();
+    // Any subsequent command that succeeds discards the message; the flag
+    // must go with it.  (`0`: on a one-line buffer `j` fails, which is an
+    // error of its own.)
+    editor.execute_keys("0").unwrap();
     assert!(editor.get_message().is_none(), "the message is gone");
     assert!(
         !editor.is_error_message(),

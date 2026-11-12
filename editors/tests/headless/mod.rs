@@ -18,6 +18,7 @@ mod counts;
 mod editing;
 mod excmd;
 mod maps_tags;
+mod motions;
 
 use vi_rs::buffer::Position;
 use vi_rs::mode::Mode;

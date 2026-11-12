@@ -29,7 +29,6 @@ pub use operator::{
 };
 pub use parser::{CommandParser, MotionCommand, ParsedCommand, ParserState};
 pub use text_object::{
-    is_blank, is_paragraph_boundary, is_punct, is_section_boundary, is_word_char, next_bigword_end,
-    next_bigword_start, next_paragraph_start, next_word_end, next_word_start, prev_bigword_start,
-    prev_paragraph_start, prev_word_start, word_end, word_start,
+    is_blank, is_punct, is_word_char, next_bigword_end, next_bigword_start, next_word_end,
+    next_word_start, prev_bigword_start, prev_word_start, word_end, word_start,
 };

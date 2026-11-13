@@ -594,19 +594,24 @@ impl<'a> Parser<'a> {
                 }
                 self.advance();
                 source_locations.push(line);
-                // return | return ( ) | return ( expression )
-                if self.at(&Token::LParen) {
+                // POSIX: return | return ( ) | return ( expression ). GNU bc
+                // also takes `return expression`, which covers the
+                // parenthesized form too: `return (x) + 1` returns x + 1.
+                if self.at(&Token::LParen) && self.peek_at(1) == Some(&Token::RParen) {
                     self.advance();
-                    if self.at(&Token::RParen) {
-                        self.advance();
-                        statements.push(StmtInstruction::Return);
-                    } else {
-                        let e = self.parse_expr()?;
-                        self.expect(Token::RParen, "')'")?;
-                        statements.push(StmtInstruction::ReturnExpr(e));
-                    }
-                } else {
+                    self.advance();
                     statements.push(StmtInstruction::Return);
+                } else if self.at_statement_separator() || self.at(&Token::RBrace) || self.at_end()
+                {
+                    statements.push(StmtInstruction::Return);
+                } else {
+                    // Grouping only matters to whether a statement writes
+                    // its value, so `return (x)` keeps the plain shape.
+                    let value = match self.parse_expr()? {
+                        ExprInstruction::Paren(inner) => *inner,
+                        value => value,
+                    };
+                    statements.push(StmtInstruction::ReturnExpr(value));
                 }
                 Ok(1)
             }
@@ -615,7 +620,7 @@ impl<'a> Parser<'a> {
                 let condition = self.parse_parenthesized_condition()?;
                 source_locations.push(line);
                 let mut body = Vec::new();
-                let instruction_count = self.parse_stmt(&mut body, source_locations)?;
+                let instruction_count = self.parse_body(&mut body, source_locations)?;
                 statements.push(StmtInstruction::If {
                     condition,
                     instruction_count,
@@ -630,7 +635,7 @@ impl<'a> Parser<'a> {
                 let was_in_loop = self.in_loop;
                 self.in_loop = true;
                 let mut body = Vec::new();
-                let result = self.parse_stmt(&mut body, source_locations);
+                let result = self.parse_body(&mut body, source_locations);
                 self.in_loop = was_in_loop;
                 let instruction_count = result?;
                 statements.push(StmtInstruction::While {
@@ -653,7 +658,7 @@ impl<'a> Parser<'a> {
                 let was_in_loop = self.in_loop;
                 self.in_loop = true;
                 let mut body = Vec::new();
-                let result = self.parse_stmt(&mut body, source_locations);
+                let result = self.parse_body(&mut body, source_locations);
                 self.in_loop = was_in_loop;
                 let instruction_count = result?;
                 statements.push(StmtInstruction::For {
@@ -691,6 +696,33 @@ impl<'a> Parser<'a> {
                 Ok(1)
             }
         }
+    }
+
+    fn skip_newlines(&mut self) {
+        while self.at(&Token::Newline) {
+            self.advance();
+        }
+    }
+
+    /// GNU bc's `opt_newline`: one newline, if there is one. Only one: a
+    /// blank line ends the construct, so an abandoned `if (x)` at a terminal
+    /// is reported rather than waiting for a body.
+    fn skip_one_newline(&mut self) {
+        if self.at(&Token::Newline) {
+            self.advance();
+        }
+    }
+
+    /// The body of an `if`, `while` or `for`. POSIX puts it directly after
+    /// the `)`; GNU bc also allows one newline first, so that `{` may open on
+    /// the next line.
+    fn parse_body(
+        &mut self,
+        statements: &mut Vec<StmtInstruction>,
+        source_locations: &mut Vec<usize>,
+    ) -> PResult<usize> {
+        self.skip_one_newline();
+        self.parse_stmt(statements, source_locations)
     }
 
     fn at_statement_separator(&self) -> bool {
@@ -780,22 +812,25 @@ impl<'a> Parser<'a> {
             self.parse_variable_list()?
         };
         self.expect(Token::RParen, "')'")?;
+        // POSIX: `')' '{' NEWLINE opt_auto_define_list statement_list '}'`.
+        // GNU bc also allows one newline before the `{`, and the body to
+        // start on the `{` line.
+        self.skip_one_newline();
         self.expect(Token::LBrace, "'{'")?;
-        // POSIX: `'{' NEWLINE opt_auto_define_list statement_list '}'`.
-        self.expect(Token::Newline, "a newline after '{'")?;
+        self.skip_newlines();
 
         let mut locals = Vec::new();
-        // POSIX: `'{' NEWLINE opt_auto_define_list statement_list '}'`. The
-        // auto list must follow the newline immediately; anywhere else `auto`
-        // is a keyword in statement position, and so a syntax error rather
-        // than a run of single-letter variable references.
+        // The auto list must come first; anywhere else `auto` is a keyword in
+        // statement position, and so a syntax error rather than a run of
+        // single-letter variable references.
         if self.at(&Token::Auto) {
             self.advance();
             locals = self.parse_variable_list()?;
-            if !self.at_statement_separator() {
-                return Err(self.expected("a newline or ';' after an auto list"));
+            if self.at_statement_separator() {
+                self.advance();
+            } else if !self.at(&Token::RBrace) {
+                return Err(self.expected("a newline, ';' or '}' after an auto list"));
             }
-            self.advance();
         }
 
         let was_in_function = self.in_function;
@@ -1565,18 +1600,28 @@ mod test {
         assert!(parse_program("{define}\n", None).is_err());
     }
 
-    /// `auto` is a keyword everywhere, so a misplaced auto list is a syntax
-    /// error rather than a sequence of variable references.
+    /// `auto` is a keyword everywhere, so an auto list after a statement is
+    /// a syntax error rather than a sequence of variable references. Blank
+    /// lines before it are fine.
     #[test]
     fn test_misplaced_auto_is_an_error() {
-        assert!(parse_program("define f() {\n\nauto x\nx = 7\nreturn(x)\n}\n", None).is_err());
         assert!(parse_program("define f() {\n1\nauto x\n}\n", None).is_err());
+        assert!(parse_program("define f() {\n\nauto x\nx = 7\nreturn(x)\n}\n", None).is_ok());
     }
 
-    /// POSIX has only `return` and `return ( expression )`.
+    /// POSIX has only `return` and `return ( expression )`; GNU bc also takes
+    /// `return expression`.
     #[test]
-    fn test_return_without_parentheses_is_an_error() {
-        assert!(parse_program("define f() {\nreturn 5\n}\n", None).is_err());
+    fn test_return_without_parentheses() {
+        let f = parse_function("define f() {\nreturn 5\n}\n");
+        assert_eq!(
+            f.body.as_ref(),
+            [StmtInstruction::ReturnExpr(ExprInstruction::Number(
+                "5".to_string()
+            ))]
+        );
+        let f = parse_function("define f() {\nreturn ()\n}\n");
+        assert_eq!(f.body.as_ref(), [StmtInstruction::Return]);
     }
 
     /// POSIX lexical rule 15 makes `--` a single token.
@@ -1649,10 +1694,33 @@ mod test {
         assert!(parse_program("1 < 2 = 3\n", None).is_err());
     }
 
-    /// A one-line definition is rejected: POSIX requires a newline after '{'.
+    /// POSIX requires a newline after a definition's '{'; GNU bc does not,
+    /// and allows newlines before the '{'.
     #[test]
-    fn test_function_requires_newline_after_brace() {
-        assert!(parse_program("define f(a) { return(a) }\n", None).is_err());
+    fn test_function_brace_newlines_are_optional() {
+        let f = parse_function("define f(a) { auto b; return(a) }\n");
+        assert_eq!(f.locals.as_ref(), [Variable::Number('b')]);
+        assert_eq!(f.body.len(), 1);
+        let f = parse_function("define f(a)\n{\nreturn(a)\n}\n");
+        assert_eq!(f.body.len(), 1);
+        // One newline, as in GNU bc; a blank line is an error.
+        assert!(parse_program("define f(a)\n\n{\nreturn(a)\n}\n", None).is_err());
+    }
+
+    /// GNU bc allows newlines between a condition's ')' and the body.
+    #[test]
+    fn test_newlines_before_a_body() {
+        for text in [
+            "if (1)\n2\n",
+            "while (0)\n{\n}\n",
+            "for (i = 0; i < 1; i++)\n{\ni\n}\n",
+        ] {
+            assert!(parse_program(text, None).is_ok(), "{text:?}");
+        }
+        // Input that stops after the ')' may yet be completed.
+        assert!(parse_program("if (1)\n", None).unwrap_err().is_incomplete);
+        // A blank line ends it, as in GNU bc.
+        assert!(!parse_program("if (1)\n\n", None).unwrap_err().is_incomplete);
     }
 
     #[test]

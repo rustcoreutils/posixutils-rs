@@ -31,6 +31,29 @@ fn test_bc_with_math_library(program: &str, expected_output: &str) {
     });
 }
 
+/// Write `contents` to a program file in `dir`, and return its path as an
+/// operand.
+fn program_file(dir: &plib::tmp::TempDir, contents: &[u8]) -> String {
+    let path = dir.path().join("program.bc");
+    std::fs::write(&path, contents).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// Run `program` on standard input and again as a file operand, and expect
+/// the same output, no diagnostics and success from both.
+fn test_bc_stdin_and_file(program: &str, expected_output: &str) {
+    test_bc(program, expected_output);
+    let dir = plib::tmp::tempdir().unwrap();
+    run_test(TestPlan {
+        cmd: String::from("bc"),
+        args: vec![program_file(&dir, program.as_bytes())],
+        stdin_data: String::new(),
+        expected_out: String::from(expected_output),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
 macro_rules! test_bc {
     ($test_name:ident) => {
         test_bc(
@@ -241,6 +264,43 @@ fn test_bc_assignment_resolves_its_target_first() {
     test_bc("i=0\nb[i] = (i=2)\nb[0]\nb[2]\nquit\n", "2\n0\n");
 }
 
+/// GNU bc accepts a newline between the `)` of an `if`, `while` or `for`
+/// and its body, so `{` may open on the next line. Rejecting it on standard
+/// input left the body to run on its own, unconditionally.
+#[test]
+fn test_bc_newline_before_a_body() {
+    test_bc_stdin_and_file("x = 0\nif (x == 1)\n  x = 99\nx\n", "0\n");
+    test_bc_stdin_and_file("if (1)\n  5\n", "5\n");
+    test_bc_stdin_and_file("for (i=0; i<2; i++)\n{\ni\n}\n", "0\n1\n");
+    test_bc_stdin_and_file("i = 0\nwhile (i < 2)\n{\ni += 1\ni\n}\n", "1\n2\n");
+    // One newline, as in GNU bc: a blank line ends the statement, so an
+    // abandoned `if (x)` at a terminal is reported instead of waiting.
+    let output = plib::testing::run_test_base("bc", &[], b"if (1)\n\n5\n");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("expected an expression"));
+    assert_eq!(output.status.code(), Some(1));
+    // The body may still follow on the same line.
+    test_bc_stdin_and_file("if (1) 5\nwhile (0) 6\n", "5\n");
+}
+
+/// GNU bc forms of a function definition: a newline before `{`, a body
+/// starting on the `{` line, and `return` without parentheses.
+#[test]
+fn test_bc_gnu_function_forms() {
+    test_bc_stdin_and_file("define f(x)\n{\nreturn (x)\n}\nf(3)\n", "3\n");
+    test_bc_stdin_and_file("define f(x) { return (x*2) }\nf(3)\n", "6\n");
+    test_bc_stdin_and_file("define f(x) { auto y; y = x; return (y) }\nf(4)\n", "4\n");
+    test_bc_stdin_and_file("define f(x) {\nreturn x\n}\nf(3)\n", "3\n");
+    test_bc_stdin_and_file("define f(x) {\nreturn x + 1\n}\nf(3)\n", "4\n");
+    // `return (x) + 1` is the expression `(x) + 1`.
+    test_bc_stdin_and_file("define f(x) {\nreturn (x) + 1\n}\nf(3)\n", "4\n");
+    test_bc_stdin_and_file("define f(x) {\nreturn\n}\nf(3)\n", "0\n");
+    test_bc_stdin_and_file("define f(x) {\nreturn ()\n}\nf(3)\n", "0\n");
+    test_bc_stdin_and_file(
+        "define f(x) { if (x) return; return (7) }\nf(0)\nf(1)\n",
+        "7\n0\n",
+    );
+}
+
 /// A mismatch used to bind the missing parameter to the global of the same
 /// name, and silently drop extra arguments without evaluating them.
 #[test]
@@ -311,9 +371,8 @@ fn test_bc_sparse_array() {
 #[test]
 fn test_bc_non_text_file() {
     let dir = plib::tmp::tempdir().unwrap();
-    let path = dir.path().join("binary.bc");
-    std::fs::write(&path, b"1+1\n\xff\xfe\n").unwrap();
-    let output = plib::testing::run_test_base("bc", &[path.to_string_lossy().to_string()], b"");
+    let path = program_file(&dir, b"1+1\n\xff\xfe\n");
+    let output = plib::testing::run_test_base("bc", &[path], b"");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("not a text file"),
@@ -350,10 +409,8 @@ fn test_bc_incomplete_input_at_eof() {
 fn test_bc_exit_status_is_consistent() {
     let dir = plib::tmp::tempdir().unwrap();
     for program in ["1/0\n", "1+\n"] {
-        let path = dir.path().join("program.bc");
-        std::fs::write(&path, program).unwrap();
-        let as_file =
-            plib::testing::run_test_base("bc", &[path.to_string_lossy().to_string()], b"");
+        let path = program_file(&dir, program.as_bytes());
+        let as_file = plib::testing::run_test_base("bc", &[path], b"");
         let as_stdin = plib::testing::run_test_base("bc", &[], program.as_bytes());
         assert_eq!(
             as_file.status.code(),
@@ -722,7 +779,6 @@ fn test_bc_write_error_message() {
     assert_write_error_message_on_full_device("bc", &[], b"1+1\n", 1);
     // Enough output to fill the buffer while the loop runs.
     let dir = plib::tmp::tempdir().unwrap();
-    let path = dir.path().join("program.bc");
-    std::fs::write(&path, "for(i=0;i<5000;++i) i\n").unwrap();
-    assert_write_error_message_on_full_device("bc", &[path.to_str().unwrap()], b"", 1);
+    let path = program_file(&dir, b"for(i=0;i<5000;++i) i\n");
+    assert_write_error_message_on_full_device("bc", &[&path], b"", 1);
 }

@@ -69,6 +69,9 @@ fn spawn_interpreter() -> std::io::Result<std::thread::JoinHandle<()>> {
 
 fn main() {
     plib::io::ensure_std_fds_open();
+    // The signal disposition, locale, message catalog and panic hook are
+    // process-wide, and are set before the interpreter thread exists.
+    diag::init_locale("bc");
     match spawn_interpreter() {
         // `run` ends the process itself; join only returns if it panicked.
         Ok(interpreter) => {
@@ -77,7 +80,6 @@ fn main() {
             }
         }
         Err(e) => {
-            diag::init("bc");
             diag::error(&diag::io_error_text(&e));
             std::process::exit(1);
         }
@@ -321,7 +323,8 @@ fn stdin_is_regular_file() -> bool {
 }
 
 fn run() {
-    diag::init_locale("bc");
+    // The diagnostic prefix and source name are per thread.
+    diag::init("bc");
 
     let args = plib::optarg::parse::<Args>();
 

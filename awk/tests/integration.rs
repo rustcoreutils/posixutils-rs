@@ -2693,7 +2693,12 @@ fn awk_nul_bytes_are_ordinary_characters() {
         ("BEGIN { RS = \";;\" } { print length($0) }", "a\0b;;c", "3\n1\n"),
         ("BEGIN { RS = \";+\" } { print length($0) }", "a\0b;;c", "3\n1\n"),
         ("BEGIN { s = \"a\\0b\"; print length(s) }", "", "3\n"),
-        ("BEGIN { printf \"%c\", 0 | \"od -An -c\" }", "", "  \\0\n"),
+        // od's layout differs between systems; its bytes in hex do not
+        (
+            "BEGIN { od = \"od -An -tx1 | tr -d ' \\\\n'\"; printf \"a%cb\", 0 | od; close(od); print \"\" }",
+            "",
+            "610062\n",
+        ),
     ]);
 }
 

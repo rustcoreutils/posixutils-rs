@@ -491,8 +491,9 @@ but no daemon to run them.  Behavior follows Vixie cron:
 ### expr
 
  * Arithmetic uses 128-bit integers, wider than the `signed long` of XCU
-   1.1.2.1.  A result or operand beyond that range is the error "integer
-   out of range", exit status 2.  Comparisons of integers work at any size.
+   1.1.2.1.  An operand beyond that range is the error "integer out of
+   range", and a result beyond it "integer overflow", both exit status 2.
+   Comparisons of integers work at any size.
 
 ### file
 

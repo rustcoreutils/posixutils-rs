@@ -3087,3 +3087,30 @@ fn awk_stdin_operands_share_their_input() {
         ("a\nb\n", "", Some(0))
     );
 }
+
+// A failure to write out standard output before reading more input is not
+// a failure of the input: the input is still read, and the write error is
+// reported at the end.
+#[cfg(target_os = "linux")]
+#[test]
+fn awk_stdout_failure_before_a_read_is_not_an_input_error() {
+    use std::io::Write;
+    let mut child = std::process::Command::new(plib::testing::get_binary_path("awk"))
+        .arg("BEGIN { print \"x\" } { n++ } END { print \"n=\" n > \"/dev/stderr\" }")
+        .stdin(std::process::Stdio::piped())
+        .stdout(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap(),
+        )
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"a\nb\nc\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.starts_with("n=3\n"), "{stderr}");
+    assert!(stderr.contains("write error"), "{stderr}");
+    assert_eq!(out.status.code(), Some(1));
+}

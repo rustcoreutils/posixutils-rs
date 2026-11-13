@@ -123,6 +123,8 @@ pub struct RecordInput<S> {
     pos: usize,
     /// The source has reported its end.
     eof: bool,
+    /// A read may wait for input: the source is not a regular file.
+    may_block: bool,
 }
 
 /// What a search for a record separator found, in the bytes after `pos`.
@@ -136,12 +138,14 @@ enum SeparatorSearch {
 }
 
 impl<S: Read> RecordInput<S> {
-    pub fn new(source: S) -> Self {
+    /// A reader of `source`, whose reads `may_block` waiting for input.
+    pub fn new(source: S, may_block: bool) -> Self {
         Self {
             source,
             buffer: Vec::new(),
             pos: 0,
             eof: false,
+            may_block,
         }
     }
 
@@ -154,17 +158,24 @@ impl<S: Read> RecordInput<S> {
     /// end of the input.  The bytes before `pos` may be dropped, so callers
     /// keep offsets relative to it.
     ///
-    /// The read may wait for input, so the output awk has collected is
-    /// written out first: a filter in a pipeline fed a line at a time then
-    /// passes each on as it comes.
+    /// A read that may wait for input writes out the output awk has
+    /// collected first: a filter in a pipeline fed a line at a time then
+    /// passes each on as it comes.  A failure to write it is not one of the
+    /// input; it is remembered, and reported at the end of the run.
     fn fill(&mut self) -> Result<usize, String> {
         if self.eof {
             return Ok(0);
         }
-        output::flush_stdout()?;
+        if self.may_block {
+            let _ = output::flush_stdout();
+        }
         if self.pos > 0 && (self.pos == self.buffer.len() || self.pos >= READ_SIZE) {
             self.buffer.drain(..self.pos);
             self.pos = 0;
+            // the room a huge record took is given back
+            if self.buffer.capacity() > 4 * READ_SIZE && self.buffer.len() < READ_SIZE {
+                self.buffer.shrink_to(2 * READ_SIZE);
+            }
         }
         let old_len = self.buffer.len();
         self.buffer.resize(old_len + READ_SIZE, 0);
@@ -310,7 +321,8 @@ pub type FileStream = RecordInput<File>;
 impl FileStream {
     pub fn open(path: &str) -> Result<Self, String> {
         let file = File::open(path_of(path)).map_err(|e| plib::diag::io_error_text(&e))?;
-        Ok(Self::new(file))
+        let regular = file.metadata().is_ok_and(|m| m.is_file());
+        Ok(Self::new(file, !regular))
     }
 }
 
@@ -319,7 +331,13 @@ pub type StdinRecordReader = RecordInput<std::io::Stdin>;
 
 impl Default for StdinRecordReader {
     fn default() -> Self {
-        Self::new(std::io::stdin())
+        // SAFETY: fstat only fills the stat buffer
+        let regular = unsafe {
+            let mut stat: libc::stat = std::mem::zeroed();
+            libc::fstat(libc::STDIN_FILENO, &mut stat) == 0
+                && (stat.st_mode & libc::S_IFMT) == libc::S_IFREG
+        };
+        Self::new(std::io::stdin(), !regular)
     }
 }
 
@@ -603,7 +621,7 @@ impl PipeRecordReader {
         // closes it; ManuallyDrop keeps the File from closing it too
         let file = std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(libc::fileno(pipe)) });
         Ok(Self {
-            input: RecordInput::new(PipeSource { pipe, file }),
+            input: RecordInput::new(PipeSource { pipe, file }, true),
             closed: false,
         })
     }
@@ -703,12 +721,15 @@ mod tests {
     /// source divides it into reads.
     fn split_records(file_contents: &str, separator: RecordSeparator) -> Vec<String> {
         let split = |chunk| {
-            let mut reader = RecordInput::new(ChunkedSource {
-                bytes: file_contents.as_bytes().to_vec(),
-                pos: 0,
-                chunk,
-                ended: false,
-            });
+            let mut reader = RecordInput::new(
+                ChunkedSource {
+                    bytes: file_contents.as_bytes().to_vec(),
+                    pos: 0,
+                    chunk,
+                    ended: false,
+                },
+                false,
+            );
             let mut result = Vec::new();
             while let Some(record) = reader.read_next_record(&separator).unwrap() {
                 result.push(record);

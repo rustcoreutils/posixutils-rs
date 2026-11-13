@@ -71,7 +71,7 @@ pub(crate) fn sprintf(
                 }
                 current_arg -= 1;
                 let value = swap_with_default(&mut values[current_arg]);
-                args.reserve_room(&mut result)?;
+                args.reserve_room(specifier, &mut result)?;
                 format_one_conversion(&mut result, specifier, value, &args, float_format)?;
                 next = iter.next();
             }

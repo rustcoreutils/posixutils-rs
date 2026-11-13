@@ -217,10 +217,15 @@ impl FormatArgs {
         Ok(())
     }
 
-    /// An error if the width or precision cannot be allocated: the output
-    /// of the conversion takes at least that much room.
-    pub fn reserve_room(&self, target: &mut String) -> Result<(), String> {
-        let room = self.width.max(self.precision.unwrap_or(0));
+    /// An error if the room the conversion `specifier` takes at least
+    /// cannot be allocated: its width, and its precision except for `%s`
+    /// and `%c`, where it is the most characters to write.
+    pub fn reserve_room(&self, specifier: char, target: &mut String) -> Result<(), String> {
+        let precision = match specifier {
+            's' | 'c' => 0,
+            _ => self.precision.unwrap_or(0),
+        };
+        let room = self.width.max(precision);
         target
             .try_reserve(room)
             .map_err(|_| "field width or precision too large".to_string())

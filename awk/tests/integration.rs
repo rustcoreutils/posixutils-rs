@@ -2997,3 +2997,20 @@ fn awk_output_is_written_before_waiting_for_input() {
         Some("got abc\n")
     );
 }
+
+// The precision of %s is the most characters to write, so a large one
+// needs no room: it was reserved, and failed under a memory limit.
+#[test]
+fn awk_large_string_precision_needs_no_room() {
+    let awk = plib::testing::get_binary_path("awk");
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(
+            "ulimit -v 500000; \"$0\" 'BEGIN { printf \"%.2000000000s|%.1999999999c\\n\", \"abc\", \"d\" }'",
+        )
+        .arg(awk)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "abc|d\n");
+    assert_eq!(out.status.code(), Some(0));
+}

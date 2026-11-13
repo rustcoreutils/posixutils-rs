@@ -214,6 +214,13 @@ fn expr_integer_out_of_range() {
         "expr: integer out of range\n",
         2,
     );
+    // A result too large for the arithmetic.
+    expr_test_status(
+        &["170141183460469231731687303715884105727", "+", "1"],
+        "",
+        "expr: integer overflow\n",
+        2,
+    );
     // x % -1 is zero for every x, though the matching division overflows.
     expr_test_status(
         &["--", "-170141183460469231731687303715884105728", "%", "-1"],

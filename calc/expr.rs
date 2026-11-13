@@ -76,17 +76,12 @@ fn bool_token(value: bool) -> Token {
     Token::Operand(if value { b"1".to_vec() } else { b"0".to_vec() })
 }
 
-// Does this operand satisfy the POSIX integer production?
+// The sign (true if negative) and the digits of an operand that satisfies
+// the POSIX integer production, or None for one that does not.
 //
 // XCU expr: "integer: An argument consisting only of an (optional) unary minus
 // followed by digits." A leading plus does not qualify, so `+5` is a string,
 // and neither do surrounding blanks.
-fn is_integer_text(bytes: &[u8]) -> bool {
-    integer_parts(bytes).is_some()
-}
-
-// The sign (true if negative) and the digits of an operand that satisfies
-// the integer production, or None for one that does not.
 fn integer_parts(bytes: &[u8]) -> Option<(bool, &[u8])> {
     let (negative, digits) = match bytes.split_first() {
         Some((b'-', rest)) => (true, rest),
@@ -101,14 +96,22 @@ fn integer_parts(bytes: &[u8]) -> Option<(bool, &[u8])> {
 // integer this implementation cannot represent; reporting the second as a
 // "non-integer argument" says something untrue about the input.
 fn integer_value(bytes: &[u8]) -> Result<i128, String> {
-    if !is_integer_text(bytes) {
-        return Err("non-integer argument".to_string());
-    }
-    // ASCII by construction, so the conversion cannot fail.
-    std::str::from_utf8(bytes)
-        .map_err(|_| "non-integer argument".to_string())?
-        .parse::<i128>()
-        .map_err(|_| "integer out of range".to_string())
+    let (negative, digits) =
+        integer_parts(bytes).ok_or_else(|| "non-integer argument".to_string())?;
+    // accumulated with the operand's sign, so that the most negative value
+    // fits as well
+    digits
+        .iter()
+        .try_fold(0i128, |value, &digit| {
+            let digit = i128::from(digit - b'0');
+            let value = value.checked_mul(10)?;
+            if negative {
+                value.checked_sub(digit)
+            } else {
+                value.checked_add(digit)
+            }
+        })
+        .ok_or_else(|| "integer out of range".to_string())
 }
 
 // Does the operand count as "null or zero"?

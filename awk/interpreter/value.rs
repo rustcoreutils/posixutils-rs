@@ -195,6 +195,19 @@ impl AwkValue {
         }
     }
 
+    /// The ERE `ere` as the operand of `~` or of a builtin taking an ERE,
+    /// which uses only the expression: unlike [`Self::from_ere`], it is not
+    /// matched against $0.
+    pub(crate) fn ere_operand(ere: Rc<Regex>) -> Self {
+        Self {
+            value: AwkValueVariant::Regex {
+                ere,
+                matches_record: false,
+            },
+            ref_type: AwkRefType::None,
+        }
+    }
+
     pub(crate) fn from_ere(ere: Rc<Regex>, record: &str) -> Self {
         let matches_record = ere.matches(record);
         Self {

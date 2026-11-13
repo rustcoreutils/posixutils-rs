@@ -657,6 +657,18 @@ impl Compiler {
         index
     }
 
+    /// Makes `operand`, when it is only a regular-expression constant, push
+    /// it as an ERE operand: a regular expression alone stands for a match
+    /// against $0, which an operand of `~` or of match, sub, gsub or split
+    /// does not need.
+    fn ere_operand(&self, operand: &mut Instructions) {
+        if let [OpCode::PushConstant(index)] = operand.opcodes[..] {
+            if matches!(self.constants.borrow()[index as usize], Constant::Regex(_)) {
+                operand.opcodes[0] = OpCode::PushEre(index);
+            }
+        }
+    }
+
     fn get_var(&self, name: &str, locals: &LocalMap) -> Result<OpCode, String> {
         if let Some(local_id) = locals.get(name) {
             Ok(OpCode::GetLocal(*local_id))
@@ -819,6 +831,15 @@ impl Compiler {
                 let fn_info = BUILTIN_FUNCTIONS
                     .get(&function.as_rule())
                     .expect("missing builtin");
+                let ere_argument = match fn_info.function {
+                    BuiltinFunction::Match => Some(1),
+                    BuiltinFunction::Sub | BuiltinFunction::Gsub => Some(0),
+                    BuiltinFunction::Split => Some(2),
+                    _ => None,
+                };
+                if let Some(arg) = ere_argument.and_then(|i| args.get_mut(i)) {
+                    self.ere_operand(arg);
+                }
                 if (fn_info.min_args..=fn_info.max_args).contains(&argc) {
                     let (mut instructions, argc) =
                         normalize_builtin_function_arguments(fn_info.function, args, line_col);
@@ -956,7 +977,11 @@ impl Compiler {
             _ => {}
         }
 
-        instructions.extend(rhs.instructions);
+        let mut rhs_instructions = rhs.instructions;
+        if matches!(op.as_rule(), Rule::match_op | Rule::not_match) {
+            self.ere_operand(&mut rhs_instructions);
+        }
+        instructions.extend(rhs_instructions);
         match op.as_rule() {
             Rule::add => {
                 instructions.push(OpCode::Add, op.line_col());
@@ -2766,11 +2791,7 @@ mod test {
         let (instructions, constants) = compile_expr(r#" "hello" ~ /hello/ "#);
         assert_eq!(
             instructions,
-            vec![
-                OpCode::PushConstant(0),
-                OpCode::PushConstant(1),
-                OpCode::Match
-            ]
+            vec![OpCode::PushConstant(0), OpCode::PushEre(1), OpCode::Match]
         );
         assert_eq!(
             constants,
@@ -2781,6 +2802,28 @@ mod test {
         )
     }
 
+    /// A regular expression that is only the operand of `~` or of match,
+    /// sub, gsub or split is not matched against $0 when pushed; one used
+    /// as a value is.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn ere_operands_are_pushed_without_matching() {
+        let pushes = |expr: &str| {
+            compile_expr(expr)
+                .0
+                .into_iter()
+                .filter(|op| matches!(op, OpCode::PushEre(_) | OpCode::PushConstant(_)))
+                .map(|op| matches!(op, OpCode::PushEre(_)))
+                .collect::<Vec<bool>>()
+        };
+        assert_eq!(pushes("match(\"ab\", /b/)"), [false, true]);
+        assert_eq!(pushes("sub(/b/, \"c\")"), [true, false]);
+        assert_eq!(pushes("gsub((/b/), \"c\", x)"), [true, false]);
+        assert_eq!(pushes("split(\"a b\", a, /b/)"), [false, true]);
+        assert_eq!(pushes("x = /b/"), [false]);
+        assert_eq!(pushes("match(/b/, \"b\")"), [false, false]);
+    }
+
     #[test]
     #[cfg_attr(miri, ignore)]
     fn test_compile_not_match() {
@@ -2789,7 +2832,7 @@ mod test {
             instructions,
             vec![
                 OpCode::PushConstant(0),
-                OpCode::PushConstant(1),
+                OpCode::PushEre(1),
                 OpCode::Match,
                 OpCode::Not
             ]
@@ -4196,7 +4239,7 @@ mod test {
             vec![
                 OpCode::PushZero,
                 OpCode::FieldRef,
-                OpCode::PushConstant(0),
+                OpCode::PushEre(0),
                 OpCode::PushConstant(1),
                 OpCode::CallBuiltin {
                     function: BuiltinFunction::Gsub,
@@ -4204,7 +4247,7 @@ mod test {
                 },
                 OpCode::Pop,
                 OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
-                OpCode::PushConstant(2),
+                OpCode::PushEre(2),
                 OpCode::PushConstant(3),
                 OpCode::CallBuiltin {
                     function: BuiltinFunction::Gsub,
@@ -4234,7 +4277,7 @@ mod test {
                 OpCode::Pop,
                 OpCode::GetGlobal(FIRST_GLOBAL_VAR + 1),
                 OpCode::PushConstant(9),
-                OpCode::PushConstant(10),
+                OpCode::PushEre(10),
                 OpCode::CallBuiltin {
                     function: BuiltinFunction::Split,
                     argc: 3,
@@ -4280,7 +4323,7 @@ mod test {
                 OpCode::Pop,
                 OpCode::PushZero,
                 OpCode::FieldRef,
-                OpCode::PushConstant(20),
+                OpCode::PushEre(20),
                 OpCode::PushConstant(21),
                 OpCode::CallBuiltin {
                     function: BuiltinFunction::Sub,
@@ -4288,7 +4331,7 @@ mod test {
                 },
                 OpCode::Pop,
                 OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
-                OpCode::PushConstant(22),
+                OpCode::PushEre(22),
                 OpCode::PushConstant(23),
                 OpCode::CallBuiltin {
                     function: BuiltinFunction::Sub,

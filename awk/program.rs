@@ -97,6 +97,10 @@ pub enum OpCode {
 
     // Push the constant value on top of the stack
     PushConstant(u32),
+    // Push the regular-expression constant as the operand of `~` or of a
+    // builtin taking an ERE, without matching it against $0 as
+    // `PushConstant` does
+    PushEre(u32),
     // Push 1 on top of the stack
     PushOne,
     // Push 0 on top of the stack

@@ -764,6 +764,10 @@ impl Interpreter {
                         stack.push_value(AwkValue::from_ere(ere, &record.record.borrow()))?
                     }
                 },
+                OpCode::PushEre(index) => match &self.constants[index as usize] {
+                    Constant::Regex(ere) => stack.push_value(AwkValue::ere_operand(ere.clone()))?,
+                    _ => unreachable!("PushEre of a constant that is not an ERE"),
+                },
                 OpCode::PushOne => {
                     stack.push_value(1.0)?;
                 }

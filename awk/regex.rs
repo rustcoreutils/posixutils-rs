@@ -261,7 +261,9 @@ impl Regex {
         if let Some(re) = DYNAMIC_REGEXES.with_borrow(|cache| cache.get(pattern).cloned()) {
             return Ok(re);
         }
-        let re = Rc::new(Self::new(charset::to_cstring(pattern)?)?);
+        let pattern_bytes = charset::to_cstring(pattern)
+            .map_err(|_| "a regular expression cannot hold a NUL character".to_string())?;
+        let re = Rc::new(Self::new(pattern_bytes)?);
         DYNAMIC_REGEXES.with_borrow_mut(|cache| {
             if cache.len() >= DYNAMIC_REGEX_CACHE_SIZE {
                 cache.clear();

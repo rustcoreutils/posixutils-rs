@@ -2772,3 +2772,16 @@ fn awk_regex_search_after_a_match_sees_the_character_before() {
         "Xab Xcd\0Xef Xgh\n",
     )]);
 }
+
+// regexec cannot be given a NUL byte, so a dynamic regular expression
+// holding one is an error that says so.
+#[test]
+fn awk_regex_with_nul_is_an_error_saying_so() {
+    let (_, stderr, status) = awk_with_deadline("BEGIN { print (\"a\" ~ \"\\0\") }");
+    assert!(
+        stderr
+            .starts_with("awk: runtime error: a regular expression cannot hold a NUL character\n"),
+        "{stderr}"
+    );
+    assert_eq!(status, Some(1));
+}

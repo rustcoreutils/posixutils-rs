@@ -500,10 +500,11 @@ impl ReadFiles {
     }
 }
 
-/// What close() of a pipe returns for the `pclose` result `status`: the
-/// command's exit status, 256 plus the number of the signal that killed it,
-/// as in gawk and mawk, or -1 if `pclose` failed.
-fn close_status(status: libc::c_int) -> i32 {
+/// What close() of a pipe and system() return for the `pclose` or
+/// `system` result `status`: the command's exit status, 256 plus the number
+/// of the signal that killed it, as in gawk and mawk, or -1 if the call
+/// failed.
+pub(crate) fn wait_status(status: libc::c_int) -> i32 {
     if status == -1 {
         -1
     } else if libc::WIFEXITED(status) {
@@ -564,12 +565,12 @@ impl WritePipes {
     }
 
     /// Close a previously-opened output pipe. Returns the command's
-    /// status as `close_status` gives it, or `None` if no pipe was open under
+    /// status as `wait_status` gives it, or `None` if no pipe was open under
     /// this name.
     pub fn close_pipe(&mut self, filename: &str) -> Option<i32> {
         self.pipes
             .remove(filename)
-            .map(|file| close_status(unsafe { libc::pclose(file) }))
+            .map(|file| wait_status(unsafe { libc::pclose(file) }))
     }
 }
 
@@ -612,11 +613,11 @@ impl PipeRecordReader {
         })
     }
 
-    /// `pclose` the pipe and return the command's status as `close_status`
+    /// `pclose` the pipe and return the command's status as `wait_status`
     /// gives it. Marks the reader closed so `Drop` will not close it again.
     fn pclose(&mut self) -> i32 {
         self.closed = true;
-        close_status(unsafe { libc::pclose(self.pipe) })
+        wait_status(unsafe { libc::pclose(self.pipe) })
     }
 }
 
@@ -685,7 +686,7 @@ impl ReadPipes {
     }
 
     /// Close a previously-opened input pipe. Returns the command's status as
-    /// `close_status` gives it, or `None` if no pipe was open under this name.
+    /// `wait_status` gives it, or `None` if no pipe was open under this name.
     pub fn close_pipe(&mut self, command: &str) -> Option<i32> {
         self.pipes.remove(command).map(|mut reader| reader.pclose())
     }

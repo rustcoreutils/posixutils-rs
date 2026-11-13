@@ -2751,3 +2751,15 @@ fn awk_diagnostics_name_the_utility_and_the_file() {
     assert_eq!(stderr, "awk: missing program argument\n");
     assert_eq!(status, Some(1));
 }
+
+// system() returns 256 plus the signal number for a command killed by a
+// signal, as close() of a pipe does and as gawk, mawk and the one true awk
+// do; it returned 128 plus the number.
+#[test]
+fn awk_system_status_of_a_signalled_command() {
+    assert_awk_cases(&[(
+        "BEGIN { print system(\"kill -9 $$\"); print \"\" | \"kill -9 $$\"; print close(\"kill -9 $$\") }",
+        "",
+        "265\n265\n",
+    )]);
+}

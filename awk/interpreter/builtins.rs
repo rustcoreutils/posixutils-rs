@@ -16,6 +16,7 @@ use super::format::{
     fmt_write_unsigned, parse_conversion_specifier_args, FormatArgs, IntegerFormat, I64_LIMIT,
     U64_LIMIT,
 };
+use super::io::wait_status;
 use super::record::{split_record, FieldSeparator, FieldsState};
 use super::stack::Stack;
 use super::string::AwkString;
@@ -489,20 +490,10 @@ fn write_stdout(s: &str) -> Result<(), String> {
     })
 }
 
-/// Run `command` via `libc::system` and translate its wait-status into the value
-/// awk's `system()` returns: the exit code for a normal exit, `128 + signal` for
-/// a signalled child, or -1 when the command could not be run.
+/// Run `command` via `libc::system`; awk's `system()` returns its status as
+/// `close()` of a pipe does (see [`wait_status`]).
 fn run_system(command: &CString) -> i32 {
-    let status = unsafe { libc::system(command.as_ptr()) };
-    if status == -1 {
-        -1
-    } else if libc::WIFEXITED(status) {
-        libc::WEXITSTATUS(status)
-    } else if libc::WIFSIGNALED(status) {
-        128 + libc::WTERMSIG(status)
-    } else {
-        -1
-    }
+    wait_status(unsafe { libc::system(command.as_ptr()) })
 }
 
 pub(crate) fn gather_values(stack: &mut Stack, count: u16) -> Result<Vec<AwkValue>, String> {

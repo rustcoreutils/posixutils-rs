@@ -2756,3 +2756,19 @@ fn awk_deep_recursion() {
         "20000\n",
     )]);
 }
+
+// A search after an earlier match sees the character before it, so a word
+// boundary is found only where there is one: gsub(/\</, "X") put an X
+// before every letter but the first of each word.
+#[test]
+fn awk_regex_search_after_a_match_sees_the_character_before() {
+    assert_awk_cases(&[(
+        "BEGIN { s = \"ab cd\"; t = s; gsub(/\\</, \"X\", s); gsub(/\\>/, \"Y\", t); print s, t }",
+        "",
+        "Xab Xcd abY cdY\n",
+    ), (
+        "{ gsub(/\\</, \"X\"); print }",
+        "ab cd\0ef gh\n",
+        "Xab Xcd\0Xef Xgh\n",
+    )]);
+}

@@ -294,36 +294,45 @@ impl Regex {
     /// `has_nul` says whether `bytes` holds a NUL byte, which the caller
     /// finds out once for a subject searched many times.
     fn find_from(&self, bytes: &[u8], from: usize, has_nul: bool) -> Option<RegexMatch> {
+        let found = |m: Match, offset: usize| RegexMatch {
+            start: offset + m.start,
+            end: offset + m.end,
+        };
+        // A search from `from` sees the text before it as context: a word
+        // boundary at `from` looks at the character before it.
         if !has_nul {
-            let m = self
+            return self
                 .inner
-                .find_bytes_flags(&bytes[from..], from > 0, false)?;
-            return Some(RegexMatch {
-                start: from + m.start,
-                end: from + m.end,
-            });
+                .find_bytes_at(bytes, from, false)
+                .map(|m| found(m, 0));
         }
-        let mut start = from;
+        // the piece that holds `from`, then those after it
+        let mut start = bytes[..from]
+            .iter()
+            .rposition(|&b| b == 0)
+            .map_or(0, |p| p + 1);
+        let mut from = from;
         loop {
-            let end = bytes[start..]
+            let end = bytes[from..]
                 .iter()
                 .position(|&b| b == 0)
-                .map_or(bytes.len(), |p| start + p);
-            let not_bol = start > 0;
+                .map_or(bytes.len(), |p| from + p);
+            let piece = &bytes[start..end];
             let not_eol = end < bytes.len();
-            if let Some(m) = self
-                .inner
-                .find_bytes_flags(&bytes[start..end], not_bol, not_eol)
-            {
-                return Some(RegexMatch {
-                    start: start + m.start,
-                    end: start + m.end,
-                });
+            let m = if from > start {
+                // `^` cannot match where the search starts
+                self.inner.find_bytes_at(piece, from - start, not_eol)
+            } else {
+                self.inner.find_bytes_flags(piece, start > 0, not_eol)
+            };
+            if let Some(m) = m {
+                return Some(found(m, start));
             }
             if end == bytes.len() {
                 return None;
             }
             start = end + 1;
+            from = start;
         }
     }
 

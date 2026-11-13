@@ -2819,7 +2819,7 @@ fn awk_call_trace_of_a_deep_recursion_is_short() {
     let lines: Vec<&str> = stderr.lines().filter(|l| !l.is_empty()).collect();
     assert!(lines.len() < 20, "{} lines", lines.len());
     assert_eq!(lines[0], "awk: runtime error: attempt to access field -1");
-    assert!(lines.contains(&"=> ... 4992 more calls"), "{stderr}");
+    assert!(lines.contains(&"=> ... 4991 more calls"), "{stderr}");
     assert_eq!(lines.last().copied(), Some("=> <start> at :1:60"));
 }
 

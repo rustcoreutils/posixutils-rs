@@ -253,7 +253,7 @@ fn stack_trace(error: String, stack: Stack) -> String {
     .expect("error writing to string");
     // the innermost calls and the outermost: a deep recursion has
     // thousands, which would bury the error
-    const INNERMOST: usize = 8;
+    const INNERMOST: usize = 9;
     let frames = stack.call_frames.len();
     for (n, frame) in stack.call_frames.iter().rev().enumerate() {
         if n == INNERMOST && frames > INNERMOST + 1 {

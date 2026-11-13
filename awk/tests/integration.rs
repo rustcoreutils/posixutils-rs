@@ -2355,3 +2355,24 @@ fn awk_printf_integer_conversions_of_any_number() {
         ),
     ]);
 }
+
+// With the default FS, fields are separated by blanks and newlines only: a
+// carriage return or form feed is part of a field, as POSIX says and the
+// other awks do.  CR ending a line of a CRLF file was taken as a
+// separator, changing NF and dropping the CR from a rebuilt record.
+#[test]
+fn awk_default_fs_splits_on_blanks_and_newlines_only() {
+    assert_awk_cases(&[
+        (
+            "{ print NF; $1 = $1; print length($0), ($NF == \"\\r\") }",
+            "a b \r\n",
+            "3\n5 1\n",
+        ),
+        ("{ print NF }", "a\x0cb\n a\tb \n", "1\n2\n"),
+        (
+            "BEGIN { print split(\"a\\rb\", x), split(\" a \\n b\\t\", y), y[2] }",
+            "",
+            "1 2 b\n",
+        ),
+    ]);
+}

@@ -54,9 +54,11 @@ pub(crate) fn split_record<S: FnMut(usize, AwkString) -> Result<(), String>>(
 ) -> Result<(), String> {
     let string = |s: &str| -> AwkString { maybe_numeric_string(s) };
     match field_separator {
+        // POSIX: fields are separated by sequences of <blank> and <newline>
+        // characters; a carriage return or form feed is part of a field
         FieldSeparator::Default => record
-            .trim_start()
-            .split_ascii_whitespace()
+            .split([' ', '\t', '\n'])
+            .filter(|s| !s.is_empty())
             .enumerate()
             .try_for_each(|(i, s)| store_result(i, string(s))),
         FieldSeparator::Char(c) => record

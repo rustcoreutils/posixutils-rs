@@ -323,7 +323,7 @@ impl Interpreter {
         let result = match op {
             ArithOp::Add => Ok(lhs.add(rhs)),
             ArithOp::Sub => Ok(lhs.sub(rhs)),
-            ArithOp::Mul => Ok(lhs.mul(rhs, self.scale)),
+            ArithOp::Mul => lhs.mul(rhs, self.scale),
             ArithOp::Div => lhs.div(rhs, self.scale),
             ArithOp::Mod => lhs.modulus(rhs, self.scale),
             ArithOp::Pow => lhs.pow(rhs, self.scale),
@@ -584,7 +584,7 @@ impl Interpreter {
     ) -> ExecutionResult<Number> {
         match expr {
             ExprInstruction::Number(x) => {
-                Number::parse(x, self.ibase).ok_or("invalid digit for the current ibase".into())
+                Number::parse(x, self.ibase).map_err(ExecutionError::from)
             }
             // Grouping changes no value; it only changes whether the statement
             // writes one, which `should_print` reads off the outermost node.

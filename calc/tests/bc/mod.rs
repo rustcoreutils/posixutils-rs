@@ -202,6 +202,44 @@ fn test_bc_working_digit_cap() {
     );
 }
 
+/// The working-digit cap holds for multiplication and for literals too. A
+/// product past it printed as 0, and a long literal was an "invalid digit".
+#[test]
+fn test_bc_working_digit_cap_for_products_and_literals() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let path = program_file(&dir, b"scale=400000\nx=1/3\nscale=2000000\nx*x*x\n");
+    let output = plib::testing::run_test_base("bc", &[path], b"");
+    assert_eq!(output.stdout, b"");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!(
+            "bc: runtime error ({} - line 4): number too large\n",
+            dir.path().join("program.bc").display()
+        )
+    );
+
+    // A literal of a million fractional digits is read, quickly; one more
+    // digit is too large. (Standard input would be paced by the test
+    // harness, so these are file operands.)
+    let path = program_file(
+        &dir,
+        format!("x=.{}\nscale(x)\n", "7".repeat(1_000_000)).as_bytes(),
+    );
+    let start = std::time::Instant::now();
+    let output = plib::testing::run_test_base("bc", &[path], b"");
+    assert_eq!(output.stdout, b"1000000\n");
+    assert!(start.elapsed().as_secs() < 30, "took {:?}", start.elapsed());
+    let path = program_file(&dir, format!("x=.{}\n", "7".repeat(1_000_001)).as_bytes());
+    let output = plib::testing::run_test_base("bc", &[path], b"");
+    assert!(String::from_utf8_lossy(&output.stderr).ends_with("number too large\n"));
+
+    // A quotient is held to the cap too, whatever the scale of its dividend.
+    let path = program_file(&dir, b"scale=1000000\nx=1/3\nscale=2000000\nx/1\n");
+    let output = plib::testing::run_test_base("bc", &[path], b"");
+    assert_eq!(output.stdout, b"");
+    assert!(String::from_utf8_lossy(&output.stderr).ends_with("number too large\n"));
+}
+
 /// POSIX: "references to any of these names from other functions that are
 /// called from this function also refer to the new value". A callee saw the
 /// global instead of the caller's parameter or auto.

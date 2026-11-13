@@ -315,11 +315,16 @@ impl Interpreter {
         Ok(())
     }
 
-    /// Closes the output files at the end of the run: an error if one could
-    /// not be written.  (Standard output is written out by the caller, which
-    /// keeps the exit status; pipes are closed, and their commands waited
-    /// for, when the interpreter is dropped.)
+    /// Ends the output at the end of the run: writes out standard output,
+    /// then closes the pipes, waiting for their commands, whose output
+    /// comes after awk's, and the output files: an error if a file could
+    /// not be written.  A failure to write standard output is remembered
+    /// (see [`output::stdout_write_error`]) for the caller, which reports
+    /// it keeping the exit status.
     fn finish_output(&mut self) -> Result<(), String> {
+        let _ = output::flush_stdout();
+        self.write_pipes = WritePipes::default();
+        self.read_pipes = ReadPipes::default();
         self.write_files.close_all()
     }
 
@@ -1193,8 +1198,9 @@ pub fn interpret(
     match result {
         Ok(status) => interpreter.finish_output().map(|()| status),
         Err(error) => {
-            // what was written before the error comes before its report
-            let _ = output::flush_stdout();
+            // what was written before the error comes before its report;
+            // a failure to write it would hide the error, so it is ignored
+            output::flush_stdout_quietly();
             Err(error)
         }
     }

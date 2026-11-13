@@ -64,6 +64,17 @@ pub fn write_stdout(s: &str) -> Result<(), String> {
     }
 }
 
+/// Writes out what standard output has collected, without remembering a
+/// failure for [`stdout_write_error`]: before an error is reported, which
+/// such a failure must not replace.
+pub fn flush_stdout_quietly() {
+    let pending = BUFFER.with_borrow_mut(|buffer| buffer.as_mut().map(std::mem::take));
+    let mut stdout = std::io::stdout().lock();
+    let _ = stdout
+        .write_all(&pending.unwrap_or_default())
+        .and_then(|_| stdout.flush());
+}
+
 /// Writes out what standard output has collected.
 pub fn flush_stdout() -> Result<(), String> {
     let pending = BUFFER.with_borrow_mut(|buffer| match buffer {

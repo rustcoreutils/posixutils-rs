@@ -2913,3 +2913,55 @@ fn awk_write_error_on_an_output_file() {
     );
     assert_eq!(status, Some(0));
 }
+
+// At the end of the run awk's own output is written before the commands
+// it printed to are waited for, so it comes before what they print then.
+#[test]
+fn awk_output_at_exit_comes_before_the_commands_output() {
+    assert_awk_cases(&[("BEGIN { print \"x\" | \"cat\"; print \"y\" }", "", "y\nx\n")]);
+}
+
+/// Runs awk with `args`, its standard output going to `stdout`, and
+/// returns its standard error and exit status.
+#[cfg(target_os = "linux")]
+fn awk_to(args: &[&str], stdout: std::fs::File) -> (String, Option<i32>) {
+    let out = std::process::Command::new(plib::testing::get_binary_path("awk"))
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(stdout)
+        .output()
+        .unwrap();
+    (
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code(),
+    )
+}
+
+// A failure at the end of the run does not lose the output awk had
+// collected, and a runtime error is reported as itself even when writing
+// out that output fails too.
+#[cfg(target_os = "linux")]
+#[test]
+fn awk_output_survives_a_failure_at_the_end() {
+    let tmp = plib::tmp::TempDir::new().unwrap();
+    let path = tmp.path().join("out");
+    let (stderr, status) = awk_to(
+        &["BEGIN { print \"hello\"; print \"x\" > \"/dev/full\" }"],
+        std::fs::File::create(&path).unwrap(),
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
+    assert!(stderr.contains("/dev/full"), "{stderr}");
+    assert_eq!(status, Some(1));
+    let (stderr, status) = awk_to(
+        &["BEGIN { print \"a\"; $(-1) }"],
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap(),
+    );
+    assert!(
+        stderr.starts_with("awk: runtime error: attempt to access field -1"),
+        "{stderr}"
+    );
+    assert_eq!(status, Some(1));
+}

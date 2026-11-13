@@ -133,10 +133,14 @@ fn main() {
         eprintln!("awk: {}", gettext("missing program argument"));
         1
     };
-    // The output awk has collected, and any line without its <newline> yet,
-    // is written out here, where a write error can still be reported.
+    // The output awk collected was written out at the end of the run; a
+    // failure then is reported here, keeping the exit status.
     if let Err(error) = interpreter::flush_stdout() {
         eprintln!("awk: {error}");
+        std::process::exit(return_status.max(1));
+    }
+    if let Some(reason) = interpreter::stdout_write_error() {
+        eprintln!("awk: {}: {reason}", gettext("write error"));
         std::process::exit(return_status.max(1));
     }
     if !plib::diag::flush_stdout() {

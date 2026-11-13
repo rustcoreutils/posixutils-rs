@@ -2418,3 +2418,51 @@ fn awk_rs_change_keeps_input_read_ahead() {
         ),
     ]);
 }
+
+/// Starts awk on `program`, writes `input` to it and, with its standard
+/// input still open, waits up to 10 seconds for a first line of output:
+/// the record awk returns before the end of its input.
+fn awk_first_line_before_eof(program: &str, input: &str) -> Option<String> {
+    use std::io::{BufRead, Write};
+    use std::time::Duration;
+    let mut child = std::process::Command::new(plib::testing::get_binary_path("awk"))
+        .arg(program)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(input.as_bytes()).unwrap();
+    stdin.flush().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = std::io::BufReader::new(stdout).read_line(&mut line);
+        let _ = sender.send(line);
+    });
+    let line = receiver.recv_timeout(Duration::from_secs(10)).ok();
+    drop(stdin);
+    let _ = child.kill();
+    child.wait().unwrap();
+    line
+}
+
+// A record is returned as soon as its separator is read, without waiting
+// for more input, when more input could not make the separator longer.
+#[test]
+fn awk_record_is_returned_before_more_input() {
+    for (program, input) in [
+        ("{ print \"got \" $0; fflush() }", "abc\n"),
+        (
+            "BEGIN { RS = \"\\n|;\" } { print \"got \" $0; fflush() }",
+            "abc\n",
+        ),
+    ] {
+        assert_eq!(
+            awk_first_line_before_eof(program, input).as_deref(),
+            Some("got abc\n"),
+            "{program}"
+        );
+    }
+}

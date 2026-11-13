@@ -67,10 +67,18 @@ fn path_of(name: &str) -> PathBuf {
     PathBuf::from(OsStr::from_bytes(&charset::encode(name)))
 }
 
+/// Whether a match of `re` might be made longer by more input: whether
+/// the expression repeats anything.  (An alternative such as `a|ab` could
+/// too, but waiting for more input after every separator would delay each
+/// record of an interactive input.)
+fn match_may_grow(re: &Regex) -> bool {
+    re.pattern().contains(['*', '+', '?', '{'])
+}
+
 /// Try to find a regex match in the byte buffer. Returns the record before
 /// the match and the remainder after it, or None if no match found.  Before
 /// the end of the input (`at_eof` false), a match that reaches the end of
-/// the buffer is not taken: the input still to come could extend it (two
+/// the buffer is not taken if the input still to come could extend it (two
 /// newlines read one at a time for RS = "\n+").
 fn ere_try_match(
     buf: &[u8],
@@ -81,7 +89,7 @@ fn ere_try_match(
         return Ok(None);
     }
     match re.find_nonempty_bytes(buf) {
-        Some(m) if at_eof || m.end < buf.len() => {
+        Some(m) if at_eof || m.end < buf.len() || !match_may_grow(re) => {
             let record = bytes_to_string(buf[..m.start].to_vec());
             let remainder = buf[m.end..].iter().copied().collect();
             Ok(Some((record, remainder)))

@@ -3026,3 +3026,39 @@ fn awk_huge_input_record_can_grow() {
         "1500001 y\n",
     )]);
 }
+
+// The files of several -f options form one program, their concatenation,
+// as POSIX says: a rule may begin in one and end in the next.  Syntax and
+// runtime errors are still reported with the file and line in it.
+#[test]
+fn awk_program_files_are_concatenated() {
+    let tmp = plib::tmp::TempDir::new().unwrap();
+    let write = |name: &str, text: &str| {
+        let path = tmp.path().join(name);
+        std::fs::write(&path, text).unwrap();
+        path.to_string_lossy().into_owned()
+    };
+    let a = write("a.awk", "BEGIN {");
+    let b = write("b.awk", "print \"ok\" }\n");
+    let (stdout, stderr, status) = awk_args(&["-f", &a, "-f", &b], "");
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), status),
+        ("ok\n", "", Some(0))
+    );
+
+    let good = write("good.awk", "BEGIN { x = 1 }\n");
+    let bad = write("bad.awk", "\n\nBEGIN { @ }\n");
+    let (_, stderr, status) = awk_args(&["-f", &good, "-f", &bad], "");
+    assert!(stderr.contains(&format!("--> {bad}:3:9")), "{stderr}");
+    assert_ne!(status, Some(0));
+
+    let main = write("main.awk", "BEGIN { f() }\n");
+    let lib = write("lib.awk", "\nfunction f() { return $(-1) }\n");
+    let (_, stderr, status) = awk_args(&["-f", &main, "-f", &lib], "");
+    assert!(stderr.contains(&format!("=> f at {lib}:2:")), "{stderr}");
+    assert!(
+        stderr.contains(&format!("=> <start> at {main}:1:")),
+        "{stderr}"
+    );
+    assert_eq!(status, Some(1));
+}

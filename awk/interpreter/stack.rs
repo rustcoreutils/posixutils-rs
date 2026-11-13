@@ -145,7 +145,6 @@ impl From<AwkValue> for StackValue {
 
 pub(crate) struct CallFrame<'i> {
     pub(crate) function_name: Rc<str>,
-    pub(crate) function_file: Rc<str>,
     pub(crate) source_locations: &'i [SourceLocation],
     pub(crate) bp: *mut StackValue,
     pub(crate) sp: *mut StackValue,
@@ -206,7 +205,6 @@ impl Drop for StackMemory {
 ///   it, as values are pushed one at a time
 pub(crate) struct Stack<'i, 's> {
     pub(crate) current_function_name: Rc<str>,
-    pub(crate) current_function_file: Rc<str>,
     pub(crate) ip: isize,
     pub(crate) instructions: &'i [OpCode],
     pub(crate) source_locations: &'i [SourceLocation],
@@ -375,10 +373,8 @@ impl<'i, 's> Stack<'i, 's> {
             ip: self.ip,
             instructions: self.instructions,
             source_locations: self.source_locations,
-            function_file: self.current_function_file.clone(),
             function_name: self.current_function_name.clone(),
         };
-        self.current_function_file = function.debug_info.file.clone();
         self.current_function_name = function.name.clone();
         self.call_frames.push(caller_frame);
         self.bp = new_bp;
@@ -397,7 +393,6 @@ impl<'i, 's> Stack<'i, 's> {
         self.instructions = caller_frame.instructions;
         self.source_locations = caller_frame.source_locations;
         self.current_function_name = caller_frame.function_name;
-        self.current_function_file = caller_frame.function_file;
         self.ip = caller_frame.ip;
     }
 
@@ -406,7 +401,6 @@ impl<'i, 's> Stack<'i, 's> {
         // one past the end pointers are safe
         let stack_end = unsafe { bp.add(memory.capacity) };
         Self {
-            current_function_file: main.debug_info.file.clone(),
             current_function_name: "<start>".into(),
             instructions: &main.instructions,
             source_locations: &main.debug_info.source_locations,

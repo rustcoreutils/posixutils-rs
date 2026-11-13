@@ -27,7 +27,7 @@ use value::{AwkRefType, AwkValue, AwkValueRef, AwkValueVariant};
 use crate::charset;
 use crate::compiler::escape_string_contents;
 use crate::program::{
-    Action, BuiltinFunction, Constant, Function, OpCode, Pattern, Program, SpecialVar,
+    Action, BuiltinFunction, Constant, Function, OpCode, Pattern, Program, SourceMap, SpecialVar,
 };
 use crate::regex::Regex;
 use std::collections::HashMap;
@@ -237,18 +237,20 @@ struct Interpreter {
     read_pipes: ReadPipes,
     rand_seed: u64,
     rng: SmallRng,
+    /// Where the files of the program start, for the lines of errors.
+    source_map: SourceMap,
 }
 
-fn stack_trace(error: String, stack: Stack) -> String {
+/// The report of the runtime error `error`, with the calls it happened in,
+/// their lines found in `source_map`.
+fn stack_trace(error: String, stack: Stack, source_map: &SourceMap) -> String {
     let mut result = format!("runtime error: {}\ncall trace:\n", error);
     let error_location = stack.source_locations[stack.ip as usize];
+    let (file, line) = source_map.locate(error_location.line);
     writeln!(
         result,
         "=> {} at {}:{}:{}",
-        stack.current_function_name,
-        stack.current_function_file,
-        error_location.line,
-        error_location.column
+        stack.current_function_name, file, line, error_location.column
     )
     .expect("error writing to string");
     // the innermost calls and the outermost: a deep recursion has
@@ -264,10 +266,11 @@ fn stack_trace(error: String, stack: Stack) -> String {
             continue;
         }
         let source_location = frame.source_locations[frame.ip as usize];
+        let (file, line) = source_map.locate(source_location.line);
         writeln!(
             result,
             "=> {} at {}:{}:{}",
-            frame.function_name, frame.function_file, source_location.line, source_location.column
+            frame.function_name, file, line, source_location.column
         )
         .expect("error writing to string");
     }
@@ -528,7 +531,7 @@ impl Interpreter {
     ) -> Result<ExecutionResult, String> {
         let mut stack = Stack::new(action, stack);
         match self.run_internal(functions, record, &mut stack, global_env, main_input) {
-            Err(err) => Err(stack_trace(err, stack)),
+            Err(err) => Err(stack_trace(err, stack, &self.source_map)),
             Ok(result) => Ok(result),
         }
     }
@@ -964,6 +967,7 @@ impl Interpreter {
             read_pipes: ReadPipes::default(),
             rand_seed: 0,
             rng: SmallRng::seed_from_u64(0),
+            source_map: SourceMap::default(),
         }
     }
 }
@@ -1029,6 +1033,7 @@ pub fn interpret(
     let mut stack = StackMemory::new(STACK_SIZE);
     let mut current_record = Record::default();
     let mut interpreter = Interpreter::new(args, env, program.constants, program.globals_count);
+    interpreter.source_map = program.source_map;
     let mut global_env = GlobalEnv::default();
     let mut range_pattern_started = vec![false; program.rules.len()];
     let mut exit_status = 0;

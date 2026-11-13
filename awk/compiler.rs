@@ -11,7 +11,7 @@
 
 use crate::program::{
     Action, AwkRule, BuiltinFunction, Constant, DebugInfo, Function, OpCode, Pattern, Program,
-    SourceLocation, SpecialVar, VarId,
+    SourceLocation, SourceMap, SpecialVar, VarId,
 };
 use crate::regex::Regex;
 
@@ -525,12 +525,11 @@ impl Instructions {
         self.source_locations.extend(instructions.source_locations);
     }
 
-    fn into_action(self, file: Rc<str>) -> Action {
+    fn into_action(self) -> Action {
         Action {
             instructions: self.opcodes,
             debug_info: DebugInfo {
                 source_locations: self.source_locations,
-                file,
             },
         }
     }
@@ -1796,17 +1795,13 @@ impl Compiler {
         }
     }
 
-    fn compile_normal_pattern(
-        &mut self,
-        pattern: Pair<Rule>,
-        file: Rc<str>,
-    ) -> Result<Pattern, PestError> {
+    fn compile_normal_pattern(&mut self, pattern: Pair<Rule>) -> Result<Pattern, PestError> {
         let pattern = first_child(pattern);
         match pattern.as_rule() {
             Rule::expr => {
                 let mut instructions = Instructions::default();
                 self.compile_expr(pattern, &mut instructions, &HashMap::new())?;
-                Ok(Pattern::Expr(instructions.into_action(file)))
+                Ok(Pattern::Expr(instructions.into_action()))
             }
             Rule::range_pattern => {
                 let mut inner = pattern.into_inner();
@@ -1820,8 +1815,8 @@ impl Compiler {
                 self.compile_expr(end, &mut end_instructions, &HashMap::new())?;
 
                 Ok(Pattern::Range {
-                    start: start_instructions.into_action(file.clone()),
-                    end: end_instructions.into_action(file),
+                    start: start_instructions.into_action(),
+                    end: end_instructions.into_action(),
                 })
             }
             _ => unreachable!(
@@ -1831,7 +1826,7 @@ impl Compiler {
         }
     }
 
-    fn compile_rule(&mut self, rule: Pair<Rule>, file: Rc<str>) -> Result<AwkRule, PestError> {
+    fn compile_rule(&mut self, rule: Pair<Rule>) -> Result<AwkRule, PestError> {
         let rule = first_child(rule);
         match rule.as_rule() {
             Rule::action => {
@@ -1839,24 +1834,24 @@ impl Compiler {
                 self.compile_action(rule, &mut instructions, &HashMap::new())?;
                 Ok(AwkRule {
                     pattern: Pattern::All,
-                    action: instructions.into_action(file),
+                    action: instructions.into_action(),
                 })
             }
             Rule::pattern_and_action => {
                 let mut inner = rule.into_inner();
-                let pattern = self.compile_normal_pattern(inner.next().unwrap(), file.clone())?;
+                let pattern = self.compile_normal_pattern(inner.next().unwrap())?;
                 let action = inner.next().unwrap();
                 let mut instructions = Instructions::default();
                 let locals = HashMap::new();
                 self.compile_action(action, &mut instructions, &locals)?;
                 Ok(AwkRule {
                     pattern,
-                    action: instructions.into_action(file),
+                    action: instructions.into_action(),
                 })
             }
             Rule::normal_pattern => {
                 let rule_line_col = rule.line_col();
-                let pattern = self.compile_normal_pattern(rule, file.clone())?;
+                let pattern = self.compile_normal_pattern(rule)?;
                 let instructions = Instructions::from_instructions_and_line_col(
                     vec![
                         OpCode::PushZero,
@@ -1870,18 +1865,14 @@ impl Compiler {
                 );
                 Ok(AwkRule {
                     pattern,
-                    action: instructions.into_action(file),
+                    action: instructions.into_action(),
                 })
             }
             _ => unreachable!("encountered {:?} while compiling rule", rule.as_rule()),
         }
     }
 
-    fn compile_function_definition(
-        &mut self,
-        function: Pair<Rule>,
-        file: Rc<str>,
-    ) -> Result<Function, PestError> {
+    fn compile_function_definition(&mut self, function: Pair<Rule>) -> Result<Function, PestError> {
         let mut inner = function.into_inner();
         let name = inner.next().unwrap();
         let mut param_map = HashMap::new();
@@ -1923,18 +1914,12 @@ impl Compiler {
             parameters_count,
             instructions: instructions.opcodes,
             debug_info: DebugInfo {
-                file,
                 source_locations: instructions.source_locations,
             },
         })
     }
 
-    fn declare_program_functions(
-        &mut self,
-        program: Pairs<Rule>,
-        filename: &str,
-        errors: &mut Vec<PestError>,
-    ) {
+    fn declare_program_functions(&mut self, program: Pairs<Rule>, errors: &mut Vec<PestError>) {
         for item in program {
             if item.as_rule() == Rule::function_definition {
                 let mut inner = item.into_inner();
@@ -1954,14 +1939,10 @@ impl Compiler {
                     },
                 );
                 if previous_value.is_some() {
-                    let error = improve_error(
-                        pest_error_from_span(
-                            name.as_span(),
-                            format!("function '{}' is defined multiple times", name),
-                        ),
-                        filename,
-                    );
-                    errors.push(error);
+                    errors.push(pest_error_from_span(
+                        name.as_span(),
+                        format!("function '{}' is defined multiple times", name),
+                    ));
                 }
             }
         }
@@ -2024,10 +2005,10 @@ fn rebase_error(error: PestError, source: &str, offset: usize) -> PestError {
     }
 }
 
-fn gather_errors(first_error: PestError, source: &str, errors: &mut Vec<PestError>, file: &str) {
+fn gather_errors(first_error: PestError, source: &str, errors: &mut Vec<PestError>) {
     let first_error_end = location_end(&first_error.location);
 
-    errors.push(improve_error(first_error, file));
+    errors.push(first_error);
     let mut search_start = first_error_end;
 
     let mut reported = vec![first_error_end];
@@ -2041,7 +2022,7 @@ fn gather_errors(first_error: PestError, source: &str, errors: &mut Vec<PestErro
                 let end = location_end(&err.location);
                 if !reported.contains(&end) {
                     reported.push(end);
-                    errors.push(improve_error(err, file));
+                    errors.push(err);
                 }
             }
         }
@@ -2068,32 +2049,72 @@ impl SourceFile {
     }
 }
 
-pub fn compile_program(sources: &[SourceFile]) -> Result<Program, CompilerErrors> {
-    let mut parsed_sources = Vec::new();
-    let mut errors = Vec::new();
-    for source_file in sources {
-        let filename: Rc<str> = source_file.filename.clone().into();
-        match AwkParser::parse(Rule::program, &source_file.contents) {
-            Ok(mut program) => {
-                let program = program.next().unwrap();
-                parsed_sources.push((filename, program.into_inner()));
-            }
-            Err(err) => {
-                gather_errors(err, &source_file.contents, &mut errors, &filename);
-            }
-        };
+/// The text of the program: the files of the -f options joined by
+/// newlines, as POSIX makes the program their concatenation; and where
+/// each file starts in it.
+fn join_sources(sources: &[SourceFile]) -> (String, SourceMap) {
+    let mut text = String::new();
+    let mut source_map = SourceMap::default();
+    let mut line = 1;
+    for (i, source) in sources.iter().enumerate() {
+        if i > 0 {
+            text.push('\n');
+            line += 1;
+        }
+        source_map.push(source.filename.as_str().into(), text.len(), line);
+        text.push_str(&source.contents);
+        line += source.contents.matches('\n').count() as u32;
     }
+    (text, source_map)
+}
+
+/// `error`, found in the text of the whole program, placed in the source
+/// file it is in, so that it reports that file and its line and column
+/// there.
+fn locate_error(error: PestError, sources: &[SourceFile], source_map: &SourceMap) -> PestError {
+    let start = match error.location {
+        InputLocation::Pos(pos) => pos,
+        InputLocation::Span((start, _)) => start,
+    };
+    let index = source_map.file_at_offset(start);
+    let (name, offset) = source_map.file(index);
+    let Some(source) = sources.get(index) else {
+        return error;
+    };
+    let contents = source.contents.as_str();
+    let local = |pos: usize| pos.saturating_sub(offset).min(contents.len());
+    let error = match error.location {
+        InputLocation::Pos(pos) => PestError::new_from_pos(
+            error.variant,
+            Position::new(contents, local(pos)).expect("error inside the file"),
+        ),
+        InputLocation::Span((start, end)) => PestError::new_from_span(
+            error.variant,
+            Span::new(contents, local(start), local(end).max(local(start)))
+                .expect("error inside the file"),
+        ),
+    };
+    improve_error(error, name)
+}
+
+pub fn compile_program(sources: &[SourceFile]) -> Result<Program, CompilerErrors> {
+    let (text, source_map) = join_sources(sources);
+    let mut errors = Vec::new();
+    let program_iter = match AwkParser::parse(Rule::program, &text) {
+        Ok(mut program) => Some(program.next().unwrap().into_inner()),
+        Err(err) => {
+            gather_errors(err, &text, &mut errors);
+            None
+        }
+    };
 
     let mut compiler = Compiler::default();
-    for (filename, program_iter) in &parsed_sources {
-        compiler.declare_program_functions(program_iter.clone(), filename, &mut errors);
-    }
-
     let mut begin_actions = Vec::new();
     let mut rules = Vec::new();
     let mut end_actions = Vec::new();
     let mut functions = Vec::new();
-    for (filename, program_iter) in parsed_sources {
+    if let Some(program_iter) = program_iter {
+        compiler.declare_program_functions(program_iter.clone(), &mut errors);
         for item in program_iter {
             match item.as_rule() {
                 Rule::begin_action | Rule::end_action => {
@@ -2105,24 +2126,22 @@ pub fn compile_program(sources: &[SourceFile]) -> Result<Program, CompilerErrors
                         &HashMap::new(),
                     );
                     if let Err(err) = result {
-                        errors.push(improve_error(err, &filename));
+                        errors.push(err);
                     }
                     if is_begin_action {
-                        begin_actions.push(instructions.into_action(filename.clone()));
+                        begin_actions.push(instructions.into_action());
                     } else {
-                        end_actions.push(instructions.into_action(filename.clone()));
+                        end_actions.push(instructions.into_action());
                     }
                 }
-                Rule::rule => match compiler.compile_rule(item, filename.clone()) {
+                Rule::rule => match compiler.compile_rule(item) {
                     Ok(rule) => rules.push(rule),
-                    Err(err) => errors.push(improve_error(err, &filename)),
+                    Err(err) => errors.push(err),
                 },
-                Rule::function_definition => {
-                    match compiler.compile_function_definition(item, filename.clone()) {
-                        Ok(function) => functions.push(function),
-                        Err(err) => errors.push(improve_error(err, &filename)),
-                    }
-                }
+                Rule::function_definition => match compiler.compile_function_definition(item) {
+                    Ok(function) => functions.push(function),
+                    Err(err) => errors.push(err),
+                },
                 Rule::EOI => {}
                 _ => unreachable!("encontered {:?} while compiling program", item.as_rule()),
             }
@@ -2149,8 +2168,13 @@ pub fn compile_program(sources: &[SourceFile]) -> Result<Program, CompilerErrors
             functions,
             globals_count: compiler.last_global_var_id.get() as usize,
             globals,
+            source_map,
         })
     } else {
+        let errors = errors
+            .into_iter()
+            .map(|error| locate_error(error, sources, &source_map))
+            .collect();
         Err(CompilerErrors { errors })
     }
 }

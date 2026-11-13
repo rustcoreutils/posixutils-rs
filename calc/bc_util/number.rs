@@ -53,6 +53,11 @@ fn integer_sqrt(n: &BigInt) -> BigInt {
 /// the hundredth would be invented. Shifting the numerator and dividing the
 /// underlying integers is exact at any scale.
 fn divide_exact(a: &BigDecimal, b: &BigDecimal, scale: u64) -> Result<BigDecimal, &'static str> {
+    // The quotient has `scale` digits after the point, whatever the
+    // operands' own scales.
+    if scale > MAX_WORKING_DIGITS {
+        return Err("number too large");
+    }
     let (a_int, a_scale) = a.as_bigint_and_exponent();
     let (b_int, b_scale) = b.as_bigint_and_exponent();
     // a/b truncated to `scale` digits is
@@ -71,6 +76,24 @@ fn divide_exact(a: &BigDecimal, b: &BigDecimal, scale: u64) -> Result<BigDecimal
     };
     // Integer division truncates toward zero, which is the rule bc wants.
     Ok(BigDecimal::new(numerator / denominator, scale as i64))
+}
+
+/// Digit strings at most this long are read directly.
+const DIRECT_READ_DIGITS: usize = 1000;
+
+/// The value of a string of digits valid in `base`.
+///
+/// num-bigint reads a decimal string in time quadratic in its length, which
+/// made a literal of a million digits take seconds. Reading the two halves
+/// and joining them as `high * base^len(low) + low` costs a few large
+/// multiplications per level instead.
+fn read_digits(digits: &str, base: u32) -> BigInt {
+    if digits.len() <= DIRECT_READ_DIGITS {
+        return BigInt::from_str_radix(digits, base).expect("digits checked against the base");
+    }
+    // Digits are ASCII, so any byte index is a character boundary.
+    let (high, low) = digits.split_at(digits.len() / 2);
+    read_digits(high, base) * BigInt::from(base).pow(low.len() as u32) + read_digits(low, base)
 }
 
 /// Converts a character to a number
@@ -220,8 +243,9 @@ impl Number {
     }
 
     /// Parse a number from a string in the given base.
-    /// # Returns
-    /// `None` if the string contains invalid characters for the given base.
+    /// # Errors
+    /// A digit not valid in `base`, or more integer or fractional digits
+    /// than the working limit.
     /// # Panics
     /// panics if:
     /// - the string is empty
@@ -229,51 +253,45 @@ impl Number {
     /// - `s` does not contain a valid number
     ///
     /// all the above should have been already checked by the parser
-    pub fn parse(s: &str, base: u64) -> Option<Number> {
+    pub fn parse(s: &str, base: u64) -> NumericResult {
         assert!(!s.is_empty(), "parsed number has no digits");
         assert!((2..=16).contains(&base), "base must be in the range 2..=16");
 
         for c in s.bytes() {
             if c != b'.' && to_digit(c) >= base as u8 {
-                return None;
+                return Err("invalid digit for the current ibase");
             }
         }
 
-        let mut integer_part = BigDecimal::zero();
-        let mut fractional_part = BigDecimal::zero();
-        let mut max_scale = 0;
-
-        if let Some((int, decimal)) = s.split_once('.') {
-            if !int.is_empty() {
-                integer_part = BigInt::from_str_radix(int, base as u32).unwrap().into();
-            }
-            max_scale = decimal.len() as u32;
-            let mut nominator = BigInt::zero();
-            let mut denominator = BigInt::one();
-
-            for c in decimal.bytes() {
-                nominator *= base;
-                denominator *= base;
-                let digit = to_digit(c);
-                if digit != 0 {
-                    nominator += digit;
-                }
-            }
-            // Truncate to the number of fractional digits written. Dividing
-            // through BigDecimal would cap the quotient at its default
-            // 100-digit context and invent every digit past that.
-            let scaled = nominator * ten_pow(max_scale as u64)?;
-            fractional_part = BigDecimal::new(scaled / denominator, max_scale as i64);
+        let (int, fraction) = s.split_once('.').unwrap_or((s, ""));
+        // Both parts are held to the working limit, like every value built.
+        if int.len() as u64 > MAX_WORKING_DIGITS || fraction.len() as u64 > MAX_WORKING_DIGITS {
+            return Err("number too large");
+        }
+        let base = base as u32;
+        let integer_part = if int.is_empty() {
+            BigInt::zero()
         } else {
-            integer_part = BigInt::from_str_radix(s, base as u32).unwrap().into();
-        }
-
+            read_digits(int, base)
+        };
         // In regards to the scale of parsed values, the standard doesn't specify.
         // The following matches the GNU implementation, which sets the scale
         // to the number of fractional digits in the string, regardless of the base
-        Some(Self(
-            (integer_part + fractional_part).with_scale(max_scale as i64),
-        ))
+        let scale = fraction.len() as u32;
+        let ten_to_scale = BigInt::from(10u8).pow(scale);
+        let fractional_part = if fraction.is_empty() {
+            BigInt::zero()
+        } else if base == 10 {
+            read_digits(fraction, base)
+        } else {
+            // The fraction is digits / base^scale, truncated to `scale`
+            // decimal places: floor(digits * 10^scale / base^scale).
+            read_digits(fraction, base) * &ten_to_scale / BigInt::from(base).pow(scale)
+        };
+        Ok(Self(BigDecimal::new(
+            integer_part * ten_to_scale + fractional_part,
+            i64::from(scale),
+        )))
     }
 
     /// Convert the number to a string in the given base.
@@ -290,12 +308,10 @@ impl Number {
         let scale = self.scale();
         let magnitude = self.0.abs().with_scale(scale as i64);
         let (unscaled, _) = magnitude.into_bigint_and_exponent();
-        let ten_to_scale = match ten_pow(scale) {
-            Some(value) => value,
-            // A scale this large cannot be rendered; the arithmetic that
-            // produced it would already have been refused.
-            None => return "0".to_string(),
-        };
+        // Every operation that sets a scale holds it to MAX_WORKING_DIGITS,
+        // so this is a bounded cost, and is computed even past it rather than
+        // printing a value that is wrong.
+        let ten_to_scale = BigInt::from(10u8).pow(scale as u32);
         let integer_part = &unscaled / &ten_to_scale;
         let fraction_numerator = &unscaled - &integer_part * &ten_to_scale;
 
@@ -353,12 +369,17 @@ impl Number {
         Self((self.0 - &other.0).with_scale(scale as i64))
     }
 
-    pub fn mul(self, other: &Number, scale: u64) -> Number {
+    pub fn mul(self, other: &Number, scale: u64) -> NumericResult {
         let a = self.scale();
         let b = other.scale();
         let required_scale = u64::min(a + b, scale.max(a).max(b));
+        // Each multiplication can add the operands' scales, so without this
+        // a few of them build a value no other operation could.
+        if required_scale > MAX_WORKING_DIGITS {
+            return Err("number too large");
+        }
         let result = self.0 * &other.0;
-        Self(result).rescale(required_scale)
+        Ok(Self(result).rescale(required_scale))
     }
 
     pub fn div(self, other: &Number, scale: u64) -> NumericResult {
@@ -417,7 +438,7 @@ impl Number {
         // POSIX defines a%b as a - (a/b)*b, with a/b evaluated at `scale`.
         let a_over_b = self.clone().div(other, scale)?;
         let scale = u64::max(scale.saturating_add(other.scale()), self.scale());
-        Ok(self.sub(&a_over_b.mul(other, scale)))
+        Ok(self.sub(&a_over_b.mul(other, scale)?))
     }
 
     pub fn sqrt(self, min_scale: u64) -> NumericResult {
@@ -634,14 +655,18 @@ mod tests {
     fn test_mul_integers() {
         let n = Number::parse("2", 10)
             .unwrap()
-            .mul(&Number::parse("5", 10).unwrap(), 10);
+            .mul(&Number::parse("5", 10).unwrap(), 10)
+            .unwrap();
         assert_eq!(n.scale(), 0);
         assert_eq!(n.to_string(10), "10");
     }
 
     #[test]
     fn test_mul() {
-        let n = Number::parse("2.25", 10).unwrap().mul(&Number::from(4), 10);
+        let n = Number::parse("2.25", 10)
+            .unwrap()
+            .mul(&Number::from(4), 10)
+            .unwrap();
         assert_eq!(n.scale(), 2);
         assert_eq!(n.to_string(10), "9.00");
     }
@@ -824,13 +849,13 @@ mod tests {
         let root = two.clone().sqrt(150).unwrap();
         assert_eq!(root.scale(), 150);
         assert!(
-            root.clone().mul(&root, 300) <= two,
+            root.clone().mul(&root, 300).unwrap() <= two,
             "the truncated root must not exceed the true root"
         );
         let ulp = Number::from(1).div(&ten_to_the(150), 150).unwrap();
         let above = root.add(&ulp);
         assert!(
-            above.clone().mul(&above, 300) > two,
+            above.clone().mul(&above, 300).unwrap() > two,
             "the truncated root must be the largest one that fits"
         );
     }
@@ -932,5 +957,94 @@ mod tests {
             Number::from(1).div(&Number::from(3), 2_000_000),
             Err("number too large")
         );
+    }
+
+    /// A product's scale is the sum of its operands' scales, so repeated
+    /// multiplication could build a value past the working limit, which then
+    /// printed as 0.
+    #[test]
+    fn test_product_beyond_the_working_limit_is_rejected() {
+        let third = Number::from(1).div(&Number::from(3), 600_000).unwrap();
+        assert_eq!(
+            third.clone().mul(&third, 2_000_000),
+            Err("number too large")
+        );
+        // At the limit it is still computed.
+        let third = Number::from(1).div(&Number::from(3), 500_000).unwrap();
+        assert_eq!(
+            third.clone().mul(&third, 2_000_000).unwrap().scale(),
+            1_000_000
+        );
+    }
+
+    /// A quotient has the scale register's scale, which division held to the
+    /// limit only through the size of its working numerator: a dividend with
+    /// a large scale of its own let the quotient past it.
+    #[test]
+    fn test_quotient_beyond_the_working_limit_is_rejected() {
+        let third = Number::from(1).div(&Number::from(3), 1_000_000).unwrap();
+        assert_eq!(
+            third.div(&Number::from(1), 2_000_000),
+            Err("number too large")
+        );
+    }
+
+    /// The integer digits of a literal are held to the limit as well.
+    #[test]
+    fn test_long_integer_literal_is_too_large() {
+        assert_eq!(
+            Number::parse(&"7".repeat(1_000_001), 10),
+            Err("number too large")
+        );
+        let n = Number::parse(&"7".repeat(1_000_000), 10).unwrap();
+        assert_eq!(n.length(), 1_000_000);
+    }
+
+    /// Reading digits splits the string in halves; the pieces must join with
+    /// the right power, including leading zeros in the low half.
+    #[test]
+    fn test_digit_strings_read_exactly() {
+        for base in [2u32, 3, 10, 16] {
+            let digits: String = (0..5000)
+                .map(|i| {
+                    char::from_digit((i * 7 + i / 3) % base, base)
+                        .unwrap()
+                        .to_ascii_uppercase()
+                })
+                .collect();
+            assert_eq!(
+                read_digits(&digits, base),
+                BigInt::from_str_radix(&digits, base).unwrap(),
+                "base {base}"
+            );
+        }
+        assert_eq!(
+            read_digits(&format!("1{}", "0".repeat(3000)), 10),
+            BigInt::from(10u8).pow(3000u32)
+        );
+    }
+
+    /// A literal with more fractional digits than the working limit is too
+    /// large, not an invalid digit.
+    #[test]
+    fn test_literal_beyond_the_working_limit_is_too_large() {
+        let text = format!(".{}", "7".repeat(1_000_001));
+        assert_eq!(Number::parse(&text, 10), Err("number too large"));
+        assert_eq!(
+            Number::parse("19", 9),
+            Err("invalid digit for the current ibase")
+        );
+    }
+
+    #[test]
+    fn test_long_fraction_parses_exactly() {
+        let digits = "7".repeat(5000);
+        let n = Number::parse(&format!("1.{digits}"), 10).unwrap();
+        assert_eq!(n.to_string(10), format!("1.{digits}"));
+        // In base 16, 0.8 is a half and keeps one fractional digit.
+        assert_eq!(Number::parse(".8", 16).unwrap().to_string(10), "0.5");
+        assert_eq!(Number::parse("A.C", 16).unwrap().to_string(10), "10.7");
+        // Truncated, not rounded: 0.2 in base 3 is 0.666...
+        assert_eq!(Number::parse(".2", 3).unwrap().to_string(10), "0.6");
     }
 }

@@ -31,6 +31,29 @@ fn test_bc_with_math_library(program: &str, expected_output: &str) {
     });
 }
 
+/// Write `contents` to a program file in `dir`, and return its path as an
+/// operand.
+fn program_file(dir: &plib::tmp::TempDir, contents: &[u8]) -> String {
+    let path = dir.path().join("program.bc");
+    std::fs::write(&path, contents).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// Run `program` on standard input and again as a file operand, and expect
+/// the same output, no diagnostics and success from both.
+fn test_bc_stdin_and_file(program: &str, expected_output: &str) {
+    test_bc(program, expected_output);
+    let dir = plib::tmp::tempdir().unwrap();
+    run_test(TestPlan {
+        cmd: String::from("bc"),
+        args: vec![program_file(&dir, program.as_bytes())],
+        stdin_data: String::new(),
+        expected_out: String::from(expected_output),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
 macro_rules! test_bc {
     ($test_name:ident) => {
         test_bc(
@@ -179,6 +202,73 @@ fn test_bc_working_digit_cap() {
     );
 }
 
+/// The working-digit cap holds for multiplication and for literals too. A
+/// product past it printed as 0, and a long literal was an "invalid digit".
+#[test]
+fn test_bc_working_digit_cap_for_products_and_literals() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let path = program_file(&dir, b"scale=400000\nx=1/3\nscale=2000000\nx*x*x\n");
+    let output = plib::testing::run_test_base("bc", &[path], b"");
+    assert_eq!(output.stdout, b"");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!(
+            "bc: runtime error ({} - line 4): number too large\n",
+            dir.path().join("program.bc").display()
+        )
+    );
+
+    // A literal of a million fractional digits is read, quickly; one more
+    // digit is too large. (Standard input would be paced by the test
+    // harness, so these are file operands.)
+    let path = program_file(
+        &dir,
+        format!("x=.{}\nscale(x)\n", "7".repeat(1_000_000)).as_bytes(),
+    );
+    let start = std::time::Instant::now();
+    let output = plib::testing::run_test_base("bc", &[path], b"");
+    assert_eq!(output.stdout, b"1000000\n");
+    assert!(start.elapsed().as_secs() < 30, "took {:?}", start.elapsed());
+    let path = program_file(&dir, format!("x=.{}\n", "7".repeat(1_000_001)).as_bytes());
+    let output = plib::testing::run_test_base("bc", &[path], b"");
+    assert!(String::from_utf8_lossy(&output.stderr).ends_with("number too large\n"));
+
+    // A quotient is held to the cap too, whatever the scale of its dividend.
+    let path = program_file(&dir, b"scale=1000000\nx=1/3\nscale=2000000\nx/1\n");
+    let output = plib::testing::run_test_base("bc", &[path], b"");
+    assert_eq!(output.stdout, b"");
+    assert!(String::from_utf8_lossy(&output.stderr).ends_with("number too large\n"));
+}
+
+/// A runtime error inside a function lists the calls that led to it, one
+/// per line, with no trailing blanks or blank line.
+#[test]
+fn test_bc_call_trace_format() {
+    let program = "define f(x) {\nreturn (x/0)\n}\nf(1)\n";
+    run_test(TestPlan {
+        cmd: String::from("bc"),
+        args: vec![],
+        stdin_data: String::from(program),
+        expected_out: String::new(),
+        expected_err: String::from(
+            "bc: runtime error: division by zero\ncall trace:\n=> 'f' at line 2\n=> <global scope> at line 4\n",
+        ),
+        expected_exit_code: 1,
+    });
+    let dir = plib::tmp::tempdir().unwrap();
+    let path = program_file(&dir, program.as_bytes());
+    run_test(TestPlan {
+        cmd: String::from("bc"),
+        args: vec![path.clone()],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: format!(
+            "bc: runtime error: division by zero\ncall trace:\n=> 'f' ({path}) at line 2\n=> <global scope> ({path}) at line 4\n"
+        ),
+        expected_exit_code: 1,
+    });
+}
+
 /// POSIX: "references to any of these names from other functions that are
 /// called from this function also refer to the new value". A callee saw the
 /// global instead of the caller's parameter or auto.
@@ -210,17 +300,85 @@ fn test_bc_array_argument_uses_the_active_binding() {
     );
 }
 
+/// POSIX: `x op= v` is `x = x op v` "except that the named-expression shall
+/// be evaluated only once". A subscript with a side effect ran twice, so
+/// the sum was read from one element and stored in the next.
+#[test]
+fn test_bc_compound_assignment_evaluates_the_target_once() {
+    test_bc("i=0\na[i++] += 5\ni\na[0]\na[1]\nquit\n", "1\n5\n0\n");
+    test_bc(
+        "define f(){\nx+=1\nreturn(0)\n}\nb[f()] += 7\nx\nb[0]\nquit\n",
+        "1\n7\n",
+    );
+    // The target's value is read before the right side runs, as in GNU bc,
+    // so a right side that changes the target does not feed into the sum.
+    test_bc("a=1\na += (a=5)\na\nquit\n", "6\n");
+    test_bc(
+        "x=1\ndefine f(){\nx=10\nreturn(1)\n}\nx += f()\nx\nquit\n",
+        "2\n",
+    );
+    // Every operator takes the same path.
+    test_bc(
+        "i=0\nc[0]=7\nc[i++] -= 2\nc[0]\ni=0\nc[i++] *= 3\nc[0]\ni=0\nc[i++] /= 5\nc[0]\ni=0\nc[i++] %= 2\nc[0]\ni=0\nc[i++] ^= 3\nc[0]\ni\nquit\n",
+        "5\n15\n3\n1\n1\n1\n",
+    );
+}
+
+/// `a[i] = v` picks its element before `v` runs, as GNU bc does and as
+/// `a[i] op= v` does, so a value that changes `i` does not move the store.
+#[test]
+fn test_bc_assignment_resolves_its_target_first() {
+    test_bc("i=0\nb[i] = (i=2)\nb[0]\nb[2]\nquit\n", "2\n0\n");
+}
+
+/// GNU bc accepts a newline between the `)` of an `if`, `while` or `for`
+/// and its body, so `{` may open on the next line. Rejecting it on standard
+/// input left the body to run on its own, unconditionally.
+#[test]
+fn test_bc_newline_before_a_body() {
+    test_bc_stdin_and_file("x = 0\nif (x == 1)\n  x = 99\nx\n", "0\n");
+    test_bc_stdin_and_file("if (1)\n  5\n", "5\n");
+    test_bc_stdin_and_file("for (i=0; i<2; i++)\n{\ni\n}\n", "0\n1\n");
+    test_bc_stdin_and_file("i = 0\nwhile (i < 2)\n{\ni += 1\ni\n}\n", "1\n2\n");
+    // One newline, as in GNU bc: a blank line ends the statement, so an
+    // abandoned `if (x)` at a terminal is reported instead of waiting.
+    let output = plib::testing::run_test_base("bc", &[], b"if (1)\n\n5\n");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("expected an expression"));
+    assert_eq!(output.status.code(), Some(1));
+    // The body may still follow on the same line.
+    test_bc_stdin_and_file("if (1) 5\nwhile (0) 6\n", "5\n");
+}
+
+/// GNU bc forms of a function definition: a newline before `{`, a body
+/// starting on the `{` line, and `return` without parentheses.
+#[test]
+fn test_bc_gnu_function_forms() {
+    test_bc_stdin_and_file("define f(x)\n{\nreturn (x)\n}\nf(3)\n", "3\n");
+    test_bc_stdin_and_file("define f(x) { return (x*2) }\nf(3)\n", "6\n");
+    test_bc_stdin_and_file("define f(x) { auto y; y = x; return (y) }\nf(4)\n", "4\n");
+    test_bc_stdin_and_file("define f(x) {\nreturn x\n}\nf(3)\n", "3\n");
+    test_bc_stdin_and_file("define f(x) {\nreturn x + 1\n}\nf(3)\n", "4\n");
+    // `return (x) + 1` is the expression `(x) + 1`.
+    test_bc_stdin_and_file("define f(x) {\nreturn (x) + 1\n}\nf(3)\n", "4\n");
+    test_bc_stdin_and_file("define f(x) {\nreturn\n}\nf(3)\n", "0\n");
+    test_bc_stdin_and_file("define f(x) {\nreturn ()\n}\nf(3)\n", "0\n");
+    test_bc_stdin_and_file(
+        "define f(x) { if (x) return; return (7) }\nf(0)\nf(1)\n",
+        "7\n0\n",
+    );
+}
+
 /// A mismatch used to bind the missing parameter to the global of the same
 /// name, and silently drop extra arguments without evaluating them.
 #[test]
 fn test_bc_argument_count_mismatch_is_an_error() {
     bc_runtime_error(
         "define f(a,b){\nreturn(b)\n}\nb=5\nf(1)",
-        "runtime error (line 1): wrong number of arguments",
+        "runtime error (line 5): wrong number of arguments",
     );
     bc_runtime_error(
         "define f(a){\nreturn(a)\n}\nf(1,2)",
-        "runtime error (line 1): wrong number of arguments",
+        "runtime error (line 4): wrong number of arguments",
     );
 }
 
@@ -235,15 +393,14 @@ fn test_bc_register_increment() {
     // value 16 and the new value 15 are both rendered in base 15. Verified
     // against GNU bc.
     test_bc("obase=16\nobase--\nobase\nquit\n", "11\n10\n");
-    // The bounds still apply. The REPL executes one line at a time, so the
-    // failing line is line 1 of its own program.
+    // The bounds still apply.
     bc_runtime_error(
         "ibase=16\nibase++",
-        "runtime error (line 1): ibase must be between 2 and 16",
+        "runtime error (line 2): ibase must be between 2 and 16",
     );
     bc_runtime_error(
         "obase=2\nobase--",
-        "runtime error (line 1): obase must be greater than 1",
+        "runtime error (line 2): obase must be greater than 1",
     );
 }
 
@@ -279,14 +436,15 @@ fn test_bc_sparse_array() {
 /// A file that exists but is not text is not an access failure.
 #[test]
 fn test_bc_non_text_file() {
+    // Like standard input, a file runs as it is read, up to where it stops
+    // being text; the rest of it is not read. The next operand still runs.
     let dir = plib::tmp::tempdir().unwrap();
-    let path = dir.path().join("binary.bc");
-    std::fs::write(&path, b"1+1\n\xff\xfe\n").unwrap();
-    let output = plib::testing::run_test_base("bc", &[path.to_string_lossy().to_string()], b"");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("not a text file"),
-        "expected a text-file diagnostic, got {stderr:?}"
+    let path = program_file(&dir, b"1+1\n\xff\xfe\n3\n");
+    let output = plib::testing::run_test_base("bc", std::slice::from_ref(&path), b"4\n");
+    assert_eq!(output.stdout, b"2\n4\n");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!("bc: {path}: not a text file\n")
     );
     assert_eq!(output.status.code(), Some(1));
 }
@@ -313,24 +471,141 @@ fn test_bc_incomplete_input_at_eof() {
     assert_eq!(output.status.code(), Some(0));
 }
 
-/// The same error reported the same way whether the program arrives as a file
-/// operand or on standard input.
+/// A program behaves the same as a file operand and on standard input.
+///
+/// POSIX: input "shall be executed as [it is] read". A runtime error ends
+/// only the input item it occurs in, as in GNU bc. A syntax error in a
+/// non-interactive run ends that input, so nothing after it runs out of
+/// context; what came before it has already run.
 #[test]
-fn test_bc_exit_status_is_consistent() {
+fn test_bc_file_and_stdin_agree() {
     let dir = plib::tmp::tempdir().unwrap();
-    for program in ["1/0\n", "1+\n"] {
-        let path = dir.path().join("program.bc");
-        std::fs::write(&path, program).unwrap();
-        let as_file =
-            plib::testing::run_test_base("bc", &[path.to_string_lossy().to_string()], b"");
+    for (program, stdout, status) in [
+        ("1/0\n", "", 1),
+        ("1+\n", "", 1),
+        ("1\n1/0\n2\n", "1\n2\n", 1),
+        ("1\n2 +\n3\n", "1\n", 1),
+        ("1\nquit\n@\n", "1\n", 0),
+        ("if (1)\n\n5\n", "", 1),
+        ("1\n@\n2\n", "1\n", 1),
+        // A runtime error earlier in the item does not skip its `quit`.
+        ("1/0; quit\n2\n", "", 1),
+        ("define f() {\nreturn (1/0)\n}\nf(); quit\n2\n", "", 1),
+    ] {
+        let path = program_file(&dir, program.as_bytes());
+        let as_file = plib::testing::run_test_base("bc", &[path], b"");
         let as_stdin = plib::testing::run_test_base("bc", &[], program.as_bytes());
-        assert_eq!(
-            as_file.status.code(),
-            as_stdin.status.code(),
-            "{program:?} gave different statuses as a file and on stdin"
-        );
-        assert_eq!(as_file.status.code(), Some(1));
+        for (how, output) in [("file", &as_file), ("stdin", &as_stdin)] {
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                stdout,
+                "{program:?} as {how}"
+            );
+            assert_eq!(output.status.code(), Some(status), "{program:?} as {how}");
+        }
     }
+}
+
+/// Diagnostics for standard input give the line in the whole input, not in
+/// the input item being parsed.
+#[test]
+fn test_bc_stdin_diagnostics_count_input_lines() {
+    run_test(TestPlan {
+        cmd: String::from("bc"),
+        args: vec![],
+        stdin_data: String::from("1\n2\n3 +\n"),
+        expected_out: String::from("1\n2\n"),
+        expected_err: String::from(
+            "bc: (standard_in):3:4: error: expected an expression, found newline\n",
+        ),
+        expected_exit_code: 1,
+    });
+    run_test(TestPlan {
+        cmd: String::from("bc"),
+        args: vec![],
+        stdin_data: String::from("1\n2\n3\n4/0\n"),
+        expected_out: String::from("1\n2\n3\n"),
+        expected_err: String::from("bc: runtime error (line 4): division by zero\n"),
+        expected_exit_code: 1,
+    });
+    let output =
+        plib::testing::run_test_base("bc", &[], b"define f(x) {\nreturn (x/0)\n}\n\n\nf(1)\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("'f' at line 2"), "{stderr:?}");
+    assert!(stderr.contains("<global scope> at line 6"), "{stderr:?}");
+}
+
+/// Standard input is program text, read as it is: no line editing applies
+/// to it, and it is held to the same rules as a file operand.
+#[test]
+fn test_bc_stdin_is_read_verbatim() {
+    // A backspace inside a string is an ordinary character.
+    let output = plib::testing::run_test_base("bc", &[], b"\"ab\x08c\"\n");
+    assert_eq!(output.stdout, b"ab\x08c");
+    assert_eq!(output.status.code(), Some(0));
+    // Outside one it is an illegal character, as in a file.
+    let output = plib::testing::run_test_base("bc", &[], b"12\x083\n");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("illegal character"));
+    assert_eq!(output.status.code(), Some(1));
+    // So is a carriage return.
+    let output = plib::testing::run_test_base("bc", &[], b"1+1\r\n");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("illegal character '\\r'"));
+    assert_eq!(output.status.code(), Some(1));
+    // A long grapheme cluster followed by a backspace once panicked.
+    let mut program = String::from("\"a");
+    program.push_str(&"\u{301}".repeat(200));
+    program.push_str("\u{8}\"\n");
+    let output = plib::testing::run_test_base("bc", &[], program.as_bytes());
+    assert_eq!(output.status.code(), Some(0));
+    // Long output is continued across lines; take that back out.
+    let stdout = String::from_utf8(output.stdout)
+        .unwrap()
+        .replace("\\\n", "");
+    assert_eq!(stdout, program[1..program.len() - 2]);
+}
+
+/// Standard input that is not text is reported where it stops being text.
+#[test]
+fn test_bc_stdin_that_is_not_text() {
+    run_test(TestPlan {
+        cmd: String::from("bc"),
+        args: vec![],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+    let output = plib::testing::run_test_base("bc", &[], b"1\n\xff\n2\n");
+    assert_eq!(output.stdout, b"1\n");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "bc: (standard_in): not a text file\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+/// A long construct on standard input is parsed once, not once per line:
+/// a 20,000-line function took 90 seconds.
+#[test]
+fn test_bc_long_construct_on_stdin_is_linear() {
+    let mut program = String::from("define f() {\n");
+    for _ in 0..20_000 {
+        program.push_str("x = x + 1\n");
+    }
+    program.push_str("}\nf()\nx\n");
+    // Standard input from a file: the test harness paces piped input.
+    let dir = plib::tmp::tempdir().unwrap();
+    let path = program_file(&dir, program.as_bytes());
+    let start = std::time::Instant::now();
+    let output = std::process::Command::new(plib::testing::get_binary_path("bc"))
+        .stdin(std::fs::File::open(&path).unwrap())
+        .output()
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(output.stdout, b"0\n20000\n");
+    // A generous bound: it was 90 seconds, and is milliseconds. The unit
+    // test `a_long_body_is_parsed_once` pins the cause deterministically.
+    assert!(elapsed.as_secs() < 30, "took {elapsed:?}");
 }
 
 /// A failed write is reported, not ignored and not a panic. Writing to
@@ -415,6 +690,21 @@ fn test_bc_quit_in_for_in_function() {
         "1\ndefine f(x){\nfor(i=0;i<5;i++){\nif(i==3)quit\n}\n}\n2\nf(0)\n3\n",
         "1\n",
     );
+}
+
+/// POSIX: quit stops bc "at the point where the statement occurs in the
+/// input". A runtime error earlier in the same input item abandoned the item
+/// before its quit was seen, and bc read on.
+#[test]
+fn test_bc_quit_after_a_runtime_error() {
+    run_test(TestPlan {
+        cmd: String::from("bc"),
+        args: vec![],
+        stdin_data: String::from("1/0; quit\n2\n"),
+        expected_out: String::new(),
+        expected_err: String::from("bc: runtime error (line 1): division by zero\n"),
+        expected_exit_code: 1,
+    });
 }
 
 #[test]
@@ -691,7 +981,6 @@ fn test_bc_write_error_message() {
     assert_write_error_message_on_full_device("bc", &[], b"1+1\n", 1);
     // Enough output to fill the buffer while the loop runs.
     let dir = plib::tmp::tempdir().unwrap();
-    let path = dir.path().join("program.bc");
-    std::fs::write(&path, "for(i=0;i<5000;++i) i\n").unwrap();
-    assert_write_error_message_on_full_device("bc", &[path.to_str().unwrap()], b"", 1);
+    let path = program_file(&dir, b"for(i=0;i<5000;++i) i\n");
+    assert_write_error_message_on_full_device("bc", &[&path], b"", 1);
 }

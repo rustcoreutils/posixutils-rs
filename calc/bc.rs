@@ -8,12 +8,11 @@
 //
 
 use std::ffi::OsString;
-use std::io::{BufWriter, IsTerminal};
+use std::io::{BufRead, BufWriter, IsTerminal};
 
 use bc_util::{
-    interpreter::{ExecutionError, Interpreter},
-    output::OutputWriter,
-    parser::{parse_program, ParseError},
+    input::Pending, instructions::Program, interpreter::Interpreter, output::OutputWriter,
+    parser::parse_program_at,
 };
 use clap::Parser;
 
@@ -70,6 +69,9 @@ fn spawn_interpreter() -> std::io::Result<std::thread::JoinHandle<()>> {
 
 fn main() {
     plib::io::ensure_std_fds_open();
+    // The signal disposition, locale, message catalog and panic hook are
+    // process-wide, and are set before the interpreter thread exists.
+    diag::init_locale("bc");
     match spawn_interpreter() {
         // `run` ends the process itself; join only returns if it panicked.
         Ok(interpreter) => {
@@ -78,25 +80,9 @@ fn main() {
             }
         }
         Err(e) => {
-            diag::init("bc");
             diag::error(&diag::io_error_text(&e));
             std::process::exit(1);
         }
-    }
-}
-
-/// Report a failure. Returns true so callers can record that something went
-/// wrong.
-fn report(e: impl std::fmt::Display) -> bool {
-    diag::error(&format!("{}", e));
-    true
-}
-
-/// Report a runtime error, or end bc if it stands for a failed write.
-fn report_exec(e: ExecutionError) -> bool {
-    match e.write_failure() {
-        Some(failure) => write_failed(failure),
-        None => report(e),
     }
 }
 
@@ -113,39 +99,272 @@ fn write_failed(e: &std::io::Error) -> ! {
     std::process::exit(1);
 }
 
-/// Report each diagnostic of a parse failure at its own position.
-fn report_parse_error(e: &ParseError) -> bool {
-    for (line, col, message) in e.diagnostics() {
-        diag::error_at(diag::Position::new(line, col), message);
+/// What to do after a piece of input has been dealt with.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    /// Go on reading this input.
+    Continue,
+    /// A syntax error in a non-interactive input: nothing more is read from
+    /// it, since what follows the error may belong to the rejected construct.
+    StopInput,
+    /// `quit` was read: stop altogether.
+    Quit,
+}
+
+/// How one input is read: a file operand, or standard input.
+struct Source<'s> {
+    /// The name diagnostics about the input itself use.
+    name: &'s str,
+    /// The file name runtime errors cite, if any.
+    file: Option<&'s str>,
+    /// POSIX: bc is interactive when "the standard input and standard
+    /// output to bc are attached to a terminal". An error then leaves the
+    /// exit status alone; otherwise it makes bc exit with failure.
+    interactive: bool,
+    /// Typed at a terminal. POSIX asks an interactive bc to "recover
+    /// following any error in the input"; a session typed at a terminal
+    /// recovers even with its output redirected, rather than ending at the
+    /// first typo. Other input stops at a syntax error.
+    typed: bool,
+    /// Flush output after each item, so a session at a terminal, or a
+    /// program driving bc through pipes, sees each result as it is made.
+    flush_each: bool,
+}
+
+/// The interpreter and its output, fed input piece by piece.
+struct Session<'a> {
+    interpreter: Interpreter,
+    out: OutputWriter<'a>,
+    had_error: bool,
+}
+
+impl Session<'_> {
+    fn flush(&mut self) {
+        if let Err(e) = self.out.flush() {
+            write_failed(&e);
+        }
     }
-    true
+
+    /// Add one line of input, with its newline if it has one, and run what
+    /// it completes. A line that is not text ends the input.
+    fn feed(&mut self, pending: &mut Pending, line: &[u8], source: &Source) -> Flow {
+        let Ok(line) = std::str::from_utf8(line) else {
+            self.flush();
+            diag::error(&format!("{}: {}", source.name, gettext("not a text file")));
+            self.had_error = true;
+            return Flow::StopInput;
+        };
+        pending.push_line(line);
+        // A line typed at a terminal is parsed at once, so a typo inside an
+        // open bracket is reported now rather than when the bracket closes.
+        // Other input is parsed once it may be complete: parsing after every
+        // line would make a long construct cost quadratic time.
+        if !pending.ready() && !source.typed {
+            return Flow::Continue;
+        }
+        self.run_pending(pending, source, false)
+    }
+
+    /// Run whatever is still gathered when the input ends. Input that ends in
+    /// the middle of a construct is reported, not silently dropped.
+    fn finish(&mut self, pending: &mut Pending, source: &Source) -> Flow {
+        if pending.is_empty() {
+            return Flow::Continue;
+        }
+        self.run_pending(pending, source, true)
+    }
+
+    fn run_pending(&mut self, pending: &mut Pending, source: &Source, at_end: bool) -> Flow {
+        match parse_program_at(pending.text(), source.file, pending.first_line()) {
+            Ok(program) => {
+                pending.clear();
+                self.exec(program, source)
+            }
+            Err(e) if e.is_incomplete && !at_end => Flow::Continue,
+            Err(e) => {
+                pending.clear();
+                self.flush();
+                for (line, col, message) in e.diagnostics() {
+                    diag::error_at(diag::Position::new(line, col), message);
+                }
+                // Input cut off in mid-construct is a failure even at a
+                // terminal: the session did not run what was typed.
+                if at_end || !source.interactive {
+                    self.had_error = true;
+                }
+                if source.typed {
+                    Flow::Continue
+                } else {
+                    Flow::StopInput
+                }
+            }
+        }
+    }
+
+    /// Run parsed items. A runtime error abandons the rest of its item only.
+    fn exec(&mut self, program: Program, source: &Source) -> Flow {
+        if let Err(e) = self.interpreter.exec(program, &mut self.out) {
+            if let Some(failure) = e.write_failure() {
+                write_failed(failure);
+            }
+            self.flush();
+            diag::error(&e.to_string());
+            if !source.interactive {
+                self.had_error = true;
+            }
+        }
+        if source.flush_each {
+            self.flush();
+        }
+        if self.interpreter.has_quit() {
+            Flow::Quit
+        } else {
+            Flow::Continue
+        }
+    }
+
+    /// End bc, with failure if any error made it fail.
+    fn exit(&mut self) -> ! {
+        self.flush();
+        std::process::exit(if self.had_error { 1 } else { 0 });
+    }
+
+    /// Run a file operand, as it is read, one item at a time.
+    fn run_file(&mut self, text: &[u8], source: &Source) -> Flow {
+        let mut pending = Pending::new();
+        for line in text.split_inclusive(|&b| b == b'\n') {
+            let flow = self.feed(&mut pending, line, source);
+            if flow != Flow::Continue {
+                return flow;
+            }
+        }
+        self.finish(&mut pending, source)
+    }
+
+    /// Run standard input without line editing: input that is not a
+    /// terminal, or a terminal whose output goes elsewhere. It is program
+    /// text, read as bytes exactly as a file is.
+    fn run_stdin_stream(&mut self, source: &Source) {
+        let mut pending = Pending::new();
+        let mut reader = std::io::stdin().lock();
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) => {
+                    self.flush();
+                    diag::error(&format!("{}: {}", source.name, diag::io_error_text(&e)));
+                    self.had_error = true;
+                    return;
+                }
+            }
+            match self.feed(&mut pending, &line, source) {
+                Flow::Continue => {}
+                Flow::StopInput => return,
+                Flow::Quit => self.exit(),
+            }
+        }
+        if self.finish(&mut pending, source) == Flow::Quit {
+            self.exit();
+        }
+    }
+
+    /// Run standard input at a terminal, with line editing and history.
+    fn run_stdin_terminal(&mut self, source: &Source) {
+        let mut repl = match DefaultEditor::new() {
+            Ok(repl) => repl,
+            Err(e) => {
+                diag::error(&diag::error_text(&e));
+                std::process::exit(1);
+            }
+        };
+        let mut pending = Pending::new();
+        loop {
+            let prompt = if pending.is_empty() { ">> " } else { ".. " };
+            match repl.readline(prompt) {
+                Ok(line) => {
+                    let _ = repl.add_history_entry(line.as_str());
+                    let line = format!("{}\n", line);
+                    match self.feed(&mut pending, line.as_bytes(), source) {
+                        Flow::Continue => {}
+                        Flow::StopInput => return,
+                        Flow::Quit => self.exit(),
+                    }
+                }
+                // Interrupt (Ctrl-C) abandons a construct being typed; at an
+                // empty prompt it ends the session, as end of input does.
+                Err(ReadlineError::Interrupted) if !pending.is_empty() => pending.clear(),
+                Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => break,
+                Err(e) => {
+                    diag::error(&diag::error_text(&e));
+                    self.had_error = true;
+                    break;
+                }
+            }
+        }
+        if self.finish(&mut pending, source) == Flow::Quit {
+            self.exit();
+        }
+    }
+}
+
+/// Whether standard input is a regular file. Such input is all there, so
+/// there is no one waiting on each result as it is made.
+fn stdin_is_regular_file() -> bool {
+    stdin_as_file()
+        .and_then(|file| file.metadata())
+        .is_ok_and(|metadata| metadata.is_file())
+}
+
+/// A duplicate of standard input's descriptor, as a `File` whose metadata can
+/// be read. Dropping it closes only the duplicate.
+#[cfg(unix)]
+fn stdin_as_file() -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsFd;
+    let fd = std::io::stdin().as_fd().try_clone_to_owned()?;
+    Ok(std::fs::File::from(fd))
+}
+
+/// A duplicate of standard input's handle, as a `File` whose metadata can be
+/// read. A console handle has none, and so is not a regular file. Dropping it
+/// closes only the duplicate.
+#[cfg(windows)]
+fn stdin_as_file() -> std::io::Result<std::fs::File> {
+    use std::os::windows::io::AsHandle;
+    let handle = std::io::stdin().as_handle().try_clone_to_owned()?;
+    Ok(std::fs::File::from(handle))
 }
 
 fn run() {
-    diag::init_locale("bc");
+    // The diagnostic prefix and source name are per thread.
+    diag::init("bc");
 
     let args = plib::optarg::parse::<Args>();
 
-    let mut interpreter = Interpreter::default();
-    let mut had_error = false;
     // Block-buffered so a long-running loop streams rather than accumulating
-    // its whole output in memory; flushed after each input item so interactive
-    // output appears without delay, as POSIX requires.
+    // its whole output in memory; flushed after each standard input item so
+    // interactive output appears without delay, as POSIX requires.
     let stdout = std::io::stdout();
     let mut sink = BufWriter::new(stdout.lock());
-    let mut out = OutputWriter::new(&mut sink);
-
-    // POSIX describes error recovery for "an interactive invocation of bc". A
-    // session at a terminal recovers and exits 0; a script fed on standard
-    // input reports failure the way a file operand does.
-    let interactive = std::io::stdin().is_terminal();
+    let mut session = Session {
+        interpreter: Interpreter::default(),
+        out: OutputWriter::new(&mut sink),
+        had_error: false,
+    };
 
     if args.define_math_functions {
         diag::set_source("math library");
         let library = include_str!("bc_util/math_functions.bc");
-        let load = parse_program(library, None)
+        let load = parse_program_at(library, None, 1)
             .map_err(|e| e.to_string())
-            .and_then(|lib| interpreter.exec(lib, &mut out).map_err(|e| e.to_string()));
+            .and_then(|lib| {
+                session
+                    .interpreter
+                    .exec(lib, &mut session.out)
+                    .map_err(|e| e.to_string())
+            });
         if let Err(e) = load {
             diag::error(&format!(
                 "{}: {}",
@@ -159,103 +378,45 @@ fn run() {
     for file in args.files {
         let name = file.to_string_lossy().into_owned();
         diag::set_source(&name);
-        // Read bytes, so a file that exists but is not text is reported as
-        // that rather than as a failure to access it.
         let bytes = match std::fs::read(&file) {
             Ok(bytes) => bytes,
             Err(e) => {
                 // POSIX CONSEQUENCES OF ERRORS: if a file operand cannot be
                 // accessed, write a diagnostic and terminate.
+                session.flush();
                 diag::error(&format!("{}: {}", name, diag::io_error_text(&e)));
-                let _ = out.flush();
                 std::process::exit(1);
             }
         };
-        let text = match String::from_utf8(bytes) {
-            Ok(text) => text,
-            Err(_) => {
-                diag::error(&format!("{}: {}", name, gettext("not a text file")));
-                had_error = true;
-                continue;
-            }
+        let source = Source {
+            name: &name,
+            file: file.to_str(),
+            interactive: false,
+            typed: false,
+            flush_each: false,
         };
-        match parse_program(&text, file.to_str()) {
-            Ok(program) => {
-                if let Err(e) = interpreter.exec(program, &mut out) {
-                    had_error |= report_exec(e);
-                }
-                if let Err(e) = out.flush() {
-                    write_failed(&e);
-                }
-            }
-            Err(e) => had_error |= report_parse_error(&e),
-        }
-        if interpreter.has_quit() {
-            if let Err(e) = out.flush() {
-                write_failed(&e);
-            }
-            std::process::exit(if had_error { 1 } else { 0 });
+        let flow = session.run_file(&bytes, &source);
+        session.flush();
+        if flow == Flow::Quit {
+            session.exit();
         }
     }
 
-    let mut repl = match DefaultEditor::new() {
-        Ok(repl) => repl,
-        Err(e) => {
-            diag::error(&diag::error_text(&e));
-            std::process::exit(1);
-        }
-    };
     diag::set_source(STDIN_NAME);
-    let mut line_buffer = String::new();
-    while !interpreter.has_quit() {
-        let prompt = if line_buffer.is_empty() { ">> " } else { ".. " };
-        match repl.readline(prompt) {
-            Ok(line) => {
-                line_buffer.push_str(&line);
-                line_buffer.push('\n');
-                match parse_program(&line_buffer, None) {
-                    Ok(program) => {
-                        // An interactive session recovers from a runtime error
-                        // and its exit status is unaffected; a script does not.
-                        let mut failed = false;
-                        if let Err(e) = interpreter.exec(program, &mut out) {
-                            failed = report_exec(e);
-                        }
-                        if let Err(e) = out.flush() {
-                            write_failed(&e);
-                        }
-                        had_error |= failed && !interactive;
-                        line_buffer.clear();
-                    }
-                    Err(e) if !e.is_incomplete => {
-                        report_parse_error(&e);
-                        had_error |= !interactive;
-                        line_buffer.clear();
-                    }
-                    _ => {}
-                }
-                let _ = repl.add_history_entry(line);
-            }
-            // End of input (Ctrl-D) or interrupt (Ctrl-C): exit silently.
-            Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => break,
-            Err(e) => {
-                had_error |= report(diag::error_text(&e));
-                break;
-            }
-        }
+    let typed = std::io::stdin().is_terminal();
+    let source = Source {
+        name: STDIN_NAME,
+        file: None,
+        interactive: typed && std::io::stdout().is_terminal(),
+        typed,
+        flush_each: typed || !stdin_is_regular_file(),
+    };
+    // Line editing writes prompts and terminal controls to standard output,
+    // so it is only for a session whose output is the terminal too.
+    if source.interactive {
+        session.run_stdin_terminal(&source);
+    } else {
+        session.run_stdin_stream(&source);
     }
-
-    // Input that ended in the middle of a construct is not simply discarded: a
-    // truncated script has to say so rather than exit as if it had run.
-    if !line_buffer.is_empty() {
-        if let Err(e) = parse_program(&line_buffer, None) {
-            report_parse_error(&e);
-            had_error = true;
-        }
-    }
-
-    if let Err(e) = out.flush() {
-        write_failed(&e);
-    }
-    std::process::exit(if had_error { 1 } else { 0 });
+    session.exit();
 }

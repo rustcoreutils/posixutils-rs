@@ -13,8 +13,8 @@ use crate::bc_util::instructions::Variable;
 
 use super::{
     instructions::{
-        BuiltinFunction, ExprInstruction, Function, FunctionArgument, NamedExpr, Program, Register,
-        StmtInstruction,
+        ArithOp, BuiltinFunction, ExprInstruction, Function, FunctionArgument, NamedExpr, Program,
+        Register, StmtInstruction,
     },
     number::Number,
     output::OutputWriter,
@@ -93,8 +93,9 @@ impl std::fmt::Display for ExecutionError {
             return write!(f, "runtime error ({file} - line {line}): {}", self.message);
         }
 
-        writeln!(f, "runtime error: {}", self.message)?;
-        writeln!(f, "call trace:",)?;
+        // The caller ends the diagnostic with a newline, so the last line of
+        // the trace has none of its own.
+        write!(f, "runtime error: {}\ncall trace:", self.message)?;
         for call in &self.call_stack {
             let function_name = if call.function_name == '\0' {
                 "<global scope>".to_string()
@@ -102,12 +103,12 @@ impl std::fmt::Display for ExecutionError {
                 format!("'{}'", call.function_name)
             };
             if call.file.is_empty() {
-                writeln!(f, "=> {function_name} at line {}", call.line)?;
+                write!(f, "\n=> {function_name} at line {}", call.line)?;
             } else {
-                writeln!(
+                write!(
                     f,
-                    "=> {function_name} ({}) at line {} ",
-                    call.file, call.line,
+                    "\n=> {function_name} ({}) at line {}",
+                    call.file, call.line
                 )?;
             }
         }
@@ -176,7 +177,9 @@ fn should_print(expr: &ExprInstruction) -> bool {
     // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/bc.html#tag_20_09_10
     !matches!(
         expr,
-        ExprInstruction::Assignment { .. } | ExprInstruction::SetRegister { .. }
+        ExprInstruction::Assignment { .. }
+            | ExprInstruction::CompoundAssignment { .. }
+            | ExprInstruction::SetRegister { .. }
     )
 }
 
@@ -192,6 +195,14 @@ fn should_print(expr: &ExprInstruction) -> bool {
 struct CallFrame {
     variables: Vec<(usize, Number)>,
     arrays: Vec<(usize, Array)>,
+}
+
+/// A storage location a named expression refers to: a variable, or one
+/// element of an array, by name index.
+#[derive(Clone, Copy)]
+enum Slot {
+    Variable(usize),
+    Element(usize, usize),
 }
 
 /// A parameter's value, computed in the caller's scope before any binding is
@@ -257,37 +268,81 @@ impl Interpreter {
         Ok(index as usize)
     }
 
-    /// Read a named expression. An element that was never assigned reads as
-    /// zero, without being created.
-    fn read_named(&mut self, named: &NamedExpr, out: &mut OutputWriter) -> ExecutionResult<Number> {
+    /// Evaluate the subscript of a named expression, if it has one, and say
+    /// which storage location it names.
+    fn resolve(&mut self, named: &NamedExpr, out: &mut OutputWriter) -> ExecutionResult<Slot> {
         match named {
-            NamedExpr::VariableNumber(c) => Ok(self.variables[name_index(*c)].clone()),
+            NamedExpr::VariableNumber(c) => Ok(Slot::Variable(name_index(*c))),
             NamedExpr::ArrayItem { name, index } => {
                 let index = self.array_index(index, out)?;
-                Ok(self.array_variables[name_index(*name)]
-                    .get(&index)
-                    .cloned()
-                    .unwrap_or_else(Number::zero))
+                Ok(Slot::Element(name_index(*name), index))
             }
         }
     }
 
-    /// Borrow a named expression for assignment, creating the element if it
-    /// does not exist yet.
+    /// The value in a slot. An element that was never assigned reads as
+    /// zero, without being created.
+    fn slot_value(&self, slot: Slot) -> Number {
+        match slot {
+            Slot::Variable(name) => self.variables[name].clone(),
+            Slot::Element(name, index) => self.array_variables[name]
+                .get(&index)
+                .cloned()
+                .unwrap_or_else(Number::zero),
+        }
+    }
+
+    /// Borrow a slot for assignment, creating the element if it does not
+    /// exist yet.
+    fn slot_mut(&mut self, slot: Slot) -> &mut Number {
+        match slot {
+            Slot::Variable(name) => &mut self.variables[name],
+            Slot::Element(name, index) => self.array_variables[name]
+                .entry(index)
+                .or_insert_with(Number::zero),
+        }
+    }
+
+    /// Read a named expression.
+    fn read_named(&mut self, named: &NamedExpr, out: &mut OutputWriter) -> ExecutionResult<Number> {
+        let slot = self.resolve(named, out)?;
+        Ok(self.slot_value(slot))
+    }
+
+    /// Borrow a named expression for assignment.
     fn write_named(
         &mut self,
         named: &NamedExpr,
         out: &mut OutputWriter,
     ) -> ExecutionResult<&mut Number> {
-        match named {
-            NamedExpr::VariableNumber(c) => Ok(&mut self.variables[name_index(*c)]),
-            NamedExpr::ArrayItem { name, index } => {
-                let index = self.array_index(index, out)?;
-                Ok(self.array_variables[name_index(*name)]
-                    .entry(index)
-                    .or_insert_with(Number::zero))
-            }
-        }
+        let slot = self.resolve(named, out)?;
+        Ok(self.slot_mut(slot))
+    }
+
+    /// `lhs op rhs`, with the scale rules of each operator.
+    fn apply_arith(&self, op: ArithOp, lhs: Number, rhs: &Number) -> ExecutionResult<Number> {
+        let result = match op {
+            ArithOp::Add => Ok(lhs.add(rhs)),
+            ArithOp::Sub => Ok(lhs.sub(rhs)),
+            ArithOp::Mul => lhs.mul(rhs, self.scale),
+            ArithOp::Div => lhs.div(rhs, self.scale),
+            ArithOp::Mod => lhs.modulus(rhs, self.scale),
+            ArithOp::Pow => lhs.pow(rhs, self.scale),
+        };
+        result.map_err(ExecutionError::from)
+    }
+
+    /// Evaluate both operands, left first, and combine them.
+    fn eval_arith(
+        &mut self,
+        op: ArithOp,
+        lhs: &ExprInstruction,
+        rhs: &ExprInstruction,
+        out: &mut OutputWriter,
+    ) -> ExecutionResult<Number> {
+        let lhs = self.eval_expr(lhs, out)?;
+        let rhs = self.eval_expr(rhs, out)?;
+        self.apply_arith(op, lhs, &rhs)
     }
 
     /// Put back the globals a call displaced.
@@ -530,7 +585,7 @@ impl Interpreter {
     ) -> ExecutionResult<Number> {
         match expr {
             ExprInstruction::Number(x) => {
-                Number::parse(x, self.ibase).ok_or("invalid digit for the current ibase".into())
+                Number::parse(x, self.ibase).map_err(ExecutionError::from)
             }
             // Grouping changes no value; it only changes whether the statement
             // writes one, which `should_print` reads off the outermost node.
@@ -579,9 +634,22 @@ impl Interpreter {
                 call_result
             }
             ExprInstruction::Assignment { named, value } => {
+                // The element is chosen before the value runs, as GNU bc
+                // does and as a compound assignment does.
+                let slot = self.resolve(named, out)?;
                 let value = self.eval_expr(value, out)?;
-                self.write_named(named, out)?.clone_from(&value);
+                self.slot_mut(slot).clone_from(&value);
                 Ok(value)
+            }
+            ExprInstruction::CompoundAssignment { named, op, value } => {
+                // The target is resolved, and its subscript evaluated, once,
+                // and read before the right side runs, as GNU bc does.
+                let slot = self.resolve(named, out)?;
+                let current = self.slot_value(slot);
+                let value = self.eval_expr(value, out)?;
+                let result = self.apply_arith(*op, current, &value)?;
+                self.slot_mut(slot).clone_from(&result);
+                Ok(result)
             }
             ExprInstruction::SetRegister { register, value } => {
                 // if the value is a single digit it has to be interpreted
@@ -610,26 +678,12 @@ impl Interpreter {
                 self.step_register(*register, -1, *prefix)
             }
             ExprInstruction::UnaryMinus(expr) => Ok(self.eval_expr(expr, out)?.negate()),
-            ExprInstruction::Add(lhs, rhs) => {
-                Ok(self.eval_expr(lhs, out)?.add(&self.eval_expr(rhs, out)?))
-            }
-            ExprInstruction::Sub(lhs, rhs) => {
-                Ok(self.eval_expr(lhs, out)?.sub(&self.eval_expr(rhs, out)?))
-            }
-            ExprInstruction::Mul(lhs, rhs) => Ok(self
-                .eval_expr(lhs, out)?
-                .mul(&self.eval_expr(rhs, out)?, self.scale)),
-            ExprInstruction::Div(lhs, rhs) => Ok(self
-                .eval_expr(lhs, out)?
-                .div(&self.eval_expr(rhs, out)?, self.scale)?),
-            ExprInstruction::Mod(lhs, rhs) => self
-                .eval_expr(lhs, out)?
-                .modulus(&self.eval_expr(rhs, out)?, self.scale)
-                .map_err(ExecutionError::from),
-            ExprInstruction::Pow(lhs, rhs) => self
-                .eval_expr(lhs, out)?
-                .pow(&self.eval_expr(rhs, out)?, self.scale)
-                .map_err(ExecutionError::from),
+            ExprInstruction::Add(lhs, rhs) => self.eval_arith(ArithOp::Add, lhs, rhs, out),
+            ExprInstruction::Sub(lhs, rhs) => self.eval_arith(ArithOp::Sub, lhs, rhs, out),
+            ExprInstruction::Mul(lhs, rhs) => self.eval_arith(ArithOp::Mul, lhs, rhs, out),
+            ExprInstruction::Div(lhs, rhs) => self.eval_arith(ArithOp::Div, lhs, rhs, out),
+            ExprInstruction::Mod(lhs, rhs) => self.eval_arith(ArithOp::Mod, lhs, rhs, out),
+            ExprInstruction::Pow(lhs, rhs) => self.eval_arith(ArithOp::Pow, lhs, rhs, out),
             ExprInstruction::Relation { op, lhs, rhs } => {
                 let lhs = self.eval_expr(lhs, out)?;
                 let rhs = self.eval_expr(rhs, out)?;
@@ -756,6 +810,23 @@ impl Interpreter {
     }
 
     pub fn exec(&mut self, program: Program, out: &mut OutputWriter) -> ExecutionResult<()> {
+        // POSIX: quit stops bc "at the point where the statement occurs in
+        // the input". A runtime error before that point abandons the rest of
+        // the item, but the quit has still been read.
+        let reads_quit = program.instructions.iter().any(|stmt| match stmt {
+            StmtInstruction::DefineFunction { function, .. } => {
+                function.body.iter().any(contains_quit)
+            }
+            stmt => contains_quit(stmt),
+        });
+        let result = self.exec_items(program, out);
+        if result.is_err() && reads_quit {
+            self.has_quit = true;
+        }
+        result
+    }
+
+    fn exec_items(&mut self, program: Program, out: &mut OutputWriter) -> ExecutionResult<()> {
         self.instruction_counter = 0;
         for stmt in program.instructions {
             if let StmtInstruction::DefineFunction { name, function } = stmt {

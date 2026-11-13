@@ -89,6 +89,13 @@ utility below:
    than assignment and associate to the left: `a = 2 > 1` assigns 2 and
    writes `1`, and `3 > 2 > 1` is `(3 > 2) > 1`.  Forced by util-linux's test
    suite (`tests/ts/ipcs/functions.sh`).
+ * As in GNU bc, the body of an `if`, `while` or `for` may follow one
+   newline after the `)`, so a `{` may open on the next line.
+ * As in GNU bc, a function definition may have one newline before its `{`,
+   and its body (`auto` list first) may start on the `{` line:
+   `define f(x) { return (x * 2) }`.
+ * As in GNU bc, `return expression` needs no parentheses; `return (x) + 1`
+   returns `x + 1`.
 
 ### c17
 

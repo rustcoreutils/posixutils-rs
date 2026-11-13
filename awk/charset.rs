@@ -50,7 +50,8 @@ pub fn init() {
     BYTE_COLLATION.store(collation_is_bytes(), Ordering::Relaxed);
 }
 
-/// Whether the `LC_COLLATE` locale in effect is C or POSIX.
+/// Whether the `LC_COLLATE` locale in effect orders strings by their
+/// bytes: C, POSIX or C.UTF-8.
 fn collation_is_bytes() -> bool {
     // SAFETY: a null locale only queries; the result, if not null, is a
     // C string valid until the next setlocale call, and is copied at once.
@@ -59,18 +60,24 @@ fn collation_is_bytes() -> bool {
         return true;
     }
     let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
-    name == b"C" || name == b"POSIX"
+    // C.UTF-8 collates by code point, which is the order of the bytes
+    matches!(
+        name,
+        b"C" | b"POSIX" | b"C.UTF-8" | b"C.utf8" | b"C.UTF8" | b"C.utf-8"
+    )
 }
 
-/// How the strings `a` and `b` compare for awk's relational operators: in
-/// the collation order of the locale (POSIX), with strings that collate
-/// equally but are not the same ordered by their bytes, so that only
-/// identical strings are equal, as `==` and `!=` require.
-pub fn compare_strings(a: &str, b: &str) -> std::cmp::Ordering {
+/// How the strings `a` and `b` compare for the relational operator `op`
+/// (its text, such as "<="): in the collation order of the locale (POSIX),
+/// with strings that collate equally but are not the same ordered by their
+/// bytes, so that only identical strings are equal.  `==` and `!=` need only
+/// that, so for them the locale is not consulted.
+pub fn compare_strings(a: &str, b: &str, op: &str) -> std::cmp::Ordering {
     if a == b {
         return std::cmp::Ordering::Equal;
     }
-    if !BYTE_COLLATION.load(Ordering::Relaxed) {
+    let needs_order = !matches!(op, "==" | "!=");
+    if needs_order && !BYTE_COLLATION.load(Ordering::Relaxed) {
         let collated = plib::locale::strcoll_bytes(&encode(a), &encode(b));
         if collated.is_ne() {
             return collated;

@@ -472,7 +472,7 @@ macro_rules! compare_op {
 									$stack.push_value(bool_to_f64(strtod(lhs) $op strtod(rhs)))?;
               	} else {
                 	$stack.push_value(bool_to_f64(
-                        crate::charset::compare_strings(lhs, rhs) $op std::cmp::Ordering::Equal
+                        crate::charset::compare_strings(lhs, rhs, stringify!($op)) $op std::cmp::Ordering::Equal
                     ))?;
               	}
             }
@@ -497,7 +497,7 @@ macro_rules! compare_op {
                 let lhs = lhs.scalar_to_string($convfmt)?;
                 let rhs = rhs.scalar_to_string($convfmt)?;
                 $stack.push_value(bool_to_f64(
-                    crate::charset::compare_strings(&lhs, &rhs) $op std::cmp::Ordering::Equal
+                    crate::charset::compare_strings(&lhs, &rhs, stringify!($op)) $op std::cmp::Ordering::Equal
                 ))?;
             }
         }

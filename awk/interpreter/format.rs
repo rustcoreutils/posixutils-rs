@@ -125,32 +125,36 @@ fn strip_trailing_zeros(target: &mut String, start: usize) {
     }
 }
 
-/// The decimal exponent of the nonnegative `value` as `%e` with
-/// `precision` writes it, after rounding.
-fn rounded_exponent(value: f64, precision: usize) -> i32 {
-    let text = format!("{value:.precision$e}");
-    let (_, exponent) = text.split_once('e').expect("exponent format has an e");
-    exponent.parse().expect("an exponent is a number")
+/// 2^63: every integral f64 smaller in magnitude fits an `i64`.
+pub const I64_LIMIT: f64 = 9_223_372_036_854_775_808.0;
+/// 2^64: every nonnegative integral f64 below it fits a `u64`.
+pub const U64_LIMIT: f64 = 18_446_744_073_709_551_616.0;
+
+/// The nonnegative `value` as Rust writes it in exponent form with
+/// `precision` digits after the radix character: the mantissa, and the
+/// exponent of the rounded value.
+fn exponent_form(value: f64, precision: usize) -> (String, i32) {
+    let mut text = format!("{value:.precision$e}");
+    let e = text.find('e').expect("exponent format has an e");
+    let exponent = text[e + 1..].parse().expect("an exponent is a number");
+    text.truncate(e);
+    (text, exponent)
 }
 
-/// Writes the nonnegative `value` in the style of `%e`: one digit, the
-/// radix character and `precision` digits, then `e` (or `E`), the sign of
+/// Writes a number in the style of `%e` from its `mantissa` and `exponent`
+/// (see [`exponent_form`]): the mantissa, then `e` (or `E`), the sign of
 /// the exponent and at least two digits of it.  With `strip`, the zeros at
 /// the end of the fraction are removed (`%g`); with `alternative_form` the
 /// radix character is always written.
 fn write_scientific(
     target: &mut String,
-    value: f64,
-    precision: usize,
+    (mantissa, exponent): (String, i32),
     lowercase_version: bool,
     strip: bool,
     alternative_form: bool,
 ) {
-    let text = format!("{value:.precision$e}");
-    let (mantissa, exponent) = text.split_once('e').expect("exponent format has an e");
-    let exponent: i32 = exponent.parse().expect("an exponent is a number");
     let mantissa_start = target.len();
-    target.push_str(mantissa);
+    target.push_str(&mantissa);
     if strip {
         strip_trailing_zeros(target, mantissa_start);
     }
@@ -384,10 +388,9 @@ pub fn fmt_write_signed(target: &mut String, value: i64, args: &FormatArgs) {
 
 /// `%d` of the integral `value`, of any magnitude: beyond the range of
 /// `i64` its digits are those of the exact value.  A value that is not
-/// finite is written as by `%g`.
+/// finite is written as by `%g`.  This is also how awk converts an
+/// integral number to a string.
 pub fn fmt_write_signed_f64(target: &mut String, value: f64, args: &FormatArgs) {
-    // 2^63; every integral f64 below it in magnitude fits an i64
-    const I64_LIMIT: f64 = 9_223_372_036_854_775_808.0;
     if !value.is_finite() {
         fmt_write_integer_as_float(target, value, args);
     } else if value.abs() < I64_LIMIT {
@@ -400,7 +403,8 @@ pub fn fmt_write_signed_f64(target: &mut String, value: f64, args: &FormatArgs) 
 
 /// An integer conversion of a value it cannot show (one beyond 64 bits, or
 /// one that is not finite), written as by `%g` with the same flags and
-/// width, as gawk and the one true awk do.
+/// width, as gawk and the one true awk do (though they write an infinity
+/// with a plus sign; this writes it as C's `%g` does).
 pub fn fmt_write_integer_as_float(target: &mut String, value: f64, args: &FormatArgs) {
     let args = FormatArgs {
         precision: None,
@@ -586,8 +590,7 @@ pub fn fmt_write_scientific_float(
     target.push_str(sign);
     write_scientific(
         target,
-        value.abs(),
-        args.precision.unwrap_or(6),
+        exponent_form(value.abs(), args.precision.unwrap_or(6)),
         lowercase_version,
         false,
         args.alternative_form,
@@ -612,14 +615,14 @@ pub fn fmt_write_float_general(
     }
     let abs_value = value.abs();
     let significant_digits = args.precision.unwrap_or(6).max(1);
-    let exponent = rounded_exponent(abs_value, significant_digits - 1);
+    let scientific = exponent_form(abs_value, significant_digits - 1);
+    let exponent = scientific.1;
     let start = target.len();
     target.push_str(sign);
     if exponent < -4 || exponent >= significant_digits as i32 {
         write_scientific(
             target,
-            abs_value,
-            significant_digits - 1,
+            scientific,
             lowercase_version,
             !args.alternative_form,
             args.alternative_form,

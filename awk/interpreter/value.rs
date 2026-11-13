@@ -12,6 +12,7 @@ use std::ffi::CString;
 use std::rc::Rc;
 
 use super::array::Array;
+use super::format::{fmt_write_signed_f64, FormatArgs, I64_LIMIT};
 use super::string::AwkString;
 use super::{bool_to_f64, is_integer, sprintf, strtod};
 use crate::program::SpecialVar;
@@ -48,17 +49,16 @@ pub(crate) struct AwkValue {
 
 pub(crate) type AwkValueRef = UnsafeCell<AwkValue>;
 
-/// The decimal digits of the integral number `num`, as `%d` would give
-/// them: exactly, also beyond the range of `i64`, where a conversion to it
-/// would saturate.
+/// The integral number `num` as a string: as by `%d`, exactly, also beyond
+/// the range of `i64`, where a conversion to it would saturate.
 pub(crate) fn integer_to_string(num: f64) -> String {
-    // 2^63; every integral f64 below it in magnitude fits an i64
-    const I64_LIMIT: f64 = 9_223_372_036_854_775_808.0;
     if num.abs() < I64_LIMIT {
-        (num as i64).to_string()
-    } else {
-        format!("{num:.0}")
+        // the common case, quickly
+        return (num as i64).to_string();
     }
+    let mut result = String::new();
+    fmt_write_signed_f64(&mut result, num, &FormatArgs::default());
+    result
 }
 
 impl AwkValue {

@@ -13,7 +13,8 @@ use std::fmt::Write;
 use super::format::{
     fmt_write_decimal_float, fmt_write_float_general, fmt_write_hex_float,
     fmt_write_integer_as_float, fmt_write_scientific_float, fmt_write_signed_f64, fmt_write_string,
-    fmt_write_unsigned, parse_conversion_specifier_args, FormatArgs, IntegerFormat,
+    fmt_write_unsigned, parse_conversion_specifier_args, FormatArgs, IntegerFormat, I64_LIMIT,
+    U64_LIMIT,
 };
 use super::record::{split_record, FieldSeparator, FieldsState};
 use super::stack::Stack;
@@ -95,13 +96,11 @@ fn format_one_conversion(
         }
         'u' | 'o' | 'x' | 'X' => {
             let value = value.scalar_as_f64().trunc();
-            // -2^63 and 2^64: a negative value is written as its 64-bit
-            // two's complement, as in C and the other awks
-            const I64_MIN: f64 = -9_223_372_036_854_775_808.0;
-            const U64_LIMIT: f64 = 18_446_744_073_709_551_616.0;
+            // a negative value is written as its 64-bit two's complement,
+            // as in C and the other awks
             let value = if (0.0..U64_LIMIT).contains(&value) {
                 value as u64
-            } else if (I64_MIN..0.0).contains(&value) {
+            } else if (-I64_LIMIT..0.0).contains(&value) {
                 value as i64 as u64
             } else {
                 fmt_write_integer_as_float(result, value, args);

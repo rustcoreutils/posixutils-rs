@@ -17,6 +17,7 @@ use super::format::{
     U64_LIMIT,
 };
 use super::io::wait_status;
+use super::output::write_stdout;
 use super::record::{split_record, FieldSeparator, FieldsState};
 use super::stack::Stack;
 use super::string::AwkString;
@@ -455,13 +456,6 @@ pub(crate) fn call_simple_builtin(
         BuiltinFunction::Gsub | BuiltinFunction::Sub => {
             return builtin_gsub(stack, global_env, function == BuiltinFunction::Sub)
         }
-        BuiltinFunction::System => {
-            let command: CString = stack
-                .pop_scalar_value()?
-                .scalar_to_string(&global_env.convfmt)?
-                .try_into()?;
-            stack.push_value(run_system(&command) as f64)?;
-        }
         BuiltinFunction::Print => {
             write_stdout(&print_to_string(stack, argc, global_env)?)?;
         }
@@ -473,27 +467,9 @@ pub(crate) fn call_simple_builtin(
     Ok(FieldsState::Ok)
 }
 
-/// The system's text for the first failed write to standard output, if one
-/// failed. It ends the run like any runtime error, but is reported as the
-/// write error it is (see [`stdout_write_error`]).
-static STDOUT_WRITE_ERROR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-/// Why writing standard output failed, if it did.
-pub fn stdout_write_error() -> Option<&'static str> {
-    STDOUT_WRITE_ERROR.get().map(String::as_str)
-}
-
-/// Write `s` to standard output as the bytes awk writes for it.
-fn write_stdout(s: &str) -> Result<(), String> {
-    std::io::Write::write_all(&mut std::io::stdout(), &crate::charset::encode(s)).map_err(|e| {
-        let reason = STDOUT_WRITE_ERROR.get_or_init(|| plib::diag::io_error_text(&e));
-        format!("{}: {reason}", gettextrs::gettext("write error"))
-    })
-}
-
 /// Run `command` via `libc::system`; awk's `system()` returns its status as
 /// `close()` of a pipe does (see [`wait_status`]).
-fn run_system(command: &CString) -> i32 {
+pub(crate) fn run_system(command: &CString) -> i32 {
     wait_status(unsafe { libc::system(command.as_ptr()) })
 }
 

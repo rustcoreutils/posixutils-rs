@@ -10,12 +10,13 @@ use std::{
     collections::{hash_map::Entry, HashMap, VecDeque},
     ffi::{CString, OsStr},
     fs::File,
-    io::{BufReader, Bytes, Read, Write},
+    io::{BufReader, BufWriter, Bytes, Read, Write},
     os::unix::ffi::OsStrExt,
     path::PathBuf,
     rc::Rc,
 };
 
+use super::output;
 use super::string::AwkString;
 use crate::charset;
 use crate::regex::Regex;
@@ -414,19 +415,52 @@ impl RecordReader for StringRecordReader {
 
 #[derive(Default)]
 pub struct WriteFiles {
-    files: HashMap<String, File>,
+    files: HashMap<String, BufWriter<File>>,
+}
+
+/// An output file name that stands for one of awk's own outputs, which awk
+/// writes itself rather than opening the device: `/dev/stdout` shares the
+/// buffer of standard output, so the order of the output is kept, and
+/// `/dev/stderr` is written at once.
+enum StandardOutput {
+    Stdout,
+    Stderr,
+}
+
+impl StandardOutput {
+    fn named(filename: &str) -> Option<Self> {
+        match filename {
+            "/dev/stdout" => Some(Self::Stdout),
+            "/dev/stderr" => Some(Self::Stderr),
+            _ => None,
+        }
+    }
+}
+
+/// The error for a failed write to the output file `filename`.
+fn file_write_error(filename: &str, e: &std::io::Error) -> String {
+    gettextrs::gettext!(
+        "cannot write to file '{}': {}",
+        filename,
+        plib::diag::io_error_text(e)
+    )
 }
 
 impl WriteFiles {
     pub fn write(&mut self, filename: &str, contents: &str, append: bool) -> Result<(), String> {
-        match self.files.entry(filename.to_string()) {
-            Entry::Occupied(mut e) => {
-                e.get_mut()
+        match StandardOutput::named(filename) {
+            Some(StandardOutput::Stdout) => return output::write_stdout(contents),
+            Some(StandardOutput::Stderr) => {
+                return std::io::stderr()
                     .write_all(&charset::encode(contents))
-                    .map_err(|e| plib::diag::io_error_text(&e))?;
+                    .map_err(|e| file_write_error(filename, &e))
             }
+            None => {}
+        }
+        let file = match self.files.entry(filename.to_string()) {
+            Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => {
-                let mut file = File::options()
+                let file = File::options()
                     .write(true)
                     .create(true)
                     .truncate(!append)
@@ -439,26 +473,32 @@ impl WriteFiles {
                             plib::diag::io_error_text(&e)
                         )
                     })?;
-                file.write_all(&charset::encode(contents))
-                    .map_err(|e| plib::diag::io_error_text(&e))?;
-                e.insert(file);
+                e.insert(BufWriter::new(file))
             }
-        }
-        Ok(())
+        };
+        file.write_all(&charset::encode(contents))
+            .map_err(|e| file_write_error(filename, &e))
     }
 
     /// Flushes the output file `filename`: whether that succeeded, or
     /// `None` if no such file is open.
     pub fn flush_file(&mut self, filename: &str) -> Option<bool> {
-        self.files
-            .get_mut(filename)
-            .map(|file| file.flush().is_ok())
+        match StandardOutput::named(filename) {
+            Some(StandardOutput::Stdout) => Some(output::flush_stdout().is_ok()),
+            Some(StandardOutput::Stderr) => Some(true),
+            None => self
+                .files
+                .get_mut(filename)
+                .map(|file| file.flush().is_ok()),
+        }
     }
 
+    /// Flushes every output file; whether all succeeded.
     pub fn flush_all(&mut self) -> bool {
+        // every one, also after a failure
         let mut success = true;
         for file in self.files.values_mut() {
-            success = success && file.flush().is_ok();
+            success &= file.flush().is_ok();
         }
         success
     }
@@ -467,9 +507,28 @@ impl WriteFiles {
     /// successful flush+close, `Some(-1)` if flushing failed, or `None` if no
     /// file was open under this name.
     pub fn close_file(&mut self, filename: &str) -> Option<i32> {
-        self.files
-            .remove(filename)
-            .map(|mut file| if file.flush().is_ok() { 0 } else { -1 })
+        let status = |ok: bool| if ok { 0 } else { -1 };
+        match StandardOutput::named(filename) {
+            Some(_) => self.flush_file(filename).map(status),
+            None => self
+                .files
+                .remove(filename)
+                .map(|mut file| status(file.flush().is_ok())),
+        }
+    }
+
+    /// Flushes and closes every output file, at the end of the run: an
+    /// error for the first that could not be written.
+    pub fn close_all(&mut self) -> Result<(), String> {
+        let mut result = Ok(());
+        for (filename, mut file) in self.files.drain() {
+            if let Err(e) = file.flush() {
+                if result.is_ok() {
+                    result = Err(file_write_error(&filename, &e));
+                }
+            }
+        }
+        result
     }
 }
 
@@ -551,6 +610,11 @@ impl WritePipes {
         Ok(())
     }
 
+    /// Whether an output pipe to `command` is open.
+    pub fn is_open(&self, command: &str) -> bool {
+        self.pipes.contains_key(command)
+    }
+
     /// Flushes the output pipe `filename`: whether that succeeded, or
     /// `None` if no such pipe is open.
     pub fn flush_file(&mut self, filename: &str) -> Option<bool> {
@@ -559,10 +623,12 @@ impl WritePipes {
             .map(|file| unsafe { libc::fflush(*file) == 0 })
     }
 
+    /// Flushes every output pipe; whether all succeeded.
     pub fn flush_all(&mut self) -> bool {
+        // every one, also after a failure
         let mut success = true;
         for file in self.pipes.values() {
-            success = success && unsafe { libc::fflush(*file) == 0 };
+            success &= unsafe { libc::fflush(*file) == 0 };
         }
         success
     }
@@ -686,6 +752,11 @@ impl ReadPipes {
                 result
             }
         }
+    }
+
+    /// Whether an input pipe from `command` is open.
+    pub fn is_open(&self, command: &str) -> bool {
+        self.pipes.contains_key(command)
     }
 
     /// Close a previously-opened input pipe. Returns the command's status as

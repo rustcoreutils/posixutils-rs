@@ -2843,3 +2843,64 @@ fn awk_fflush_of_an_open_file_or_pipe() {
     );
     assert_awk_cases(&[(&program, "", "y\n0 0 -1\n")]);
 }
+
+// Output reaches its destination in the order awk writes it, also around
+// the commands awk runs: standard output is flushed before a command
+// starts or is waited for, before reading from a command, and at the end
+// of the run, whatever ends it.  /dev/stdout shares awk's standard
+// output and /dev/stderr is its standard error.
+#[test]
+fn awk_output_order_around_commands_and_special_files() {
+    assert_awk_cases(&[
+        ("BEGIN { printf \"a\"; system(\"echo b\") }", "", "ab\n"),
+        (
+            "BEGIN { printf \"a\"; print \"b\" | \"cat\"; close(\"cat\"); print \"c\" }",
+            "",
+            "ab\nc\n",
+        ),
+        (
+            "BEGIN { print \"x\"; print \"b\" | \"sort\"; close(\"sort\"); print \"y\" }",
+            "",
+            "x\nb\ny\n",
+        ),
+        (
+            "BEGIN { printf \"a\"; \"echo b\" | getline v; print v }",
+            "",
+            "ab\n",
+        ),
+        (
+            "BEGIN { print 1; print 2 > \"/dev/stdout\"; printf \"3\" >> \"/dev/stdout\"; print 4; print close(\"/dev/stdout\") }",
+            "",
+            "1\n2\n34\n0\n",
+        ),
+        ("BEGIN { printf \"x\"; exit }", "", "x"),
+        ("{ printf \"%s\", $0 } END { printf \"!\" }", "a\nb\n", "ab!"),
+    ]);
+    let (stdout, stderr, status) = awk_args(
+        &["BEGIN { print \"e\" > \"/dev/stderr\"; print \"o\" }"],
+        "",
+    );
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), status),
+        ("o\n", "e\n", Some(0))
+    );
+    let (stdout, stderr, status) = awk_args(&["BEGIN { printf \"before\"; $(-1) }"], "");
+    assert_eq!(stdout, "before");
+    assert!(stderr.starts_with("awk: runtime error"), "{stderr}");
+    assert_eq!(status, Some(1));
+}
+
+// A failed write to an output file, which may show only when its buffer
+// is flushed at the end, is an error naming the file.
+#[cfg(target_os = "linux")]
+#[test]
+fn awk_write_error_on_an_output_file() {
+    let (_, stderr, status) = awk_args(&["BEGIN { print \"x\" > \"/dev/full\" }"], "");
+    assert!(stderr.contains("/dev/full"), "{stderr}");
+    assert_eq!(status, Some(1));
+    let (_, _, status) = awk_args(
+        &["BEGIN { print \"x\" > \"/dev/full\"; print close(\"/dev/full\") }"],
+        "",
+    );
+    assert_eq!(status, Some(0));
+}

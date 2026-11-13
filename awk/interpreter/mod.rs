@@ -8,10 +8,12 @@
 //
 
 use array::Array;
-pub use builtins::stdout_write_error;
-use builtins::{builtin_match, builtin_sprintf, call_simple_builtin, print_to_string, sprintf};
+use builtins::{
+    builtin_match, builtin_sprintf, call_simple_builtin, print_to_string, run_system, sprintf,
+};
 use io::{ReadFiles, ReadPipes, RecordSeparator, WriteFiles, WritePipes};
 use main_input::MainInput;
+pub use output::{flush_stdout, stdout_write_error};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use record::{ere_escape_char, record_index, FieldSeparator, FieldsState, Record};
@@ -29,6 +31,7 @@ use crate::program::{
 };
 use crate::regex::Regex;
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::fmt::Write;
 use std::iter;
 use std::os::unix::ffi::OsStringExt;
@@ -40,6 +43,7 @@ mod builtins;
 mod format;
 mod io;
 mod main_input;
+mod output;
 mod record;
 mod stack;
 mod string;
@@ -278,6 +282,11 @@ impl Interpreter {
     /// any non-zero status (a failure, or the exit status of a pipe's
     /// command), else 0, else -1 when nothing matched.
     fn close_streams(&mut self, name: &str) -> i32 {
+        if self.write_pipes.is_open(name) || self.read_pipes.is_open(name) {
+            // the command's output comes after awk's so far; a failed write
+            // shows at the end of the run
+            let _ = self.before_command();
+        }
         let results = [
             self.write_files.close_file(name),
             self.read_files.close_file(name),
@@ -294,6 +303,24 @@ impl Interpreter {
                 .find(|&s| s != 0)
                 .unwrap_or(0)
         }
+    }
+
+    /// Writes out the output awk has collected, before a command starts or
+    /// is waited for: the command's output must come after it, and the
+    /// command may read the files awk wrote.
+    fn before_command(&mut self) -> Result<(), String> {
+        output::flush_stdout()?;
+        self.write_files.flush_all();
+        self.write_pipes.flush_all();
+        Ok(())
+    }
+
+    /// Closes the output files at the end of the run: an error if one could
+    /// not be written.  (Standard output is written out by the caller, which
+    /// keeps the exit status; pipes are closed, and their commands waited
+    /// for, when the interpreter is dropped.)
+    fn finish_output(&mut self) -> Result<(), String> {
+        self.write_files.close_all()
     }
 
     /// Increment a special counter global (NR or FNR) by one, keeping its
@@ -367,6 +394,9 @@ impl Interpreter {
                 } else {
                     builtin_sprintf(stack, argc - 1, global_env)?
                 };
+                if !self.write_pipes.is_open(&command) {
+                    self.before_command()?;
+                }
                 self.write_pipes.write(command, str)?;
             }
             BuiltinFunction::Close => {
@@ -384,8 +414,9 @@ impl Interpreter {
                     AwkString::default()
                 };
                 let result = if expr_str.is_empty() {
-                    let stdout_ok = std::io::Write::flush(&mut std::io::stdout()).is_ok();
-                    stdout_ok && self.write_files.flush_all() && self.write_pipes.flush_all()
+                    let stdout_ok = output::flush_stdout().is_ok();
+                    let files_ok = self.write_files.flush_all();
+                    stdout_ok && files_ok && self.write_pipes.flush_all()
                 } else {
                     // the name is open as a file, a pipe or both
                     let file = self.write_files.flush_file(&expr_str);
@@ -416,6 +447,11 @@ impl Interpreter {
                 // the file or command is under the target, which is evaluated after it
                 let (filename, var) = stack.pop_scalar_under_ref()?;
                 let filename = filename.scalar_to_string(&global_env.convfmt)?;
+                if function == BuiltinFunction::GetLineFromPipe
+                    && !self.read_pipes.is_open(&filename)
+                {
+                    self.before_command()?;
+                }
                 let maybe_next_record = if function == BuiltinFunction::GetLineFromFile {
                     self.read_files.read_next_record(filename, &global_env.rs)
                 } else {
@@ -439,6 +475,14 @@ impl Interpreter {
                         stack.push_value(-1.0)?;
                     }
                 }
+            }
+            BuiltinFunction::System => {
+                let command: CString = stack
+                    .pop_scalar_value()?
+                    .scalar_to_string(&global_env.convfmt)?
+                    .try_into()?;
+                self.before_command()?;
+                stack.push_value(run_system(&command) as f64)?;
             }
             BuiltinFunction::Rand => {
                 let rand = self.rng.random_range(0.0..1.0);
@@ -996,89 +1040,64 @@ pub fn interpret(
     }
 
     let mut main_input = MainInput::new(program.globals);
-    for action in program.begin_actions {
-        let begin_result = interpreter.run(
-            &action,
-            &program.functions,
-            &mut current_record,
-            &mut stack,
-            &mut global_env,
-            &mut main_input,
-        )?;
-        if let ExecutionResult::Exit(status) = begin_result {
-            // `exit` in BEGIN skips the input, but not the END actions
-            exit_status = status.unwrap_or(exit_status);
-            main_input.finish();
-            break;
+    // the run proper; whatever ends it, the output awk has collected is
+    // written out
+    let result = (|| -> Result<i32, String> {
+        for action in program.begin_actions {
+            let begin_result = interpreter.run(
+                &action,
+                &program.functions,
+                &mut current_record,
+                &mut stack,
+                &mut global_env,
+                &mut main_input,
+            )?;
+            if let ExecutionResult::Exit(status) = begin_result {
+                // `exit` in BEGIN skips the input, but not the END actions
+                exit_status = status.unwrap_or(exit_status);
+                main_input.finish();
+                break;
+            }
         }
-    }
 
-    if program.rules.is_empty() && program.end_actions.is_empty() {
-        return Ok(exit_status);
-    }
+        if program.rules.is_empty() && program.end_actions.is_empty() {
+            return Ok(exit_status);
+        }
 
-    'record_loop: while let Some(record) =
-        main_input.next_record(&interpreter.globals, &mut global_env)?
-    {
-        let fs = global_env.effective_fs()?;
-        current_record.reset(record, fs)?;
-        interpreter.globals[SpecialVar::Nf as usize].get_mut().value =
-            AwkValue::from(current_record.get_last_field() as f64).value;
-        global_env.nf = current_record.get_last_field();
+        'record_loop: while let Some(record) =
+            main_input.next_record(&interpreter.globals, &mut global_env)?
+        {
+            let fs = global_env.effective_fs()?;
+            current_record.reset(record, fs)?;
+            interpreter.globals[SpecialVar::Nf as usize].get_mut().value =
+                AwkValue::from(current_record.get_last_field() as f64).value;
+            global_env.nf = current_record.get_last_field();
 
-        global_env.fnr = global_env.fnr.saturating_add(1);
-        global_env.nr = global_env.nr.saturating_add(1);
-        interpreter.globals[SpecialVar::Fnr as usize]
-            .get_mut()
-            .value = AwkValue::from(global_env.fnr as f64).value;
-        interpreter.globals[SpecialVar::Nr as usize].get_mut().value =
-            AwkValue::from(global_env.nr as f64).value;
+            global_env.fnr = global_env.fnr.saturating_add(1);
+            global_env.nr = global_env.nr.saturating_add(1);
+            interpreter.globals[SpecialVar::Fnr as usize]
+                .get_mut()
+                .value = AwkValue::from(global_env.fnr as f64).value;
+            interpreter.globals[SpecialVar::Nr as usize].get_mut().value =
+                AwkValue::from(global_env.nr as f64).value;
 
-        for (i, rule) in program.rules.iter().enumerate() {
-            // a `next`, `nextfile` or `exit` in a function a pattern calls
-            let mut control = None;
-            let should_execute = match &rule.pattern {
-                Pattern::All => true,
-                Pattern::Expr(expr) => interpreter
-                    .run(
-                        expr,
-                        &program.functions,
-                        &mut current_record,
-                        &mut stack,
-                        &mut global_env,
-                        &mut main_input,
-                    )?
-                    .pattern_matched(&mut control),
-                Pattern::Range { start, end } => {
-                    if range_pattern_started[i] {
-                        let end_matches = interpreter
-                            .run(
-                                end,
-                                &program.functions,
-                                &mut current_record,
-                                &mut stack,
-                                &mut global_env,
-                                &mut main_input,
-                            )?
-                            .pattern_matched(&mut control);
-                        if end_matches {
-                            range_pattern_started[i] = false;
-                        }
-                        // range is inclusive
-                        true
-                    } else {
-                        let should_start = interpreter
-                            .run(
-                                start,
-                                &program.functions,
-                                &mut current_record,
-                                &mut stack,
-                                &mut global_env,
-                                &mut main_input,
-                            )?
-                            .pattern_matched(&mut control);
-                        if should_start {
-                            // Check if end also matches on the same line
+            for (i, rule) in program.rules.iter().enumerate() {
+                // a `next`, `nextfile` or `exit` in a function a pattern calls
+                let mut control = None;
+                let should_execute = match &rule.pattern {
+                    Pattern::All => true,
+                    Pattern::Expr(expr) => interpreter
+                        .run(
+                            expr,
+                            &program.functions,
+                            &mut current_record,
+                            &mut stack,
+                            &mut global_env,
+                            &mut main_input,
+                        )?
+                        .pattern_matched(&mut control),
+                    Pattern::Range { start, end } => {
+                        if range_pattern_started[i] {
                             let end_matches = interpreter
                                 .run(
                                     end,
@@ -1089,57 +1108,94 @@ pub fn interpret(
                                     &mut main_input,
                                 )?
                                 .pattern_matched(&mut control);
-                            // If end matches on the same line, don't keep range open
-                            range_pattern_started[i] = !end_matches;
+                            if end_matches {
+                                range_pattern_started[i] = false;
+                            }
+                            // range is inclusive
+                            true
+                        } else {
+                            let should_start = interpreter
+                                .run(
+                                    start,
+                                    &program.functions,
+                                    &mut current_record,
+                                    &mut stack,
+                                    &mut global_env,
+                                    &mut main_input,
+                                )?
+                                .pattern_matched(&mut control);
+                            if should_start {
+                                // Check if end also matches on the same line
+                                let end_matches = interpreter
+                                    .run(
+                                        end,
+                                        &program.functions,
+                                        &mut current_record,
+                                        &mut stack,
+                                        &mut global_env,
+                                        &mut main_input,
+                                    )?
+                                    .pattern_matched(&mut control);
+                                // If end matches on the same line, don't keep range open
+                                range_pattern_started[i] = !end_matches;
+                            }
+                            should_start
                         }
-                        should_start
                     }
+                };
+                let rule_result = if let Some(control) = control {
+                    control
+                } else if should_execute {
+                    interpreter.run(
+                        &rule.action,
+                        &program.functions,
+                        &mut current_record,
+                        &mut stack,
+                        &mut global_env,
+                        &mut main_input,
+                    )?
+                } else {
+                    continue;
+                };
+                match rule_result {
+                    ExecutionResult::Next => break,
+                    ExecutionResult::NextFile => {
+                        main_input.skip_file();
+                        break;
+                    }
+                    ExecutionResult::Exit(status) => {
+                        exit_status = status.unwrap_or(exit_status);
+                        main_input.finish();
+                        break 'record_loop;
+                    }
+                    ExecutionResult::Expression(_) => {}
                 }
-            };
-            let rule_result = if let Some(control) = control {
-                control
-            } else if should_execute {
-                interpreter.run(
-                    &rule.action,
-                    &program.functions,
-                    &mut current_record,
-                    &mut stack,
-                    &mut global_env,
-                    &mut main_input,
-                )?
-            } else {
-                continue;
-            };
-            match rule_result {
-                ExecutionResult::Next => break,
-                ExecutionResult::NextFile => {
-                    main_input.skip_file();
-                    break;
-                }
-                ExecutionResult::Exit(status) => {
-                    exit_status = status.unwrap_or(exit_status);
-                    main_input.finish();
-                    break 'record_loop;
-                }
-                ExecutionResult::Expression(_) => {}
             }
         }
-    }
 
-    for action in program.end_actions {
-        let end_result = interpreter.run(
-            &action,
-            &program.functions,
-            &mut current_record,
-            &mut stack,
-            &mut global_env,
-            &mut main_input,
-        )?;
-        if let ExecutionResult::Exit(status) = end_result {
-            exit_status = status.unwrap_or(exit_status);
-            break;
+        for action in program.end_actions {
+            let end_result = interpreter.run(
+                &action,
+                &program.functions,
+                &mut current_record,
+                &mut stack,
+                &mut global_env,
+                &mut main_input,
+            )?;
+            if let ExecutionResult::Exit(status) = end_result {
+                exit_status = status.unwrap_or(exit_status);
+                break;
+            }
+        }
+
+        Ok(exit_status)
+    })();
+    match result {
+        Ok(status) => interpreter.finish_output().map(|()| status),
+        Err(error) => {
+            // what was written before the error comes before its report
+            let _ = output::flush_stdout();
+            Err(error)
         }
     }
-
-    Ok(exit_status)
 }

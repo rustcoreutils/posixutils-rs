@@ -2775,7 +2775,9 @@ fn awk_deep_recursion() {
 
 // A search after an earlier match sees the character before it, so a word
 // boundary is found only where there is one: gsub(/\</, "X") put an X
-// before every letter but the first of each word.
+// before every letter but the first of each word.  (Apple's regcomp has no
+// \< or \>.)
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn awk_regex_search_after_a_match_sees_the_character_before() {
     assert_awk_cases(&[(

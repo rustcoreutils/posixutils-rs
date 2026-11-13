@@ -3014,3 +3014,15 @@ fn awk_large_string_precision_needs_no_room() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "abc|d\n");
     assert_eq!(out.status.code(), Some(0));
 }
+
+// A record read with more fields than an assignment may create on its own
+// may still be extended past them by a few.
+#[test]
+fn awk_huge_input_record_can_grow() {
+    let line = format!("{}\n", vec!["x"; 1_500_000].join(","));
+    assert_awk_cases(&[(
+        "BEGIN { FS = \",\" } { $(NF + 1) = \"y\"; print NF, $NF }",
+        &line,
+        "1500001 y\n",
+    )]);
+}

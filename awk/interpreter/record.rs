@@ -122,6 +122,9 @@ pub(crate) struct Record {
     #[allow(clippy::vec_box)]
     fields: RefCell<Vec<Box<AwkValueRef>>>,
     pub(crate) last_field: RefCell<usize>,
+    /// The most fields a record had when split from its text, which bounds
+    /// the fields an assignment may create (see [`Self::check_growth`]).
+    split_fields: std::cell::Cell<usize>,
 }
 
 impl Record {
@@ -129,17 +132,18 @@ impl Record {
     /// holds it in a `u32`.
     pub(crate) const MAX_FIELDS: usize = i32::MAX as usize;
 
-    /// The highest field an assignment to a field or to NF may create
-    /// beyond those the record has: the record's storage holds every field
-    /// up to the last, so `NF = 2e9`, or many smaller steps, would
-    /// otherwise allocate billions of them.  A record read from the input
-    /// may have more fields, as its size bounds them.
-    const MAX_CREATED_FIELD: usize = 1 << 20;
+    /// How far past the most fields a split record has had an assignment
+    /// to a field or to NF may create fields: the record's storage holds
+    /// every field up to the last, so `NF = 2e9`, or many smaller steps,
+    /// would otherwise allocate billions of them.  A record split from its
+    /// text may have any number, as the text's size bounds them.
+    const MAX_CREATED_FIELDS: usize = 1 << 20;
 
-    /// An error if making `index` the last field would create a field
-    /// past both the record's storage and [`Self::MAX_CREATED_FIELD`].
+    /// An error if making `index` the last field would create a field more
+    /// than [`Self::MAX_CREATED_FIELDS`] past the most fields a split
+    /// record has had.
     pub(crate) fn check_growth(&self, index: usize) -> Result<(), String> {
-        if index >= self.fields.borrow().len() && index > Self::MAX_CREATED_FIELD {
+        if index > self.split_fields.get() + Self::MAX_CREATED_FIELDS {
             Err(format!("attempt to create field {index}"))
         } else {
             Ok(())
@@ -237,6 +241,8 @@ impl Record {
         let fields = self.fields.get_mut();
         let last_field =
             Self::fill_fields(fields, record.clone(), field_separator, previous_last_field)?;
+        self.split_fields
+            .set(self.split_fields.get().max(last_field));
         *fields[0].get_mut() = AwkValue::field_ref(record.clone(), 0);
         *self.record.get_mut() = record;
         *self.last_field.get_mut() = last_field;
@@ -320,6 +326,8 @@ impl Record {
             global_env.effective_fs()?,
             previous_last_field,
         )?;
+        self.split_fields
+            .set(self.split_fields.get().max(last_field));
         *fields[0].get_mut() = AwkValue::field_ref(record_str.clone(), 0);
         drop(fields);
         *self.record.borrow_mut() = record_str;
@@ -346,6 +354,7 @@ impl Default for Record {
             record: AwkString::default().into(),
             fields: RefCell::new(fields),
             last_field: 0.into(),
+            split_fields: 0.into(),
         }
     }
 }

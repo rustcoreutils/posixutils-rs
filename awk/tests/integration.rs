@@ -2965,3 +2965,16 @@ fn awk_output_survives_a_failure_at_the_end() {
     );
     assert_eq!(status, Some(1));
 }
+
+// getline from a file awk is writing reads what awk has written to it:
+// the file's output buffer is flushed when getline opens it.
+#[test]
+fn awk_getline_reads_what_awk_wrote_to_the_file() {
+    let tmp = plib::tmp::TempDir::new().unwrap();
+    let file = tmp.path().join("t");
+    let program = format!(
+        "BEGIN {{ print \"data\" > \"{0}\"; while ((getline l < \"{0}\") > 0) n++; print n + 0, l }}",
+        file.display()
+    );
+    assert_awk_cases(&[(&program, "", "1 data\n")]);
+}

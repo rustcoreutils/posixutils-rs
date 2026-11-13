@@ -471,6 +471,11 @@ impl ReadFiles {
         }
     }
 
+    /// Whether an input file is open under `filename`.
+    pub fn is_open(&self, filename: &str) -> bool {
+        self.files.contains_key(filename)
+    }
+
     /// Close a previously-opened input file. Returns `Some(0)` if a file was
     /// open under this name, or `None` otherwise.
     pub fn close_file(&mut self, filename: &str) -> Option<i32> {

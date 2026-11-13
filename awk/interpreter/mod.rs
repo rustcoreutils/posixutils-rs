@@ -457,6 +457,12 @@ impl Interpreter {
                 {
                     self.before_command()?;
                 }
+                if function == BuiltinFunction::GetLineFromFile
+                    && !self.read_files.is_open(&filename)
+                {
+                    // what awk wrote to the file is there to be read
+                    self.write_files.flush_file(&filename);
+                }
                 let maybe_next_record = if function == BuiltinFunction::GetLineFromFile {
                     self.read_files.read_next_record(filename, &global_env.rs)
                 } else {

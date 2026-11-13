@@ -12,7 +12,6 @@ use crate::interpreter::interpret;
 use clap::Parser;
 use compiler::SourceFile;
 use gettextrs::gettext;
-use std::error::Error;
 use std::fmt::Display;
 use std::io::Read;
 
@@ -47,7 +46,10 @@ struct Args {
     arguments: Vec<String>,
 }
 
-fn exit_if_error<T, U: Display>(r: Result<T, U>) -> T {
+/// The value of `r`, or else the end of the run with its error, after
+/// `prefix` (the compiler's errors carry their own location, so they have
+/// none; the others begin with "awk: ").
+fn exit_if_error<T, U: Display>(r: Result<T, U>, prefix: &str) -> T {
     match r {
         Ok(v) => v,
         Err(err) => {
@@ -55,14 +57,14 @@ fn exit_if_error<T, U: Display>(r: Result<T, U>) -> T {
             // error, but it is the output that failed, not the program.
             match interpreter::stdout_write_error() {
                 Some(reason) => eprintln!("awk: {}: {reason}", gettext("write error")),
-                None => eprintln!("{err}"),
+                None => eprintln!("{prefix}{err}"),
             }
             std::process::exit(1);
         }
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() {
     plib::diag::init_locale("awk");
     charset::init();
 
@@ -82,41 +84,53 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mut sources = Vec::new();
         for source_file in &args.program_files {
             let mut contents = Vec::new();
-            if source_file == "-" {
+            let reason = |e: std::io::Error| plib::diag::io_error_text(&e);
+            let read = if source_file == "-" {
                 // POSIX: a progfile of '-' denotes the standard input.
                 std::io::stdin()
                     .read_to_end(&mut contents)
-                    .map_err(|_| gettext!("could not read standard input"))?;
+                    .map_err(|e| gettext!("cannot read standard input: {}", reason(e)))
             } else {
-                let mut file = std::fs::File::open(source_file)
-                    .map_err(|_| gettext!("could not open file '{}'", source_file))?;
-                file.read_to_end(&mut contents)
-                    .map_err(|_| gettext!("could not read file '{}'", source_file))?;
-            }
+                std::fs::File::open(source_file)
+                    .map_err(|e| gettext!("cannot open file '{}': {}", source_file, reason(e)))
+                    .and_then(|mut file| {
+                        file.read_to_end(&mut contents).map_err(|e| {
+                            gettext!("cannot read file '{}': {}", source_file, reason(e))
+                        })
+                    })
+            };
+            exit_if_error(read, "awk: ");
             sources.push(SourceFile {
                 contents: charset::decode(contents),
                 filename: source_file.clone(),
             });
         }
-        let program = exit_if_error(compile_program(&sources));
-        exit_if_error(interpret(
-            program,
-            &args.arguments,
-            &args.assignments,
-            args.separator_string,
-        ))
+        let program = exit_if_error(compile_program(&sources), "");
+        exit_if_error(
+            interpret(
+                program,
+                &args.arguments,
+                &args.assignments,
+                args.separator_string,
+            ),
+            "awk: ",
+        )
     } else if !args.arguments.is_empty() {
-        let program = exit_if_error(compile_program(&[SourceFile::stdin(
-            args.arguments[0].clone(),
-        )]));
-        exit_if_error(interpret(
-            program,
-            &args.arguments[1..],
-            &args.assignments,
-            args.separator_string,
-        ))
+        let program = exit_if_error(
+            compile_program(&[SourceFile::stdin(args.arguments[0].clone())]),
+            "",
+        );
+        exit_if_error(
+            interpret(
+                program,
+                &args.arguments[1..],
+                &args.assignments,
+                args.separator_string,
+            ),
+            "awk: ",
+        )
     } else {
-        eprintln!("{}", gettext("missing program argument"));
+        eprintln!("awk: {}", gettext("missing program argument"));
         1
     };
     // Output without a final <newline> is still in stdout's line buffer, and

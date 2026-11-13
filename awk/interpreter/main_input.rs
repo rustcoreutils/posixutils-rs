@@ -129,7 +129,9 @@ impl MainInput {
             self.reader = Some(if operand.as_str() == "-" {
                 Box::new(StdinRecordReader::default())
             } else {
-                Box::new(FileStream::open(&operand)?)
+                Box::new(FileStream::open(&operand).map_err(|reason| {
+                    gettextrs::gettext!("cannot open file '{}': {}", operand, reason)
+                })?)
             });
             self.opened_a_file = true;
             unsafe { &mut *global(globals, SpecialVar::Filename) }.value =

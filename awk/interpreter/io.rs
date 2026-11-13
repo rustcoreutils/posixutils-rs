@@ -429,7 +429,13 @@ impl WriteFiles {
                     .truncate(!append)
                     .append(append)
                     .open(path_of(filename))
-                    .map_err(|e| plib::diag::io_error_text(&e))?;
+                    .map_err(|e| {
+                        gettextrs::gettext!(
+                            "cannot open file '{}' for writing: {}",
+                            filename,
+                            plib::diag::io_error_text(&e)
+                        )
+                    })?;
                 file.write_all(&charset::encode(contents))
                     .map_err(|e| plib::diag::io_error_text(&e))?;
                 e.insert(file);

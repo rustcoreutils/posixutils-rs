@@ -1709,7 +1709,7 @@ fn awk_runtime_error_after_a_call_reports_the_caller() {
     assert_eq!(stdout, "");
     assert_eq!(
         stderr,
-        "runtime error: not enough arguments for format string\ncall trace:\n=> <start> at :2:14\n\n"
+        "awk: runtime error: not enough arguments for format string\ncall trace:\n=> <start> at :2:14\n\n"
     );
     assert_eq!(status, Some(1));
 }
@@ -2100,7 +2100,7 @@ fn awk_scalar_used_as_an_array_is_an_error() {
         let (stdout, stderr, status) = awk_with_deadline(program);
         assert_eq!(stdout, "", "{program}");
         assert!(
-            stderr.starts_with("runtime error: scalar used in array context\n"),
+            stderr.starts_with("awk: runtime error: scalar used in array context\n"),
             "{program}: {stderr}"
         );
         assert_eq!(status, Some(1), "{program}");
@@ -2713,4 +2713,41 @@ fn awk_nul_bytes_are_ordinary_characters() {
         ("BEGIN { s = \"a\\0b\"; print length(s) }", "", "3\n"),
         ("BEGIN { printf \"%c\", 0 | \"od -An -c\" }", "", "  \\0\n"),
     ]);
+}
+
+// Diagnostics begin with "awk: ", and a file that cannot be opened is
+// named in the message.
+#[test]
+fn awk_diagnostics_name_the_utility_and_the_file() {
+    let missing = "/nonexistent/awk-file";
+    let reason = plib::diag::io_error_text(&std::fs::File::open(missing).unwrap_err());
+    let (_, stderr, status) = awk_args(&["1", missing], "");
+    assert_eq!(
+        stderr,
+        format!("awk: cannot open file '{missing}': {reason}\n")
+    );
+    assert_eq!(status, Some(1));
+    let program = format!("BEGIN {{ print \"x\" > \"{missing}\" }}");
+    let (_, stderr, status) = awk_args(&[&program], "");
+    assert!(
+        stderr.starts_with(&format!(
+            "awk: runtime error: cannot open file '{missing}' for writing: {reason}\n"
+        )),
+        "{stderr}"
+    );
+    assert_eq!(status, Some(1));
+    let (_, stderr, _) = awk_args(&["BEGIN { $(-1) }"], "");
+    assert!(
+        stderr.starts_with("awk: runtime error: attempt to access field -1\n"),
+        "{stderr}"
+    );
+    let (_, stderr, status) = awk_args(&["-f", missing], "");
+    assert_eq!(
+        stderr,
+        format!("awk: cannot open file '{missing}': {reason}\n")
+    );
+    assert_eq!(status, Some(1));
+    let (_, stderr, status) = awk_args(&[], "");
+    assert_eq!(stderr, "awk: missing program argument\n");
+    assert_eq!(status, Some(1));
 }

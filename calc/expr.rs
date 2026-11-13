@@ -82,11 +82,17 @@ fn bool_token(value: bool) -> Token {
 // followed by digits." A leading plus does not qualify, so `+5` is a string,
 // and neither do surrounding blanks.
 fn is_integer_text(bytes: &[u8]) -> bool {
-    let digits = match bytes.first() {
-        Some(b'-') => &bytes[1..],
-        _ => bytes,
+    integer_parts(bytes).is_some()
+}
+
+// The sign (true if negative) and the digits of an operand that satisfies
+// the integer production, or None for one that does not.
+fn integer_parts(bytes: &[u8]) -> Option<(bool, &[u8])> {
+    let (negative, digits) = match bytes.split_first() {
+        Some((b'-', rest)) => (true, rest),
+        _ => (false, bytes),
     };
-    !digits.is_empty() && digits.iter().all(u8::is_ascii_digit)
+    (!digits.is_empty() && digits.iter().all(u8::is_ascii_digit)).then_some((negative, digits))
 }
 
 // The integer value of an operand.
@@ -199,33 +205,27 @@ fn tokenize() -> Vec<Token> {
     args.into_iter().map(parse_token).collect()
 }
 
-// Compare two operands that satisfy the integer production by their decimal
-// value, whatever their size: one too large for the arithmetic is still an
-// integer, and comparing it as a string gives the wrong answer.
-fn compare_integer_text(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+// Compare two integers, given as the sign and digits of `integer_parts`, by
+// their decimal value, whatever their size: one too large for the arithmetic
+// is still an integer, and comparing it as a string gives the wrong answer.
+fn compare_integers(a: (bool, &[u8]), b: (bool, &[u8])) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    // sign and magnitude digits without leading zeros; -0 is zero
-    let split = |t: &[u8]| -> (bool, Vec<u8>) {
-        let (negative, digits) = match t.split_first() {
-            Some((b'-', rest)) => (true, rest),
-            _ => (false, t),
-        };
-        let start = digits
-            .iter()
-            .position(|&d| d != b'0')
-            .unwrap_or(digits.len());
-        let magnitude = digits[start..].to_vec();
-        (negative && !magnitude.is_empty(), magnitude)
-    };
-    let (a_negative, a_digits) = split(a);
-    let (b_negative, b_digits) = split(b);
-    let magnitude = a_digits
+    // the sign and the digits without leading zeros; -0 is zero
+    fn magnitude((negative, mut digits): (bool, &[u8])) -> (bool, &[u8]) {
+        while let [b'0', rest @ ..] = digits {
+            digits = rest;
+        }
+        (negative && !digits.is_empty(), digits)
+    }
+    let (a_negative, a_digits) = magnitude(a);
+    let (b_negative, b_digits) = magnitude(b);
+    let by_size = a_digits
         .len()
         .cmp(&b_digits.len())
-        .then_with(|| a_digits.cmp(&b_digits));
+        .then_with(|| a_digits.cmp(b_digits));
     match (a_negative, b_negative) {
-        (false, false) => magnitude,
-        (true, true) => magnitude.reverse(),
+        (false, false) => by_size,
+        (true, true) => by_size.reverse(),
         (true, false) => Ordering::Less,
         (false, true) => Ordering::Greater,
     }
@@ -240,12 +240,11 @@ fn cmpop(lhs: &Token, rhs: &Token, op: CmpOp) -> Result<Token, String> {
     let lhs = operand_bytes(lhs)?;
     let rhs = operand_bytes(rhs)?;
 
-    let ordering = if is_integer_text(lhs) && is_integer_text(rhs) {
-        compare_integer_text(lhs, rhs)
-    } else {
+    let ordering = match (integer_parts(lhs), integer_parts(rhs)) {
+        (Some(a), Some(b)) => compare_integers(a, b),
         // Compare the operands as written; canonicalizing an integer first
         // would compare something the caller never passed.
-        plib::locale::strcoll_bytes(lhs, rhs)
+        _ => plib::locale::strcoll_bytes(lhs, rhs),
     };
 
     let result = match op {

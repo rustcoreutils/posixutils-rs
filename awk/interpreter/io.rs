@@ -68,13 +68,20 @@ fn path_of(name: &str) -> PathBuf {
 }
 
 /// Try to find a regex match in the byte buffer. Returns the record before
-/// the match and the remainder after it, or None if no match found.
-fn ere_try_match(buf: &[u8], re: &Regex) -> Result<Option<(String, VecDeque<u8>)>, String> {
+/// the match and the remainder after it, or None if no match found.  Before
+/// the end of the input (`at_eof` false), a match that reaches the end of
+/// the buffer is not taken: the input still to come could extend it (two
+/// newlines read one at a time for RS = "\n+").
+fn ere_try_match(
+    buf: &[u8],
+    re: &Regex,
+    at_eof: bool,
+) -> Result<Option<(String, VecDeque<u8>)>, String> {
     if buf.is_empty() {
         return Ok(None);
     }
     match re.find_nonempty_bytes(buf) {
-        Some(m) => {
+        Some(m) if at_eof || m.end < buf.len() => {
             let record = bytes_to_string(buf[..m.start].to_vec());
             let remainder = buf[m.end..].iter().copied().collect();
             Ok(Some((record, remainder)))
@@ -119,7 +126,7 @@ pub trait RecordReader: Iterator<Item = ReadResult> {
                 let mut byte_buf = Vec::from(std::mem::take(self.ere_byte_buffer()));
 
                 // Check existing buffer first (remainder from previous call)
-                if let Some((record, remainder)) = ere_try_match(&byte_buf, re)? {
+                if let Some((record, remainder)) = ere_try_match(&byte_buf, re, false)? {
                     *self.ere_byte_buffer() = remainder;
                     return Ok(Some(record));
                 }
@@ -144,7 +151,9 @@ pub trait RecordReader: Iterator<Item = ReadResult> {
                             };
                             if check {
                                 bytes_since_check = 0;
-                                if let Some((record, remainder)) = ere_try_match(&byte_buf, re)? {
+                                if let Some((record, remainder)) =
+                                    ere_try_match(&byte_buf, re, false)?
+                                {
                                     *self.ere_byte_buffer() = remainder;
                                     return Ok(Some(record));
                                 }
@@ -157,7 +166,7 @@ pub trait RecordReader: Iterator<Item = ReadResult> {
                             if byte_buf.is_empty() {
                                 return Ok(None);
                             }
-                            if let Some((record, remainder)) = ere_try_match(&byte_buf, re)? {
+                            if let Some((record, remainder)) = ere_try_match(&byte_buf, re, true)? {
                                 if !remainder.is_empty() {
                                     *self.ere_byte_buffer() = remainder;
                                 }

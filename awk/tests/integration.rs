@@ -2377,6 +2377,30 @@ fn awk_default_fs_splits_on_blanks_and_newlines_only() {
     ]);
 }
 
+// A regular-expression RS is matched only where more input cannot extend
+// the match: RS = "\n+" ended a record at the first of two newlines read,
+// making an empty record of the second.
+#[test]
+fn awk_regex_rs_match_is_not_cut_at_a_read_boundary() {
+    assert_awk_cases(&[
+        (
+            "BEGIN { RS = \"\\n+\" } { print NR \":\" $0 }",
+            "a\n\nb\n",
+            "1:a\n2:b\n",
+        ),
+        (
+            "BEGIN { RS = \"\\n\\n+\" } { print NR \":\" $0 }",
+            "a\nb\n\n\n\nc\n",
+            "1:a\nb\n2:c\n\n",
+        ),
+        (
+            "BEGIN { RS = \"x+\" } { print NR \":\" $0 }",
+            "axxxb",
+            "1:a\n2:b\n",
+        ),
+    ]);
+}
+
 // Changing RS from a regular expression to one character, or to "", keeps
 // the input the regular expression's reader had read ahead; it was lost.
 #[test]

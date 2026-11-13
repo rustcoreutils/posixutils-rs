@@ -84,40 +84,60 @@ enum Target {
     Register(Register),
 }
 
-/// The value `x op= v` assigns: `v` for a plain `=`, otherwise `x op v`.
-fn combine_assignment(
-    op: &Token,
-    current: ExprInstruction,
-    value: ExprInstruction,
-) -> ExprInstruction {
-    let build: fn(Box<ExprInstruction>, Box<ExprInstruction>) -> ExprInstruction = match op {
-        Token::Assign => return value,
-        Token::AddAssign => ExprInstruction::Add,
-        Token::SubAssign => ExprInstruction::Sub,
-        Token::MulAssign => ExprInstruction::Mul,
-        Token::DivAssign => ExprInstruction::Div,
-        Token::ModAssign => ExprInstruction::Mod,
-        Token::PowAssign => ExprInstruction::Pow,
+/// The arithmetic an assignment operator applies: none for a plain `=`.
+fn assignment_arith(op: &Token) -> Option<ArithOp> {
+    match op {
+        Token::Assign => None,
+        Token::AddAssign => Some(ArithOp::Add),
+        Token::SubAssign => Some(ArithOp::Sub),
+        Token::MulAssign => Some(ArithOp::Mul),
+        Token::DivAssign => Some(ArithOp::Div),
+        Token::ModAssign => Some(ArithOp::Mod),
+        Token::PowAssign => Some(ArithOp::Pow),
         _ => unreachable!("assign_op only returns assignment operators"),
-    };
-    build(Box::new(current), Box::new(value))
+    }
 }
 
-/// Desugar `x op= v` into an assignment of `x op v` to `x`.
+/// `lhs op rhs` as an expression node.
+fn arith_expr(op: ArithOp, lhs: ExprInstruction, rhs: ExprInstruction) -> ExprInstruction {
+    let build: fn(Box<ExprInstruction>, Box<ExprInstruction>) -> ExprInstruction = match op {
+        ArithOp::Add => ExprInstruction::Add,
+        ArithOp::Sub => ExprInstruction::Sub,
+        ArithOp::Mul => ExprInstruction::Mul,
+        ArithOp::Div => ExprInstruction::Div,
+        ArithOp::Mod => ExprInstruction::Mod,
+        ArithOp::Pow => ExprInstruction::Pow,
+    };
+    build(Box::new(lhs), Box::new(rhs))
+}
+
+/// The node for `x op= v`.
+///
+/// A variable or array element keeps the operator in a `CompoundAssignment`,
+/// so its subscript is evaluated once. A register has no subscript, and
+/// `r op= v` is simply `r = r op v`.
 fn build_assignment(target: Target, op: &Token, value: ExprInstruction) -> ExprInstruction {
+    let arith = assignment_arith(op);
     match target {
-        Target::Named(named) => {
-            let current = ExprInstruction::Named(named.clone());
-            ExprInstruction::Assignment {
+        Target::Named(named) => match arith {
+            None => ExprInstruction::Assignment {
                 named,
-                value: Box::new(combine_assignment(op, current, value)),
-            }
-        }
+                value: Box::new(value),
+            },
+            Some(op) => ExprInstruction::CompoundAssignment {
+                named,
+                op,
+                value: Box::new(value),
+            },
+        },
         Target::Register(register) => {
-            let current = ExprInstruction::GetRegister(register);
+            let value = match arith {
+                None => value,
+                Some(op) => arith_expr(op, ExprInstruction::GetRegister(register), value),
+            };
             ExprInstruction::SetRegister {
                 register,
-                value: Box::new(combine_assignment(op, current, value)),
+                value: Box::new(value),
             }
         }
     }
@@ -1165,16 +1185,47 @@ mod test {
     }
 
     #[test]
+    fn test_every_compound_operator_keeps_its_arith_op() {
+        for (text, op) in [
+            ("a += 1\n", ArithOp::Add),
+            ("a -= 1\n", ArithOp::Sub),
+            ("a *= 1\n", ArithOp::Mul),
+            ("a /= 1\n", ArithOp::Div),
+            ("a %= 1\n", ArithOp::Mod),
+            ("a ^= 1\n", ArithOp::Pow),
+        ] {
+            match parse_expr(text) {
+                ExprInstruction::CompoundAssignment { op: parsed, .. } => {
+                    assert_eq!(parsed, op, "{text:?}")
+                }
+                other => panic!("{text:?} parsed as {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_compound_register_assignment_reads_the_register() {
+        assert_eq!(
+            parse_expr("scale ^= 2\n"),
+            ExprInstruction::SetRegister {
+                register: Register::Scale,
+                value: Box::new(ExprInstruction::Pow(
+                    Box::new(ExprInstruction::GetRegister(Register::Scale)),
+                    Box::new(ExprInstruction::Number("2".to_string()))
+                ))
+            }
+        );
+    }
+
+    #[test]
     fn test_parse_compound_assignment() {
         let expr = parse_expr("a += 1\n");
         assert_eq!(
             expr,
-            ExprInstruction::Assignment {
+            ExprInstruction::CompoundAssignment {
                 named: NamedExpr::VariableNumber('a'),
-                value: Box::new(ExprInstruction::Add(
-                    Box::new(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
-                    Box::new(ExprInstruction::Number("1".to_string()))
-                ))
+                op: ArithOp::Add,
+                value: Box::new(ExprInstruction::Number("1".to_string()))
             }
         );
     }

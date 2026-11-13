@@ -210,6 +210,30 @@ fn test_bc_array_argument_uses_the_active_binding() {
     );
 }
 
+/// POSIX: `x op= v` is `x = x op v` "except that the named-expression shall
+/// be evaluated only once". A subscript with a side effect ran twice, so
+/// the sum was read from one element and stored in the next.
+#[test]
+fn test_bc_compound_assignment_evaluates_the_target_once() {
+    test_bc("i=0\na[i++] += 5\ni\na[0]\na[1]\nquit\n", "1\n5\n0\n");
+    test_bc(
+        "define f(){\nx+=1\nreturn(0)\n}\nb[f()] += 7\nx\nb[0]\nquit\n",
+        "1\n7\n",
+    );
+    // The target's value is read before the right side runs, as in GNU bc,
+    // so a right side that changes the target does not feed into the sum.
+    test_bc("a=1\na += (a=5)\na\nquit\n", "6\n");
+    test_bc(
+        "x=1\ndefine f(){\nx=10\nreturn(1)\n}\nx += f()\nx\nquit\n",
+        "2\n",
+    );
+    // Every operator takes the same path.
+    test_bc(
+        "i=0\nc[0]=7\nc[i++] -= 2\nc[0]\ni=0\nc[i++] *= 3\nc[0]\ni=0\nc[i++] /= 5\nc[0]\ni=0\nc[i++] %= 2\nc[0]\ni=0\nc[i++] ^= 3\nc[0]\ni\nquit\n",
+        "5\n15\n3\n1\n1\n1\n",
+    );
+}
+
 /// A mismatch used to bind the missing parameter to the global of the same
 /// name, and silently drop extra arguments without evaluating them.
 #[test]

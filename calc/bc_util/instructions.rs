@@ -99,6 +99,16 @@ pub enum ExprInstruction {
         named: NamedExpr,
         value: Box<ExprInstruction>,
     },
+    /// `named op= value`.
+    ///
+    /// Not desugared into `named = named op value`: POSIX evaluates the
+    /// named expression "only once", and a subscript such as `a[i++]` would
+    /// otherwise run twice.
+    CompoundAssignment {
+        named: NamedExpr,
+        op: ArithOp,
+        value: Box<ExprInstruction>,
+    },
     SetRegister {
         register: Register,
         value: Box<ExprInstruction>,
@@ -132,6 +142,18 @@ pub enum ExprInstruction {
         lhs: Box<ExprInstruction>,
         rhs: Box<ExprInstruction>,
     },
+}
+
+/// The arithmetic operator of a compound assignment: `+=`, `-=`, `*=`, `/=`,
+/// `%=`, `^=`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Pow,
 }
 
 /// A relational operator: `==`, `!=`, `<`, `<=`, `>`, `>=`.

@@ -11,7 +11,7 @@ use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use super::array::{Array, KeyIterator, ValueIndex};
+use super::array::{Array, Key, KeyIterator, ValueIndex};
 use super::value::{AwkRefType, AwkValue, AwkValueVariant};
 use crate::program::{Action, Function, OpCode, SourceLocation};
 
@@ -27,7 +27,23 @@ pub(crate) struct ArrayIterator {
 #[derive(Clone, PartialEq)]
 pub(crate) struct ArrayElementRef {
     pub(crate) array: *mut AwkValue,
+    /// Where the element was when the reference was taken; only a hint,
+    /// since the code evaluated before the reference is used may change
+    /// the array.
     pub(crate) value_index: ValueIndex,
+    pub(crate) key: Key,
+}
+
+impl ArrayElementRef {
+    /// The referenced element, found by its key.
+    /// # Safety
+    /// `array` has to be valid and dereferencable
+    unsafe fn element(&self) -> *mut AwkValue {
+        (*self.array)
+            .as_array()
+            .expect("expected array")
+            .element(self.value_index, &self.key)
+    }
 }
 
 pub(crate) enum StackValue {
@@ -47,11 +63,7 @@ impl StackValue {
             StackValue::Value(val) => val.get_mut(),
             StackValue::ValueRef(val_ref) => &mut **val_ref,
             StackValue::UninitializedRef(val_ref) => &mut **val_ref,
-            StackValue::ArrayElementRef(array_element_ref) => (*array_element_ref.array)
-                .as_array()
-                .expect("expected array")
-                .index_to_value(array_element_ref.value_index)
-                .expect("invalid array value index"),
+            StackValue::ArrayElementRef(array_element_ref) => &mut *array_element_ref.element(),
             _ => unreachable!("invalid stack value"),
         }
     }
@@ -63,13 +75,9 @@ impl StackValue {
         match self {
             StackValue::ValueRef(ptr) => ptr,
             StackValue::UninitializedRef(ptr) => ptr,
+            // safe by type invariance
             StackValue::ArrayElementRef(array_element_ref) => unsafe {
-                // safe by type invariance
-                (*array_element_ref.array)
-                    .as_array()
-                    .expect("invalid array")
-                    .index_to_value(array_element_ref.value_index)
-                    .expect("invalid array value index")
+                array_element_ref.element()
             },
             _ => unreachable!("expected lvalue"),
         }
@@ -89,14 +97,9 @@ impl StackValue {
             StackValue::Value(val) => val.into_inner(),
             StackValue::ValueRef(ref_val) => (*ref_val).clone().into_ref(AwkRefType::None),
             StackValue::UninitializedRef(_) => AwkValue::uninitialized_scalar(),
-            StackValue::ArrayElementRef(array_element_ref) => {
-                let val = (*array_element_ref.array)
-                    .as_array()
-                    .expect("expected array")
-                    .index_to_value(array_element_ref.value_index)
-                    .expect("invalid array value index");
-                (*val).clone().into_ref(AwkRefType::None)
-            }
+            StackValue::ArrayElementRef(array_element_ref) => (*array_element_ref.element())
+                .clone()
+                .into_ref(AwkRefType::None),
             _ => unreachable!("invalid stack value"),
         }
     }

@@ -112,6 +112,22 @@ impl Array {
         self.pairs[index.index].as_mut().map(|(_, val)| val)
     }
 
+    /// The element `key`, which was at `hint` when it was looked up: the
+    /// slot is reused if it still holds `key`, else the key is looked up
+    /// again, and created if it is gone.  Code that ran in between may have
+    /// deleted elements (moving another into the slot), or cleared the
+    /// array.
+    pub fn element(&mut self, hint: ValueIndex, key: &Key) -> &mut AwkValue {
+        let index = match self.pairs.get(hint.index) {
+            Some(Some((slot_key, _))) if Rc::ptr_eq(slot_key, key) || slot_key == key => hint,
+            _ => self
+                .get_value_index(key.clone())
+                .expect("inserting into an array cannot fail"),
+        };
+        self.index_to_value(index)
+            .expect("the slot of an element holds it")
+    }
+
     pub fn get_value(&mut self, key: Key) -> Result<&mut AwkValue, String> {
         let index = self.get_value_index(key)?;
         Ok(self.index_to_value(index).unwrap())

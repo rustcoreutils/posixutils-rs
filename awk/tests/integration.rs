@@ -2193,3 +2193,52 @@ fn test_awk_open_errors_name_the_system_error() {
         assert!(!stderr.contains("(os error"), "{args:?}: {stderr:?}");
     }
 }
+
+/// Runs each `(program, input, expected stdout)` case, expecting no
+/// diagnostics and exit status 0.
+fn assert_awk_cases(cases: &[(&str, &str, &str)]) {
+    for &(program, input, output) in cases {
+        let (stdout, stderr, status) = awk_with_deadline_input(program, input);
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str()),
+            (output, ""),
+            "{program}"
+        );
+        assert_eq!(status, Some(0), "{program}");
+    }
+}
+
+// An array element being assigned is found again by its key after the
+// right-hand side runs: a function there that deleted from the array, or
+// cleared or split into it, made the assignment land on another element or
+// panic.
+#[test]
+fn awk_array_element_assigned_after_rhs_changes_the_array() {
+    assert_awk_cases(&[
+        (
+            "function f() { delete a[\"x\"]; return 5 } BEGIN { a[\"x\"] = 1; a[\"y\"] = 2; a[\"x\"] = f(); print a[\"x\"], a[\"y\"], length(a) }",
+            "",
+            "5 2 2\n",
+        ),
+        (
+            "function f() { delete a; return 5 } BEGIN { a[\"x\"] = 1; a[\"x\"] = f(); print a[\"x\"], length(a) }",
+            "",
+            "5 1\n",
+        ),
+        (
+            "function f() { delete a[\"x\"]; return 5 } BEGIN { a[\"x\"] = 1; a[\"x\"] += f(); print a[\"x\"], length(a) }",
+            "",
+            "5 1\n",
+        ),
+        (
+            "function f() { split(\"p q r\", a); return 5 } BEGIN { a[\"x\"] = 1; a[\"y\"] = 2; a[\"x\"] = f(); print a[1], a[2], a[3], a[\"x\"], length(a) }",
+            "",
+            "p q r 5 4\n",
+        ),
+        (
+            "function f() { delete a; return \"v\" } BEGIN { a[1] = \"old\"; sub(/o/, f(), a[1]); print length(a), \"[\" a[1] \"]\" }",
+            "",
+            "1 []\n",
+        ),
+    ]);
+}

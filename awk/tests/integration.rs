@@ -2799,3 +2799,17 @@ fn awk_reclaiming_slots_after_each_loop_is_quick() {
         "0\n",
     )]);
 }
+
+// The call trace of a runtime error in a deep recursion shows the
+// innermost calls and the outermost, not every one of thousands.
+#[test]
+fn awk_call_trace_of_a_deep_recursion_is_short() {
+    let program = "function f(k) { return k == 0 ? $(-1) : f(k - 1) } BEGIN { f(5000) }";
+    let (_, stderr, status) = awk_with_deadline(program);
+    assert_eq!(status, Some(1));
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert!(lines.len() < 20, "{} lines", lines.len());
+    assert_eq!(lines[0], "awk: runtime error: attempt to access field -1");
+    assert!(lines.contains(&"=> ... 4992 more calls"), "{stderr}");
+    assert_eq!(lines.last().copied(), Some("=> <start> at :1:60"));
+}

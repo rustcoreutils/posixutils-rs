@@ -247,7 +247,18 @@ fn stack_trace(error: String, stack: Stack) -> String {
         error_location.column
     )
     .expect("error writing to string");
-    for frame in stack.call_frames.iter().rev() {
+    // the innermost calls and the outermost: a deep recursion has
+    // thousands, which would bury the error
+    const INNERMOST: usize = 8;
+    let frames = stack.call_frames.len();
+    for (n, frame) in stack.call_frames.iter().rev().enumerate() {
+        if n == INNERMOST && frames > INNERMOST + 1 {
+            writeln!(result, "=> ... {} more calls", frames - INNERMOST - 1)
+                .expect("error writing to string");
+        }
+        if n >= INNERMOST && n + 1 < frames {
+            continue;
+        }
         let source_location = frame.source_locations[frame.ip as usize];
         writeln!(
             result,

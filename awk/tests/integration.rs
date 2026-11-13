@@ -3114,3 +3114,19 @@ fn awk_stdout_failure_before_a_read_is_not_an_input_error() {
     assert!(stderr.contains("write error"), "{stderr}");
     assert_eq!(out.status.code(), Some(1));
 }
+
+// A regular-expression separator in a full read is found at once: only
+// short reads were searched, so a record whose separator came in a full
+// 64 KiB read waited for more input.
+#[test]
+fn awk_regex_rs_in_a_full_read_ends_the_record_at_once() {
+    let input = format!("a;{}", "x".repeat(65534));
+    assert_eq!(
+        awk_first_line_before_eof(
+            "BEGIN { RS = \";|#\" } { print \"got \" $0; fflush() }",
+            &input
+        )
+        .as_deref(),
+        Some("got a\n")
+    );
+}

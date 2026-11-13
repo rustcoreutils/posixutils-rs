@@ -267,32 +267,30 @@ impl<S: Read> RecordInput<S> {
     /// A record ended by a match of the regular expression `re`, or by the
     /// end of the input.
     ///
-    /// A match is searched for after each read that came back short (the
-    /// source had no more for now, as on an interactive input) and after
-    /// the bytes read have doubled, so that a long record costs time in
-    /// proportion to its length.
+    /// A match is searched for after each read, so that a record is
+    /// returned as soon as its separator arrives; but once the bytes read
+    /// for the record pass `EAGER_SEARCH_LIMIT`, only after they have
+    /// doubled, so that a huge record costs time in proportion to its
+    /// length rather than to its length times the number of reads.
     fn read_to_match(&mut self, re: &Regex) -> Result<Option<String>, String> {
+        const EAGER_SEARCH_LIMIT: usize = 1 << 20;
         let mut next_search_len = 0;
         loop {
             let at_eof = self.eof;
-            if at_eof || self.pending().len() >= next_search_len {
+            let len = self.pending().len();
+            if at_eof || len <= EAGER_SEARCH_LIMIT || len >= next_search_len {
                 match self.search_separator(re, at_eof) {
                     SeparatorSearch::Found(len, end) => {
                         return Ok(Some(self.take_record(len, end - len)));
                     }
                     _ if at_eof => {
-                        let len = self.pending().len();
                         return Ok((len > 0).then(|| self.take_record(len, 0)));
                     }
-                    // try again after the next read
                     SeparatorSearch::Deferred => next_search_len = 0,
-                    SeparatorSearch::NotFound => next_search_len = 2 * self.pending().len(),
+                    SeparatorSearch::NotFound => next_search_len = 2 * len,
                 }
             }
-            if self.fill()? < READ_SIZE {
-                // a short read: search what there is
-                next_search_len = 0;
-            }
+            self.fill()?;
         }
     }
 
@@ -788,6 +786,29 @@ mod tests {
         ] {
             assert_eq!(match_may_grow(pattern), grows, "{pattern}");
         }
+    }
+
+    /// A source that gives its bytes in one full read and would then wait
+    /// for more, as a pipe whose writer has paused.
+    struct PausedSource(Vec<u8>);
+
+    impl Read for PausedSource {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            assert!(!self.0.is_empty(), "read while the input has paused");
+            let n = buf.len().min(self.0.len());
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0.drain(..n);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn regex_rs_in_a_full_read_is_found_without_reading_more() {
+        let mut bytes = b"a;".to_vec();
+        bytes.resize(READ_SIZE, b'x');
+        let mut reader = RecordInput::new(PausedSource(bytes), true);
+        let rs = RecordSeparator::Ere(crate::regex::regex_from_str(";|#"));
+        assert_eq!(reader.read_next_record(&rs).unwrap().as_deref(), Some("a"));
     }
 
     #[test]

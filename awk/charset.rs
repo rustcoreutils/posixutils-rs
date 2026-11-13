@@ -67,16 +67,15 @@ fn collation_is_bytes() -> bool {
     )
 }
 
-/// How the strings `a` and `b` compare for the relational operator `op`
-/// (its text, such as "<="): in the collation order of the locale (POSIX),
-/// with strings that collate equally but are not the same ordered by their
-/// bytes, so that only identical strings are equal.  `==` and `!=` need only
-/// that, so for them the locale is not consulted.
-pub fn compare_strings(a: &str, b: &str, op: &str) -> std::cmp::Ordering {
+/// How the strings `a` and `b` compare for awk's relational operators: in
+/// the collation order of the locale (POSIX), with strings that collate
+/// equally but are not the same ordered by their bytes, so that only
+/// identical strings are equal.  `==` and `!=` need only that, so for them
+/// (`needs_order` false) the locale is not consulted.
+pub fn compare_strings(a: &str, b: &str, needs_order: bool) -> std::cmp::Ordering {
     if a == b {
         return std::cmp::Ordering::Equal;
     }
-    let needs_order = !matches!(op, "==" | "!=");
     if needs_order && !BYTE_COLLATION.load(Ordering::Relaxed) {
         let collated = plib::locale::strcoll_bytes(&encode(a), &encode(b));
         if collated.is_ne() {

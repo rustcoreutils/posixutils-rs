@@ -2568,58 +2568,30 @@ fn awk_args(args: &[&str], input: &str) -> (String, String, Option<i32>) {
     )
 }
 
-// A backslash before a character with no escape meaning is dropped with a
-// warning, as in gawk and the one true awk, in a string literal, -v, -F
-// and an assignment operand; it was a fatal error, so -F '\|' failed.  A
-// backslash at the end of an assigned value stays.
+// A backslash before a character with no escape meaning stays, with the
+// character, as in the one true awk and mawk, in a string literal, -v, -F
+// and an assignment operand: so -F '\|' is a literal bar and "\." used as
+// a regular expression a literal period.  (It was a fatal error, then
+// dropped with a warning as gawk does, which changed what such a regular
+// expression matches.)  A backslash at the end of an assigned value stays.
 #[test]
-fn awk_undefined_escape_is_a_warning() {
-    let warning =
-        |c: char| format!("awk: warning: escape sequence `\\{c}' treated as plain `{c}'\n");
-    for (args, input, out, err) in [
+fn awk_undefined_escape_keeps_its_backslash() {
+    for (args, input, out) in [
+        (&["-F", "\\|", "{ print $2 }"][..], "a|b\n", "b\n"),
+        (&["-v", "x=a\\.b", "BEGIN { print x }"][..], "", "a\\.b\n"),
+        (&["{ print x }", "x=C:\\dir", "-"][..], "l\n", "C:\\dir\n"),
+        (&["BEGIN { print \"a\\.b\" }"][..], "", "a\\.b\n"),
         (
-            &["-F", "\\|", "{ print $2 }"][..],
-            "a|b\n",
-            "b\n",
-            warning('|'),
+            &["-v", "re=\\.", "{ print ($0 ~ re) }"][..],
+            "ab\na.b\n",
+            "0\n1\n",
         ),
-        (
-            &["-v", "x=a\\.b", "BEGIN { print x }"][..],
-            "",
-            "a.b\n",
-            warning('.'),
-        ),
-        (
-            &["{ print x }", "x=C:\\dir", "-"][..],
-            "l\n",
-            "C:dir\n",
-            warning('d'),
-        ),
-        (
-            &["BEGIN { print \"a\\.b\" }"][..],
-            "",
-            "a.b\n",
-            warning('.'),
-        ),
-        (
-            &["-v", "x=a\\", "BEGIN { print x }"][..],
-            "",
-            "a\\\n",
-            String::new(),
-        ),
-        (
-            &["BEGIN { print \"a\\\nb\" }"][..],
-            "",
-            "ab\n",
-            String::new(),
-        ),
+        (&["{ print ($0 ~ \"\\.\") }"][..], "ab\n", "0\n"),
+        (&["-v", "x=a\\", "BEGIN { print x }"][..], "", "a\\\n"),
+        (&["BEGIN { print \"a\\\nb\" }"][..], "", "ab\n"),
     ] {
         let (stdout, stderr, status) = awk_args(args, input);
-        assert_eq!(
-            (stdout.as_str(), stderr.as_str()),
-            (out, err.as_str()),
-            "{args:?}"
-        );
+        assert_eq!((stdout.as_str(), stderr.as_str()), (out, ""), "{args:?}");
         assert_eq!(status, Some(0), "{args:?}");
     }
 }

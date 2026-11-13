@@ -10,7 +10,7 @@
 use super::io::{FileStream, RecordReader, StdinRecordReader};
 use super::value::{AwkValue, AwkValueRef, AwkValueVariant};
 use super::{maybe_numeric_string, parse_assignment, GlobalEnv};
-use crate::compiler::{escape_string_contents, warn_plain_escape};
+use crate::compiler::escape_string_contents;
 use crate::program::SpecialVar;
 use std::collections::HashMap;
 
@@ -119,8 +119,7 @@ impl MainInput {
             }
             if let Some((var, value)) = parse_assignment(&operand) {
                 if let Some(&index) = self.program_globals.get(var) {
-                    let value =
-                        maybe_numeric_string(escape_string_contents(value, warn_plain_escape)?);
+                    let value = maybe_numeric_string(escape_string_contents(value)?);
                     unsafe { &mut *globals[index as usize].get() }.assign(value, global_env)?;
                 }
                 continue;

@@ -15,7 +15,6 @@ use crate::program::{
 };
 use crate::regex::Regex;
 
-use gettextrs::gettext;
 use pest::error::InputLocation;
 use pest::iterators::{Pair, Pairs};
 use pest::pratt_parser::{Assoc, Op, PrattParser};
@@ -255,26 +254,14 @@ fn is_octal_digit(c: char) -> bool {
     ('0'..='7').contains(&c)
 }
 
-/// Prints the warning for the escape sequence `\c` that has no meaning,
-/// which stands for `c`, as gawk and the one true awk do.
-pub fn warn_plain_escape(c: char) {
-    eprintln!(
-        "awk: {}",
-        gettext!(
-            "warning: escape sequence `\\{}' treated as plain `{}'",
-            c,
-            c
-        )
-    );
-}
-
 /// The value of the text of a string: the contents of a STRING token, or
 /// the value of an assignment (-v, an operand, -F), with its escape
 /// sequences replaced.  A backslash before a character with no escape
-/// meaning is dropped, and `warn` called with the character (POSIX leaves
-/// that undefined); a backslash before a newline is a continuation and
-/// removed with it; a backslash at the end stays.
-pub fn escape_string_contents(s: &str, mut warn: impl FnMut(char)) -> Result<Rc<str>, String> {
+/// meaning stays, with the character, as in the one true awk and mawk
+/// (POSIX leaves it undefined), so that such a string used as a regular
+/// expression keeps the escape; a backslash before a newline is a
+/// continuation and removed with it; a backslash at the end stays.
+pub fn escape_string_contents(s: &str) -> Result<Rc<str>, String> {
     let mut result = String::new();
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
@@ -311,7 +298,7 @@ pub fn escape_string_contents(s: &str, mut warn: impl FnMut(char)) -> Result<Rc<
                         char::from_u32(char_code).ok_or("invalid character".to_string())?
                     }
                     other => {
-                        warn(other);
+                        result.push('\\');
                         other
                     }
                 };
@@ -750,7 +737,7 @@ impl Compiler {
             Rule::string => {
                 let span = primary.as_span();
                 let string_line_col = primary.line_col();
-                let str = escape_string_contents(first_child(primary).as_str(), warn_plain_escape)
+                let str = escape_string_contents(first_child(primary).as_str())
                     .map_err(|e| pest_error_from_span(span, e))?;
                 let index = self.push_constant(Constant::String(str));
                 Ok(Expr::new(

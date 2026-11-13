@@ -16,7 +16,8 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use record::{ere_escape_char, record_index, FieldSeparator, FieldsState, Record};
 use stack::{
-    compare_op, numeric_op, ArrayElementRef, ArrayIterator, ExecutionResult, Stack, StackValue,
+    compare_op, numeric_op, ArrayElementRef, ArrayIterator, ExecutionResult, Stack, StackMemory,
+    StackValue,
 };
 use string::AwkString;
 use value::{AwkRefType, AwkValue, AwkValueRef, AwkValueVariant};
@@ -47,7 +48,9 @@ mod value;
 #[cfg(test)]
 mod tests;
 
-const STACK_SIZE: usize = 2048;
+/// The room on the operand stack, in values: enough for a recursion some
+/// 100000 calls deep (see `StackMemory`).
+const STACK_SIZE: usize = 1 << 18;
 
 pub(crate) fn bool_to_f64(p: bool) -> f64 {
     if p {
@@ -447,7 +450,7 @@ impl Interpreter {
         action: &Action,
         functions: &[Function],
         record: &mut Record,
-        stack: &mut [StackValue],
+        stack: &mut StackMemory,
         global_env: &mut GlobalEnv,
         main_input: &mut MainInput,
     ) -> Result<ExecutionResult, String> {
@@ -951,9 +954,7 @@ pub fn interpret(
         })
         .collect();
 
-    let mut stack = iter::repeat_with(|| StackValue::Invalid)
-        .take(STACK_SIZE)
-        .collect::<Vec<StackValue>>();
+    let mut stack = StackMemory::new(STACK_SIZE);
     let mut current_record = Record::default();
     let mut interpreter = Interpreter::new(args, env, program.constants, program.globals_count);
     let mut global_env = GlobalEnv::default();

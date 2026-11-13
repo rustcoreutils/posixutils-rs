@@ -2774,3 +2774,14 @@ fn awk_dynamic_regexes_stay_correct_past_the_cache() {
         "4 3\n",
     )]);
 }
+
+// A function may recurse tens of thousands of calls deep; the operand
+// stack held 2048 values, so about a thousand calls overflowed it.
+#[test]
+fn awk_deep_recursion() {
+    assert_awk_cases(&[(
+        "function f(k) { if (k == 0) return 0; return 1 + f(k - 1) } BEGIN { print f(20000) }",
+        "",
+        "20000\n",
+    )]);
+}

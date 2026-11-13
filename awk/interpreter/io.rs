@@ -89,7 +89,8 @@ fn match_may_grow(pattern: &str) -> bool {
 /// The index just past the `]` that ends the bracket expression whose
 /// contents start at `start`, or the length of `bytes` if none does.  A
 /// `]` first (after an optional `^`) is part of it, as are the contents of
-/// `[:class:]`, `[.symbol.]` and `[=class=]`.
+/// `[:class:]`, `[.symbol.]` and `[=class=]`, and a character after a
+/// backslash, which awk takes as an escape there too.
 fn bracket_expression_end(bytes: &[u8], start: usize) -> usize {
     let mut i = start;
     if bytes.get(i) == Some(&b'^') {
@@ -101,6 +102,8 @@ fn bracket_expression_end(bytes: &[u8], start: usize) -> usize {
     while i < bytes.len() {
         match bytes[i] {
             b']' => return i + 1,
+            // an awk escape: the character after the backslash is literal
+            b'\\' => i += 2,
             b'[' if matches!(bytes.get(i + 1), Some(b':' | b'.' | b'=')) => {
                 let delimiter = bytes[i + 1];
                 i += 2;
@@ -775,6 +778,9 @@ mod tests {
             ("[[:alpha:]+]", false),
             ("\\*\n", false),
             ("[a]b*", true),
+            // awk escapes hold in a bracket expression too
+            ("[\\][]x+", true),
+            ("[\\]+]", false),
         ] {
             assert_eq!(match_may_grow(pattern), grows, "{pattern}");
         }

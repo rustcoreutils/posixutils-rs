@@ -387,7 +387,13 @@ impl Interpreter {
                     let stdout_ok = std::io::Write::flush(&mut std::io::stdout()).is_ok();
                     stdout_ok && self.write_files.flush_all() && self.write_pipes.flush_all()
                 } else {
-                    self.write_files.flush_file(&expr_str) && self.write_pipes.flush_file(&expr_str)
+                    // the name is open as a file, a pipe or both
+                    let file = self.write_files.flush_file(&expr_str);
+                    let pipe = self.write_pipes.flush_file(&expr_str);
+                    match (file, pipe) {
+                        (None, None) => false,
+                        (file, pipe) => file.unwrap_or(true) && pipe.unwrap_or(true),
+                    }
                 };
                 stack.push_value(if result { 0.0 } else { -1.0 })?;
             }

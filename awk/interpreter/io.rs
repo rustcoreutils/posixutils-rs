@@ -447,12 +447,12 @@ impl WriteFiles {
         Ok(())
     }
 
-    pub fn flush_file(&mut self, filename: &str) -> bool {
-        if let Some(file) = self.files.get_mut(filename) {
-            file.flush().is_ok()
-        } else {
-            false
-        }
+    /// Flushes the output file `filename`: whether that succeeded, or
+    /// `None` if no such file is open.
+    pub fn flush_file(&mut self, filename: &str) -> Option<bool> {
+        self.files
+            .get_mut(filename)
+            .map(|file| file.flush().is_ok())
     }
 
     pub fn flush_all(&mut self) -> bool {
@@ -551,12 +551,12 @@ impl WritePipes {
         Ok(())
     }
 
-    pub fn flush_file(&mut self, filename: &str) -> bool {
-        if let Some(file) = self.pipes.get(filename) {
-            unsafe { libc::fflush(*file) == 0 }
-        } else {
-            false
-        }
+    /// Flushes the output pipe `filename`: whether that succeeded, or
+    /// `None` if no such pipe is open.
+    pub fn flush_file(&mut self, filename: &str) -> Option<bool> {
+        self.pipes
+            .get(filename)
+            .map(|file| unsafe { libc::fflush(*file) == 0 })
     }
 
     pub fn flush_all(&mut self) -> bool {

@@ -2830,3 +2830,16 @@ fn awk_huge_printf_width_is_an_error() {
         assert!(stderr.contains("too large"), "{program}: {stderr}");
     }
 }
+
+// fflush of an open output file or pipe returns 0; it required the name to
+// be open as both, so it returned -1 for every one.
+#[test]
+fn awk_fflush_of_an_open_file_or_pipe() {
+    let tmp = plib::tmp::TempDir::new().unwrap();
+    let file = tmp.path().join("out.txt");
+    let program = format!(
+        "BEGIN {{ print \"x\" > \"{0}\"; a = fflush(\"{0}\"); print \"y\" | \"cat\"; b = fflush(\"cat\"); close(\"cat\"); print a, b, fflush(\"nope\") }}",
+        file.display()
+    );
+    assert_awk_cases(&[(&program, "", "y\n0 0 -1\n")]);
+}

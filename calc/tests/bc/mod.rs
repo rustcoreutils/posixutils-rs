@@ -505,6 +505,21 @@ fn test_bc_quit_in_for_in_function() {
     );
 }
 
+/// POSIX: quit stops bc "at the point where the statement occurs in the
+/// input". A runtime error earlier in the same input item abandoned the item
+/// before its quit was seen, and bc read on.
+#[test]
+fn test_bc_quit_after_a_runtime_error() {
+    run_test(TestPlan {
+        cmd: String::from("bc"),
+        args: vec![],
+        stdin_data: String::from("1/0; quit\n2\n"),
+        expected_out: String::new(),
+        expected_err: String::from("bc: runtime error (line 1): division by zero\n"),
+        expected_exit_code: 1,
+    });
+}
+
 #[test]
 fn test_bc_arrays_are_passed_to_function_by_value() {
     test_bc!(arrays_are_passed_to_function_by_value)

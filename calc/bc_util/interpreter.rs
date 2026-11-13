@@ -809,6 +809,23 @@ impl Interpreter {
     }
 
     pub fn exec(&mut self, program: Program, out: &mut OutputWriter) -> ExecutionResult<()> {
+        // POSIX: quit stops bc "at the point where the statement occurs in
+        // the input". A runtime error before that point abandons the rest of
+        // the item, but the quit has still been read.
+        let reads_quit = program.instructions.iter().any(|stmt| match stmt {
+            StmtInstruction::DefineFunction { function, .. } => {
+                function.body.iter().any(contains_quit)
+            }
+            stmt => contains_quit(stmt),
+        });
+        let result = self.exec_items(program, out);
+        if result.is_err() && reads_quit {
+            self.has_quit = true;
+        }
+        result
+    }
+
+    fn exec_items(&mut self, program: Program, out: &mut OutputWriter) -> ExecutionResult<()> {
         self.instruction_counter = 0;
         for stmt in program.instructions {
             if let StmtInstruction::DefineFunction { name, function } = stmt {

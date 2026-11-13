@@ -68,11 +68,52 @@ fn path_of(name: &str) -> PathBuf {
 }
 
 /// Whether a match of the ERE `pattern` might be made longer by more
-/// input: whether the expression repeats anything.  (An alternative such
-/// as `a|ab` could too, but waiting for more input after every separator
-/// would delay each record of an interactive input.)
+/// input: whether it repeats anything, with `*`, `+`, `?` or an interval,
+/// outside a bracket expression and not quoted by a backslash.  (An
+/// alternative such as `a|ab` could too, but waiting for more input after
+/// every separator would delay each record of an interactive input.)
 fn match_may_grow(pattern: &str) -> bool {
-    pattern.contains(['*', '+', '?', '{'])
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'[' => i = bracket_expression_end(bytes, i + 1),
+            b'*' | b'+' | b'?' | b'{' => return true,
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+/// The index just past the `]` that ends the bracket expression whose
+/// contents start at `start`, or the length of `bytes` if none does.  A
+/// `]` first (after an optional `^`) is part of it, as are the contents of
+/// `[:class:]`, `[.symbol.]` and `[=class=]`.
+fn bracket_expression_end(bytes: &[u8], start: usize) -> usize {
+    let mut i = start;
+    if bytes.get(i) == Some(&b'^') {
+        i += 1;
+    }
+    if bytes.get(i) == Some(&b']') {
+        i += 1;
+    }
+    while i < bytes.len() {
+        match bytes[i] {
+            b']' => return i + 1,
+            b'[' if matches!(bytes.get(i + 1), Some(b':' | b'.' | b'=')) => {
+                let delimiter = bytes[i + 1];
+                i += 2;
+                while i < bytes.len() && !(bytes[i] == delimiter && bytes.get(i + 1) == Some(&b']'))
+                {
+                    i += 1;
+                }
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    bytes.len()
 }
 
 /// What a search for the RS in the bytes read so far found.
@@ -711,6 +752,24 @@ mod tests {
         assert_eq!(records, vec!["abc"]);
         let records = split_records("\n\nabc", RecordSeparator::Null);
         assert_eq!(records, vec!["abc"]);
+    }
+
+    #[test]
+    fn rs_match_may_grow_only_by_repetition() {
+        for (pattern, grows) in [
+            ("\n+", true),
+            ("a{2,}", true),
+            ("x?", true),
+            ("\n|;", false),
+            ("[+]\n", false),
+            ("[]*]x", false),
+            ("[^]?]x", false),
+            ("[[:alpha:]+]", false),
+            ("\\*\n", false),
+            ("[a]b*", true),
+        ] {
+            assert_eq!(match_may_grow(pattern), grows, "{pattern}");
+        }
     }
 
     #[test]

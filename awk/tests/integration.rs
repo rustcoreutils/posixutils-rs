@@ -2458,6 +2458,15 @@ fn awk_record_is_returned_before_more_input() {
             "BEGIN { RS = \"\\n|;\" } { print \"got \" $0; fflush() }",
             "abc\n",
         ),
+        // a quoted repetition character repeats nothing
+        (
+            "BEGIN { RS = \"[+]\\n\" } { print \"got \" $0; fflush() }",
+            "abc+\n",
+        ),
+        (
+            "BEGIN { RS = \"\\\\*\\n\" } { print \"got \" $0; fflush() }",
+            "abc*\n",
+        ),
     ] {
         assert_eq!(
             awk_first_line_before_eof(program, input).as_deref(),

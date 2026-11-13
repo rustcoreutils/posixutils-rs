@@ -307,11 +307,11 @@ fn test_bc_gnu_function_forms() {
 fn test_bc_argument_count_mismatch_is_an_error() {
     bc_runtime_error(
         "define f(a,b){\nreturn(b)\n}\nb=5\nf(1)",
-        "runtime error (line 1): wrong number of arguments",
+        "runtime error (line 5): wrong number of arguments",
     );
     bc_runtime_error(
         "define f(a){\nreturn(a)\n}\nf(1,2)",
-        "runtime error (line 1): wrong number of arguments",
+        "runtime error (line 4): wrong number of arguments",
     );
 }
 
@@ -326,15 +326,14 @@ fn test_bc_register_increment() {
     // value 16 and the new value 15 are both rendered in base 15. Verified
     // against GNU bc.
     test_bc("obase=16\nobase--\nobase\nquit\n", "11\n10\n");
-    // The bounds still apply. The REPL executes one line at a time, so the
-    // failing line is line 1 of its own program.
+    // The bounds still apply.
     bc_runtime_error(
         "ibase=16\nibase++",
-        "runtime error (line 1): ibase must be between 2 and 16",
+        "runtime error (line 2): ibase must be between 2 and 16",
     );
     bc_runtime_error(
         "obase=2\nobase--",
-        "runtime error (line 1): obase must be greater than 1",
+        "runtime error (line 2): obase must be greater than 1",
     );
 }
 
@@ -370,13 +369,15 @@ fn test_bc_sparse_array() {
 /// A file that exists but is not text is not an access failure.
 #[test]
 fn test_bc_non_text_file() {
+    // Like standard input, a file runs as it is read, up to where it stops
+    // being text; the rest of it is not read. The next operand still runs.
     let dir = plib::tmp::tempdir().unwrap();
-    let path = program_file(&dir, b"1+1\n\xff\xfe\n");
-    let output = plib::testing::run_test_base("bc", &[path], b"");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("not a text file"),
-        "expected a text-file diagnostic, got {stderr:?}"
+    let path = program_file(&dir, b"1+1\n\xff\xfe\n3\n");
+    let output = plib::testing::run_test_base("bc", std::slice::from_ref(&path), b"4\n");
+    assert_eq!(output.stdout, b"2\n4\n");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!("bc: {path}: not a text file\n")
     );
     assert_eq!(output.status.code(), Some(1));
 }
@@ -403,22 +404,141 @@ fn test_bc_incomplete_input_at_eof() {
     assert_eq!(output.status.code(), Some(0));
 }
 
-/// The same error reported the same way whether the program arrives as a file
-/// operand or on standard input.
+/// A program behaves the same as a file operand and on standard input.
+///
+/// POSIX: input "shall be executed as [it is] read". A runtime error ends
+/// only the input item it occurs in, as in GNU bc. A syntax error in a
+/// non-interactive run ends that input, so nothing after it runs out of
+/// context; what came before it has already run.
 #[test]
-fn test_bc_exit_status_is_consistent() {
+fn test_bc_file_and_stdin_agree() {
     let dir = plib::tmp::tempdir().unwrap();
-    for program in ["1/0\n", "1+\n"] {
+    for (program, stdout, status) in [
+        ("1/0\n", "", 1),
+        ("1+\n", "", 1),
+        ("1\n1/0\n2\n", "1\n2\n", 1),
+        ("1\n2 +\n3\n", "1\n", 1),
+        ("1\nquit\n@\n", "1\n", 0),
+        ("if (1)\n\n5\n", "", 1),
+        ("1\n@\n2\n", "1\n", 1),
+        // A runtime error earlier in the item does not skip its `quit`.
+        ("1/0; quit\n2\n", "", 1),
+        ("define f() {\nreturn (1/0)\n}\nf(); quit\n2\n", "", 1),
+    ] {
         let path = program_file(&dir, program.as_bytes());
         let as_file = plib::testing::run_test_base("bc", &[path], b"");
         let as_stdin = plib::testing::run_test_base("bc", &[], program.as_bytes());
-        assert_eq!(
-            as_file.status.code(),
-            as_stdin.status.code(),
-            "{program:?} gave different statuses as a file and on stdin"
-        );
-        assert_eq!(as_file.status.code(), Some(1));
+        for (how, output) in [("file", &as_file), ("stdin", &as_stdin)] {
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                stdout,
+                "{program:?} as {how}"
+            );
+            assert_eq!(output.status.code(), Some(status), "{program:?} as {how}");
+        }
     }
+}
+
+/// Diagnostics for standard input give the line in the whole input, not in
+/// the input item being parsed.
+#[test]
+fn test_bc_stdin_diagnostics_count_input_lines() {
+    run_test(TestPlan {
+        cmd: String::from("bc"),
+        args: vec![],
+        stdin_data: String::from("1\n2\n3 +\n"),
+        expected_out: String::from("1\n2\n"),
+        expected_err: String::from(
+            "bc: (standard_in):3:4: error: expected an expression, found newline\n",
+        ),
+        expected_exit_code: 1,
+    });
+    run_test(TestPlan {
+        cmd: String::from("bc"),
+        args: vec![],
+        stdin_data: String::from("1\n2\n3\n4/0\n"),
+        expected_out: String::from("1\n2\n3\n"),
+        expected_err: String::from("bc: runtime error (line 4): division by zero\n"),
+        expected_exit_code: 1,
+    });
+    let output =
+        plib::testing::run_test_base("bc", &[], b"define f(x) {\nreturn (x/0)\n}\n\n\nf(1)\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("'f' at line 2"), "{stderr:?}");
+    assert!(stderr.contains("<global scope> at line 6"), "{stderr:?}");
+}
+
+/// Standard input is program text, read as it is: no line editing applies
+/// to it, and it is held to the same rules as a file operand.
+#[test]
+fn test_bc_stdin_is_read_verbatim() {
+    // A backspace inside a string is an ordinary character.
+    let output = plib::testing::run_test_base("bc", &[], b"\"ab\x08c\"\n");
+    assert_eq!(output.stdout, b"ab\x08c");
+    assert_eq!(output.status.code(), Some(0));
+    // Outside one it is an illegal character, as in a file.
+    let output = plib::testing::run_test_base("bc", &[], b"12\x083\n");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("illegal character"));
+    assert_eq!(output.status.code(), Some(1));
+    // So is a carriage return.
+    let output = plib::testing::run_test_base("bc", &[], b"1+1\r\n");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("illegal character '\\r'"));
+    assert_eq!(output.status.code(), Some(1));
+    // A long grapheme cluster followed by a backspace once panicked.
+    let mut program = String::from("\"a");
+    program.push_str(&"\u{301}".repeat(200));
+    program.push_str("\u{8}\"\n");
+    let output = plib::testing::run_test_base("bc", &[], program.as_bytes());
+    assert_eq!(output.status.code(), Some(0));
+    // Long output is continued across lines; take that back out.
+    let stdout = String::from_utf8(output.stdout)
+        .unwrap()
+        .replace("\\\n", "");
+    assert_eq!(stdout, program[1..program.len() - 2]);
+}
+
+/// Standard input that is not text is reported where it stops being text.
+#[test]
+fn test_bc_stdin_that_is_not_text() {
+    run_test(TestPlan {
+        cmd: String::from("bc"),
+        args: vec![],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+    let output = plib::testing::run_test_base("bc", &[], b"1\n\xff\n2\n");
+    assert_eq!(output.stdout, b"1\n");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "bc: (standard_in): not a text file\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+/// A long construct on standard input is parsed once, not once per line:
+/// a 20,000-line function took 90 seconds.
+#[test]
+fn test_bc_long_construct_on_stdin_is_linear() {
+    let mut program = String::from("define f() {\n");
+    for _ in 0..20_000 {
+        program.push_str("x = x + 1\n");
+    }
+    program.push_str("}\nf()\nx\n");
+    // Standard input from a file: the test harness paces piped input.
+    let dir = plib::tmp::tempdir().unwrap();
+    let path = program_file(&dir, program.as_bytes());
+    let start = std::time::Instant::now();
+    let output = std::process::Command::new(plib::testing::get_binary_path("bc"))
+        .stdin(std::fs::File::open(&path).unwrap())
+        .output()
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(output.stdout, b"0\n20000\n");
+    // A generous bound: it was 90 seconds, and is milliseconds. The unit
+    // test `a_long_body_is_parsed_once` pins the cause deterministically.
+    assert!(elapsed.as_secs() < 30, "took {elapsed:?}");
 }
 
 /// A failed write is reported, not ignored and not a panic. Writing to

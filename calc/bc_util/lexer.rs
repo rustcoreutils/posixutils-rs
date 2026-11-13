@@ -194,12 +194,12 @@ struct Lexer<'a> {
 }
 
 impl<'a> Lexer<'a> {
-    fn new(text: &'a str) -> Self {
+    fn new(text: &'a str, first_line: usize) -> Self {
         Lexer {
             src: text.as_bytes(),
             text,
             pos: 0,
-            line: 1,
+            line: first_line,
             col: 1,
         }
     }
@@ -486,9 +486,9 @@ impl<'a> Lexer<'a> {
     }
 }
 
-/// Split `text` into tokens.
-pub fn tokenize(text: &str) -> Result<Vec<PositionedToken>, LexError> {
-    let mut lexer = Lexer::new(text);
+/// Split `text` into tokens, numbering its lines from `first_line`.
+pub fn tokenize(text: &str, first_line: usize) -> Result<Vec<PositionedToken>, LexError> {
+    let mut lexer = Lexer::new(text, first_line);
     let mut tokens = Vec::new();
     while let Some(token) = lexer.next_token()? {
         tokens.push(token);
@@ -497,8 +497,8 @@ pub fn tokenize(text: &str) -> Result<Vec<PositionedToken>, LexError> {
 }
 
 /// Where the input ended, for reporting an error at end of input.
-pub fn end_position(text: &str) -> (usize, usize) {
-    let mut line = 1;
+pub fn end_position(text: &str, first_line: usize) -> (usize, usize) {
+    let mut line = first_line;
     let mut col = 1;
     for c in text.chars() {
         if c == '\n' {
@@ -516,7 +516,7 @@ mod tests {
     use super::*;
 
     fn toks(text: &str) -> Vec<Token> {
-        tokenize(text)
+        tokenize(text, 1)
             .expect("lex error")
             .into_iter()
             .map(|t| t.token)
@@ -524,7 +524,7 @@ mod tests {
     }
 
     fn lex_err(text: &str) -> LexError {
-        tokenize(text).expect_err("expected a lex error")
+        tokenize(text, 1).expect_err("expected a lex error")
     }
 
     #[test]
@@ -667,12 +667,12 @@ mod tests {
 
     #[test]
     fn positions_track_lines_and_columns() {
-        let t = tokenize("1\n  22\n").expect("lex error");
+        let t = tokenize("1\n  22\n", 1).expect("lex error");
         assert_eq!((t[0].line, t[0].col), (1, 1));
         assert_eq!(t[1].token, Token::Newline);
         assert_eq!((t[2].line, t[2].col), (2, 3));
         // A spliced continuation still advances the line counter.
-        let t = tokenize("1\\\n2\na\n").expect("lex error");
+        let t = tokenize("1\\\n2\na\n", 1).expect("lex error");
         assert_eq!(t[0].token, Token::Number("12".into()));
         let a = t.iter().find(|p| p.token == Token::Letter('a')).unwrap();
         assert_eq!(a.line, 3);

@@ -883,8 +883,20 @@ impl<'a> Parser<'a> {
 }
 
 /// Parse a complete `bc` program.
+#[cfg(test)]
 pub fn parse_program(text: &str, file_path: Option<&str>) -> Result<Program, ParseError> {
-    let tokens = match tokenize(text) {
+    parse_program_at(text, file_path, 1)
+}
+
+/// Parse `bc` program text whose first line is line `first_line` of its
+/// input, so that diagnostics and runtime errors name the line in the
+/// whole input rather than in this piece of it.
+pub fn parse_program_at(
+    text: &str,
+    file_path: Option<&str>,
+    first_line: usize,
+) -> Result<Program, ParseError> {
+    let tokens = match tokenize(text, first_line) {
         Ok(tokens) => tokens,
         Err(e) => {
             return Err(ParseError {
@@ -899,7 +911,7 @@ pub fn parse_program(text: &str, file_path: Option<&str>) -> Result<Program, Par
         }
     };
     let file = Rc::<str>::from(file_path.unwrap_or(""));
-    let mut parser = Parser::new(&tokens, end_position(text));
+    let mut parser = Parser::new(&tokens, end_position(text, first_line));
     match parser.parse_program(file) {
         Ok(program) => Ok(program),
         Err(e) => {

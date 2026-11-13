@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+pub mod input;
 pub mod instructions;
 pub mod interpreter;
 mod lexer;

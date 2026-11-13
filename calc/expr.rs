@@ -122,6 +122,34 @@ fn token_is_null_or_zero(t: &Token) -> bool {
     }
 }
 
+// The argument a token came from, for a diagnostic.
+fn token_text(t: &Token) -> String {
+    let text: &[u8] = match t {
+        Token::LParen => b"(",
+        Token::RParen => b")",
+        Token::OpMul => b"*",
+        Token::OpDiv => b"/",
+        Token::OpRem => b"%",
+        Token::OpAdd => b"+",
+        Token::OpSub => b"-",
+        Token::OpEq => b"=",
+        Token::OpGT => b">",
+        Token::OpLT => b"<",
+        Token::OpGE => b">=",
+        Token::OpLE => b"<=",
+        Token::OpNE => b"!=",
+        Token::OpAnd => b"&",
+        Token::OpOr => b"|",
+        Token::OpMatch => b":",
+        Token::Operand(bytes) => bytes,
+    };
+    String::from_utf8_lossy(text).into_owned()
+}
+
+fn unexpected_argument(t: &Token) -> String {
+    format!("syntax error: unexpected argument '{}'", token_text(t))
+}
+
 // parse a single argument into a token
 //
 // POSIX APPLICATION USAGE: expr "is not required to be able to tell the
@@ -544,11 +572,15 @@ impl Parser {
                 let val = val?;
                 match self.advance() {
                     Some(Token::RParen) => Ok(val),
-                    _ => Err("syntax error: expected ')'".to_string()),
+                    Some(t) => Err(format!(
+                        "syntax error: expected ')' but found '{}'",
+                        token_text(&t)
+                    )),
+                    None => Err("syntax error: missing ')'".to_string()),
                 }
             }
             Some(t) if token_is_lval(&t) => Ok(t),
-            Some(_) => Err("syntax error: unexpected operator".to_string()),
+            Some(t) => Err(unexpected_argument(&t)),
             None => Err("syntax error: missing argument".to_string()),
         }
     }
@@ -558,8 +590,8 @@ impl Parser {
 fn eval_expression(tokens: Vec<Token>) -> Result<Token, String> {
     let mut parser = Parser::new(tokens);
     let result = parser.parse_or()?;
-    if parser.pos != parser.tokens.len() {
-        return Err("syntax error: unexpected trailing argument".to_string());
+    if let Some(t) = parser.peek() {
+        return Err(unexpected_argument(t));
     }
     Ok(result)
 }

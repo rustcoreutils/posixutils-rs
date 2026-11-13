@@ -430,6 +430,36 @@ fn expr_huge_integers_compare_numerically() {
     expr_test(&["--", "-10", "<", "-9"], "1\n");
 }
 
+/// A syntax error names the argument it was found at.
+#[test]
+fn expr_syntax_errors_name_the_argument() {
+    expr_test_status(
+        &["1", "+", "2", "3"],
+        "",
+        "expr: syntax error: unexpected argument '3'\n",
+        2,
+    );
+    expr_test_status(
+        &["-", "1"],
+        "",
+        "expr: syntax error: unexpected argument '-'\n",
+        2,
+    );
+    expr_test_status(
+        &["(", ")"],
+        "",
+        "expr: syntax error: unexpected argument ')'\n",
+        2,
+    );
+    expr_test_status(
+        &["(", "1", "2"],
+        "",
+        "expr: syntax error: expected ')' but found '2'\n",
+        2,
+    );
+    expr_test_status(&["(", "1"], "", "expr: syntax error: missing ')'\n", 2);
+}
+
 /// An invalid regular expression is reported with regcomp's reason.
 #[test]
 fn expr_invalid_regex_gives_the_reason() {

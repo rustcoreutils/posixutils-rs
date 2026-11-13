@@ -674,6 +674,7 @@ impl Interpreter {
                 }
                 OpCode::FieldRef => {
                     let index = record_index(stack.pop_scalar_value()?.scalar_as_f64())?;
+                    record.check_growth(index)?;
                     // The boxed cell keeps this pointer valid across later field
                     // growth, and fields outlive the stack, so this is safe.
                     unsafe { stack.push_ref(record.field_ref_ptr(index))? };

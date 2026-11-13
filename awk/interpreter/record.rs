@@ -128,6 +128,21 @@ impl Record {
     /// holds it in a `u32`.
     pub(crate) const MAX_FIELDS: usize = i32::MAX as usize;
 
+    /// How many fields one assignment to a field or to NF may add: the
+    /// record's storage holds every field up to the last, so `NF = 2e9`
+    /// would otherwise allocate billions of them.
+    const MAX_NEW_FIELDS: usize = 1 << 24;
+
+    /// An error if making `index` the last field would add more than
+    /// [`Self::MAX_NEW_FIELDS`] fields.
+    pub(crate) fn check_growth(&self, index: usize) -> Result<(), String> {
+        if index >= self.fields.borrow().len() + Self::MAX_NEW_FIELDS {
+            Err(format!("attempt to create field {index}"))
+        } else {
+            Ok(())
+        }
+    }
+
     fn new_field_cell(index: usize) -> Box<AwkValueRef> {
         Box::new(AwkValueRef::new(
             AwkValue::uninitialized_scalar().into_ref(AwkRefType::Field(index as u32)),
@@ -236,6 +251,7 @@ impl Record {
         if last_field > Self::MAX_FIELDS {
             return Err("too many fields".to_string());
         }
+        self.check_growth(last_field)?;
         let previous_last_field = *self.last_field.borrow();
         let last_field = if truncate_fields {
             // NF was assigned: the record now has exactly `last_field` fields.
@@ -338,7 +354,13 @@ impl Default for Record {
 pub(crate) fn record_index(number: f64) -> Result<usize, String> {
     let number = number.trunc();
     if number < 0.0 || number > Record::MAX_FIELDS as f64 {
-        Err(format!("attempt to access field {number}"))
+        // a huge number in exponent form, not with all its digits
+        let text = if number.abs() < 1e15 {
+            format!("{number}")
+        } else {
+            format!("{number:e}")
+        };
+        Err(format!("attempt to access field {text}"))
     } else {
         // NaN converts to 0
         Ok(number as usize)

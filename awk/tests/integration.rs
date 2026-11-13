@@ -2647,3 +2647,19 @@ fn awk_string_comparison_uses_collation() {
         assert_eq!(run("en_US.UTF-8"), "1 1 1 0 0\n");
     }
 }
+
+// An assignment that would create billions of fields at once is an error,
+// not an allocation that aborts the process or exhausts memory.
+#[test]
+fn awk_huge_field_creation_is_an_error() {
+    for program in [
+        "BEGIN { NF = 2000000000 }",
+        "BEGIN { $2147483647 = 1 }",
+        "BEGIN { $1e300 = 1 }",
+    ] {
+        let (_, stderr, status) = awk_with_deadline(program);
+        assert_eq!(status, Some(1), "{program}: {stderr}");
+        assert!(stderr.contains("field"), "{program}: {stderr}");
+        assert!(stderr.len() < 200, "{program}: {stderr}");
+    }
+}

@@ -67,39 +67,50 @@ fn path_of(name: &str) -> PathBuf {
     PathBuf::from(OsStr::from_bytes(&charset::encode(name)))
 }
 
-/// Whether a match of `re` might be made longer by more input: whether
-/// the expression repeats anything.  (An alternative such as `a|ab` could
-/// too, but waiting for more input after every separator would delay each
-/// record of an interactive input.)
-fn match_may_grow(re: &Regex) -> bool {
-    re.pattern().contains(['*', '+', '?', '{'])
+/// Whether a match of the ERE `pattern` might be made longer by more
+/// input: whether the expression repeats anything.  (An alternative such
+/// as `a|ab` could too, but waiting for more input after every separator
+/// would delay each record of an interactive input.)
+fn match_may_grow(pattern: &str) -> bool {
+    pattern.contains(['*', '+', '?', '{'])
 }
 
-/// Try to find a regex match in the byte buffer. Returns the record before
-/// the match and the remainder after it, or None if no match found.  Before
-/// the end of the input (`at_eof` false), a match that reaches the end of
-/// the buffer is not taken if the input still to come could extend it (two
-/// newlines read one at a time for RS = "\n+").
-fn ere_try_match(
-    buf: &[u8],
-    re: &Regex,
-    at_eof: bool,
-) -> Result<Option<(String, VecDeque<u8>)>, String> {
+/// What a search for the RS in the bytes read so far found.
+enum RsSearch {
+    /// The record before the separator, and the bytes after it.
+    Found(String, VecDeque<u8>),
+    /// A separator reaching the end of the bytes read, which the input to
+    /// come could make longer.
+    Deferred,
+    NotFound,
+}
+
+/// Searches the byte buffer for a match of the RS `re`.  Before the end of
+/// the input (`at_eof` false), a match that reaches the end of the buffer
+/// is not taken if the input still to come could extend it (two newlines
+/// read one at a time for RS = "\n+").
+fn ere_try_match(buf: &[u8], re: &Regex, at_eof: bool) -> RsSearch {
     if buf.is_empty() {
-        return Ok(None);
+        return RsSearch::NotFound;
     }
     match re.find_nonempty_bytes(buf) {
-        Some(m) if at_eof || m.end < buf.len() || !match_may_grow(re) => {
+        Some(m) if at_eof || m.end < buf.len() || !match_may_grow(re.pattern()) => {
             let record = bytes_to_string(buf[..m.start].to_vec());
             let remainder = buf[m.end..].iter().copied().collect();
-            Ok(Some((record, remainder)))
+            RsSearch::Found(record, remainder)
         }
-        _ => Ok(None),
+        Some(_) => RsSearch::Deferred,
+        None => RsSearch::NotFound,
     }
 }
 
 pub trait RecordReader: Iterator<Item = ReadResult> {
+    /// Whether the input has ended and nothing read ahead is left.
     fn is_done(&self) -> bool;
+
+    /// Whether the input has reported its end; it is not read again then,
+    /// as a terminal would wait for more.
+    fn input_ended(&self) -> bool;
 
     /// The input a regular-expression RS has read past the record it
     /// returned, which the next record starts with.
@@ -134,9 +145,14 @@ pub trait RecordReader: Iterator<Item = ReadResult> {
                 let mut byte_buf = Vec::from(std::mem::take(self.ere_byte_buffer()));
 
                 // Check existing buffer first (remainder from previous call)
-                if let Some((record, remainder)) = ere_try_match(&byte_buf, re, false)? {
-                    *self.ere_byte_buffer() = remainder;
-                    return Ok(Some(record));
+                let at_eof = self.input_ended();
+                match ere_try_match(&byte_buf, re, at_eof) {
+                    RsSearch::Found(record, remainder) => {
+                        *self.ere_byte_buffer() = remainder;
+                        return Ok(Some(record));
+                    }
+                    _ if at_eof => return Ok(Some(bytes_to_string(byte_buf))),
+                    _ => {}
                 }
 
                 // After a failed match at length L, skip newline-triggered checks
@@ -159,8 +175,8 @@ pub trait RecordReader: Iterator<Item = ReadResult> {
                             };
                             if check {
                                 bytes_since_check = 0;
-                                if let Some((record, remainder)) =
-                                    ere_try_match(&byte_buf, re, false)?
+                                if let RsSearch::Found(record, remainder) =
+                                    ere_try_match(&byte_buf, re, false)
                                 {
                                     *self.ere_byte_buffer() = remainder;
                                     return Ok(Some(record));
@@ -174,10 +190,10 @@ pub trait RecordReader: Iterator<Item = ReadResult> {
                             if byte_buf.is_empty() {
                                 return Ok(None);
                             }
-                            if let Some((record, remainder)) = ere_try_match(&byte_buf, re, true)? {
-                                if !remainder.is_empty() {
-                                    *self.ere_byte_buffer() = remainder;
-                                }
+                            if let RsSearch::Found(record, remainder) =
+                                ere_try_match(&byte_buf, re, true)
+                            {
+                                *self.ere_byte_buffer() = remainder;
                                 return Ok(Some(record));
                             }
                             let input = bytes_to_string(byte_buf);
@@ -285,15 +301,22 @@ impl RecordReader for FileStream {
         self.is_done && self.ere_byte_buffer.is_empty()
     }
 
+    fn input_ended(&self) -> bool {
+        self.is_done
+    }
+
     fn ere_byte_buffer(&mut self) -> &mut VecDeque<u8> {
         &mut self.ere_byte_buffer
     }
 }
 
+/// A reader of a string for tests.  Like a terminal after an end of file,
+/// it must not be read again once it has reported the end.
 #[cfg(test)]
 pub struct StringRecordReader {
     string: String,
     index: usize,
+    ended: bool,
     ere_byte_buffer: VecDeque<u8>,
 }
 
@@ -303,6 +326,7 @@ impl<S: Into<String>> From<S> for StringRecordReader {
         Self {
             string: value.into(),
             index: 0,
+            ended: false,
             ere_byte_buffer: VecDeque::new(),
         }
     }
@@ -314,6 +338,8 @@ impl Iterator for StringRecordReader {
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.index == self.string.len() {
+            assert!(!self.ended, "read again after the end of the input");
+            self.ended = true;
             None
         } else {
             let result = self.string.as_bytes()[self.index];
@@ -327,6 +353,10 @@ impl Iterator for StringRecordReader {
 impl RecordReader for StringRecordReader {
     fn is_done(&self) -> bool {
         self.index == self.string.len() && self.ere_byte_buffer.is_empty()
+    }
+
+    fn input_ended(&self) -> bool {
+        self.ended
     }
 
     fn ere_byte_buffer(&mut self) -> &mut VecDeque<u8> {
@@ -557,6 +587,10 @@ impl RecordReader for PipeRecordReader {
         self.is_done && self.ere_byte_buffer.is_empty()
     }
 
+    fn input_ended(&self) -> bool {
+        self.is_done
+    }
+
     fn ere_byte_buffer(&mut self) -> &mut VecDeque<u8> {
         &mut self.ere_byte_buffer
     }
@@ -632,6 +666,10 @@ impl RecordReader for StdinRecordReader {
         self.is_done && self.ere_byte_buffer.is_empty()
     }
 
+    fn input_ended(&self) -> bool {
+        self.is_done
+    }
+
     fn ere_byte_buffer(&mut self) -> &mut VecDeque<u8> {
         &mut self.ere_byte_buffer
     }
@@ -669,6 +707,13 @@ mod tests {
         assert_eq!(records, vec!["abc"]);
         let records = split_records("\n\nabc", RecordSeparator::Null);
         assert_eq!(records, vec!["abc"]);
+    }
+
+    #[test]
+    fn regex_rs_does_not_read_again_after_the_end() {
+        let ere = || RecordSeparator::Ere(crate::regex::regex_from_str("\n+"));
+        assert_eq!(split_records("a\n\nb\n\n", ere()), vec!["a", "b"]);
+        assert_eq!(split_records("a\n\nb", ere()), vec!["a", "b"]);
     }
 
     #[test]

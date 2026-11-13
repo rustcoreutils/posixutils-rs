@@ -29,13 +29,9 @@ fn integer_hex_prefix_str(integer_format: IntegerFormat, args: &FormatArgs) -> &
     ""
 }
 
-fn decimal_point() -> char {
-    if cfg!(miri) {
-        '.'
-    } else {
-        unsafe { (*(*libc::localeconv()).decimal_point) as u8 as char }
-    }
-}
+/// The radix character of numbers awk writes: always a period, as Rust's
+/// formatting writes it, and as awk reads numbers whatever the locale.
+const RADIX: char = '.';
 
 fn copy_buffer_to_target(buffer: &[u8], target: &mut String) {
     for c in buffer.iter() {
@@ -119,12 +115,12 @@ fn write_inf_or_nan(
 /// `target[start..]`, and its radix character if no digit follows it; a
 /// number without a fraction is left alone.
 fn strip_trailing_zeros(target: &mut String, start: usize) {
-    if !target[start..].contains('.') {
+    if !target[start..].contains(RADIX) {
         return;
     }
     let trimmed = target.trim_end_matches('0').len();
     target.truncate(trimmed);
-    if target.ends_with('.') {
+    if target.ends_with(RADIX) {
         target.pop();
     }
 }
@@ -158,8 +154,8 @@ fn write_scientific(
     if strip {
         strip_trailing_zeros(target, mantissa_start);
     }
-    if alternative_form && !target[mantissa_start..].contains('.') {
-        target.push(decimal_point());
+    if alternative_form && !target[mantissa_start..].contains(RADIX) {
+        target.push(RADIX);
     }
     target.push(if lowercase_version { 'e' } else { 'E' });
     target.push(if exponent < 0 { '-' } else { '+' });
@@ -512,11 +508,11 @@ pub fn fmt_write_hex_float(
 
     let copy_fraction = |target: &mut String| {
         if fraction_buffer_length != 0 {
-            target.push(decimal_point());
+            target.push(RADIX);
             copy_buffer_to_target(&fraction_buffer[..fraction_buffer_length], target);
             pad_target(target, extra_trailing_zeros, b'0');
         } else if args.alternative_form {
-            target.push(decimal_point());
+            target.push(RADIX);
         }
     };
 
@@ -571,7 +567,7 @@ pub fn fmt_write_decimal_float(
     target.push_str(sign);
     write!(target, "{:.1$}", value.abs(), precision).expect("error writing to string");
     if precision == 0 && args.alternative_form {
-        target.push(decimal_point());
+        target.push(RADIX);
     }
     pad_number(target, start, sign.len(), args);
 }
@@ -635,7 +631,7 @@ pub fn fmt_write_float_general(
         if !args.alternative_form {
             strip_trailing_zeros(target, number_start);
         } else if precision == 0 {
-            target.push(decimal_point());
+            target.push(RADIX);
         }
     }
     pad_number(target, start, sign.len(), args);

@@ -39,7 +39,8 @@ pub struct Array {
     key_map: HashMap<Key, usize>,
     pairs: Vec<Option<KeyValuePair>>,
     iterator_count: usize,
-    empty_slots: usize,
+    /// The slots deletions emptied during an iteration.
+    holes: Vec<usize>,
 }
 
 impl Array {
@@ -56,7 +57,7 @@ impl Array {
                 }
             } else {
                 self.pairs[pair_index] = None;
-                self.empty_slots += 1;
+                self.holes.push(pair_index);
             }
         }
     }
@@ -89,20 +90,31 @@ impl Array {
     /// its deletions emptied are reclaimed.
     pub fn end_iterator(&mut self) {
         self.iterator_count -= 1;
-        if self.iterator_count == 0 && self.empty_slots > 0 {
-            self.compact();
+        if self.iterator_count == 0 && !self.holes.is_empty() {
+            self.fill_holes();
         }
     }
 
-    /// Removes the empty slots, moving the elements after them down.  No
-    /// iteration may be going on; a reference to an element by its slot
-    /// finds it again by its key (see [`Array::element`]).
-    fn compact(&mut self) {
-        self.pairs.retain(Option::is_some);
-        for (index, (key, _)) in self.pairs.iter().flatten().enumerate() {
-            *self.key_map.get_mut(key).expect("every element has a slot") = index;
+    /// Fills the empty slots with the elements at the end, in time for the
+    /// holes rather than for the array.  No iteration may be going on; a
+    /// reference to an element by its slot finds it again by its key (see
+    /// [`Array::element`]).
+    fn fill_holes(&mut self) {
+        let mut holes = std::mem::take(&mut self.holes);
+        holes.sort_unstable();
+        for hole in holes {
+            while matches!(self.pairs.last(), Some(None)) {
+                self.pairs.pop();
+            }
+            if hole >= self.pairs.len() {
+                // the hole was at the end, and is gone
+                continue;
+            }
+            let last = self.pairs.pop().expect("an element follows the hole");
+            let (key, _) = last.as_ref().expect("trailing empty slots were removed");
+            *self.key_map.get_mut(key).expect("every element has a slot") = hole;
+            self.pairs[hole] = last;
         }
-        self.empty_slots = 0;
     }
 
     /// Get the `ValueIndex` of the key in the array. If the key does not exist, it will be inserted.
@@ -182,7 +194,7 @@ impl Array {
     pub fn clear(&mut self) {
         self.key_map.clear();
         self.pairs.clear();
-        self.empty_slots = 0;
+        self.holes.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -229,7 +241,7 @@ mod tests {
             }
         }
         assert_eq!(array.pairs.len(), 5);
-        assert_eq!(array.empty_slots, 0);
+        assert!(array.holes.is_empty());
         for i in (1..10).step_by(2) {
             assert_eq!(array.get(&i.to_string()), Some(&AwkValue::from(i as f64)));
         }

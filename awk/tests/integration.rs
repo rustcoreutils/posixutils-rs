@@ -2787,3 +2787,15 @@ fn awk_regex_with_nul_is_an_error_saying_so() {
     );
     assert_eq!(status, Some(1));
 }
+
+// Reclaiming the slot a for-in loop emptied costs time for that slot, not
+// for the whole array: deleting one element per loop left by break,
+// 40000 times over, took half a minute.
+#[test]
+fn awk_reclaiming_slots_after_each_loop_is_quick() {
+    assert_awk_cases(&[(
+        "BEGIN { for (i = 0; i < 40000; i++) a[i]; for (j = 0; j < 40000; j++) for (k in a) { delete a[k]; break }; print length(a) }",
+        "",
+        "0\n",
+    )]);
+}

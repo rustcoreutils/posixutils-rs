@@ -2636,6 +2636,8 @@ fn awk_huge_field_creation_is_an_error() {
         "BEGIN { NF = 2000000000 }",
         "BEGIN { $2147483647 = 1 }",
         "BEGIN { $1e300 = 1 }",
+        // nor many steps that each add a few million
+        "BEGIN { for (i = 1; i <= 128; i++) NF = i * 2^19 }",
     ] {
         let (_, stderr, status) = awk_with_deadline(program);
         assert_eq!(status, Some(1), "{program}: {stderr}");

@@ -129,15 +129,17 @@ impl Record {
     /// holds it in a `u32`.
     pub(crate) const MAX_FIELDS: usize = i32::MAX as usize;
 
-    /// How many fields one assignment to a field or to NF may add: the
-    /// record's storage holds every field up to the last, so `NF = 2e9`
-    /// would otherwise allocate billions of them.
-    const MAX_NEW_FIELDS: usize = 1 << 24;
+    /// The highest field an assignment to a field or to NF may create
+    /// beyond those the record has: the record's storage holds every field
+    /// up to the last, so `NF = 2e9`, or many smaller steps, would
+    /// otherwise allocate billions of them.  A record read from the input
+    /// may have more fields, as its size bounds them.
+    const MAX_CREATED_FIELD: usize = 1 << 20;
 
-    /// An error if making `index` the last field would add more than
-    /// [`Self::MAX_NEW_FIELDS`] fields.
+    /// An error if making `index` the last field would create a field
+    /// past both the record's storage and [`Self::MAX_CREATED_FIELD`].
     pub(crate) fn check_growth(&self, index: usize) -> Result<(), String> {
-        if index >= self.fields.borrow().len() + Self::MAX_NEW_FIELDS {
+        if index >= self.fields.borrow().len() && index > Self::MAX_CREATED_FIELD {
             Err(format!("attempt to create field {index}"))
         } else {
             Ok(())

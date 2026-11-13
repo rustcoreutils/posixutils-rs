@@ -2376,3 +2376,21 @@ fn awk_default_fs_splits_on_blanks_and_newlines_only() {
         ),
     ]);
 }
+
+// Changing RS from a regular expression to one character, or to "", keeps
+// the input the regular expression's reader had read ahead; it was lost.
+#[test]
+fn awk_rs_change_keeps_input_read_ahead() {
+    assert_awk_cases(&[
+        (
+            "BEGIN { RS = \";;\" } NR == 1 { RS = \"\\n\" } { print NR \":\" $0 }",
+            "a;;b\nc\nd\n",
+            "1:a\n2:b\n3:c\n4:d\n",
+        ),
+        (
+            "BEGIN { RS = \";;\" } NR == 1 { RS = \"\" } { print NR \":\" $0 }",
+            "a;;b\nc\n\nd\n",
+            "1:a\n2:b\nc\n3:d\n",
+        ),
+    ]);
+}

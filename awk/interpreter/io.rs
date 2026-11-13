@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 use std::{
-    collections::{hash_map::Entry, HashMap},
+    collections::{hash_map::Entry, HashMap, VecDeque},
     ffi::{CString, OsStr},
     fs::File,
     io::{BufReader, Bytes, Read, Write},
@@ -43,15 +43,17 @@ impl TryFrom<AwkString> for RecordSeparator {
 
 type ReadResult = Result<u8, String>;
 
+/// The byte in the `Option<ReadResult>` `$next`, or a return of `$ret` (by
+/// default `Ok(None)`) at the end of the input.
 macro_rules! read_iter_next {
-    ($iter:expr, $ret:expr) => {
-        match $iter.next() {
+    ($next:expr, $ret:expr) => {
+        match $next {
             Some(byte_result) => byte_result?,
             None => return $ret,
         }
     };
-    ($iter:expr) => {
-        read_iter_next!($iter, Ok(None))
+    ($next:expr) => {
+        read_iter_next!($next, Ok(None))
     };
 }
 
@@ -67,23 +69,34 @@ fn path_of(name: &str) -> PathBuf {
 
 /// Try to find a regex match in the byte buffer. Returns the record before
 /// the match and the remainder after it, or None if no match found.
-fn ere_try_match(buf: &[u8], re: &Regex) -> Result<Option<(String, Vec<u8>)>, String> {
+fn ere_try_match(buf: &[u8], re: &Regex) -> Result<Option<(String, VecDeque<u8>)>, String> {
     if buf.is_empty() {
         return Ok(None);
     }
-    if let Some(m) = re.find_nonempty_bytes(buf) {
-        let record = bytes_to_string(buf[..m.start].to_vec());
-        let remainder = buf[m.end..].to_vec();
-        Ok(Some((record, remainder)))
-    } else {
-        Ok(None)
+    match re.find_nonempty_bytes(buf) {
+        Some(m) => {
+            let record = bytes_to_string(buf[..m.start].to_vec());
+            let remainder = buf[m.end..].iter().copied().collect();
+            Ok(Some((record, remainder)))
+        }
+        _ => Ok(None),
     }
 }
 
 pub trait RecordReader: Iterator<Item = ReadResult> {
     fn is_done(&self) -> bool;
 
-    fn ere_byte_buffer(&mut self) -> &mut Vec<u8>;
+    /// The input a regular-expression RS has read past the record it
+    /// returned, which the next record starts with.
+    fn ere_byte_buffer(&mut self) -> &mut VecDeque<u8>;
+
+    /// The next byte of the input: first those read ahead, then new ones.
+    fn next_byte(&mut self) -> Option<ReadResult> {
+        match self.ere_byte_buffer().pop_front() {
+            Some(byte) => Some(Ok(byte)),
+            None => self.next(),
+        }
+    }
 
     fn read_next_record(&mut self, separator: &RecordSeparator) -> Result<Option<String>, String> {
         if self.is_done() {
@@ -92,10 +105,10 @@ pub trait RecordReader: Iterator<Item = ReadResult> {
         match separator {
             RecordSeparator::Char(sep) => {
                 let mut buf = Vec::new();
-                let mut next = read_iter_next!(self);
+                let mut next = read_iter_next!(self.next_byte());
                 while next != *sep {
                     buf.push(next);
-                    next = read_iter_next!(self, Ok(Some(bytes_to_string(buf))));
+                    next = read_iter_next!(self.next_byte(), Ok(Some(bytes_to_string(buf))));
                 }
                 Ok(Some(bytes_to_string(buf)))
             }
@@ -103,7 +116,7 @@ pub trait RecordReader: Iterator<Item = ReadResult> {
                 // Incremental matching: read bytes into a buffer and check
                 // for RS matches periodically to support streaming/interactive
                 // input without reading everything into memory at once.
-                let mut byte_buf = std::mem::take(self.ere_byte_buffer());
+                let mut byte_buf = Vec::from(std::mem::take(self.ere_byte_buffer()));
 
                 // Check existing buffer first (remainder from previous call)
                 if let Some((record, remainder)) = ere_try_match(&byte_buf, re)? {
@@ -162,7 +175,7 @@ pub trait RecordReader: Iterator<Item = ReadResult> {
                 loop {
                     // at the end of the input, a first line with no
                     // newline after it is the whole record
-                    let next = match self.next() {
+                    let next = match self.next_byte() {
                         Some(byte_result) => byte_result?,
                         None if line_buf.is_empty() => return Ok(None),
                         None => return Ok(Some(bytes_to_string(line_buf))),
@@ -185,7 +198,7 @@ pub trait RecordReader: Iterator<Item = ReadResult> {
                 loop {
                     let mut line_buf = Vec::new();
                     loop {
-                        match self.next() {
+                        match self.next_byte() {
                             Some(byte_result) => {
                                 let byte = byte_result?;
                                 if byte == b'\n' {
@@ -220,7 +233,7 @@ pub trait RecordReader: Iterator<Item = ReadResult> {
 pub struct FileStream {
     bytes: Bytes<BufReader<File>>,
     is_done: bool,
-    ere_byte_buffer: Vec<u8>,
+    ere_byte_buffer: VecDeque<u8>,
 }
 
 impl FileStream {
@@ -230,7 +243,7 @@ impl FileStream {
         Ok(Self {
             bytes: reader.bytes(),
             is_done: false,
-            ere_byte_buffer: Vec::new(),
+            ere_byte_buffer: VecDeque::new(),
         })
     }
 }
@@ -255,7 +268,7 @@ impl RecordReader for FileStream {
         self.is_done && self.ere_byte_buffer.is_empty()
     }
 
-    fn ere_byte_buffer(&mut self) -> &mut Vec<u8> {
+    fn ere_byte_buffer(&mut self) -> &mut VecDeque<u8> {
         &mut self.ere_byte_buffer
     }
 }
@@ -264,7 +277,7 @@ impl RecordReader for FileStream {
 pub struct StringRecordReader {
     string: String,
     index: usize,
-    ere_byte_buffer: Vec<u8>,
+    ere_byte_buffer: VecDeque<u8>,
 }
 
 #[cfg(test)]
@@ -273,7 +286,7 @@ impl<S: Into<String>> From<S> for StringRecordReader {
         Self {
             string: value.into(),
             index: 0,
-            ere_byte_buffer: Vec::new(),
+            ere_byte_buffer: VecDeque::new(),
         }
     }
 }
@@ -299,7 +312,7 @@ impl RecordReader for StringRecordReader {
         self.index == self.string.len() && self.ere_byte_buffer.is_empty()
     }
 
-    fn ere_byte_buffer(&mut self) -> &mut Vec<u8> {
+    fn ere_byte_buffer(&mut self) -> &mut VecDeque<u8> {
         &mut self.ere_byte_buffer
     }
 }
@@ -479,7 +492,7 @@ pub struct PipeRecordReader {
     /// Set once the pipe has been `pclose`d by an explicit `close()`, so the
     /// `Drop` impl does not close it a second time.
     closed: bool,
-    ere_byte_buffer: Vec<u8>,
+    ere_byte_buffer: VecDeque<u8>,
 }
 
 impl PipeRecordReader {
@@ -496,7 +509,7 @@ impl PipeRecordReader {
             pipe: file,
             is_done: false,
             closed: false,
-            ere_byte_buffer: Vec::new(),
+            ere_byte_buffer: VecDeque::new(),
         })
     }
 
@@ -527,7 +540,7 @@ impl RecordReader for PipeRecordReader {
         self.is_done && self.ere_byte_buffer.is_empty()
     }
 
-    fn ere_byte_buffer(&mut self) -> &mut Vec<u8> {
+    fn ere_byte_buffer(&mut self) -> &mut VecDeque<u8> {
         &mut self.ere_byte_buffer
     }
 }
@@ -578,7 +591,7 @@ impl ReadPipes {
 #[derive(Default)]
 pub struct StdinRecordReader {
     is_done: bool,
-    ere_byte_buffer: Vec<u8>,
+    ere_byte_buffer: VecDeque<u8>,
 }
 
 impl Iterator for StdinRecordReader {
@@ -602,7 +615,7 @@ impl RecordReader for StdinRecordReader {
         self.is_done && self.ere_byte_buffer.is_empty()
     }
 
-    fn ere_byte_buffer(&mut self) -> &mut Vec<u8> {
+    fn ere_byte_buffer(&mut self) -> &mut VecDeque<u8> {
         &mut self.ere_byte_buffer
     }
 }

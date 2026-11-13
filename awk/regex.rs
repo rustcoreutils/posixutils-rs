@@ -48,6 +48,8 @@ pub struct MatchIter<'re> {
     /// offset of each byte, and of the end.
     string_offsets: Option<Vec<usize>>,
     next_start: usize,
+    /// Whether the subject holds a NUL byte (see [`Regex::find_from`]).
+    has_nul: bool,
     regex: &'re Regex,
 }
 
@@ -84,16 +86,10 @@ impl Iterator for MatchIter<'_> {
             return None;
         }
 
-        // Find match starting from current offset
-        let subject = &self.bytes[self.next_start..];
-        let m = if self.next_start == 0 {
-            self.regex.inner.find_bytes(subject)?
-        } else {
-            self.regex.inner.find_notbol_bytes(subject)?
-        };
-
-        let start = self.next_start + m.start;
-        let end = self.next_start + m.end;
+        let m = self
+            .regex
+            .find_from(&self.bytes, self.next_start, self.has_nul)?;
+        let (start, end) = (m.start, m.end);
         let result = RegexMatch {
             start: self.string_offset(start),
             end: self.string_offset(end),
@@ -258,24 +254,62 @@ impl Regex {
         })
     }
 
-    /// Returns the first match in the raw input bytes `bytes` that is not
-    /// empty, as byte offsets: an empty match separates nothing.
-    pub fn find_nonempty_bytes(&self, bytes: &[u8]) -> Option<RegexMatch> {
-        let mut start = 0;
-        while start <= bytes.len() {
-            let subject = &bytes[start..];
-            let m = if start == 0 {
-                self.inner.find_bytes(subject)?
-            } else {
-                self.inner.find_notbol_bytes(subject)?
-            };
-            if m.start != m.end {
+    /// The first match in the subject `bytes` that starts at or after
+    /// `from`, as byte offsets; `^` matches only at the start of the
+    /// subject.
+    ///
+    /// regexec takes a C string, so a subject holding NUL bytes is searched
+    /// one piece between them at a time, leftmost first, `^` matching only
+    /// in the first piece and `$` only in the last.  No pattern matches a
+    /// NUL byte itself, or a match across one.
+    ///
+    /// `has_nul` says whether `bytes` holds a NUL byte, which the caller
+    /// finds out once for a subject searched many times.
+    fn find_from(&self, bytes: &[u8], from: usize, has_nul: bool) -> Option<RegexMatch> {
+        if !has_nul {
+            let m = self
+                .inner
+                .find_bytes_flags(&bytes[from..], from > 0, false)?;
+            return Some(RegexMatch {
+                start: from + m.start,
+                end: from + m.end,
+            });
+        }
+        let mut start = from;
+        loop {
+            let end = bytes[start..]
+                .iter()
+                .position(|&b| b == 0)
+                .map_or(bytes.len(), |p| start + p);
+            let not_bol = start > 0;
+            let not_eol = end < bytes.len();
+            if let Some(m) = self
+                .inner
+                .find_bytes_flags(&bytes[start..end], not_bol, not_eol)
+            {
                 return Some(RegexMatch {
                     start: start + m.start,
                     end: start + m.end,
                 });
             }
-            start = next_char(bytes, start + m.start);
+            if end == bytes.len() {
+                return None;
+            }
+            start = end + 1;
+        }
+    }
+
+    /// Returns the first match in the raw input bytes `bytes` that is not
+    /// empty, as byte offsets: an empty match separates nothing.
+    pub fn find_nonempty_bytes(&self, bytes: &[u8]) -> Option<RegexMatch> {
+        let has_nul = bytes.contains(&0);
+        let mut start = 0;
+        while start <= bytes.len() {
+            let m = self.find_from(bytes, start, has_nul)?;
+            if m.start != m.end {
+                return Some(m);
+            }
+            start = next_char(bytes, m.start);
         }
         None
     }
@@ -294,6 +328,7 @@ impl Regex {
             ),
         };
         MatchIter {
+            has_nul: bytes.contains(&0),
             bytes: bytes.into_owned(),
             string_offsets,
             next_start: 0,
@@ -305,9 +340,14 @@ impl Regex {
         &self.pattern_string
     }
 
-    /// Whether the regular expression matches the bytes of `string`.
-    pub fn matches(&self, string: &CString) -> bool {
-        self.inner.is_match_bytes(string.as_bytes())
+    /// Whether the regular expression matches the string.
+    pub fn matches(&self, string: &str) -> bool {
+        let bytes = charset::encode(string);
+        if bytes.contains(&0) {
+            self.find_from(&bytes, 0, true).is_some()
+        } else {
+            self.inner.is_match_bytes(&bytes)
+        }
     }
 }
 
@@ -350,7 +390,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     fn test_regex_matches() {
         let ere = regex_from_str("ab*c");
-        assert!(ere.matches(&CString::new("abbbbc").unwrap()));
+        assert!(ere.matches("abbbbc"));
     }
 
     #[test]

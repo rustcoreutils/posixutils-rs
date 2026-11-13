@@ -532,9 +532,10 @@ impl WritePipes {
                 file
             }
         };
-        let contents: CString = contents.try_into()?;
-        let result = unsafe { libc::fputs(contents.as_ptr(), file) };
-        if result == libc::EOF {
+        // fwrite, not fputs: the output may hold NUL bytes
+        let bytes = charset::encode(&contents);
+        let written = unsafe { libc::fwrite(bytes.as_ptr().cast(), 1, bytes.len(), file) };
+        if written != bytes.len() {
             return Err("failed to write to file".to_string());
         }
         Ok(())

@@ -308,9 +308,6 @@ pub fn escape_string_contents(s: &str, mut warn: impl FnMut(char)) -> Result<Rc<
                                 }
                             }
                         }
-                        if char_code == 0 {
-                            return Err("invalid escape sequence: \\0".to_string());
-                        }
                         char::from_u32(char_code).ok_or("invalid character".to_string())?
                     }
                     other => {

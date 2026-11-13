@@ -200,7 +200,7 @@ impl AwkValue {
         }
     }
 
-    pub(crate) fn from_ere(ere: Rc<Regex>, record: &CString) -> Self {
+    pub(crate) fn from_ere(ere: Rc<Regex>, record: &str) -> Self {
         let matches_record = ere.matches(record);
         Self {
             value: AwkValueVariant::Regex {

@@ -2688,3 +2688,29 @@ fn awk_growable_rs_record_is_returned_when_more_input_comes() {
         Some("got 1000\n")
     );
 }
+
+// A NUL byte in the input is an ordinary character: it ended the run with
+// "string contains a NUL character".  Regular expressions match on either
+// side of it, with ^ and $ anchored at the ends of the whole string.
+#[test]
+fn awk_nul_bytes_are_ordinary_characters() {
+    assert_awk_cases(&[
+        ("{ print NR, length($0) }", "a\0b\nc\n", "1 3\n2 1\n"),
+        (
+            "{ print ($0 ~ /b/), ($0 ~ /^b/), ($0 ~ /a$/), ($0 ~ /^a/), ($0 ~ /b$/), ($0 ~ \"a.b\") }",
+            "a\0b\n",
+            "1 0 0 1 1 0\n",
+        ),
+        ("{ gsub(/b/, \"X\"); print }", "a\0b\0b\n", "a\0X\0X\n"),
+        (
+            "{ n = split($0, x, /,/); print n, length(x[2]), match(x[2], /r/), RSTART }",
+            "p,q\0r,s\n",
+            "3 3 3 3\n",
+        ),
+        ("BEGIN { FS = \",+\" } { print NF, $2 }", "a\0b,,c\n", "2 c\n"),
+        ("BEGIN { RS = \";;\" } { print length($0) }", "a\0b;;c", "3\n1\n"),
+        ("BEGIN { RS = \";+\" } { print length($0) }", "a\0b;;c", "3\n1\n"),
+        ("BEGIN { s = \"a\\0b\"; print length(s) }", "", "3\n"),
+        ("BEGIN { printf \"%c\", 0 | \"od -An -c\" }", "", "  \\0\n"),
+    ]);
+}

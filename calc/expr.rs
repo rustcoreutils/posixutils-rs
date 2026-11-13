@@ -151,7 +151,9 @@ const OPERATORS: [(&[u8], Token); 16] = [
     (b":", Token::OpMatch),
 ];
 
-// The argument a token came from, for a diagnostic.
+// The argument a token came from, for a diagnostic: control characters and
+// bytes that are not UTF-8 are written as \xHH, so that the message neither
+// drives the terminal nor misquotes the argument.
 fn token_text(t: &Token) -> String {
     let text = match t {
         Token::Operand(bytes) => bytes.as_slice(),
@@ -161,7 +163,22 @@ fn token_text(t: &Token) -> String {
             .map(|(text, _)| *text)
             .expect("every operator is in the table"),
     };
-    String::from_utf8_lossy(text).into_owned()
+    let mut shown = String::new();
+    for chunk in text.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            if c.is_control() && (c as u32) < 0x100 {
+                shown.push_str(&format!("\\x{:02x}", c as u32));
+            } else if c.is_control() {
+                shown.extend(c.escape_unicode());
+            } else {
+                shown.push(c);
+            }
+        }
+        for byte in chunk.invalid() {
+            shown.push_str(&format!("\\x{byte:02x}"));
+        }
+    }
+    shown
 }
 
 fn unexpected_argument(t: &Token) -> String {

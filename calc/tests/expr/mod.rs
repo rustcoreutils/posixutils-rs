@@ -479,3 +479,34 @@ fn expr_invalid_regex_gives_the_reason() {
     assert!(reason.trim().len() > 1, "{stderr:?}");
     assert_eq!(out.status.code(), Some(2));
 }
+
+/// An argument named in a diagnostic has its control characters and the
+/// bytes that are not text escaped, so the message neither drives the
+/// terminal nor misquotes the argument.
+#[cfg(unix)]
+#[test]
+fn expr_diagnostic_escapes_the_argument() {
+    for (arg, shown) in [
+        (&b"\x1b]0;x\x07"[..], &b"\\x1b]0;x\\x07"[..]),
+        (&b"a\xffb"[..], &b"a\\xffb"[..]),
+        (&b"tab\there"[..], &b"tab\\x09here"[..]),
+        ("é".as_bytes(), "é".as_bytes()),
+    ] {
+        let mut expected_err = b"expr: syntax error: unexpected argument '".to_vec();
+        expected_err.extend_from_slice(shown);
+        expected_err.extend_from_slice(b"'\n");
+        run_test_os(TestPlanOs {
+            cmd: String::from("expr"),
+            args: vec![
+                os_bytes(b"1"),
+                os_bytes(b"+"),
+                os_bytes(b"2"),
+                os_bytes(arg),
+            ],
+            stdin_data: Vec::new(),
+            expected_out: Vec::new(),
+            expected_err,
+            expected_exit_code: 2,
+        });
+    }
+}

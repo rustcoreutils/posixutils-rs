@@ -3062,3 +3062,16 @@ fn awk_program_files_are_concatenated() {
     );
     assert_eq!(status, Some(1));
 }
+
+// At the end of the run the output files are written before the pipes are
+// closed, as the commands may read them.
+#[test]
+fn awk_files_are_written_before_pipes_close_at_exit() {
+    let tmp = plib::tmp::TempDir::new().unwrap();
+    let file = tmp.path().join("f");
+    let program = format!(
+        "BEGIN {{ print \"cat {0}\" | \"sh\"; print \"hello\" > \"{0}\" }}",
+        file.display()
+    );
+    assert_awk_cases(&[(&program, "", "hello\n")]);
+}

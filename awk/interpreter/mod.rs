@@ -319,16 +319,18 @@ impl Interpreter {
     }
 
     /// Ends the output at the end of the run: writes out standard output,
-    /// then closes the pipes, waiting for their commands, whose output
-    /// comes after awk's, and the output files: an error if a file could
-    /// not be written.  A failure to write standard output is remembered
+    /// closes the output files, then closes the pipes, waiting for their
+    /// commands, whose output comes after awk's and which may read those
+    /// files: an error if a file could not be written.  A failure to write standard output is remembered
     /// (see [`output::stdout_write_error`]) for the caller, which reports
     /// it keeping the exit status.
     fn finish_output(&mut self) -> Result<(), String> {
         let _ = output::flush_stdout();
+        // the commands may read the files
+        let files = self.write_files.close_all();
         self.write_pipes = WritePipes::default();
         self.read_pipes = ReadPipes::default();
-        self.write_files.close_all()
+        files
     }
 
     /// Increment a special counter global (NR or FNR) by one, keeping its

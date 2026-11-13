@@ -166,10 +166,9 @@ fn token_text(t: &Token) -> String {
     let mut shown = String::new();
     for chunk in text.utf8_chunks() {
         for c in chunk.valid().chars() {
-            if c.is_control() && (c as u32) < 0x100 {
+            // the control characters are all below U+0100
+            if c.is_control() {
                 shown.push_str(&format!("\\x{:02x}", c as u32));
-            } else if c.is_control() {
-                shown.extend(c.escape_unicode());
             } else {
                 shown.push(c);
             }

@@ -2813,3 +2813,20 @@ fn awk_call_trace_of_a_deep_recursion_is_short() {
     assert!(lines.contains(&"=> ... 4992 more calls"), "{stderr}");
     assert_eq!(lines.last().copied(), Some("=> <start> at :1:60"));
 }
+
+// A printf field width or precision beyond what C allows (INT_MAX) is a
+// runtime error; it was taken as given, and the allocation for it
+// aborted the process, or a literal one overflowed silently.
+#[test]
+fn awk_huge_printf_width_is_an_error() {
+    for program in [
+        "BEGIN { printf \"%*d\", 1e15, 1 }",
+        "BEGIN { printf \"%.*f\", 1e15, 1 }",
+        "BEGIN { printf \"%99999999999999999999d\", 1 }",
+        "BEGIN { x = sprintf(\"%.3000000000s\", \"a\") }",
+    ] {
+        let (_, stderr, status) = awk_with_deadline(program);
+        assert_eq!(status, Some(1), "{program}: {stderr}");
+        assert!(stderr.contains("too large"), "{program}: {stderr}");
+    }
+}

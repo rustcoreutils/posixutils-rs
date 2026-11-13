@@ -198,23 +198,44 @@ impl FormatArgs {
 
     /// Apply a `*` field width fetched from the argument list. Per C/POSIX a
     /// negative width means left-justified with the absolute value.
-    pub fn set_width(&mut self, width: i64) {
+    pub fn set_width(&mut self, width: i64) -> Result<(), String> {
         if width < 0 {
             self.left_justified = true;
-            self.width = width.unsigned_abs() as usize;
-        } else {
-            self.width = width as usize;
         }
+        self.width = checked_field_size(width.unsigned_abs())?;
+        Ok(())
     }
 
     /// Apply a `.*` precision fetched from the argument list. A negative
     /// precision is treated as if the precision were omitted.
-    pub fn set_precision(&mut self, precision: i64) {
+    pub fn set_precision(&mut self, precision: i64) -> Result<(), String> {
         self.precision = if precision < 0 {
             None
         } else {
-            Some(precision as usize)
+            Some(checked_field_size(precision as u64)?)
         };
+        Ok(())
+    }
+
+    /// An error if the width or precision cannot be allocated: the output
+    /// of the conversion takes at least that much room.
+    pub fn reserve_room(&self, target: &mut String) -> Result<(), String> {
+        let room = self.width.max(self.precision.unwrap_or(0));
+        target
+            .try_reserve(room)
+            .map_err(|_| "field width or precision too large".to_string())
+    }
+}
+
+/// The largest field width or precision, that of C (`INT_MAX`).
+const MAX_FIELD_SIZE: u64 = i32::MAX as u64;
+
+/// `size` as a field width or precision; an error if it is too large.
+fn checked_field_size(size: u64) -> Result<usize, String> {
+    if size > MAX_FIELD_SIZE {
+        Err("field width or precision too large".to_string())
+    } else {
+        Ok(size as usize)
     }
 }
 
@@ -228,17 +249,13 @@ pub fn parse_conversion_specifier_args(iter: &mut Chars) -> Result<(char, Format
     let iter_next = |iter: &mut Chars| iter.next().ok_or("invalid format string".to_string());
 
     let parse_number = |next: &mut char, iter: &mut Chars| -> Result<usize, String> {
-        let mut number = 0;
-        loop {
-            match *next {
-                c if c.is_ascii_digit() => {
-                    number = number * 10 + c.to_digit(10).unwrap() as usize;
-                }
-                _ => break,
-            }
+        let mut number: u64 = 0;
+        while let Some(digit) = next.to_digit(10) {
+            // saturating: anything past the limit is an error below
+            number = number.saturating_mul(10).saturating_add(u64::from(digit));
             *next = iter_next(iter)?;
         }
-        Ok(number)
+        checked_field_size(number)
     };
 
     let mut result = FormatArgs::default();

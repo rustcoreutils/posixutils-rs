@@ -53,7 +53,7 @@ pub(crate) fn sprintf(
                     current_arg -= 1;
                     args.set_width(
                         swap_with_default(&mut values[current_arg]).scalar_as_f64() as i64
-                    );
+                    )?;
                 }
                 if args.needs_precision_arg() {
                     if current_arg == 0 {
@@ -61,8 +61,8 @@ pub(crate) fn sprintf(
                     }
                     current_arg -= 1;
                     args.set_precision(
-                        swap_with_default(&mut values[current_arg]).scalar_as_f64() as i64
-                    );
+                        swap_with_default(&mut values[current_arg]).scalar_as_f64() as i64,
+                    )?;
                 }
 
                 if current_arg == 0 {
@@ -70,6 +70,7 @@ pub(crate) fn sprintf(
                 }
                 current_arg -= 1;
                 let value = swap_with_default(&mut values[current_arg]);
+                args.reserve_room(&mut result)?;
                 format_one_conversion(&mut result, specifier, value, &args, float_format)?;
                 next = iter.next();
             }

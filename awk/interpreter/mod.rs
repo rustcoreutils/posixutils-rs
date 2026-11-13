@@ -22,7 +22,7 @@ use string::AwkString;
 use value::{AwkRefType, AwkValue, AwkValueRef, AwkValueVariant};
 
 use crate::charset;
-use crate::compiler::escape_string_contents;
+use crate::compiler::{escape_string_contents, warn_plain_escape};
 use crate::program::{
     Action, BuiltinFunction, Constant, Function, OpCode, Pattern, Program, SpecialVar,
 };
@@ -915,7 +915,7 @@ fn set_globals_with_assignment_arguments(
         .filter_map(|s| parse_assignment(s))
         .filter_map(|(var, value)| globals.get(var).copied().map(|index| (index, value)))
         .try_for_each(|(global_index, value)| {
-            let value = escape_string_contents(value)?;
+            let value = escape_string_contents(value, warn_plain_escape)?;
             interpreter.globals[global_index as usize]
                 .get_mut()
                 .assign(maybe_numeric_string(value), global_env)
@@ -966,7 +966,7 @@ pub fn interpret(
         // POSIX: `-F sepstring` is equivalent to `-v FS=sepstring`, so the
         // separator undergoes the same escape processing (e.g. `-F '\t'` is a
         // tab), matching the -v path above.
-        let separator = escape_string_contents(&separator)?;
+        let separator = escape_string_contents(&separator, warn_plain_escape)?;
         interpreter.globals[SpecialVar::Fs as usize]
             .get_mut()
             .assign(AwkString::from(separator), &mut global_env)?;

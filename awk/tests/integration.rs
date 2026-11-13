@@ -2540,3 +2540,71 @@ fn awk_record_counters_go_past_32_bits() {
         ),
     ]);
 }
+
+/// Runs awk with `args` and `input`, returning stdout, stderr and the
+/// exit status.
+fn awk_args(args: &[&str], input: &str) -> (String, String, Option<i32>) {
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let out = plib::testing::run_test_base("awk", &args, input.as_bytes());
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code(),
+    )
+}
+
+// A backslash before a character with no escape meaning is dropped with a
+// warning, as in gawk and the one true awk, in a string literal, -v, -F
+// and an assignment operand; it was a fatal error, so -F '\|' failed.  A
+// backslash at the end of an assigned value stays.
+#[test]
+fn awk_undefined_escape_is_a_warning() {
+    let warning =
+        |c: char| format!("awk: warning: escape sequence `\\{c}' treated as plain `{c}'\n");
+    for (args, input, out, err) in [
+        (
+            &["-F", "\\|", "{ print $2 }"][..],
+            "a|b\n",
+            "b\n",
+            warning('|'),
+        ),
+        (
+            &["-v", "x=a\\.b", "BEGIN { print x }"][..],
+            "",
+            "a.b\n",
+            warning('.'),
+        ),
+        (
+            &["{ print x }", "x=C:\\dir", "-"][..],
+            "l\n",
+            "C:dir\n",
+            warning('d'),
+        ),
+        (
+            &["BEGIN { print \"a\\.b\" }"][..],
+            "",
+            "a.b\n",
+            warning('.'),
+        ),
+        (
+            &["-v", "x=a\\", "BEGIN { print x }"][..],
+            "",
+            "a\\\n",
+            String::new(),
+        ),
+        (
+            &["BEGIN { print \"a\\\nb\" }"][..],
+            "",
+            "ab\n",
+            String::new(),
+        ),
+    ] {
+        let (stdout, stderr, status) = awk_args(args, input);
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str()),
+            (out, err.as_str()),
+            "{args:?}"
+        );
+        assert_eq!(status, Some(0), "{args:?}");
+    }
+}

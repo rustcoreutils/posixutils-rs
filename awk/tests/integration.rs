@@ -2538,6 +2538,12 @@ fn awk_record_counters_go_past_32_bits() {
             "a\nb\n",
             "5000000001\n",
         ),
+        // a count at the end of the range stays there
+        (
+            "BEGIN { NR = 1e19 } END { print (NR > 9e18) }",
+            "a\nb\n",
+            "1\n",
+        ),
     ]);
 }
 

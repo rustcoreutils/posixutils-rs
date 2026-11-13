@@ -1003,8 +1003,8 @@ pub fn interpret(
             AwkValue::from(current_record.get_last_field() as f64).value;
         global_env.nf = current_record.get_last_field();
 
-        global_env.fnr += 1;
-        global_env.nr += 1;
+        global_env.fnr = global_env.fnr.saturating_add(1);
+        global_env.nr = global_env.nr.saturating_add(1);
         interpreter.globals[SpecialVar::Fnr as usize]
             .get_mut()
             .value = AwkValue::from(global_env.fnr as f64).value;

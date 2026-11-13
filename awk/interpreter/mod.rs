@@ -8,15 +8,18 @@
 //
 
 use array::Array;
-pub use builtins::stdout_write_error;
-use builtins::{builtin_match, builtin_sprintf, call_simple_builtin, print_to_string, sprintf};
+use builtins::{
+    builtin_match, builtin_sprintf, call_simple_builtin, print_to_string, run_system, sprintf,
+};
 use io::{ReadFiles, ReadPipes, RecordSeparator, WriteFiles, WritePipes};
 use main_input::MainInput;
+pub use output::{flush_stdout, stdout_write_error};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
-use record::{ere_escape_char, is_valid_record_index, FieldSeparator, FieldsState, Record};
+use record::{ere_escape_char, record_index, FieldSeparator, FieldsState, Record};
 use stack::{
-    compare_op, numeric_op, ArrayElementRef, ArrayIterator, ExecutionResult, Stack, StackValue,
+    compare_op, numeric_op, ArrayElementRef, ArrayIterator, ExecutionResult, Stack, StackMemory,
+    StackValue,
 };
 use string::AwkString;
 use value::{AwkRefType, AwkValue, AwkValueRef, AwkValueVariant};
@@ -24,10 +27,11 @@ use value::{AwkRefType, AwkValue, AwkValueRef, AwkValueVariant};
 use crate::charset;
 use crate::compiler::escape_string_contents;
 use crate::program::{
-    Action, BuiltinFunction, Constant, Function, OpCode, Pattern, Program, SpecialVar,
+    Action, BuiltinFunction, Constant, Function, OpCode, Pattern, Program, SourceMap, SpecialVar,
 };
 use crate::regex::Regex;
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::fmt::Write;
 use std::iter;
 use std::os::unix::ffi::OsStringExt;
@@ -39,6 +43,7 @@ mod builtins;
 mod format;
 mod io;
 mod main_input;
+mod output;
 mod record;
 mod stack;
 mod string;
@@ -47,7 +52,9 @@ mod value;
 #[cfg(test)]
 mod tests;
 
-const STACK_SIZE: usize = 2048;
+/// The room on the operand stack, in values: enough for a recursion some
+/// 100000 calls deep (see `StackMemory`).
+const STACK_SIZE: usize = 1 << 18;
 
 pub(crate) fn bool_to_f64(p: bool) -> f64 {
     if p {
@@ -130,8 +137,8 @@ struct GlobalEnv {
     ors: AwkString,
     ofmt: AwkString,
     rs: RecordSeparator,
-    nr: u32,
-    fnr: u32,
+    nr: i64,
+    fnr: i64,
     nf: usize,
     /// Cached FS combined with newline for paragraph mode (RS="").
     /// Invalidated when FS or RS changes.
@@ -154,8 +161,8 @@ impl GlobalEnv {
                 self.rs = as_string(value)?.try_into()?;
                 self.paragraph_fs_cache = None;
             }
-            SpecialVar::Nr => self.nr = value.scalar_as_f64() as u32,
-            SpecialVar::Fnr => self.fnr = value.scalar_as_f64() as u32,
+            SpecialVar::Nr => self.nr = value.scalar_as_f64() as i64,
+            SpecialVar::Fnr => self.fnr = value.scalar_as_f64() as i64,
             SpecialVar::Nf => self.nf = value.scalar_as_f64() as usize,
             _ => {
                 // not needed
@@ -230,26 +237,40 @@ struct Interpreter {
     read_pipes: ReadPipes,
     rand_seed: u64,
     rng: SmallRng,
+    /// Where the files of the program start, for the lines of errors.
+    source_map: SourceMap,
 }
 
-fn stack_trace(error: String, stack: Stack) -> String {
+/// The report of the runtime error `error`, with the calls it happened in,
+/// their lines found in `source_map`.
+fn stack_trace(error: String, stack: Stack, source_map: &SourceMap) -> String {
     let mut result = format!("runtime error: {}\ncall trace:\n", error);
     let error_location = stack.source_locations[stack.ip as usize];
+    let (file, line) = source_map.locate(error_location.line);
     writeln!(
         result,
         "=> {} at {}:{}:{}",
-        stack.current_function_name,
-        stack.current_function_file,
-        error_location.line,
-        error_location.column
+        stack.current_function_name, file, line, error_location.column
     )
     .expect("error writing to string");
-    for frame in stack.call_frames.iter().rev() {
+    // the innermost calls and the outermost: a deep recursion has
+    // thousands, which would bury the error
+    const INNERMOST: usize = 9;
+    let frames = stack.call_frames.len();
+    for (n, frame) in stack.call_frames.iter().rev().enumerate() {
+        if n == INNERMOST && frames > INNERMOST + 1 {
+            writeln!(result, "=> ... {} more calls", frames - INNERMOST - 1)
+                .expect("error writing to string");
+        }
+        if n >= INNERMOST && n + 1 < frames {
+            continue;
+        }
         let source_location = frame.source_locations[frame.ip as usize];
+        let (file, line) = source_map.locate(source_location.line);
         writeln!(
             result,
             "=> {} at {}:{}:{}",
-            frame.function_name, frame.function_file, source_location.line, source_location.column
+            frame.function_name, file, line, source_location.column
         )
         .expect("error writing to string");
     }
@@ -264,6 +285,11 @@ impl Interpreter {
     /// any non-zero status (a failure, or the exit status of a pipe's
     /// command), else 0, else -1 when nothing matched.
     fn close_streams(&mut self, name: &str) -> i32 {
+        if self.write_pipes.is_open(name) || self.read_pipes.is_open(name) {
+            // the command's output comes after awk's so far; a failed write
+            // shows at the end of the run
+            let _ = self.before_command();
+        }
         let results = [
             self.write_files.close_file(name),
             self.read_files.close_file(name),
@@ -280,6 +306,31 @@ impl Interpreter {
                 .find(|&s| s != 0)
                 .unwrap_or(0)
         }
+    }
+
+    /// Writes out the output awk has collected, before a command starts or
+    /// is waited for: the command's output must come after it, and the
+    /// command may read the files awk wrote.
+    fn before_command(&mut self) -> Result<(), String> {
+        output::flush_stdout()?;
+        self.write_files.flush_all();
+        self.write_pipes.flush_all();
+        Ok(())
+    }
+
+    /// Ends the output at the end of the run: writes out standard output,
+    /// closes the output files, then closes the pipes, waiting for their
+    /// commands, whose output comes after awk's and which may read those
+    /// files: an error if a file could not be written.  A failure to write standard output is remembered
+    /// (see [`output::stdout_write_error`]) for the caller, which reports
+    /// it keeping the exit status.
+    fn finish_output(&mut self) -> Result<(), String> {
+        let _ = output::flush_stdout();
+        // the commands may read the files
+        let files = self.write_files.close_all();
+        self.write_pipes = WritePipes::default();
+        self.read_pipes = ReadPipes::default();
+        files
     }
 
     /// Increment a special counter global (NR or FNR) by one, keeping its
@@ -353,6 +404,9 @@ impl Interpreter {
                 } else {
                     builtin_sprintf(stack, argc - 1, global_env)?
                 };
+                if !self.write_pipes.is_open(&command) {
+                    self.before_command()?;
+                }
                 self.write_pipes.write(command, str)?;
             }
             BuiltinFunction::Close => {
@@ -370,10 +424,17 @@ impl Interpreter {
                     AwkString::default()
                 };
                 let result = if expr_str.is_empty() {
-                    let stdout_ok = std::io::Write::flush(&mut std::io::stdout()).is_ok();
-                    stdout_ok && self.write_files.flush_all() && self.write_pipes.flush_all()
+                    let stdout_ok = output::flush_stdout().is_ok();
+                    let files_ok = self.write_files.flush_all();
+                    stdout_ok && files_ok && self.write_pipes.flush_all()
                 } else {
-                    self.write_files.flush_file(&expr_str) && self.write_pipes.flush_file(&expr_str)
+                    // the name is open as a file, a pipe or both
+                    let file = self.write_files.flush_file(&expr_str);
+                    let pipe = self.write_pipes.flush_file(&expr_str);
+                    match (file, pipe) {
+                        (None, None) => false,
+                        (file, pipe) => file.unwrap_or(true) && pipe.unwrap_or(true),
+                    }
                 };
                 stack.push_value(if result { 0.0 } else { -1.0 })?;
             }
@@ -396,6 +457,17 @@ impl Interpreter {
                 // the file or command is under the target, which is evaluated after it
                 let (filename, var) = stack.pop_scalar_under_ref()?;
                 let filename = filename.scalar_to_string(&global_env.convfmt)?;
+                if function == BuiltinFunction::GetLineFromPipe
+                    && !self.read_pipes.is_open(&filename)
+                {
+                    self.before_command()?;
+                }
+                if function == BuiltinFunction::GetLineFromFile
+                    && !self.read_files.is_open(&filename)
+                {
+                    // what awk wrote to the file is there to be read
+                    self.write_files.flush_file(&filename);
+                }
                 let maybe_next_record = if function == BuiltinFunction::GetLineFromFile {
                     self.read_files.read_next_record(filename, &global_env.rs)
                 } else {
@@ -419,6 +491,14 @@ impl Interpreter {
                         stack.push_value(-1.0)?;
                     }
                 }
+            }
+            BuiltinFunction::System => {
+                let command: CString = stack
+                    .pop_scalar_value()?
+                    .scalar_to_string(&global_env.convfmt)?
+                    .try_into()?;
+                self.before_command()?;
+                stack.push_value(run_system(&command) as f64)?;
             }
             BuiltinFunction::Rand => {
                 let rand = self.rng.random_range(0.0..1.0);
@@ -447,13 +527,13 @@ impl Interpreter {
         action: &Action,
         functions: &[Function],
         record: &mut Record,
-        stack: &mut [StackValue],
+        stack: &mut StackMemory,
         global_env: &mut GlobalEnv,
         main_input: &mut MainInput,
     ) -> Result<ExecutionResult, String> {
         let mut stack = Stack::new(action, stack);
         match self.run_internal(functions, record, &mut stack, global_env, main_input) {
-            Err(err) => Err(stack_trace(err, stack)),
+            Err(err) => Err(stack_trace(err, stack, &self.source_map)),
             Ok(result) => Ok(result),
         }
     }
@@ -518,7 +598,7 @@ impl Interpreter {
                     let string = stack
                         .pop_scalar_value()?
                         .scalar_to_string(&global_env.convfmt)?;
-                    let result = ere.matches(&string.try_into()?);
+                    let result = ere.matches(&string);
                     stack.push_value(bool_to_f64(result))?;
                 }
                 OpCode::Concat => {
@@ -649,8 +729,7 @@ impl Interpreter {
                     unsafe { stack.push(StackValue::from_var(value))? };
                 }
                 OpCode::GetField => {
-                    let index = stack.pop_scalar_value()?.scalar_as_f64() as usize;
-                    is_valid_record_index(index)?;
+                    let index = record_index(stack.pop_scalar_value()?.scalar_as_f64())?;
                     stack.push_value(record.read_field(index))?;
                 }
                 OpCode::IndexArrayGetValue => {
@@ -674,8 +753,8 @@ impl Interpreter {
                     unsafe { stack.push_ref(value)? };
                 }
                 OpCode::FieldRef => {
-                    let index = stack.pop_scalar_value()?.scalar_as_f64() as usize;
-                    is_valid_record_index(index)?;
+                    let index = record_index(stack.pop_scalar_value()?.scalar_as_f64())?;
+                    record.check_growth(index)?;
                     // The boxed cell keeps this pointer valid across later field
                     // growth, and fields outlive the stack, so this is safe.
                     unsafe { stack.push_ref(record.field_ref_ptr(index))? };
@@ -686,15 +765,15 @@ impl Interpreter {
                         .scalar_to_string(&global_env.convfmt)?;
                     let array = stack.pop_array_ptr()?;
                     // safe by type invariance
-                    let value_index = unsafe { &mut *array }
-                        .as_array()?
-                        .get_value_index(key.into())?;
+                    let (value_index, key) =
+                        unsafe { &mut *array }.as_array()?.element_ref(key.into());
                     // array is valid at least until this stack value is popped by stack invariance,
                     // so this is safe
                     unsafe {
                         stack.push(StackValue::ArrayElementRef(ArrayElementRef {
                             array,
                             value_index,
+                            key,
                         }))?
                     };
                 }
@@ -764,6 +843,10 @@ impl Interpreter {
                     Constant::Regex(ere) => {
                         stack.push_value(AwkValue::from_ere(ere, &record.record.borrow()))?
                     }
+                },
+                OpCode::PushEre(index) => match &self.constants[index as usize] {
+                    Constant::Regex(ere) => stack.push_value(AwkValue::ere_operand(ere.clone()))?,
+                    _ => unreachable!("PushEre of a constant that is not an ERE"),
                 },
                 OpCode::PushOne => {
                     stack.push_value(1.0)?;
@@ -886,6 +969,7 @@ impl Interpreter {
             read_pipes: ReadPipes::default(),
             rand_seed: 0,
             rng: SmallRng::seed_from_u64(0),
+            source_map: SourceMap::default(),
         }
     }
 }
@@ -948,11 +1032,10 @@ pub fn interpret(
         })
         .collect();
 
-    let mut stack = iter::repeat_with(|| StackValue::Invalid)
-        .take(STACK_SIZE)
-        .collect::<Vec<StackValue>>();
+    let mut stack = StackMemory::new(STACK_SIZE);
     let mut current_record = Record::default();
     let mut interpreter = Interpreter::new(args, env, program.constants, program.globals_count);
+    interpreter.source_map = program.source_map;
     let mut global_env = GlobalEnv::default();
     let mut range_pattern_started = vec![false; program.rules.len()];
     let mut exit_status = 0;
@@ -975,89 +1058,64 @@ pub fn interpret(
     }
 
     let mut main_input = MainInput::new(program.globals);
-    for action in program.begin_actions {
-        let begin_result = interpreter.run(
-            &action,
-            &program.functions,
-            &mut current_record,
-            &mut stack,
-            &mut global_env,
-            &mut main_input,
-        )?;
-        if let ExecutionResult::Exit(status) = begin_result {
-            // `exit` in BEGIN skips the input, but not the END actions
-            exit_status = status.unwrap_or(exit_status);
-            main_input.finish();
-            break;
+    // the run proper; whatever ends it, the output awk has collected is
+    // written out
+    let result = (|| -> Result<i32, String> {
+        for action in program.begin_actions {
+            let begin_result = interpreter.run(
+                &action,
+                &program.functions,
+                &mut current_record,
+                &mut stack,
+                &mut global_env,
+                &mut main_input,
+            )?;
+            if let ExecutionResult::Exit(status) = begin_result {
+                // `exit` in BEGIN skips the input, but not the END actions
+                exit_status = status.unwrap_or(exit_status);
+                main_input.finish();
+                break;
+            }
         }
-    }
 
-    if program.rules.is_empty() && program.end_actions.is_empty() {
-        return Ok(exit_status);
-    }
+        if program.rules.is_empty() && program.end_actions.is_empty() {
+            return Ok(exit_status);
+        }
 
-    'record_loop: while let Some(record) =
-        main_input.next_record(&interpreter.globals, &mut global_env)?
-    {
-        let fs = global_env.effective_fs()?;
-        current_record.reset(record, fs)?;
-        interpreter.globals[SpecialVar::Nf as usize].get_mut().value =
-            AwkValue::from(current_record.get_last_field() as f64).value;
-        global_env.nf = current_record.get_last_field();
+        'record_loop: while let Some(record) =
+            main_input.next_record(&interpreter.globals, &mut global_env)?
+        {
+            let fs = global_env.effective_fs()?;
+            current_record.reset(record, fs)?;
+            interpreter.globals[SpecialVar::Nf as usize].get_mut().value =
+                AwkValue::from(current_record.get_last_field() as f64).value;
+            global_env.nf = current_record.get_last_field();
 
-        global_env.fnr += 1;
-        global_env.nr += 1;
-        interpreter.globals[SpecialVar::Fnr as usize]
-            .get_mut()
-            .value = AwkValue::from(global_env.fnr as f64).value;
-        interpreter.globals[SpecialVar::Nr as usize].get_mut().value =
-            AwkValue::from(global_env.nr as f64).value;
+            global_env.fnr = global_env.fnr.saturating_add(1);
+            global_env.nr = global_env.nr.saturating_add(1);
+            interpreter.globals[SpecialVar::Fnr as usize]
+                .get_mut()
+                .value = AwkValue::from(global_env.fnr as f64).value;
+            interpreter.globals[SpecialVar::Nr as usize].get_mut().value =
+                AwkValue::from(global_env.nr as f64).value;
 
-        for (i, rule) in program.rules.iter().enumerate() {
-            // a `next`, `nextfile` or `exit` in a function a pattern calls
-            let mut control = None;
-            let should_execute = match &rule.pattern {
-                Pattern::All => true,
-                Pattern::Expr(expr) => interpreter
-                    .run(
-                        expr,
-                        &program.functions,
-                        &mut current_record,
-                        &mut stack,
-                        &mut global_env,
-                        &mut main_input,
-                    )?
-                    .pattern_matched(&mut control),
-                Pattern::Range { start, end } => {
-                    if range_pattern_started[i] {
-                        let end_matches = interpreter
-                            .run(
-                                end,
-                                &program.functions,
-                                &mut current_record,
-                                &mut stack,
-                                &mut global_env,
-                                &mut main_input,
-                            )?
-                            .pattern_matched(&mut control);
-                        if end_matches {
-                            range_pattern_started[i] = false;
-                        }
-                        // range is inclusive
-                        true
-                    } else {
-                        let should_start = interpreter
-                            .run(
-                                start,
-                                &program.functions,
-                                &mut current_record,
-                                &mut stack,
-                                &mut global_env,
-                                &mut main_input,
-                            )?
-                            .pattern_matched(&mut control);
-                        if should_start {
-                            // Check if end also matches on the same line
+            for (i, rule) in program.rules.iter().enumerate() {
+                // a `next`, `nextfile` or `exit` in a function a pattern calls
+                let mut control = None;
+                let should_execute = match &rule.pattern {
+                    Pattern::All => true,
+                    Pattern::Expr(expr) => interpreter
+                        .run(
+                            expr,
+                            &program.functions,
+                            &mut current_record,
+                            &mut stack,
+                            &mut global_env,
+                            &mut main_input,
+                        )?
+                        .pattern_matched(&mut control),
+                    Pattern::Range { start, end } => {
+                        if range_pattern_started[i] {
                             let end_matches = interpreter
                                 .run(
                                     end,
@@ -1068,57 +1126,95 @@ pub fn interpret(
                                     &mut main_input,
                                 )?
                                 .pattern_matched(&mut control);
-                            // If end matches on the same line, don't keep range open
-                            range_pattern_started[i] = !end_matches;
+                            if end_matches {
+                                range_pattern_started[i] = false;
+                            }
+                            // range is inclusive
+                            true
+                        } else {
+                            let should_start = interpreter
+                                .run(
+                                    start,
+                                    &program.functions,
+                                    &mut current_record,
+                                    &mut stack,
+                                    &mut global_env,
+                                    &mut main_input,
+                                )?
+                                .pattern_matched(&mut control);
+                            if should_start {
+                                // Check if end also matches on the same line
+                                let end_matches = interpreter
+                                    .run(
+                                        end,
+                                        &program.functions,
+                                        &mut current_record,
+                                        &mut stack,
+                                        &mut global_env,
+                                        &mut main_input,
+                                    )?
+                                    .pattern_matched(&mut control);
+                                // If end matches on the same line, don't keep range open
+                                range_pattern_started[i] = !end_matches;
+                            }
+                            should_start
                         }
-                        should_start
                     }
+                };
+                let rule_result = if let Some(control) = control {
+                    control
+                } else if should_execute {
+                    interpreter.run(
+                        &rule.action,
+                        &program.functions,
+                        &mut current_record,
+                        &mut stack,
+                        &mut global_env,
+                        &mut main_input,
+                    )?
+                } else {
+                    continue;
+                };
+                match rule_result {
+                    ExecutionResult::Next => break,
+                    ExecutionResult::NextFile => {
+                        main_input.skip_file();
+                        break;
+                    }
+                    ExecutionResult::Exit(status) => {
+                        exit_status = status.unwrap_or(exit_status);
+                        main_input.finish();
+                        break 'record_loop;
+                    }
+                    ExecutionResult::Expression(_) => {}
                 }
-            };
-            let rule_result = if let Some(control) = control {
-                control
-            } else if should_execute {
-                interpreter.run(
-                    &rule.action,
-                    &program.functions,
-                    &mut current_record,
-                    &mut stack,
-                    &mut global_env,
-                    &mut main_input,
-                )?
-            } else {
-                continue;
-            };
-            match rule_result {
-                ExecutionResult::Next => break,
-                ExecutionResult::NextFile => {
-                    main_input.skip_file();
-                    break;
-                }
-                ExecutionResult::Exit(status) => {
-                    exit_status = status.unwrap_or(exit_status);
-                    main_input.finish();
-                    break 'record_loop;
-                }
-                ExecutionResult::Expression(_) => {}
             }
         }
-    }
 
-    for action in program.end_actions {
-        let end_result = interpreter.run(
-            &action,
-            &program.functions,
-            &mut current_record,
-            &mut stack,
-            &mut global_env,
-            &mut main_input,
-        )?;
-        if let ExecutionResult::Exit(status) = end_result {
-            exit_status = status.unwrap_or(exit_status);
-            break;
+        for action in program.end_actions {
+            let end_result = interpreter.run(
+                &action,
+                &program.functions,
+                &mut current_record,
+                &mut stack,
+                &mut global_env,
+                &mut main_input,
+            )?;
+            if let ExecutionResult::Exit(status) = end_result {
+                exit_status = status.unwrap_or(exit_status);
+                break;
+            }
+        }
+
+        Ok(exit_status)
+    })();
+    match result {
+        Ok(status) => interpreter.finish_output().map(|()| status),
+        Err(error) => {
+            // what was written before the error comes before its report;
+            // a failure to write it would hide the error, so it is ignored
+            output::flush_stdout_quietly();
+            Err(error)
         }
     }
-
-    Ok(exit_status)
 }

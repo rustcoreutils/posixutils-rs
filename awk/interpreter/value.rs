@@ -8,10 +8,10 @@
 //
 
 use std::cell::UnsafeCell;
-use std::ffi::CString;
 use std::rc::Rc;
 
 use super::array::Array;
+use super::format::{fmt_write_signed_f64, FormatArgs, I64_LIMIT};
 use super::string::AwkString;
 use super::{bool_to_f64, is_integer, sprintf, strtod};
 use crate::program::SpecialVar;
@@ -35,7 +35,7 @@ pub(crate) enum AwkValueVariant {
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum AwkRefType {
     None,
-    Field(u16),
+    Field(u32),
     SpecialGlobalVar(SpecialVar),
 }
 
@@ -47,6 +47,18 @@ pub(crate) struct AwkValue {
 }
 
 pub(crate) type AwkValueRef = UnsafeCell<AwkValue>;
+
+/// The integral number `num` as a string: as by `%d`, exactly, also beyond
+/// the range of `i64`, where a conversion to it would saturate.
+pub(crate) fn integer_to_string(num: f64) -> String {
+    if num.abs() < I64_LIMIT {
+        // the common case, quickly
+        return (num as i64).to_string();
+    }
+    let mut result = String::new();
+    fmt_write_signed_f64(&mut result, num, &FormatArgs::default());
+    result
+}
 
 impl AwkValue {
     pub(crate) fn scalar_as_f64(&self) -> f64 {
@@ -83,7 +95,7 @@ impl AwkValue {
         match self.value {
             AwkValueVariant::Number(num) => {
                 if is_integer(num) {
-                    Ok((num as i64).to_string().into())
+                    Ok(integer_to_string(num).into())
                 } else {
                     sprintf(num_fmt, &mut [num.into()], num_fmt)
                 }
@@ -162,13 +174,9 @@ impl AwkValue {
     pub(crate) fn into_ere(self, convfmt: &str) -> Result<Rc<Regex>, String> {
         match self.value {
             AwkValueVariant::Regex { ere, .. } => Ok(ere),
-            AwkValueVariant::String(s) => Ok(Rc::new(Regex::new(s.try_into()?)?)),
-            AwkValueVariant::UninitializedScalar => {
-                Ok(Rc::new(Regex::new(CString::new("").unwrap())?))
-            }
-            AwkValueVariant::Number(_) => Ok(Rc::new(Regex::new(
-                self.scalar_to_string(convfmt)?.try_into()?,
-            )?)),
+            AwkValueVariant::String(s) => Regex::dynamic(&s),
+            AwkValueVariant::UninitializedScalar => Regex::dynamic(""),
+            AwkValueVariant::Number(_) => Regex::dynamic(&self.scalar_to_string(convfmt)?),
             _ => Err("expected extended regular expression".to_string()),
         }
     }
@@ -187,7 +195,20 @@ impl AwkValue {
         }
     }
 
-    pub(crate) fn from_ere(ere: Rc<Regex>, record: &CString) -> Self {
+    /// The ERE `ere` as the operand of `~` or of a builtin taking an ERE,
+    /// which uses only the expression: unlike [`Self::from_ere`], it is not
+    /// matched against $0.
+    pub(crate) fn ere_operand(ere: Rc<Regex>) -> Self {
+        Self {
+            value: AwkValueVariant::Regex {
+                ere,
+                matches_record: false,
+            },
+            ref_type: AwkRefType::None,
+        }
+    }
+
+    pub(crate) fn from_ere(ere: Rc<Regex>, record: &str) -> Self {
         let matches_record = ere.matches(record);
         Self {
             value: AwkValueVariant::Regex {
@@ -198,7 +219,7 @@ impl AwkValue {
         }
     }
 
-    pub(crate) fn field_ref<V: Into<AwkValue>>(value: V, field_index: u16) -> Self {
+    pub(crate) fn field_ref<V: Into<AwkValue>>(value: V, field_index: u32) -> Self {
         let value = value.into();
         value.into_ref(AwkRefType::Field(field_index))
     }

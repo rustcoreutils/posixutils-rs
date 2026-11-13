@@ -8,10 +8,9 @@
 //
 
 use std::cell::UnsafeCell;
-use std::marker::PhantomData;
 use std::rc::Rc;
 
-use super::array::{Array, KeyIterator, ValueIndex};
+use super::array::{Array, Key, KeyIterator, ValueIndex};
 use super::value::{AwkRefType, AwkValue, AwkValueVariant};
 use crate::program::{Action, Function, OpCode, SourceLocation};
 
@@ -27,7 +26,23 @@ pub(crate) struct ArrayIterator {
 #[derive(Clone, PartialEq)]
 pub(crate) struct ArrayElementRef {
     pub(crate) array: *mut AwkValue,
+    /// Where the element was when the reference was taken; only a hint,
+    /// since the code evaluated before the reference is used may change
+    /// the array.
     pub(crate) value_index: ValueIndex,
+    pub(crate) key: Key,
+}
+
+impl ArrayElementRef {
+    /// The referenced element, found by its key.
+    /// # Safety
+    /// `array` has to be valid and dereferencable
+    unsafe fn element(&self) -> *mut AwkValue {
+        (*self.array)
+            .as_array()
+            .expect("expected array")
+            .element(self.value_index, &self.key)
+    }
 }
 
 pub(crate) enum StackValue {
@@ -47,11 +62,7 @@ impl StackValue {
             StackValue::Value(val) => val.get_mut(),
             StackValue::ValueRef(val_ref) => &mut **val_ref,
             StackValue::UninitializedRef(val_ref) => &mut **val_ref,
-            StackValue::ArrayElementRef(array_element_ref) => (*array_element_ref.array)
-                .as_array()
-                .expect("expected array")
-                .index_to_value(array_element_ref.value_index)
-                .expect("invalid array value index"),
+            StackValue::ArrayElementRef(array_element_ref) => &mut *array_element_ref.element(),
             _ => unreachable!("invalid stack value"),
         }
     }
@@ -63,13 +74,9 @@ impl StackValue {
         match self {
             StackValue::ValueRef(ptr) => ptr,
             StackValue::UninitializedRef(ptr) => ptr,
+            // safe by type invariance
             StackValue::ArrayElementRef(array_element_ref) => unsafe {
-                // safe by type invariance
-                (*array_element_ref.array)
-                    .as_array()
-                    .expect("invalid array")
-                    .index_to_value(array_element_ref.value_index)
-                    .expect("invalid array value index")
+                array_element_ref.element()
             },
             _ => unreachable!("expected lvalue"),
         }
@@ -89,14 +96,9 @@ impl StackValue {
             StackValue::Value(val) => val.into_inner(),
             StackValue::ValueRef(ref_val) => (*ref_val).clone().into_ref(AwkRefType::None),
             StackValue::UninitializedRef(_) => AwkValue::uninitialized_scalar(),
-            StackValue::ArrayElementRef(array_element_ref) => {
-                let val = (*array_element_ref.array)
-                    .as_array()
-                    .expect("expected array")
-                    .index_to_value(array_element_ref.value_index)
-                    .expect("invalid array value index");
-                (*val).clone().into_ref(AwkRefType::None)
-            }
+            StackValue::ArrayElementRef(array_element_ref) => (*array_element_ref.element())
+                .clone()
+                .into_ref(AwkRefType::None),
             _ => unreachable!("invalid stack value"),
         }
     }
@@ -143,12 +145,54 @@ impl From<AwkValue> for StackValue {
 
 pub(crate) struct CallFrame<'i> {
     pub(crate) function_name: Rc<str>,
-    pub(crate) function_file: Rc<str>,
     pub(crate) source_locations: &'i [SourceLocation],
     pub(crate) bp: *mut StackValue,
     pub(crate) sp: *mut StackValue,
     pub(crate) ip: isize,
     pub(crate) instructions: &'i [OpCode],
+}
+
+/// The memory of the operand stack: room for `capacity` values, of which
+/// only those ever pushed are initialized.  The room is allocated but not
+/// written, so the pages of a deep stack a program never reaches cost
+/// nothing, and a program may recurse deeply without every run paying to
+/// initialize the whole stack.
+pub(crate) struct StackMemory {
+    base: *mut StackValue,
+    capacity: usize,
+    /// One past the last value ever pushed; everything before it is
+    /// initialized.
+    initialized_end: *mut StackValue,
+}
+
+impl StackMemory {
+    pub(crate) fn new(capacity: usize) -> Self {
+        let layout = std::alloc::Layout::array::<StackValue>(capacity).expect("stack too large");
+        // SAFETY: the layout is not empty (StackValue is not zero-sized, and
+        // capacity is positive)
+        let base = unsafe { std::alloc::alloc(layout) }.cast::<StackValue>();
+        if base.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        Self {
+            base,
+            capacity,
+            initialized_end: base,
+        }
+    }
+}
+
+impl Drop for StackMemory {
+    fn drop(&mut self) {
+        // SAFETY: the values in [base, initialized_end) are initialized, and
+        // base was allocated with this layout
+        unsafe {
+            let initialized = self.initialized_end.offset_from(self.base) as usize;
+            std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(self.base, initialized));
+            let layout = std::alloc::Layout::array::<StackValue>(self.capacity).unwrap();
+            std::alloc::dealloc(self.base.cast(), layout);
+        }
+    }
 }
 
 /// # Invariants
@@ -157,17 +201,18 @@ pub(crate) struct CallFrame<'i> {
 /// - `stack_end` is one past the last valid pointer
 ///   of the allocated memory starting at `bp`
 /// - values in the range [`bp`, `sp`) can be accessed safely
+/// - values before `*initialized_end` are initialized; `sp` never passes
+///   it, as values are pushed one at a time
 pub(crate) struct Stack<'i, 's> {
     pub(crate) current_function_name: Rc<str>,
-    pub(crate) current_function_file: Rc<str>,
     pub(crate) ip: isize,
     pub(crate) instructions: &'i [OpCode],
     pub(crate) source_locations: &'i [SourceLocation],
     pub(crate) sp: *mut StackValue,
     pub(crate) bp: *mut StackValue,
     pub(crate) stack_end: *mut StackValue,
+    pub(crate) initialized_end: &'s mut *mut StackValue,
     pub(crate) call_frames: Vec<CallFrame<'i>>,
-    pub(crate) _stack_lifetime: PhantomData<&'s ()>,
 }
 
 /// Safe interface to work with the program stack.
@@ -195,7 +240,13 @@ impl<'i, 's> Stack<'i, 's> {
         if self.sp == self.stack_end {
             Err("stack overflow".to_string())
         } else {
-            *self.sp = value;
+            if self.sp < *self.initialized_end {
+                *self.sp = value;
+            } else {
+                // a slot never used before: nothing to drop
+                std::ptr::write(self.sp, value);
+                *self.initialized_end = self.sp.add(1);
+            }
             self.sp = self.sp.add(1);
             Ok(())
         }
@@ -322,10 +373,8 @@ impl<'i, 's> Stack<'i, 's> {
             ip: self.ip,
             instructions: self.instructions,
             source_locations: self.source_locations,
-            function_file: self.current_function_file.clone(),
             function_name: self.current_function_name.clone(),
         };
-        self.current_function_file = function.debug_info.file.clone();
         self.current_function_name = function.name.clone();
         self.call_frames.push(caller_frame);
         self.bp = new_bp;
@@ -344,17 +393,14 @@ impl<'i, 's> Stack<'i, 's> {
         self.instructions = caller_frame.instructions;
         self.source_locations = caller_frame.source_locations;
         self.current_function_name = caller_frame.function_name;
-        self.current_function_file = caller_frame.function_file;
         self.ip = caller_frame.ip;
     }
 
-    pub(crate) fn new(main: &'i Action, stack: &'s mut [StackValue]) -> Self {
-        let stack_len = stack.len();
-        let bp = stack.as_mut_ptr();
+    pub(crate) fn new(main: &'i Action, memory: &'s mut StackMemory) -> Self {
+        let bp = memory.base;
         // one past the end pointers are safe
-        let stack_end = unsafe { bp.add(stack_len) };
+        let stack_end = unsafe { bp.add(memory.capacity) };
         Self {
-            current_function_file: main.debug_info.file.clone(),
             current_function_name: "<start>".into(),
             instructions: &main.instructions,
             source_locations: &main.debug_info.source_locations,
@@ -362,8 +408,8 @@ impl<'i, 's> Stack<'i, 's> {
             bp,
             sp: bp,
             stack_end,
+            initialized_end: &mut memory.initialized_end,
             call_frames: Vec::new(),
-            _stack_lifetime: PhantomData,
         }
     }
 }
@@ -419,7 +465,9 @@ macro_rules! compare_op {
               	if lhs.is_numeric && rhs.is_numeric {
 									$stack.push_value(bool_to_f64(strtod(lhs) $op strtod(rhs)))?;
               	} else {
-                	$stack.push_value(bool_to_f64(lhs.as_str() $op rhs.as_str()))?;
+                	$stack.push_value(bool_to_f64(
+                        crate::charset::compare_strings(lhs, rhs, !matches!(stringify!($op), "==" | "!=")) $op std::cmp::Ordering::Equal
+                    ))?;
               	}
             }
             (AwkValueVariant::UninitializedScalar, AwkValueVariant::UninitializedScalar) => {
@@ -440,7 +488,11 @@ macro_rules! compare_op {
                 $stack.push_value(bool_to_f64(*x $op rhs.scalar_as_f64()))?;
             }
             (_, _) => {
-                $stack.push_value(bool_to_f64(lhs.scalar_to_string($convfmt)?.as_str() $op rhs.scalar_to_string($convfmt)?.as_str()))?;
+                let lhs = lhs.scalar_to_string($convfmt)?;
+                let rhs = rhs.scalar_to_string($convfmt)?;
+                $stack.push_value(bool_to_f64(
+                    crate::charset::compare_strings(&lhs, &rhs, !matches!(stringify!($op), "==" | "!=")) $op std::cmp::Ordering::Equal
+                ))?;
             }
         }
     };

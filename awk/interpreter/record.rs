@@ -8,7 +8,6 @@
 //
 
 use std::cell::RefCell;
-use std::ffi::CString;
 use std::fmt::Write;
 use std::rc::Rc;
 
@@ -37,7 +36,7 @@ pub(crate) fn ere_escape_char(c: char) -> String {
 /// created from `$0`/FS that "does not contain any characters" has the
 /// uninitialized value (so e.g. an empty field compares numerically equal to 0),
 /// while a non-empty field is a (possibly numeric) string.
-fn make_field(value: AwkString, index: u16) -> AwkValue {
+fn make_field(value: AwkString, index: u32) -> AwkValue {
     if value.is_empty() {
         AwkValue::uninitialized_scalar().into_ref(AwkRefType::Field(index))
     } else {
@@ -54,9 +53,11 @@ pub(crate) fn split_record<S: FnMut(usize, AwkString) -> Result<(), String>>(
 ) -> Result<(), String> {
     let string = |s: &str| -> AwkString { maybe_numeric_string(s) };
     match field_separator {
+        // POSIX: fields are separated by sequences of <blank> and <newline>
+        // characters; a carriage return or form feed is part of a field
         FieldSeparator::Default => record
-            .trim_start()
-            .split_ascii_whitespace()
+            .split([' ', '\t', '\n'])
+            .filter(|s| !s.is_empty())
             .enumerate()
             .try_for_each(|(i, s)| store_result(i, string(s))),
         FieldSeparator::Char(c) => record
@@ -110,7 +111,9 @@ pub(crate) enum FieldsState {
 }
 
 pub(crate) struct Record {
-    pub(crate) record: RefCell<CString>,
+    /// The text of `$0`, which a regular expression alone in a pattern
+    /// is matched against.
+    pub(crate) record: RefCell<AwkString>,
     /// Field storage, grown on demand. Each field lives in its own `Box`, so a
     /// raw pointer obtained from a cell stays valid even when the outer `Vec` is
     /// reallocated by a later growth — the operand stack holds such pointers
@@ -119,15 +122,37 @@ pub(crate) struct Record {
     #[allow(clippy::vec_box)]
     fields: RefCell<Vec<Box<AwkValueRef>>>,
     pub(crate) last_field: RefCell<usize>,
+    /// The most fields a record had when split from its text, which bounds
+    /// the fields an assignment may create (see [`Self::check_growth`]).
+    split_fields: std::cell::Cell<usize>,
 }
 
 impl Record {
-    /// Hard ceiling on the field index, imposed by `AwkRefType::Field(u16)`.
-    pub(crate) const MAX_FIELDS: usize = u16::MAX as usize;
+    /// Ceiling on the field index (that of gawk); `AwkRefType::Field`
+    /// holds it in a `u32`.
+    pub(crate) const MAX_FIELDS: usize = i32::MAX as usize;
+
+    /// How far past the most fields a split record has had an assignment
+    /// to a field or to NF may create fields: the record's storage holds
+    /// every field up to the last, so `NF = 2e9`, or many smaller steps,
+    /// would otherwise allocate billions of them.  A record split from its
+    /// text may have any number, as the text's size bounds them.
+    const MAX_CREATED_FIELDS: usize = 1 << 20;
+
+    /// An error if making `index` the last field would create a field more
+    /// than [`Self::MAX_CREATED_FIELDS`] past the most fields a split
+    /// record has had.
+    pub(crate) fn check_growth(&self, index: usize) -> Result<(), String> {
+        if index > self.split_fields.get() + Self::MAX_CREATED_FIELDS {
+            Err(format!("attempt to create field {index}"))
+        } else {
+            Ok(())
+        }
+    }
 
     fn new_field_cell(index: usize) -> Box<AwkValueRef> {
         Box::new(AwkValueRef::new(
-            AwkValue::uninitialized_scalar().into_ref(AwkRefType::Field(index as u16)),
+            AwkValue::uninitialized_scalar().into_ref(AwkRefType::Field(index as u32)),
         ))
     }
 
@@ -154,7 +179,7 @@ impl Record {
                 let next = fields.len();
                 fields.push(Record::new_field_cell(next));
             }
-            *fields[field_index].get_mut() = make_field(s, field_index as u16);
+            *fields[field_index].get_mut() = make_field(s, field_index as u32);
             last_field = field_index;
             Ok(())
         })?;
@@ -178,7 +203,7 @@ impl Record {
             .skip(new_last + 1)
         {
             *cell.get_mut() =
-                AwkValue::uninitialized_scalar().into_ref(AwkRefType::Field(idx as u16));
+                AwkValue::uninitialized_scalar().into_ref(AwkRefType::Field(idx as u32));
         }
     }
 
@@ -202,7 +227,7 @@ impl Record {
         match fields.get(index) {
             // safe: fields are never arrays
             Some(cell) => unsafe { (*cell.get()).clone() },
-            None => AwkValue::uninitialized_scalar().into_ref(AwkRefType::Field(index as u16)),
+            None => AwkValue::uninitialized_scalar().into_ref(AwkRefType::Field(index as u32)),
         }
     }
 
@@ -216,8 +241,10 @@ impl Record {
         let fields = self.fields.get_mut();
         let last_field =
             Self::fill_fields(fields, record.clone(), field_separator, previous_last_field)?;
+        self.split_fields
+            .set(self.split_fields.get().max(last_field));
         *fields[0].get_mut() = AwkValue::field_ref(record.clone(), 0);
-        *self.record.get_mut() = record.try_into()?;
+        *self.record.get_mut() = record;
         *self.last_field.get_mut() = last_field;
         Ok(())
     }
@@ -233,6 +260,7 @@ impl Record {
         if last_field > Self::MAX_FIELDS {
             return Err("too many fields".to_string());
         }
+        self.check_growth(last_field)?;
         let previous_last_field = *self.last_field.borrow();
         let last_field = if truncate_fields {
             // NF was assigned: the record now has exactly `last_field` fields.
@@ -255,7 +283,7 @@ impl Record {
         if last_field == 0 {
             let record_str = maybe_numeric_string(String::new());
             *self.fields.borrow()[0].get() = AwkValue::field_ref(record_str.clone(), 0);
-            *self.record.borrow_mut() = record_str.try_into()?;
+            *self.record.borrow_mut() = record_str;
             *self.last_field.borrow_mut() = 0;
             return Ok(());
         }
@@ -279,26 +307,30 @@ impl Record {
         // mark it as a numeric string if appropriate
         let record_str = maybe_numeric_string(new_record);
         *self.fields.borrow()[0].get() = AwkValue::field_ref(record_str.clone(), 0);
-        *self.record.borrow_mut() = record_str.try_into()?;
+        *self.record.borrow_mut() = record_str;
         *self.last_field.borrow_mut() = last_field;
         Ok(())
     }
 
     /// # Safety
     /// The caller has to ensure that there are no active references to the fields
-    pub(crate) unsafe fn recompute_fields(&self, global_env: &GlobalEnv) -> Result<(), String> {
+    /// The record is split with the FS in effect, which in paragraph mode
+    /// (RS = "") also separates fields at newlines.
+    pub(crate) unsafe fn recompute_fields(&self, global_env: &mut GlobalEnv) -> Result<(), String> {
         let record_str = self.read_field(0).scalar_to_string(&global_env.convfmt)?;
         let previous_last_field = *self.last_field.borrow();
         let mut fields = self.fields.borrow_mut();
         let last_field = Self::fill_fields(
             &mut fields,
             record_str.clone(),
-            &global_env.fs,
+            global_env.effective_fs()?,
             previous_last_field,
         )?;
+        self.split_fields
+            .set(self.split_fields.get().max(last_field));
         *fields[0].get_mut() = AwkValue::field_ref(record_str.clone(), 0);
         drop(fields);
-        *self.record.borrow_mut() = record_str.try_into()?;
+        *self.record.borrow_mut() = record_str;
         *self.last_field.borrow_mut() = last_field;
         Ok(())
     }
@@ -319,17 +351,30 @@ impl Default for Record {
         // Only `$0` is allocated up front; numbered fields grow on demand.
         let fields = vec![Record::new_field_cell(0)];
         Self {
-            record: CString::default().into(),
+            record: AwkString::default().into(),
             fields: RefCell::new(fields),
             last_field: 0.into(),
+            split_fields: 0.into(),
         }
     }
 }
 
-pub(crate) fn is_valid_record_index(index: usize) -> Result<(), String> {
-    if index > Record::MAX_FIELDS {
-        Err("invalid field index".to_string())
+/// The field number the value `number` of a `$` expression designates,
+/// truncated toward zero; a negative one, or one past the limit, is an
+/// error.  (POSIX leaves anything but a non-negative integer unspecified;
+/// gawk and mawk make a negative one fatal.)
+pub(crate) fn record_index(number: f64) -> Result<usize, String> {
+    let number = number.trunc();
+    if number < 0.0 || number > Record::MAX_FIELDS as f64 {
+        // a huge number in exponent form, not with all its digits
+        let text = if number.abs() < 1e15 {
+            format!("{number}")
+        } else {
+            format!("{number:e}")
+        };
+        Err(format!("attempt to access field {text}"))
     } else {
-        Ok(())
+        // NaN converts to 0
+        Ok(number as usize)
     }
 }

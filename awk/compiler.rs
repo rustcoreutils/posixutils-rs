@@ -11,7 +11,7 @@
 
 use crate::program::{
     Action, AwkRule, BuiltinFunction, Constant, DebugInfo, Function, OpCode, Pattern, Program,
-    SourceLocation, SpecialVar, VarId,
+    SourceLocation, SourceMap, SpecialVar, VarId,
 };
 use crate::regex::Regex;
 
@@ -254,13 +254,23 @@ fn is_octal_digit(c: char) -> bool {
     ('0'..='7').contains(&c)
 }
 
+/// The value of the text of a string: the contents of a STRING token, or
+/// the value of an assignment (-v, an operand, -F), with its escape
+/// sequences replaced.  A backslash before a character with no escape
+/// meaning stays, with the character, as in the one true awk and mawk
+/// (POSIX leaves it undefined), so that such a string used as a regular
+/// expression keeps the escape; a backslash before a newline is a
+/// continuation and removed with it; a backslash at the end stays.
 pub fn escape_string_contents(s: &str) -> Result<Rc<str>, String> {
     let mut result = String::new();
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
             '\\' => {
-                let next_char = chars.next().ok_or("invalid escape sequence".to_string())?;
+                let Some(next_char) = chars.next() else {
+                    result.push('\\');
+                    break;
+                };
                 let escaped_char = match next_char {
                     '"' => '"',
                     '/' => '/',
@@ -272,6 +282,7 @@ pub fn escape_string_contents(s: &str) -> Result<Rc<str>, String> {
                     't' => '\t',
                     'v' => '\x0B',
                     '\\' => '\\',
+                    '\n' => continue,
                     n if is_octal_digit(n) => {
                         let mut char_code = n.to_digit(8).unwrap();
                         for _ in 0..2 {
@@ -284,13 +295,11 @@ pub fn escape_string_contents(s: &str) -> Result<Rc<str>, String> {
                                 }
                             }
                         }
-                        if char_code == 0 {
-                            return Err("invalid escape sequence: \\0".to_string());
-                        }
                         char::from_u32(char_code).ok_or("invalid character".to_string())?
                     }
                     other => {
-                        return Err(format!("invalid escape sequence: \\{}", other));
+                        result.push('\\');
+                        other
                     }
                 };
                 result.push(escaped_char);
@@ -516,12 +525,11 @@ impl Instructions {
         self.source_locations.extend(instructions.source_locations);
     }
 
-    fn into_action(self, file: Rc<str>) -> Action {
+    fn into_action(self) -> Action {
         Action {
             instructions: self.opcodes,
             debug_info: DebugInfo {
                 source_locations: self.source_locations,
-                file,
             },
         }
     }
@@ -633,6 +641,18 @@ impl Compiler {
         let index = self.constants.borrow().len() as u32;
         self.constants.borrow_mut().push(constant);
         index
+    }
+
+    /// Makes `operand`, when it is only a regular-expression constant, push
+    /// it as an ERE operand: a regular expression alone stands for a match
+    /// against $0, which an operand of `~` or of match, sub, gsub or split
+    /// does not need.
+    fn ere_operand(&self, operand: &mut Instructions) {
+        if let [OpCode::PushConstant(index)] = operand.opcodes[..] {
+            if matches!(self.constants.borrow()[index as usize], Constant::Regex(_)) {
+                operand.opcodes[0] = OpCode::PushEre(index);
+            }
+        }
     }
 
     fn get_var(&self, name: &str, locals: &LocalMap) -> Result<OpCode, String> {
@@ -797,6 +817,15 @@ impl Compiler {
                 let fn_info = BUILTIN_FUNCTIONS
                     .get(&function.as_rule())
                     .expect("missing builtin");
+                let ere_argument = match fn_info.function {
+                    BuiltinFunction::Match => Some(1),
+                    BuiltinFunction::Sub | BuiltinFunction::Gsub => Some(0),
+                    BuiltinFunction::Split => Some(2),
+                    _ => None,
+                };
+                if let Some(arg) = ere_argument.and_then(|i| args.get_mut(i)) {
+                    self.ere_operand(arg);
+                }
                 if (fn_info.min_args..=fn_info.max_args).contains(&argc) {
                     let (mut instructions, argc) =
                         normalize_builtin_function_arguments(fn_info.function, args, line_col);
@@ -934,7 +963,11 @@ impl Compiler {
             _ => {}
         }
 
-        instructions.extend(rhs.instructions);
+        let mut rhs_instructions = rhs.instructions;
+        if matches!(op.as_rule(), Rule::match_op | Rule::not_match) {
+            self.ere_operand(&mut rhs_instructions);
+        }
+        instructions.extend(rhs_instructions);
         match op.as_rule() {
             Rule::add => {
                 instructions.push(OpCode::Add, op.line_col());
@@ -1762,17 +1795,13 @@ impl Compiler {
         }
     }
 
-    fn compile_normal_pattern(
-        &mut self,
-        pattern: Pair<Rule>,
-        file: Rc<str>,
-    ) -> Result<Pattern, PestError> {
+    fn compile_normal_pattern(&mut self, pattern: Pair<Rule>) -> Result<Pattern, PestError> {
         let pattern = first_child(pattern);
         match pattern.as_rule() {
             Rule::expr => {
                 let mut instructions = Instructions::default();
                 self.compile_expr(pattern, &mut instructions, &HashMap::new())?;
-                Ok(Pattern::Expr(instructions.into_action(file)))
+                Ok(Pattern::Expr(instructions.into_action()))
             }
             Rule::range_pattern => {
                 let mut inner = pattern.into_inner();
@@ -1786,8 +1815,8 @@ impl Compiler {
                 self.compile_expr(end, &mut end_instructions, &HashMap::new())?;
 
                 Ok(Pattern::Range {
-                    start: start_instructions.into_action(file.clone()),
-                    end: end_instructions.into_action(file),
+                    start: start_instructions.into_action(),
+                    end: end_instructions.into_action(),
                 })
             }
             _ => unreachable!(
@@ -1797,7 +1826,7 @@ impl Compiler {
         }
     }
 
-    fn compile_rule(&mut self, rule: Pair<Rule>, file: Rc<str>) -> Result<AwkRule, PestError> {
+    fn compile_rule(&mut self, rule: Pair<Rule>) -> Result<AwkRule, PestError> {
         let rule = first_child(rule);
         match rule.as_rule() {
             Rule::action => {
@@ -1805,24 +1834,24 @@ impl Compiler {
                 self.compile_action(rule, &mut instructions, &HashMap::new())?;
                 Ok(AwkRule {
                     pattern: Pattern::All,
-                    action: instructions.into_action(file),
+                    action: instructions.into_action(),
                 })
             }
             Rule::pattern_and_action => {
                 let mut inner = rule.into_inner();
-                let pattern = self.compile_normal_pattern(inner.next().unwrap(), file.clone())?;
+                let pattern = self.compile_normal_pattern(inner.next().unwrap())?;
                 let action = inner.next().unwrap();
                 let mut instructions = Instructions::default();
                 let locals = HashMap::new();
                 self.compile_action(action, &mut instructions, &locals)?;
                 Ok(AwkRule {
                     pattern,
-                    action: instructions.into_action(file),
+                    action: instructions.into_action(),
                 })
             }
             Rule::normal_pattern => {
                 let rule_line_col = rule.line_col();
-                let pattern = self.compile_normal_pattern(rule, file.clone())?;
+                let pattern = self.compile_normal_pattern(rule)?;
                 let instructions = Instructions::from_instructions_and_line_col(
                     vec![
                         OpCode::PushZero,
@@ -1836,18 +1865,14 @@ impl Compiler {
                 );
                 Ok(AwkRule {
                     pattern,
-                    action: instructions.into_action(file),
+                    action: instructions.into_action(),
                 })
             }
             _ => unreachable!("encountered {:?} while compiling rule", rule.as_rule()),
         }
     }
 
-    fn compile_function_definition(
-        &mut self,
-        function: Pair<Rule>,
-        file: Rc<str>,
-    ) -> Result<Function, PestError> {
+    fn compile_function_definition(&mut self, function: Pair<Rule>) -> Result<Function, PestError> {
         let mut inner = function.into_inner();
         let name = inner.next().unwrap();
         let mut param_map = HashMap::new();
@@ -1889,18 +1914,12 @@ impl Compiler {
             parameters_count,
             instructions: instructions.opcodes,
             debug_info: DebugInfo {
-                file,
                 source_locations: instructions.source_locations,
             },
         })
     }
 
-    fn declare_program_functions(
-        &mut self,
-        program: Pairs<Rule>,
-        filename: &str,
-        errors: &mut Vec<PestError>,
-    ) {
+    fn declare_program_functions(&mut self, program: Pairs<Rule>, errors: &mut Vec<PestError>) {
         for item in program {
             if item.as_rule() == Rule::function_definition {
                 let mut inner = item.into_inner();
@@ -1920,14 +1939,10 @@ impl Compiler {
                     },
                 );
                 if previous_value.is_some() {
-                    let error = improve_error(
-                        pest_error_from_span(
-                            name.as_span(),
-                            format!("function '{}' is defined multiple times", name),
-                        ),
-                        filename,
-                    );
-                    errors.push(error);
+                    errors.push(pest_error_from_span(
+                        name.as_span(),
+                        format!("function '{}' is defined multiple times", name),
+                    ));
                 }
             }
         }
@@ -1990,10 +2005,10 @@ fn rebase_error(error: PestError, source: &str, offset: usize) -> PestError {
     }
 }
 
-fn gather_errors(first_error: PestError, source: &str, errors: &mut Vec<PestError>, file: &str) {
+fn gather_errors(first_error: PestError, source: &str, errors: &mut Vec<PestError>) {
     let first_error_end = location_end(&first_error.location);
 
-    errors.push(improve_error(first_error, file));
+    errors.push(first_error);
     let mut search_start = first_error_end;
 
     let mut reported = vec![first_error_end];
@@ -2007,7 +2022,7 @@ fn gather_errors(first_error: PestError, source: &str, errors: &mut Vec<PestErro
                 let end = location_end(&err.location);
                 if !reported.contains(&end) {
                     reported.push(end);
-                    errors.push(improve_error(err, file));
+                    errors.push(err);
                 }
             }
         }
@@ -2034,32 +2049,72 @@ impl SourceFile {
     }
 }
 
-pub fn compile_program(sources: &[SourceFile]) -> Result<Program, CompilerErrors> {
-    let mut parsed_sources = Vec::new();
-    let mut errors = Vec::new();
-    for source_file in sources {
-        let filename: Rc<str> = source_file.filename.clone().into();
-        match AwkParser::parse(Rule::program, &source_file.contents) {
-            Ok(mut program) => {
-                let program = program.next().unwrap();
-                parsed_sources.push((filename, program.into_inner()));
-            }
-            Err(err) => {
-                gather_errors(err, &source_file.contents, &mut errors, &filename);
-            }
-        };
+/// The text of the program: the files of the -f options joined by
+/// newlines, as POSIX makes the program their concatenation; and where
+/// each file starts in it.
+fn join_sources(sources: &[SourceFile]) -> (String, SourceMap) {
+    let mut text = String::new();
+    let mut source_map = SourceMap::default();
+    let mut line = 1;
+    for (i, source) in sources.iter().enumerate() {
+        if i > 0 {
+            text.push('\n');
+            line += 1;
+        }
+        source_map.push(source.filename.as_str().into(), text.len(), line);
+        text.push_str(&source.contents);
+        line += source.contents.matches('\n').count() as u32;
     }
+    (text, source_map)
+}
+
+/// `error`, found in the text of the whole program, placed in the source
+/// file it is in, so that it reports that file and its line and column
+/// there.
+fn locate_error(error: PestError, sources: &[SourceFile], source_map: &SourceMap) -> PestError {
+    let start = match error.location {
+        InputLocation::Pos(pos) => pos,
+        InputLocation::Span((start, _)) => start,
+    };
+    let index = source_map.file_at_offset(start);
+    let (name, offset) = source_map.file(index);
+    let Some(source) = sources.get(index) else {
+        return error;
+    };
+    let contents = source.contents.as_str();
+    let local = |pos: usize| pos.saturating_sub(offset).min(contents.len());
+    let error = match error.location {
+        InputLocation::Pos(pos) => PestError::new_from_pos(
+            error.variant,
+            Position::new(contents, local(pos)).expect("error inside the file"),
+        ),
+        InputLocation::Span((start, end)) => PestError::new_from_span(
+            error.variant,
+            Span::new(contents, local(start), local(end).max(local(start)))
+                .expect("error inside the file"),
+        ),
+    };
+    improve_error(error, name)
+}
+
+pub fn compile_program(sources: &[SourceFile]) -> Result<Program, CompilerErrors> {
+    let (text, source_map) = join_sources(sources);
+    let mut errors = Vec::new();
+    let program_iter = match AwkParser::parse(Rule::program, &text) {
+        Ok(mut program) => Some(program.next().unwrap().into_inner()),
+        Err(err) => {
+            gather_errors(err, &text, &mut errors);
+            None
+        }
+    };
 
     let mut compiler = Compiler::default();
-    for (filename, program_iter) in &parsed_sources {
-        compiler.declare_program_functions(program_iter.clone(), filename, &mut errors);
-    }
-
     let mut begin_actions = Vec::new();
     let mut rules = Vec::new();
     let mut end_actions = Vec::new();
     let mut functions = Vec::new();
-    for (filename, program_iter) in parsed_sources {
+    if let Some(program_iter) = program_iter {
+        compiler.declare_program_functions(program_iter.clone(), &mut errors);
         for item in program_iter {
             match item.as_rule() {
                 Rule::begin_action | Rule::end_action => {
@@ -2071,24 +2126,22 @@ pub fn compile_program(sources: &[SourceFile]) -> Result<Program, CompilerErrors
                         &HashMap::new(),
                     );
                     if let Err(err) = result {
-                        errors.push(improve_error(err, &filename));
+                        errors.push(err);
                     }
                     if is_begin_action {
-                        begin_actions.push(instructions.into_action(filename.clone()));
+                        begin_actions.push(instructions.into_action());
                     } else {
-                        end_actions.push(instructions.into_action(filename.clone()));
+                        end_actions.push(instructions.into_action());
                     }
                 }
-                Rule::rule => match compiler.compile_rule(item, filename.clone()) {
+                Rule::rule => match compiler.compile_rule(item) {
                     Ok(rule) => rules.push(rule),
-                    Err(err) => errors.push(improve_error(err, &filename)),
+                    Err(err) => errors.push(err),
                 },
-                Rule::function_definition => {
-                    match compiler.compile_function_definition(item, filename.clone()) {
-                        Ok(function) => functions.push(function),
-                        Err(err) => errors.push(improve_error(err, &filename)),
-                    }
-                }
+                Rule::function_definition => match compiler.compile_function_definition(item) {
+                    Ok(function) => functions.push(function),
+                    Err(err) => errors.push(err),
+                },
                 Rule::EOI => {}
                 _ => unreachable!("encontered {:?} while compiling program", item.as_rule()),
             }
@@ -2115,8 +2168,13 @@ pub fn compile_program(sources: &[SourceFile]) -> Result<Program, CompilerErrors
             functions,
             globals_count: compiler.last_global_var_id.get() as usize,
             globals,
+            source_map,
         })
     } else {
+        let errors = errors
+            .into_iter()
+            .map(|error| locate_error(error, sources, &source_map))
+            .collect();
         Err(CompilerErrors { errors })
     }
 }
@@ -2744,11 +2802,7 @@ mod test {
         let (instructions, constants) = compile_expr(r#" "hello" ~ /hello/ "#);
         assert_eq!(
             instructions,
-            vec![
-                OpCode::PushConstant(0),
-                OpCode::PushConstant(1),
-                OpCode::Match
-            ]
+            vec![OpCode::PushConstant(0), OpCode::PushEre(1), OpCode::Match]
         );
         assert_eq!(
             constants,
@@ -2759,6 +2813,28 @@ mod test {
         )
     }
 
+    /// A regular expression that is only the operand of `~` or of match,
+    /// sub, gsub or split is not matched against $0 when pushed; one used
+    /// as a value is.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn ere_operands_are_pushed_without_matching() {
+        let pushes = |expr: &str| {
+            compile_expr(expr)
+                .0
+                .into_iter()
+                .filter(|op| matches!(op, OpCode::PushEre(_) | OpCode::PushConstant(_)))
+                .map(|op| matches!(op, OpCode::PushEre(_)))
+                .collect::<Vec<bool>>()
+        };
+        assert_eq!(pushes("match(\"ab\", /b/)"), [false, true]);
+        assert_eq!(pushes("sub(/b/, \"c\")"), [true, false]);
+        assert_eq!(pushes("gsub((/b/), \"c\", x)"), [true, false]);
+        assert_eq!(pushes("split(\"a b\", a, /b/)"), [false, true]);
+        assert_eq!(pushes("x = /b/"), [false]);
+        assert_eq!(pushes("match(/b/, \"b\")"), [false, false]);
+    }
+
     #[test]
     #[cfg_attr(miri, ignore)]
     fn test_compile_not_match() {
@@ -2767,7 +2843,7 @@ mod test {
             instructions,
             vec![
                 OpCode::PushConstant(0),
-                OpCode::PushConstant(1),
+                OpCode::PushEre(1),
                 OpCode::Match,
                 OpCode::Not
             ]
@@ -4174,7 +4250,7 @@ mod test {
             vec![
                 OpCode::PushZero,
                 OpCode::FieldRef,
-                OpCode::PushConstant(0),
+                OpCode::PushEre(0),
                 OpCode::PushConstant(1),
                 OpCode::CallBuiltin {
                     function: BuiltinFunction::Gsub,
@@ -4182,7 +4258,7 @@ mod test {
                 },
                 OpCode::Pop,
                 OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
-                OpCode::PushConstant(2),
+                OpCode::PushEre(2),
                 OpCode::PushConstant(3),
                 OpCode::CallBuiltin {
                     function: BuiltinFunction::Gsub,
@@ -4212,7 +4288,7 @@ mod test {
                 OpCode::Pop,
                 OpCode::GetGlobal(FIRST_GLOBAL_VAR + 1),
                 OpCode::PushConstant(9),
-                OpCode::PushConstant(10),
+                OpCode::PushEre(10),
                 OpCode::CallBuiltin {
                     function: BuiltinFunction::Split,
                     argc: 3,
@@ -4258,7 +4334,7 @@ mod test {
                 OpCode::Pop,
                 OpCode::PushZero,
                 OpCode::FieldRef,
-                OpCode::PushConstant(20),
+                OpCode::PushEre(20),
                 OpCode::PushConstant(21),
                 OpCode::CallBuiltin {
                     function: BuiltinFunction::Sub,
@@ -4266,7 +4342,7 @@ mod test {
                 },
                 OpCode::Pop,
                 OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
-                OpCode::PushConstant(22),
+                OpCode::PushEre(22),
                 OpCode::PushConstant(23),
                 OpCode::CallBuiltin {
                     function: BuiltinFunction::Sub,

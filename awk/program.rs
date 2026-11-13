@@ -97,6 +97,10 @@ pub enum OpCode {
 
     // Push the constant value on top of the stack
     PushConstant(u32),
+    // Push the regular-expression constant as the operand of `~` or of a
+    // builtin taking an ERE, without matching it against $0 as
+    // `PushConstant` does
+    PushEre(u32),
     // Push 1 on top of the stack
     PushOne,
     // Push 0 on top of the stack
@@ -154,8 +158,52 @@ pub struct SourceLocation {
 #[cfg_attr(test, derive(Debug))]
 #[derive(PartialEq, Default)]
 pub struct DebugInfo {
-    pub file: Rc<str>,
+    /// The location of each instruction, its line counted in the text of
+    /// the whole program (see [`SourceMap`]).
     pub source_locations: Vec<SourceLocation>,
+}
+
+/// Where each source file starts in the text of the whole program, the
+/// files of the -f options joined by newlines, so that a line of that text
+/// can be reported as the line of a file.
+#[derive(Default)]
+pub struct SourceMap {
+    /// Each file's name, its offset in the text and the line of the text
+    /// its first line is, in order.
+    files: Vec<(Rc<str>, usize, u32)>,
+}
+
+impl SourceMap {
+    pub fn push(&mut self, name: Rc<str>, offset: usize, first_line: u32) {
+        self.files.push((name, offset, first_line));
+    }
+
+    /// The index of the file holding byte `offset` of the text.
+    pub fn file_at_offset(&self, offset: usize) -> usize {
+        self.files
+            .iter()
+            .rposition(|&(_, start, _)| start <= offset)
+            .unwrap_or(0)
+    }
+
+    /// The name of file `index` and its offset in the text.
+    pub fn file(&self, index: usize) -> (&str, usize) {
+        let (name, offset, _) = &self.files[index];
+        (name, *offset)
+    }
+
+    /// The file and the line in it that `line` of the text is.
+    pub fn locate(&self, line: u32) -> (&str, u32) {
+        match self
+            .files
+            .iter()
+            .rev()
+            .find(|&&(_, _, first)| first <= line)
+        {
+            Some((name, _, first)) => (name, line - first + 1),
+            None => ("", line),
+        }
+    }
 }
 
 #[cfg_attr(test, derive(Debug))]
@@ -197,6 +245,7 @@ pub struct Program {
     pub rules: Vec<AwkRule>,
     pub end_actions: Vec<Action>,
     pub functions: Vec<Function>,
+    pub source_map: SourceMap,
 }
 
 #[cfg(test)]

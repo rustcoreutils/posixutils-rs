@@ -35,6 +35,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// without it (unit tests) keeps the UTF-8 behaviour.
 static SINGLE_BYTE: AtomicBool = AtomicBool::new(false);
 
+/// Whether `LC_COLLATE` orders strings by their bytes (the C or POSIX
+/// locale), so that comparisons need not call `strcoll`. On until [`init`]
+/// runs.
+static BYTE_COLLATION: AtomicBool = AtomicBool::new(true);
+
 /// Decide, from the current `LC_CTYPE`, whether characters are bytes. Call
 /// once, after the locale is set and before anything is decoded.
 pub fn init() {
@@ -42,6 +47,44 @@ pub fn init() {
     // reads it as two.
     let single = plib::locale::next_char_offset("é".as_bytes(), 0) == Some(1);
     SINGLE_BYTE.store(single, Ordering::Relaxed);
+    BYTE_COLLATION.store(collation_is_bytes(), Ordering::Relaxed);
+}
+
+/// Whether the `LC_COLLATE` locale in effect orders strings by their
+/// bytes: C, POSIX or C.UTF-8.
+fn collation_is_bytes() -> bool {
+    // SAFETY: a null locale only queries; the result, if not null, is a
+    // C string valid until the next setlocale call, and is copied at once.
+    let name = unsafe { libc::setlocale(libc::LC_COLLATE, std::ptr::null()) };
+    if name.is_null() {
+        return true;
+    }
+    let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
+    // C.UTF-8 collates by code point, which is the order of the bytes
+    matches!(
+        name,
+        b"C" | b"POSIX" | b"C.UTF-8" | b"C.utf8" | b"C.UTF8" | b"C.utf-8"
+    )
+}
+
+/// How the strings `a` and `b` compare for awk's relational operators: in
+/// the collation order of the locale (POSIX), with strings that collate
+/// equally but are not the same ordered by their bytes, so that only
+/// identical strings are equal.  `==` and `!=` need only that, so for them
+/// (`needs_order` false) the locale is not consulted.
+pub fn compare_strings(a: &str, b: &str, needs_order: bool) -> std::cmp::Ordering {
+    if a == b {
+        return std::cmp::Ordering::Equal;
+    }
+    if needs_order && !BYTE_COLLATION.load(Ordering::Relaxed) {
+        let collated = plib::locale::strcoll_bytes(&encode(a), &encode(b));
+        if collated.is_ne() {
+            return collated;
+        }
+    }
+    // as their bytes: code point order is the order of both a string's
+    // UTF-8 and the bytes of a single-byte locale
+    a.cmp(b)
 }
 
 /// Whether the locale is a single-byte one, where an awk character is a byte.

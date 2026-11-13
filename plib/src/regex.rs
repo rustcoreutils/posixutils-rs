@@ -576,6 +576,14 @@ impl Regex {
 
     /// As [`Regex::find_notbol`], over bytes.
     pub fn find_notbol_bytes(&self, text: &[u8]) -> Option<Match> {
+        self.find_bytes_flags(text, true, false)
+    }
+
+    /// The first match in the bytes `text`, which are a piece of a longer
+    /// subject: `not_bol` says the start of `text` is not the start of the
+    /// subject, so `^` cannot match there, and `not_eol` that its end is
+    /// not the end, so `$` cannot match there.
+    pub fn find_bytes_flags(&self, text: &[u8], not_bol: bool, not_eol: bool) -> Option<Match> {
         if self.empty {
             return Some(Match { start: 0, end: 0 });
         }
@@ -583,11 +591,16 @@ impl Regex {
             rm_so: -1,
             rm_eo: -1,
         };
-
-        if !self.exec(text, std::slice::from_mut(&mut pmatch), REG_NOTBOL) || pmatch.rm_so < 0 {
+        let mut eflags = 0;
+        if not_bol {
+            eflags |= REG_NOTBOL;
+        }
+        if not_eol {
+            eflags |= REG_NOTEOL;
+        }
+        if !self.exec(text, std::slice::from_mut(&mut pmatch), eflags) || pmatch.rm_so < 0 {
             return None;
         }
-
         Some(Match {
             start: pmatch.rm_so as usize,
             end: pmatch.rm_eo as usize,
@@ -1331,6 +1344,22 @@ mod tests {
             let re = Regex::bre(r"\(.\)\1").unwrap();
             assert_eq!(re.find("xéüü"), Some(Match { start: 3, end: 7 }));
         }
+    }
+
+    /// A piece of a subject matches `^` and `$` only at the subject's ends.
+    #[test]
+    fn find_bytes_flags_anchors_only_at_the_subject_ends() {
+        let find = |pattern: &str, text: &str, not_bol, not_eol| {
+            Regex::ere(pattern)
+                .unwrap()
+                .find_bytes_flags(text.as_bytes(), not_bol, not_eol)
+        };
+        let at = |start, end| Some(Match { start, end });
+        assert_eq!(find("^a", "ab", false, false), at(0, 1));
+        assert_eq!(find("^a", "ab", true, false), None);
+        assert_eq!(find("b$", "ab", false, false), at(1, 2));
+        assert_eq!(find("b$", "ab", false, true), None);
+        assert_eq!(find("b", "ab", true, true), at(1, 2));
     }
 
     /// A search from an offset sees the text before it: `^` does not match

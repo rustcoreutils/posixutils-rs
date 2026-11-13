@@ -12,9 +12,12 @@ use std::fmt::Write;
 
 use super::format::{
     fmt_write_decimal_float, fmt_write_float_general, fmt_write_hex_float,
-    fmt_write_scientific_float, fmt_write_signed, fmt_write_string, fmt_write_unsigned,
-    parse_conversion_specifier_args, FormatArgs, IntegerFormat,
+    fmt_write_integer_as_float, fmt_write_scientific_float, fmt_write_signed_f64, fmt_write_string,
+    fmt_write_unsigned, parse_conversion_specifier_args, FormatArgs, IntegerFormat, I64_LIMIT,
+    U64_LIMIT,
 };
+use super::io::wait_status;
+use super::output::write_stdout;
 use super::record::{split_record, FieldSeparator, FieldsState};
 use super::stack::Stack;
 use super::string::AwkString;
@@ -51,7 +54,7 @@ pub(crate) fn sprintf(
                     current_arg -= 1;
                     args.set_width(
                         swap_with_default(&mut values[current_arg]).scalar_as_f64() as i64
-                    );
+                    )?;
                 }
                 if args.needs_precision_arg() {
                     if current_arg == 0 {
@@ -59,8 +62,8 @@ pub(crate) fn sprintf(
                     }
                     current_arg -= 1;
                     args.set_precision(
-                        swap_with_default(&mut values[current_arg]).scalar_as_f64() as i64
-                    );
+                        swap_with_default(&mut values[current_arg]).scalar_as_f64() as i64,
+                    )?;
                 }
 
                 if current_arg == 0 {
@@ -68,6 +71,7 @@ pub(crate) fn sprintf(
                 }
                 current_arg -= 1;
                 let value = swap_with_default(&mut values[current_arg]);
+                args.reserve_room(specifier, &mut result)?;
                 format_one_conversion(&mut result, specifier, value, &args, float_format)?;
                 next = iter.next();
             }
@@ -91,14 +95,20 @@ fn format_one_conversion(
 ) -> Result<(), String> {
     match specifier {
         'd' | 'i' => {
-            let value = value.scalar_as_f64() as i64;
-            fmt_write_signed(result, value, args);
+            fmt_write_signed_f64(result, value.scalar_as_f64().trunc(), args);
         }
         'u' | 'o' | 'x' | 'X' => {
-            let value = value.scalar_as_f64() as i64;
-            if value.is_negative() {
-                return Err("negative value for unsigned format specifier".to_string());
-            }
+            let value = value.scalar_as_f64().trunc();
+            // a negative value is written as its 64-bit two's complement,
+            // as in C and the other awks
+            let value = if (0.0..U64_LIMIT).contains(&value) {
+                value as u64
+            } else if (-I64_LIMIT..0.0).contains(&value) {
+                value as i64 as u64
+            } else {
+                fmt_write_integer_as_float(result, value, args);
+                return Ok(());
+            };
             let format = match specifier {
                 'u' => IntegerFormat::Decimal,
                 'o' => IntegerFormat::Octal,
@@ -106,7 +116,7 @@ fn format_one_conversion(
                 'X' => IntegerFormat::HexUpper,
                 _ => unreachable!(),
             };
-            fmt_write_unsigned(result, value as u64, format, args);
+            fmt_write_unsigned(result, value, format, args);
         }
         'a' | 'A' => {
             let value = value.scalar_as_f64();
@@ -446,13 +456,6 @@ pub(crate) fn call_simple_builtin(
         BuiltinFunction::Gsub | BuiltinFunction::Sub => {
             return builtin_gsub(stack, global_env, function == BuiltinFunction::Sub)
         }
-        BuiltinFunction::System => {
-            let command: CString = stack
-                .pop_scalar_value()?
-                .scalar_to_string(&global_env.convfmt)?
-                .try_into()?;
-            stack.push_value(run_system(&command) as f64)?;
-        }
         BuiltinFunction::Print => {
             write_stdout(&print_to_string(stack, argc, global_env)?)?;
         }
@@ -464,38 +467,10 @@ pub(crate) fn call_simple_builtin(
     Ok(FieldsState::Ok)
 }
 
-/// The system's text for the first failed write to standard output, if one
-/// failed. It ends the run like any runtime error, but is reported as the
-/// write error it is (see [`stdout_write_error`]).
-static STDOUT_WRITE_ERROR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-/// Why writing standard output failed, if it did.
-pub fn stdout_write_error() -> Option<&'static str> {
-    STDOUT_WRITE_ERROR.get().map(String::as_str)
-}
-
-/// Write `s` to standard output as the bytes awk writes for it.
-fn write_stdout(s: &str) -> Result<(), String> {
-    std::io::Write::write_all(&mut std::io::stdout(), &crate::charset::encode(s)).map_err(|e| {
-        let reason = STDOUT_WRITE_ERROR.get_or_init(|| plib::diag::io_error_text(&e));
-        format!("{}: {reason}", gettextrs::gettext("write error"))
-    })
-}
-
-/// Run `command` via `libc::system` and translate its wait-status into the value
-/// awk's `system()` returns: the exit code for a normal exit, `128 + signal` for
-/// a signalled child, or -1 when the command could not be run.
-fn run_system(command: &CString) -> i32 {
-    let status = unsafe { libc::system(command.as_ptr()) };
-    if status == -1 {
-        -1
-    } else if libc::WIFEXITED(status) {
-        libc::WEXITSTATUS(status)
-    } else if libc::WIFSIGNALED(status) {
-        128 + libc::WTERMSIG(status)
-    } else {
-        -1
-    }
+/// Run `command` via `libc::system`; awk's `system()` returns its status as
+/// `close()` of a pipe does (see [`wait_status`]).
+pub(crate) fn run_system(command: &CString) -> i32 {
+    wait_status(unsafe { libc::system(command.as_ptr()) })
 }
 
 pub(crate) fn gather_values(stack: &mut Stack, count: u16) -> Result<Vec<AwkValue>, String> {

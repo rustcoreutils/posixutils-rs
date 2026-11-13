@@ -10,12 +10,13 @@ use std::{
     collections::{hash_map::Entry, HashMap},
     ffi::{CString, OsStr},
     fs::File,
-    io::{BufReader, Bytes, Read, Write},
+    io::{BufWriter, Read, Write},
     os::unix::ffi::OsStrExt,
     path::PathBuf,
     rc::Rc,
 };
 
+use super::output;
 use super::string::AwkString;
 use crate::charset;
 use crate::regex::Regex;
@@ -41,20 +42,6 @@ impl TryFrom<AwkString> for RecordSeparator {
     }
 }
 
-type ReadResult = Result<u8, String>;
-
-macro_rules! read_iter_next {
-    ($iter:expr, $ret:expr) => {
-        match $iter.next() {
-            Some(byte_result) => byte_result?,
-            None => return $ret,
-        }
-    };
-    ($iter:expr) => {
-        read_iter_next!($iter, Ok(None))
-    };
-}
-
 /// The awk string for the bytes of a record.
 fn bytes_to_string(buf: Vec<u8>) -> String {
     charset::decode(buf)
@@ -65,280 +52,379 @@ fn path_of(name: &str) -> PathBuf {
     PathBuf::from(OsStr::from_bytes(&charset::encode(name)))
 }
 
-/// Try to find a regex match in the byte buffer. Returns the record before
-/// the match and the remainder after it, or None if no match found.
-fn ere_try_match(buf: &[u8], re: &Regex) -> Result<Option<(String, Vec<u8>)>, String> {
-    if buf.is_empty() {
-        return Ok(None);
+/// Whether a match of the ERE `pattern` might be made longer by more
+/// input: whether it repeats anything, with `*`, `+`, `?` or an interval,
+/// outside a bracket expression and not quoted by a backslash.  (An
+/// alternative such as `a|ab` could too, but waiting for more input after
+/// every separator would delay each record of an interactive input.)
+fn match_may_grow(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'[' => i = bracket_expression_end(bytes, i + 1),
+            b'*' | b'+' | b'?' | b'{' => return true,
+            _ => i += 1,
+        }
     }
-    if let Some(m) = re.find_nonempty_bytes(buf) {
-        let record = bytes_to_string(buf[..m.start].to_vec());
-        let remainder = buf[m.end..].to_vec();
-        Ok(Some((record, remainder)))
-    } else {
-        Ok(None)
-    }
+    false
 }
 
-pub trait RecordReader: Iterator<Item = ReadResult> {
-    fn is_done(&self) -> bool;
-
-    fn ere_byte_buffer(&mut self) -> &mut Vec<u8>;
-
-    fn read_next_record(&mut self, separator: &RecordSeparator) -> Result<Option<String>, String> {
-        if self.is_done() {
-            return Ok(None);
+/// The index just past the `]` that ends the bracket expression whose
+/// contents start at `start`, or the length of `bytes` if none does.  A
+/// `]` first (after an optional `^`) is part of it, as are the contents of
+/// `[:class:]`, `[.symbol.]` and `[=class=]`, and a character after a
+/// backslash, which awk takes as an escape there too.
+fn bracket_expression_end(bytes: &[u8], start: usize) -> usize {
+    let mut i = start;
+    if bytes.get(i) == Some(&b'^') {
+        i += 1;
+    }
+    if bytes.get(i) == Some(&b']') {
+        i += 1;
+    }
+    while i < bytes.len() {
+        match bytes[i] {
+            b']' => return i + 1,
+            // an awk escape: the character after the backslash is literal
+            b'\\' => i += 2,
+            b'[' if matches!(bytes.get(i + 1), Some(b':' | b'.' | b'=')) => {
+                let delimiter = bytes[i + 1];
+                i += 2;
+                while i < bytes.len() && !(bytes[i] == delimiter && bytes.get(i + 1) == Some(&b']'))
+                {
+                    i += 1;
+                }
+                i += 2;
+            }
+            _ => i += 1,
         }
+    }
+    bytes.len()
+}
+
+/// How many bytes a reader asks its source for at a time.
+const READ_SIZE: usize = 64 * 1024;
+
+/// A reader of records: the bytes of a source, read in large pieces into a
+/// buffer, from which records are taken whatever the record separator,
+/// which may change between records.  What is read past a record stays in
+/// the buffer for the next.
+///
+/// Each read returns as soon as the source has something, so a record is
+/// returned as soon as its separator arrives, and the source is never read
+/// again once it has reported its end, as a terminal would then wait for
+/// more.
+pub struct RecordInput<S> {
+    source: S,
+    buffer: Vec<u8>,
+    /// Where the bytes not yet returned start in `buffer`.
+    pos: usize,
+    /// The source has reported its end.
+    eof: bool,
+    /// A read may wait for input: the source is not a regular file.
+    may_block: bool,
+}
+
+/// What a search for a record separator found, in the bytes after `pos`.
+enum SeparatorSearch {
+    /// The record ends at the first offset, the separator at the second.
+    Found(usize, usize),
+    /// A separator reaching the end of the bytes read, which the input to
+    /// come could make longer.
+    Deferred,
+    NotFound,
+}
+
+impl<S: Read> RecordInput<S> {
+    /// A reader of `source`, whose reads `may_block` waiting for input.
+    pub fn new(source: S, may_block: bool) -> Self {
+        Self {
+            source,
+            buffer: Vec::new(),
+            pos: 0,
+            eof: false,
+            may_block,
+        }
+    }
+
+    /// The bytes read and not yet returned.
+    fn pending(&self) -> &[u8] {
+        &self.buffer[self.pos..]
+    }
+
+    /// Reads more of the source into the buffer: how many bytes, 0 at the
+    /// end of the input.  The bytes before `pos` may be dropped, so callers
+    /// keep offsets relative to it.
+    ///
+    /// A read that may wait for input writes out the output awk has
+    /// collected first: a filter in a pipeline fed a line at a time then
+    /// passes each on as it comes.  A failure to write it is not one of the
+    /// input; it is remembered, and reported at the end of the run.
+    fn fill(&mut self) -> Result<usize, String> {
+        if self.eof {
+            return Ok(0);
+        }
+        if self.may_block {
+            let _ = output::flush_stdout();
+        }
+        if self.pos > 0 && (self.pos == self.buffer.len() || self.pos >= READ_SIZE) {
+            self.buffer.drain(..self.pos);
+            self.pos = 0;
+            // the room a huge record took is given back
+            if self.buffer.capacity() > 4 * READ_SIZE && self.buffer.len() < READ_SIZE {
+                self.buffer.shrink_to(2 * READ_SIZE);
+            }
+        }
+        let old_len = self.buffer.len();
+        self.buffer.resize(old_len + READ_SIZE, 0);
+        loop {
+            match self.source.read(&mut self.buffer[old_len..]) {
+                Ok(n) => {
+                    self.buffer.truncate(old_len + n);
+                    self.eof = n == 0;
+                    return Ok(n);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    self.buffer.truncate(old_len);
+                    return Err(plib::diag::io_error_text(&e));
+                }
+            }
+        }
+    }
+
+    /// Returns the `len` bytes after `pos` as a record, and moves `pos`
+    /// past them and the `skip` bytes of the separator after them.
+    fn take_record(&mut self, len: usize, skip: usize) -> String {
+        let record = bytes_to_string(self.pending()[..len].to_vec());
+        self.pos += len + skip;
+        record
+    }
+
+    /// Whether the input has ended and every byte of it has been returned.
+    #[cfg(test)]
+    pub fn is_done(&self) -> bool {
+        self.eof && self.pos == self.buffer.len()
+    }
+
+    pub fn read_next_record(
+        &mut self,
+        separator: &RecordSeparator,
+    ) -> Result<Option<String>, String> {
         match separator {
-            RecordSeparator::Char(sep) => {
-                let mut buf = Vec::new();
-                let mut next = read_iter_next!(self);
-                while next != *sep {
-                    buf.push(next);
-                    next = read_iter_next!(self, Ok(Some(bytes_to_string(buf))));
-                }
-                Ok(Some(bytes_to_string(buf)))
+            RecordSeparator::Char(sep) => self.read_to_byte(*sep),
+            RecordSeparator::Null => self.read_paragraph(),
+            RecordSeparator::Ere(re) => self.read_to_match(re),
+        }
+    }
+
+    /// A record ended by the byte `sep`, or by the end of the input.
+    fn read_to_byte(&mut self, sep: u8) -> Result<Option<String>, String> {
+        // the bytes already searched, after `pos`
+        let mut searched = 0;
+        loop {
+            if let Some(i) = self.pending()[searched..].iter().position(|&b| b == sep) {
+                return Ok(Some(self.take_record(searched + i, 1)));
             }
-            RecordSeparator::Ere(re) => {
-                // Incremental matching: read bytes into a buffer and check
-                // for RS matches periodically to support streaming/interactive
-                // input without reading everything into memory at once.
-                let mut byte_buf = std::mem::take(self.ere_byte_buffer());
+            searched = self.pending().len();
+            if self.fill()? == 0 {
+                return Ok((searched > 0).then(|| self.take_record(searched, 0)));
+            }
+        }
+    }
 
-                // Check existing buffer first (remainder from previous call)
-                if let Some((record, remainder)) = ere_try_match(&byte_buf, re)? {
-                    *self.ere_byte_buffer() = remainder;
-                    return Ok(Some(record));
-                }
+    /// A record of paragraph mode (RS = ""): lines up to a blank line or
+    /// the end of the input, after any blank lines before them.
+    fn read_paragraph(&mut self) -> Result<Option<String>, String> {
+        loop {
+            let blank = self.pending().iter().take_while(|&&b| b == b'\n').count();
+            self.pos += blank;
+            if !self.pending().is_empty() {
+                break;
+            }
+            if self.fill()? == 0 {
+                return Ok(None);
+            }
+        }
+        let mut searched = 0;
+        loop {
+            let pending = self.pending();
+            if let Some(i) = pending[searched..].windows(2).position(|w| w == b"\n\n") {
+                return Ok(Some(self.take_record(searched + i, 2)));
+            }
+            // a newline at the end may begin the blank line
+            searched = pending.len().saturating_sub(1);
+            if self.fill()? == 0 {
+                let len = self.pending().len();
+                let newline = self.pending().ends_with(b"\n") as usize;
+                return Ok(Some(self.take_record(len - newline, newline)));
+            }
+        }
+    }
 
-                // After a failed match at length L, skip newline-triggered checks
-                // until the buffer grows enough. This avoids O(n*m) worst-case
-                // when every newline triggers a futile re-scan of the whole buffer.
-                // Threshold starts at 0 so the first newline always triggers a check
-                // (important for interactive/streaming input).
-                let mut next_newline_check_len: usize = 0;
-                let mut bytes_since_check = 0usize;
-                loop {
-                    match self.next() {
-                        Some(byte_result) => {
-                            let byte = byte_result?;
-                            byte_buf.push(byte);
-                            bytes_since_check += 1;
-                            let check = if byte == b'\n' {
-                                byte_buf.len() >= next_newline_check_len
-                            } else {
-                                bytes_since_check >= 8192
-                            };
-                            if check {
-                                bytes_since_check = 0;
-                                if let Some((record, remainder)) = ere_try_match(&byte_buf, re)? {
-                                    *self.ere_byte_buffer() = remainder;
-                                    return Ok(Some(record));
-                                }
-                                let len = byte_buf.len();
-                                next_newline_check_len = len + len.min(8192);
-                            }
-                        }
-                        None => {
-                            // EOF: check for final match, then return remainder
-                            if byte_buf.is_empty() {
-                                return Ok(None);
-                            }
-                            if let Some((record, remainder)) = ere_try_match(&byte_buf, re)? {
-                                if !remainder.is_empty() {
-                                    *self.ere_byte_buffer() = remainder;
-                                }
-                                return Ok(Some(record));
-                            }
-                            let input = bytes_to_string(byte_buf);
-                            return Ok(Some(input));
-                        }
+    /// A record ended by a match of the regular expression `re`, or by the
+    /// end of the input.
+    ///
+    /// A match is searched for after each read, so that a record is
+    /// returned as soon as its separator arrives; but once the bytes read
+    /// for the record pass `EAGER_SEARCH_LIMIT`, only after they have
+    /// doubled, so that a huge record costs time in proportion to its
+    /// length rather than to its length times the number of reads.
+    fn read_to_match(&mut self, re: &Regex) -> Result<Option<String>, String> {
+        const EAGER_SEARCH_LIMIT: usize = 1 << 20;
+        let mut next_search_len = 0;
+        loop {
+            let at_eof = self.eof;
+            let len = self.pending().len();
+            if at_eof || len <= EAGER_SEARCH_LIMIT || len >= next_search_len {
+                match self.search_separator(re, at_eof) {
+                    SeparatorSearch::Found(len, end) => {
+                        return Ok(Some(self.take_record(len, end - len)));
                     }
+                    _ if at_eof => {
+                        return Ok((len > 0).then(|| self.take_record(len, 0)));
+                    }
+                    SeparatorSearch::Deferred => next_search_len = 0,
+                    SeparatorSearch::NotFound => next_search_len = 2 * len,
                 }
             }
-            RecordSeparator::Null => {
-                // Skip leading blank lines
-                let mut line_buf = Vec::new();
-                loop {
-                    let next = read_iter_next!(self);
-                    if next == b'\n' {
-                        if line_buf.is_empty() {
-                            // blank line, keep skipping
-                            continue;
-                        }
-                        // non-blank line found, we have the first line
-                        break;
-                    }
-                    line_buf.push(next);
-                }
+            self.fill()?;
+        }
+    }
 
-                // line_buf has the first line (without newline)
-                let mut record_buf = line_buf;
-
-                // Accumulate subsequent lines until a blank line or EOF
-                loop {
-                    let mut line_buf = Vec::new();
-                    loop {
-                        match self.next() {
-                            Some(byte_result) => {
-                                let byte = byte_result?;
-                                if byte == b'\n' {
-                                    break;
-                                }
-                                line_buf.push(byte);
-                            }
-                            None => {
-                                // EOF: if this line has content, add it
-                                if !line_buf.is_empty() {
-                                    record_buf.push(b'\n');
-                                    record_buf.extend_from_slice(&line_buf);
-                                }
-                                return Ok(Some(bytes_to_string(record_buf)));
-                            }
-                        }
-                    }
-                    if line_buf.is_empty() {
-                        // blank line: end of record
-                        break;
-                    }
-                    record_buf.push(b'\n');
-                    record_buf.extend_from_slice(&line_buf);
-                }
-
-                Ok(Some(bytes_to_string(record_buf)))
+    /// Searches the bytes after `pos` for a match of the RS `re`.  Before
+    /// the end of the input (`at_eof` false), a match that reaches the end
+    /// of them is not taken if the input still to come could extend it
+    /// (two newlines read one at a time for RS = "\n+").
+    fn search_separator(&self, re: &Regex, at_eof: bool) -> SeparatorSearch {
+        let pending = self.pending();
+        if pending.is_empty() {
+            return SeparatorSearch::NotFound;
+        }
+        match re.find_nonempty_bytes(pending) {
+            Some(m) if at_eof || m.end < pending.len() || !match_may_grow(re.pattern()) => {
+                SeparatorSearch::Found(m.start, m.end)
             }
+            Some(_) => SeparatorSearch::Deferred,
+            None => SeparatorSearch::NotFound,
         }
     }
 }
 
-pub struct FileStream {
-    bytes: Bytes<BufReader<File>>,
-    is_done: bool,
-    ere_byte_buffer: Vec<u8>,
-}
+/// A file read for records.
+pub type FileStream = RecordInput<File>;
 
 impl FileStream {
     pub fn open(path: &str) -> Result<Self, String> {
         let file = File::open(path_of(path)).map_err(|e| plib::diag::io_error_text(&e))?;
-        let reader = BufReader::new(file);
-        Ok(Self {
-            bytes: reader.bytes(),
-            is_done: false,
-            ere_byte_buffer: Vec::new(),
-        })
+        let regular = file.metadata().is_ok_and(|m| m.is_file());
+        Ok(Self::new(file, !regular))
     }
 }
 
-impl Iterator for FileStream {
-    type Item = ReadResult;
+/// Standard input read for records.  `Stdin` takes its lock for each read.
+pub type StdinRecordReader = RecordInput<std::io::Stdin>;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.bytes.next() {
-            Some(Ok(byte)) => Some(Ok(byte)),
-            Some(Err(e)) => Some(Err(plib::diag::io_error_text(&e))),
-            None => {
-                self.is_done = true;
-                None
-            }
-        }
-    }
-}
-
-impl RecordReader for FileStream {
-    fn is_done(&self) -> bool {
-        self.is_done && self.ere_byte_buffer.is_empty()
-    }
-
-    fn ere_byte_buffer(&mut self) -> &mut Vec<u8> {
-        &mut self.ere_byte_buffer
-    }
-}
-
-#[cfg(test)]
-pub struct StringRecordReader {
-    string: String,
-    index: usize,
-    ere_byte_buffer: Vec<u8>,
-}
-
-#[cfg(test)]
-impl<S: Into<String>> From<S> for StringRecordReader {
-    fn from(value: S) -> Self {
-        Self {
-            string: value.into(),
-            index: 0,
-            ere_byte_buffer: Vec::new(),
-        }
-    }
-}
-
-#[cfg(test)]
-impl Iterator for StringRecordReader {
-    type Item = ReadResult;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.index == self.string.len() {
-            None
-        } else {
-            let result = self.string.as_bytes()[self.index];
-            self.index += 1;
-            Some(Ok(result))
-        }
-    }
-}
-
-#[cfg(test)]
-impl RecordReader for StringRecordReader {
-    fn is_done(&self) -> bool {
-        self.index == self.string.len() && self.ere_byte_buffer.is_empty()
-    }
-
-    fn ere_byte_buffer(&mut self) -> &mut Vec<u8> {
-        &mut self.ere_byte_buffer
+impl Default for StdinRecordReader {
+    fn default() -> Self {
+        // SAFETY: fstat only fills the stat buffer
+        let regular = unsafe {
+            let mut stat: libc::stat = std::mem::zeroed();
+            libc::fstat(libc::STDIN_FILENO, &mut stat) == 0
+                && (stat.st_mode & libc::S_IFMT) == libc::S_IFREG
+        };
+        Self::new(std::io::stdin(), !regular)
     }
 }
 
 #[derive(Default)]
 pub struct WriteFiles {
-    files: HashMap<String, File>,
+    files: HashMap<String, BufWriter<File>>,
+}
+
+/// An output file name that stands for one of awk's own outputs, which awk
+/// writes itself rather than opening the device: `/dev/stdout` shares the
+/// buffer of standard output, so the order of the output is kept, and
+/// `/dev/stderr` is written at once.
+enum StandardOutput {
+    Stdout,
+    Stderr,
+}
+
+impl StandardOutput {
+    fn named(filename: &str) -> Option<Self> {
+        match filename {
+            "/dev/stdout" => Some(Self::Stdout),
+            "/dev/stderr" => Some(Self::Stderr),
+            _ => None,
+        }
+    }
+}
+
+/// The error for a failed write to the output file `filename`.
+fn file_write_error(filename: &str, e: &std::io::Error) -> String {
+    gettextrs::gettext!(
+        "cannot write to file '{}': {}",
+        filename,
+        plib::diag::io_error_text(e)
+    )
 }
 
 impl WriteFiles {
     pub fn write(&mut self, filename: &str, contents: &str, append: bool) -> Result<(), String> {
-        match self.files.entry(filename.to_string()) {
-            Entry::Occupied(mut e) => {
-                e.get_mut()
+        match StandardOutput::named(filename) {
+            Some(StandardOutput::Stdout) => return output::write_stdout(contents),
+            Some(StandardOutput::Stderr) => {
+                return std::io::stderr()
                     .write_all(&charset::encode(contents))
-                    .map_err(|e| plib::diag::io_error_text(&e))?;
+                    .map_err(|e| file_write_error(filename, &e))
             }
+            None => {}
+        }
+        let file = match self.files.entry(filename.to_string()) {
+            Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => {
-                let mut file = File::options()
+                let file = File::options()
                     .write(true)
                     .create(true)
                     .truncate(!append)
                     .append(append)
                     .open(path_of(filename))
-                    .map_err(|e| plib::diag::io_error_text(&e))?;
-                file.write_all(&charset::encode(contents))
-                    .map_err(|e| plib::diag::io_error_text(&e))?;
-                e.insert(file);
+                    .map_err(|e| {
+                        gettextrs::gettext!(
+                            "cannot open file '{}' for writing: {}",
+                            filename,
+                            plib::diag::io_error_text(&e)
+                        )
+                    })?;
+                e.insert(BufWriter::new(file))
             }
-        }
-        Ok(())
+        };
+        file.write_all(&charset::encode(contents))
+            .map_err(|e| file_write_error(filename, &e))
     }
 
-    pub fn flush_file(&mut self, filename: &str) -> bool {
-        if let Some(file) = self.files.get_mut(filename) {
-            file.flush().is_ok()
-        } else {
-            false
+    /// Flushes the output file `filename`: whether that succeeded, or
+    /// `None` if no such file is open.
+    pub fn flush_file(&mut self, filename: &str) -> Option<bool> {
+        match StandardOutput::named(filename) {
+            Some(StandardOutput::Stdout) => Some(output::flush_stdout().is_ok()),
+            Some(StandardOutput::Stderr) => Some(true),
+            None => self
+                .files
+                .get_mut(filename)
+                .map(|file| file.flush().is_ok()),
         }
     }
 
+    /// Flushes every output file; whether all succeeded.
     pub fn flush_all(&mut self) -> bool {
+        // every one, also after a failure
         let mut success = true;
         for file in self.files.values_mut() {
-            success = success && file.flush().is_ok();
+            success &= file.flush().is_ok();
         }
         success
     }
@@ -347,9 +433,28 @@ impl WriteFiles {
     /// successful flush+close, `Some(-1)` if flushing failed, or `None` if no
     /// file was open under this name.
     pub fn close_file(&mut self, filename: &str) -> Option<i32> {
-        self.files
-            .remove(filename)
-            .map(|mut file| if file.flush().is_ok() { 0 } else { -1 })
+        let status = |ok: bool| if ok { 0 } else { -1 };
+        match StandardOutput::named(filename) {
+            Some(_) => self.flush_file(filename).map(status),
+            None => self
+                .files
+                .remove(filename)
+                .map(|mut file| status(file.flush().is_ok())),
+        }
+    }
+
+    /// Flushes and closes every output file, at the end of the run: an
+    /// error for the first that could not be written.
+    pub fn close_all(&mut self) -> Result<(), String> {
+        let mut result = Ok(());
+        for (filename, mut file) in self.files.drain() {
+            if let Err(e) = file.flush() {
+                if result.is_ok() {
+                    result = Err(file_write_error(&filename, &e));
+                }
+            }
+        }
+        result
     }
 }
 
@@ -376,6 +481,11 @@ impl ReadFiles {
         }
     }
 
+    /// Whether an input file is open under `filename`.
+    pub fn is_open(&self, filename: &str) -> bool {
+        self.files.contains_key(filename)
+    }
+
     /// Close a previously-opened input file. Returns `Some(0)` if a file was
     /// open under this name, or `None` otherwise.
     pub fn close_file(&mut self, filename: &str) -> Option<i32> {
@@ -383,10 +493,11 @@ impl ReadFiles {
     }
 }
 
-/// What close() of a pipe returns for the `pclose` result `status`: the
-/// command's exit status, 256 plus the number of the signal that killed it,
-/// as in gawk and mawk, or -1 if `pclose` failed.
-fn close_status(status: libc::c_int) -> i32 {
+/// What close() of a pipe and system() return for the `pclose` or
+/// `system` result `status`: the command's exit status, 256 plus the number
+/// of the signal that killed it, as in gawk and mawk, or -1 if the call
+/// failed.
+pub(crate) fn wait_status(status: libc::c_int) -> i32 {
     if status == -1 {
         -1
     } else if libc::WIFEXITED(status) {
@@ -421,37 +532,45 @@ impl WritePipes {
                 file
             }
         };
-        let contents: CString = contents.try_into()?;
-        let result = unsafe { libc::fputs(contents.as_ptr(), file) };
-        if result == libc::EOF {
+        // fwrite, not fputs: the output may hold NUL bytes
+        let bytes = charset::encode(&contents);
+        let written = unsafe { libc::fwrite(bytes.as_ptr().cast(), 1, bytes.len(), file) };
+        if written != bytes.len() {
             return Err("failed to write to file".to_string());
         }
         Ok(())
     }
 
-    pub fn flush_file(&mut self, filename: &str) -> bool {
-        if let Some(file) = self.pipes.get(filename) {
-            unsafe { libc::fflush(*file) == 0 }
-        } else {
-            false
-        }
+    /// Whether an output pipe to `command` is open.
+    pub fn is_open(&self, command: &str) -> bool {
+        self.pipes.contains_key(command)
     }
 
+    /// Flushes the output pipe `filename`: whether that succeeded, or
+    /// `None` if no such pipe is open.
+    pub fn flush_file(&mut self, filename: &str) -> Option<bool> {
+        self.pipes
+            .get(filename)
+            .map(|file| unsafe { libc::fflush(*file) == 0 })
+    }
+
+    /// Flushes every output pipe; whether all succeeded.
     pub fn flush_all(&mut self) -> bool {
+        // every one, also after a failure
         let mut success = true;
         for file in self.pipes.values() {
-            success = success && unsafe { libc::fflush(*file) == 0 };
+            success &= unsafe { libc::fflush(*file) == 0 };
         }
         success
     }
 
     /// Close a previously-opened output pipe. Returns the command's
-    /// status as `close_status` gives it, or `None` if no pipe was open under
+    /// status as `wait_status` gives it, or `None` if no pipe was open under
     /// this name.
     pub fn close_pipe(&mut self, filename: &str) -> Option<i32> {
         self.pipes
             .remove(filename)
-            .map(|file| close_status(unsafe { libc::pclose(file) }))
+            .map(|file| wait_status(unsafe { libc::pclose(file) }))
     }
 }
 
@@ -467,62 +586,56 @@ impl Drop for WritePipes {
     }
 }
 
-pub struct PipeRecordReader {
+/// The read end of a pipe `popen` opened, read through its descriptor:
+/// the `FILE` is used only to `pclose` it, so stdio buffers nothing.
+pub struct PipeSource {
     pipe: *mut libc::FILE,
-    is_done: bool,
+    file: std::mem::ManuallyDrop<File>,
+}
+
+impl Read for PipeSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (&*self.file).read(buf)
+    }
+}
+
+/// The output of a command read for records (`cmd | getline`).
+pub struct PipeRecordReader {
+    input: RecordInput<PipeSource>,
     /// Set once the pipe has been `pclose`d by an explicit `close()`, so the
     /// `Drop` impl does not close it a second time.
     closed: bool,
-    ere_byte_buffer: Vec<u8>,
 }
 
 impl PipeRecordReader {
     pub fn open(command: &str) -> Result<Self, String> {
+        use std::os::unix::io::FromRawFd;
         let command = charset::to_cstring(command)?;
-        let file = unsafe {
-            let file = libc::popen(command.as_ptr(), c"r".as_ptr());
-            if file.is_null() {
-                return Err("failed to open pipe".to_string());
-            }
-            file
-        };
+        let pipe = unsafe { libc::popen(command.as_ptr(), c"r".as_ptr()) };
+        if pipe.is_null() {
+            return Err("failed to open pipe".to_string());
+        }
+        // SAFETY: the descriptor is the pipe's, open until pclose, which
+        // closes it; ManuallyDrop keeps the File from closing it too
+        let file = std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(libc::fileno(pipe)) });
         Ok(Self {
-            pipe: file,
-            is_done: false,
+            input: RecordInput::new(PipeSource { pipe, file }, true),
             closed: false,
-            ere_byte_buffer: Vec::new(),
         })
     }
 
-    /// `pclose` the pipe and return the command's status as `close_status`
+    pub fn read_next_record(
+        &mut self,
+        separator: &RecordSeparator,
+    ) -> Result<Option<String>, String> {
+        self.input.read_next_record(separator)
+    }
+
+    /// `pclose` the pipe and return the command's status as `wait_status`
     /// gives it. Marks the reader closed so `Drop` will not close it again.
     fn pclose(&mut self) -> i32 {
         self.closed = true;
-        close_status(unsafe { libc::pclose(self.pipe) })
-    }
-}
-
-impl Iterator for PipeRecordReader {
-    type Item = ReadResult;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let result = unsafe { libc::fgetc(self.pipe) };
-        if result == libc::EOF {
-            self.is_done = true;
-            None
-        } else {
-            Some(Ok(result as u8))
-        }
-    }
-}
-
-impl RecordReader for PipeRecordReader {
-    fn is_done(&self) -> bool {
-        self.is_done && self.ere_byte_buffer.is_empty()
-    }
-
-    fn ere_byte_buffer(&mut self) -> &mut Vec<u8> {
-        &mut self.ere_byte_buffer
+        wait_status(unsafe { libc::pclose(self.input.source.pipe) })
     }
 }
 
@@ -532,7 +645,7 @@ impl Drop for PipeRecordReader {
             return;
         }
         unsafe {
-            if libc::pclose(self.pipe) == -1 {
+            if libc::pclose(self.input.source.pipe) == -1 {
                 eprintln!("awk: warning: failed to close read pipe");
             };
         }
@@ -562,42 +675,15 @@ impl ReadPipes {
         }
     }
 
+    /// Whether an input pipe from `command` is open.
+    pub fn is_open(&self, command: &str) -> bool {
+        self.pipes.contains_key(command)
+    }
+
     /// Close a previously-opened input pipe. Returns the command's status as
-    /// `close_status` gives it, or `None` if no pipe was open under this name.
+    /// `wait_status` gives it, or `None` if no pipe was open under this name.
     pub fn close_pipe(&mut self, command: &str) -> Option<i32> {
         self.pipes.remove(command).map(|mut reader| reader.pclose())
-    }
-}
-
-#[derive(Default)]
-pub struct StdinRecordReader {
-    is_done: bool,
-    ere_byte_buffer: Vec<u8>,
-}
-
-impl Iterator for StdinRecordReader {
-    type Item = ReadResult;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let next = std::io::stdin().lock().bytes().next();
-        match next {
-            Some(Ok(byte)) => Some(Ok(byte)),
-            Some(Err(e)) => Some(Err(plib::diag::io_error_text(&e))),
-            None => {
-                self.is_done = true;
-                None
-            }
-        }
-    }
-}
-
-impl RecordReader for StdinRecordReader {
-    fn is_done(&self) -> bool {
-        self.is_done && self.ere_byte_buffer.is_empty()
-    }
-
-    fn ere_byte_buffer(&mut self) -> &mut Vec<u8> {
-        &mut self.ere_byte_buffer
     }
 }
 
@@ -605,11 +691,57 @@ impl RecordReader for StdinRecordReader {
 mod tests {
     use super::*;
 
+    /// A source of the bytes of a string that gives at most `chunk` bytes
+    /// a read.  Like a terminal after an end of file, it must not be read
+    /// again once it has reported the end.
+    struct ChunkedSource {
+        bytes: Vec<u8>,
+        pos: usize,
+        chunk: usize,
+        ended: bool,
+    }
+
+    impl Read for ChunkedSource {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos == self.bytes.len() {
+                assert!(!self.ended, "read again after the end of the input");
+                self.ended = true;
+                return Ok(0);
+            }
+            let n = self.chunk.min(buf.len()).min(self.bytes.len() - self.pos);
+            buf[..n].copy_from_slice(&self.bytes[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    /// The records of `file_contents`, which must be the same however the
+    /// source divides it into reads.
     fn split_records(file_contents: &str, separator: RecordSeparator) -> Vec<String> {
-        let mut reader = StringRecordReader::from(file_contents);
-        let mut result = Vec::new();
-        while let Some(record) = reader.read_next_record(&separator).unwrap() {
-            result.push(record);
+        let split = |chunk| {
+            let mut reader = RecordInput::new(
+                ChunkedSource {
+                    bytes: file_contents.as_bytes().to_vec(),
+                    pos: 0,
+                    chunk,
+                    ended: false,
+                },
+                false,
+            );
+            let mut result = Vec::new();
+            while let Some(record) = reader.read_next_record(&separator).unwrap() {
+                result.push(record);
+            }
+            assert!(reader.is_done());
+            result
+        };
+        let result = split(READ_SIZE);
+        for chunk in [1, 2, 3, 7] {
+            assert_eq!(
+                split(chunk),
+                result,
+                "{file_contents:?} read {chunk} bytes at a time"
+            );
         }
         result
     }
@@ -623,6 +755,67 @@ mod tests {
     fn split_records_with_paragraph_separator() {
         let records = split_records("record1\nrecord2\n\nrecord3\n", RecordSeparator::Null);
         assert_eq!(records, vec!["record1\nrecord2", "record3"]);
+    }
+
+    #[test]
+    fn split_paragraphs_without_final_newline() {
+        let records = split_records("a\n\nb", RecordSeparator::Null);
+        assert_eq!(records, vec!["a", "b"]);
+        let records = split_records("abc", RecordSeparator::Null);
+        assert_eq!(records, vec!["abc"]);
+        let records = split_records("\n\nabc", RecordSeparator::Null);
+        assert_eq!(records, vec!["abc"]);
+    }
+
+    #[test]
+    fn rs_match_may_grow_only_by_repetition() {
+        for (pattern, grows) in [
+            ("\n+", true),
+            ("a{2,}", true),
+            ("x?", true),
+            ("\n|;", false),
+            ("[+]\n", false),
+            ("[]*]x", false),
+            ("[^]?]x", false),
+            ("[[:alpha:]+]", false),
+            ("\\*\n", false),
+            ("[a]b*", true),
+            // awk escapes hold in a bracket expression too
+            ("[\\][]x+", true),
+            ("[\\]+]", false),
+        ] {
+            assert_eq!(match_may_grow(pattern), grows, "{pattern}");
+        }
+    }
+
+    /// A source that gives its bytes in one full read and would then wait
+    /// for more, as a pipe whose writer has paused.
+    struct PausedSource(Vec<u8>);
+
+    impl Read for PausedSource {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            assert!(!self.0.is_empty(), "read while the input has paused");
+            let n = buf.len().min(self.0.len());
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0.drain(..n);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn regex_rs_in_a_full_read_is_found_without_reading_more() {
+        let mut bytes = b"a;".to_vec();
+        bytes.resize(READ_SIZE, b'x');
+        let mut reader = RecordInput::new(PausedSource(bytes), true);
+        let rs = RecordSeparator::Ere(crate::regex::regex_from_str(";|#"));
+        assert_eq!(reader.read_next_record(&rs).unwrap().as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn regex_rs_does_not_read_again_after_the_end() {
+        let ere = || RecordSeparator::Ere(crate::regex::regex_from_str("\n+"));
+        assert_eq!(split_records("a\n\nb\n\n", ere()), vec!["a", "b"]);
+        assert_eq!(split_records("a\n\nb", ere()), vec!["a", "b"]);
     }
 
     #[test]

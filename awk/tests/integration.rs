@@ -1709,7 +1709,7 @@ fn awk_runtime_error_after_a_call_reports_the_caller() {
     assert_eq!(stdout, "");
     assert_eq!(
         stderr,
-        "runtime error: not enough arguments for format string\ncall trace:\n=> <start> at :2:14\n\n"
+        "awk: runtime error: not enough arguments for format string\ncall trace:\n=> <start> at :2:14\n\n"
     );
     assert_eq!(status, Some(1));
 }
@@ -2100,7 +2100,7 @@ fn awk_scalar_used_as_an_array_is_an_error() {
         let (stdout, stderr, status) = awk_with_deadline(program);
         assert_eq!(stdout, "", "{program}");
         assert!(
-            stderr.starts_with("runtime error: scalar used in array context\n"),
+            stderr.starts_with("awk: runtime error: scalar used in array context\n"),
             "{program}: {stderr}"
         );
         assert_eq!(status, Some(1), "{program}");
@@ -2192,4 +2192,948 @@ fn test_awk_open_errors_name_the_system_error() {
         assert!(stderr.contains(&open_error), "{args:?}: {stderr:?}");
         assert!(!stderr.contains("(os error"), "{args:?}: {stderr:?}");
     }
+}
+
+/// Runs each `(program, input, expected stdout)` case, expecting no
+/// diagnostics and exit status 0.
+fn assert_awk_cases(cases: &[(&str, &str, &str)]) {
+    for &(program, input, output) in cases {
+        let (stdout, stderr, status) = awk_with_deadline_input(program, input);
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str()),
+            (output, ""),
+            "{program}"
+        );
+        assert_eq!(status, Some(0), "{program}");
+    }
+}
+
+// An array element being assigned is found again by its key after the
+// right-hand side runs: a function there that deleted from the array, or
+// cleared or split into it, made the assignment land on another element or
+// panic.
+#[test]
+fn awk_array_element_assigned_after_rhs_changes_the_array() {
+    assert_awk_cases(&[
+        (
+            "function f() { delete a[\"x\"]; return 5 } BEGIN { a[\"x\"] = 1; a[\"y\"] = 2; a[\"x\"] = f(); print a[\"x\"], a[\"y\"], length(a) }",
+            "",
+            "5 2 2\n",
+        ),
+        (
+            "function f() { delete a; return 5 } BEGIN { a[\"x\"] = 1; a[\"x\"] = f(); print a[\"x\"], length(a) }",
+            "",
+            "5 1\n",
+        ),
+        (
+            "function f() { delete a[\"x\"]; return 5 } BEGIN { a[\"x\"] = 1; a[\"x\"] += f(); print a[\"x\"], length(a) }",
+            "",
+            "5 1\n",
+        ),
+        (
+            "function f() { split(\"p q r\", a); return 5 } BEGIN { a[\"x\"] = 1; a[\"y\"] = 2; a[\"x\"] = f(); print a[1], a[2], a[3], a[\"x\"], length(a) }",
+            "",
+            "p q r 5 4\n",
+        ),
+        (
+            "function f() { delete a; return \"v\" } BEGIN { a[1] = \"old\"; sub(/o/, f(), a[1]); print length(a), \"[\" a[1] \"]\" }",
+            "",
+            "1 []\n",
+        ),
+    ]);
+}
+
+// With RS = "", a last paragraph of one line with no newline after it is
+// still a record; it was dropped.
+#[test]
+fn awk_paragraph_mode_keeps_a_last_line_without_newline() {
+    assert_awk_cases(&[
+        (
+            "BEGIN { RS = \"\" } { print NR \":\" $0 }",
+            "a\n\nb",
+            "1:a\n2:b\n",
+        ),
+        (
+            "BEGIN { RS = \"\" } { print NR \":\" $0 }",
+            "abc",
+            "1:abc\n",
+        ),
+        (
+            "BEGIN { RS = \"\" } { print NR \":\" $0 }",
+            "a\n\n\nb\nc",
+            "1:a\n2:b\nc\n",
+        ),
+    ]);
+}
+
+// An integral number converts to the string of its exact value, as by
+// "%d", also beyond the range of a 64-bit integer: it saturated to
+// 9223372036854775807, so that large subscripts named one element.
+#[test]
+fn awk_large_integers_convert_exactly() {
+    assert_awk_cases(&[
+        (
+            "BEGIN { x = 1e30; print x; print x \"\"; print 2^63, -2^63, -2^64, 2^53 + 1 }",
+            "",
+            "1000000000000000019884624838656\n1000000000000000019884624838656\n9223372036854775808 -9223372036854775808 -18446744073709551616 9007199254740992\n",
+        ),
+        (
+            "BEGIN { a[1e19]; a[2e19]; print length(a); for (k in a) n += (k == 1e19 || k == 2e19); print n }",
+            "",
+            "2\n2\n",
+        ),
+    ]);
+}
+
+// %g, and so OFMT and CONVFMT, chooses between %e and %f style from the
+// exponent of the rounded value, as C does, and keeps the zeros of the
+// integer part: 120000.25 printed as "12" and 100000 as "1".  Width and
+// padding apply to the whole number in every float conversion.
+#[test]
+fn awk_float_conversions_follow_c() {
+    assert_awk_cases(&[
+        (
+            "BEGIN { print 100000.5, 120000.25, 999999.5, 300000.1 \"\", 1234567.5, 0.000123456, 123456.7 }",
+            "",
+            "100000 120000 1e+06 300000 1.23457e+06 0.000123456 123457\n",
+        ),
+        (
+            "BEGIN { printf \"%g|%g|%g|%.3g|%g|%G|%#g|%#.3g|%.0g|%g|%g\\n\", 100000, 999999.5, 0.00001, 99950, 9.99999999e-5, 1e-300, 1e30, 100, 123, 0.5, 0 }",
+            "",
+            "100000|1e+06|1e-05|1e+05|0.0001|1E-300|1.00000e+30|100.|1e+02|0.5|0\n",
+        ),
+        (
+            "BEGIN { printf \"%8g|%-8g|%08g|%+g|% g|%8g|%-9g|%08.3g|\\n\", -1e30, -1e30, -1e30, 1e30, 1e-30, -1.5, 120000, -0.0001 }",
+            "",
+            "  -1e+30|-1e+30  |-001e+30|+1e+30| 1e-30|    -1.5|120000   |-00.0001|\n",
+        ),
+        (
+            "BEGIN { printf \"%e|%10.3e|%-12e|%012.2e|%#.0e|%.0e|%E\\n\", 9.9999999e9, -1234.5, 1.5, -1.5, 5e10, 5e10, 1e-300 }",
+            "",
+            "1.000000e+10|-1.234e+03|1.500000e+00|-0001.50e+00|5.e+10|5e+10|1.000000E-300\n",
+        ),
+        (
+            "BEGIN { printf \"%-10.2f|%010.2f|%#.0f|%.0f|%+.1f|%8.3f|\\n\", -1.5, -1.5, 3, 2.5, 0.05, 3.14159 }",
+            "",
+            "-1.50     |-000001.50|3.|2|+0.1|   3.142|\n",
+        ),
+        (
+            "BEGIN { printf \"%5g|%-6f|%05e|%5G|\\n\", -log(0), log(0), -log(0), -log(0) }",
+            "",
+            "  inf|-inf  |  inf|  INF|\n",
+        ),
+    ]);
+}
+
+// printf's integer conversions take any number: %d writes every digit of a
+// value beyond 64 bits (it saturated), %u, %o and %x write a negative
+// value as its 64-bit two's complement (it was a fatal error), and one
+// beyond what they can show is written as by %g, as gawk does.
+#[test]
+fn awk_printf_integer_conversions_of_any_number() {
+    assert_awk_cases(&[
+        (
+            "BEGIN { printf \"%x|%X|%u|%o\\n\", -1, -255, -1, -1 }",
+            "",
+            "ffffffffffffffff|FFFFFFFFFFFFFF01|18446744073709551615|1777777777777777777777\n",
+        ),
+        (
+            "BEGIN { printf \"%d|%i|%5d|%-34d|\\n\", 1e30, -2^64, 2^63, 1e30 }",
+            "",
+            "1000000000000000019884624838656|-18446744073709551616|9223372036854775808|1000000000000000019884624838656   |\n",
+        ),
+        (
+            "BEGIN { printf \"%x|%u|%8o|%u\\n\", 1e30, 2^64, -1e30, 2^64 - 2^12 }",
+            "",
+            "1e+30|1.84467e+19|  -1e+30|18446744073709547520\n",
+        ),
+        (
+            "BEGIN { printf \"%d|%x\\n\", -log(0), log(0) }",
+            "",
+            "inf|-inf\n",
+        ),
+    ]);
+}
+
+// With the default FS, fields are separated by blanks and newlines only: a
+// carriage return or form feed is part of a field, as POSIX says and the
+// other awks do.  CR ending a line of a CRLF file was taken as a
+// separator, changing NF and dropping the CR from a rebuilt record.
+#[test]
+fn awk_default_fs_splits_on_blanks_and_newlines_only() {
+    assert_awk_cases(&[
+        (
+            "{ print NF; $1 = $1; print length($0), ($NF == \"\\r\") }",
+            "a b \r\n",
+            "3\n5 1\n",
+        ),
+        ("{ print NF }", "a\x0cb\n a\tb \n", "1\n2\n"),
+        (
+            "BEGIN { print split(\"a\\rb\", x), split(\" a \\n b\\t\", y), y[2] }",
+            "",
+            "1 2 b\n",
+        ),
+    ]);
+}
+
+// A regular-expression RS is matched only where more input cannot extend
+// the match: RS = "\n+" ended a record at the first of two newlines read,
+// making an empty record of the second.
+#[test]
+fn awk_regex_rs_match_is_not_cut_at_a_read_boundary() {
+    assert_awk_cases(&[
+        (
+            "BEGIN { RS = \"\\n+\" } { print NR \":\" $0 }",
+            "a\n\nb\n",
+            "1:a\n2:b\n",
+        ),
+        (
+            "BEGIN { RS = \"\\n\\n+\" } { print NR \":\" $0 }",
+            "a\nb\n\n\n\nc\n",
+            "1:a\nb\n2:c\n\n",
+        ),
+        (
+            "BEGIN { RS = \"x+\" } { print NR \":\" $0 }",
+            "axxxb",
+            "1:a\n2:b\n",
+        ),
+    ]);
+}
+
+// Changing RS from a regular expression to one character, or to "", keeps
+// the input the regular expression's reader had read ahead; it was lost.
+#[test]
+fn awk_rs_change_keeps_input_read_ahead() {
+    assert_awk_cases(&[
+        (
+            "BEGIN { RS = \";;\" } NR == 1 { RS = \"\\n\" } { print NR \":\" $0 }",
+            "a;;b\nc\nd\n",
+            "1:a\n2:b\n3:c\n4:d\n",
+        ),
+        (
+            "BEGIN { RS = \";;\" } NR == 1 { RS = \"\" } { print NR \":\" $0 }",
+            "a;;b\nc\n\nd\n",
+            "1:a\n2:b\nc\n3:d\n",
+        ),
+    ]);
+}
+
+/// Starts awk on `program`, writes `input` to it and, with its standard
+/// input still open, waits up to 10 seconds for a first line of output:
+/// the record awk returns before the end of its input.
+fn awk_first_line_before_eof(program: &str, input: &str) -> Option<String> {
+    use std::io::{BufRead, Write};
+    use std::time::Duration;
+    let mut child = std::process::Command::new(plib::testing::get_binary_path("awk"))
+        .arg(program)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(input.as_bytes()).unwrap();
+    stdin.flush().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = std::io::BufReader::new(stdout).read_line(&mut line);
+        let _ = sender.send(line);
+    });
+    let line = receiver.recv_timeout(Duration::from_secs(10)).ok();
+    drop(stdin);
+    let _ = child.kill();
+    child.wait().unwrap();
+    line
+}
+
+// A record is returned as soon as its separator is read, without waiting
+// for more input, when more input could not make the separator longer.
+#[test]
+fn awk_record_is_returned_before_more_input() {
+    for (program, input) in [
+        ("{ print \"got \" $0; fflush() }", "abc\n"),
+        (
+            "BEGIN { RS = \"\\n|;\" } { print \"got \" $0; fflush() }",
+            "abc\n",
+        ),
+        // a separator with no newline in it, read as soon as it comes
+        (
+            "BEGIN { RS = \";;\" } { print \"got \" $0; fflush() }",
+            "abc;;",
+        ),
+        (
+            "BEGIN { RS = \"\" } { print \"got \" $0; fflush() }",
+            "abc\n\n",
+        ),
+        // a quoted repetition character repeats nothing
+        (
+            "BEGIN { RS = \"[+]\\n\" } { print \"got \" $0; fflush() }",
+            "abc+\n",
+        ),
+        (
+            "BEGIN { RS = \"\\\\*\\n\" } { print \"got \" $0; fflush() }",
+            "abc*\n",
+        ),
+    ] {
+        assert_eq!(
+            awk_first_line_before_eof(program, input).as_deref(),
+            Some("got abc\n"),
+            "{program}"
+        );
+    }
+}
+
+// With RS = "", newline separates fields whatever FS is, also when $0 is
+// split again after it is assigned or read by plain getline.
+#[test]
+fn awk_paragraph_mode_resplit_uses_newline_too() {
+    assert_awk_cases(&[
+        (
+            "BEGIN { RS = \"\"; FS = \":\" } { $0 = \"d:e\\nf\"; print NF, $3 }",
+            "x\n",
+            "3 f\n",
+        ),
+        (
+            "BEGIN { RS = \"\"; FS = \":\" } NR == 1 { getline; print NF, $3 }",
+            "a:b\nc\n\nd:e\nf\n",
+            "3 f\n",
+        ),
+    ]);
+}
+
+// A record may have more than 65535 fields, the limit a 16-bit field
+// index set: such a record ended the run with "too many fields".
+#[test]
+fn awk_record_with_more_than_65535_fields() {
+    let line = format!("{}\n", vec!["x"; 70_001].join(","));
+    assert_awk_cases(&[
+        (
+            "BEGIN { FS = \",\" } { print NF, $70001, length($0) }",
+            &line,
+            "70001 x 140001\n",
+        ),
+        (
+            "BEGIN { $100000 = \"y\"; print NF, $100000 }",
+            "",
+            "100000 y\n",
+        ),
+    ]);
+}
+
+// A negative field number is an error, as in gawk and mawk; it was taken
+// as $0, so $(-1) = "x" replaced the record.
+#[test]
+fn awk_negative_field_is_an_error() {
+    for program in [
+        "{ print $(-1) }",
+        "{ $(-1) = \"x\"; print }",
+        "{ $(NF - 3)++ }",
+    ] {
+        let (stdout, stderr, status) = awk_with_deadline_input(program, "a b\n");
+        assert_eq!(stdout, "", "{program}");
+        assert!(
+            stderr.contains("attempt to access field -"),
+            "{program}: {stderr}"
+        );
+        assert_ne!(status, Some(0), "{program}");
+    }
+    assert_awk_cases(&[("{ print $(-0.5), $1.9 }", "a b\n", "a b a\n")]);
+}
+
+// NR and FNR count past 2^32 records; they were 32-bit and wrapped to 0.
+#[test]
+fn awk_record_counters_go_past_32_bits() {
+    assert_awk_cases(&[
+        (
+            "NR == 1 { NR = 4294967295; FNR = 4294967295 } { print NR, FNR }",
+            "a\nb\n",
+            "4294967295 4294967295\n4294967296 4294967296\n",
+        ),
+        (
+            "NR == 1 { NR = 5e9 } END { print NR }",
+            "a\nb\n",
+            "5000000001\n",
+        ),
+        // a count at the end of the range stays there
+        (
+            "BEGIN { NR = 1e19 } END { print (NR > 9e18) }",
+            "a\nb\n",
+            "1\n",
+        ),
+    ]);
+}
+
+/// Runs awk with `args` and `input`, returning stdout, stderr and the
+/// exit status.
+fn awk_args(args: &[&str], input: &str) -> (String, String, Option<i32>) {
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let out = plib::testing::run_test_base("awk", &args, input.as_bytes());
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code(),
+    )
+}
+
+// A backslash before a character with no escape meaning stays, with the
+// character, as in the one true awk and mawk, in a string literal, -v, -F
+// and an assignment operand: so -F '\|' is a literal bar and "\." used as
+// a regular expression a literal period.  (It was a fatal error, then
+// dropped with a warning as gawk does, which changed what such a regular
+// expression matches.)  A backslash at the end of an assigned value stays.
+#[test]
+fn awk_undefined_escape_keeps_its_backslash() {
+    for (args, input, out) in [
+        (&["-F", "\\|", "{ print $2 }"][..], "a|b\n", "b\n"),
+        (&["-v", "x=a\\.b", "BEGIN { print x }"][..], "", "a\\.b\n"),
+        (&["{ print x }", "x=C:\\dir", "-"][..], "l\n", "C:\\dir\n"),
+        (&["BEGIN { print \"a\\.b\" }"][..], "", "a\\.b\n"),
+        (
+            &["-v", "re=\\.", "{ print ($0 ~ re) }"][..],
+            "ab\na.b\n",
+            "0\n1\n",
+        ),
+        (&["{ print ($0 ~ \"\\.\") }"][..], "ab\n", "0\n"),
+        (&["-v", "x=a\\", "BEGIN { print x }"][..], "", "a\\\n"),
+        (&["BEGIN { print \"a\\\nb\" }"][..], "", "ab\n"),
+    ] {
+        let (stdout, stderr, status) = awk_args(args, input);
+        assert_eq!((stdout.as_str(), stderr.as_str()), (out, ""), "{args:?}");
+        assert_eq!(status, Some(0), "{args:?}");
+    }
+}
+
+/// Whether the system has the locale `name`, as `locale -a` lists it.
+fn locale_available(name: &str) -> bool {
+    let wanted = name.to_lowercase().replace("utf-8", "utf8");
+    std::process::Command::new("locale")
+        .arg("-a")
+        .output()
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .any(|l| l.to_lowercase().replace("utf-8", "utf8") == wanted)
+        })
+        .unwrap_or(false)
+}
+
+// String comparisons other than == and != follow the collation order of
+// the locale (POSIX); == and != compare the strings themselves.
+#[test]
+fn awk_string_comparison_uses_collation() {
+    let program = "BEGIN { print (\"a\" < \"B\"), (\"B\" > \"a\"), (\"a\" <= \"a\"), (\"a\" == \"A\"), (\"b\" != \"b\") }";
+    let run = |locale: &str| {
+        let out = std::process::Command::new(plib::testing::get_binary_path("awk"))
+            .arg(program)
+            .env("LC_ALL", locale)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    assert_eq!(run("C"), "0 0 1 0 0\n");
+    if locale_available("en_US.UTF-8") {
+        assert_eq!(run("en_US.UTF-8"), "1 1 1 0 0\n");
+    }
+}
+
+// An assignment that would create billions of fields at once is an error,
+// not an allocation that aborts the process or exhausts memory.
+#[test]
+fn awk_huge_field_creation_is_an_error() {
+    for program in [
+        "BEGIN { NF = 2000000000 }",
+        "BEGIN { $2147483647 = 1 }",
+        "BEGIN { $1e300 = 1 }",
+        // nor many steps that each add a few million
+        "BEGIN { for (i = 1; i <= 128; i++) NF = i * 2^19 }",
+    ] {
+        let (_, stderr, status) = awk_with_deadline(program);
+        assert_eq!(status, Some(1), "{program}: {stderr}");
+        assert!(stderr.contains("field"), "{program}: {stderr}");
+        assert!(stderr.len() < 200, "{program}: {stderr}");
+    }
+}
+
+// A record whose separator could still grow is returned once more input
+// shows that it did not, also after a long record: that delay made the
+// next check wait until the read-ahead doubled.
+#[test]
+fn awk_growable_rs_record_is_returned_when_more_input_comes() {
+    let input = format!("{}\nb\n", "a".repeat(1000));
+    assert_eq!(
+        awk_first_line_before_eof(
+            "BEGIN { RS = \"\\n+\" } { print \"got \" length($0); fflush() }",
+            &input
+        )
+        .as_deref(),
+        Some("got 1000\n")
+    );
+}
+
+// A NUL byte in the input is an ordinary character: it ended the run with
+// "string contains a NUL character".  Regular expressions match on either
+// side of it, with ^ and $ anchored at the ends of the whole string.
+#[test]
+fn awk_nul_bytes_are_ordinary_characters() {
+    assert_awk_cases(&[
+        ("{ print NR, length($0) }", "a\0b\nc\n", "1 3\n2 1\n"),
+        (
+            "{ print ($0 ~ /b/), ($0 ~ /^b/), ($0 ~ /a$/), ($0 ~ /^a/), ($0 ~ /b$/), ($0 ~ \"a.b\") }",
+            "a\0b\n",
+            "1 0 0 1 1 0\n",
+        ),
+        ("{ gsub(/b/, \"X\"); print }", "a\0b\0b\n", "a\0X\0X\n"),
+        (
+            "{ n = split($0, x, /,/); print n, length(x[2]), match(x[2], /r/), RSTART }",
+            "p,q\0r,s\n",
+            "3 3 3 3\n",
+        ),
+        ("BEGIN { FS = \",+\" } { print NF, $2 }", "a\0b,,c\n", "2 c\n"),
+        ("BEGIN { RS = \";;\" } { print length($0) }", "a\0b;;c", "3\n1\n"),
+        ("BEGIN { RS = \";+\" } { print length($0) }", "a\0b;;c", "3\n1\n"),
+        ("BEGIN { s = \"a\\0b\"; print length(s) }", "", "3\n"),
+        // od's layout differs between systems; its bytes in hex do not
+        (
+            "BEGIN { od = \"od -An -tx1 | tr -d ' \\\\n'\"; printf \"a%cb\", 0 | od; close(od); print \"\" }",
+            "",
+            "610062\n",
+        ),
+    ]);
+}
+
+// Diagnostics begin with "awk: ", and a file that cannot be opened is
+// named in the message.
+#[test]
+fn awk_diagnostics_name_the_utility_and_the_file() {
+    let missing = "/nonexistent/awk-file";
+    let reason = plib::diag::io_error_text(&std::fs::File::open(missing).unwrap_err());
+    let (_, stderr, status) = awk_args(&["1", missing], "");
+    assert_eq!(
+        stderr,
+        format!("awk: cannot open file '{missing}': {reason}\n")
+    );
+    assert_eq!(status, Some(1));
+    let program = format!("BEGIN {{ print \"x\" > \"{missing}\" }}");
+    let (_, stderr, status) = awk_args(&[&program], "");
+    assert!(
+        stderr.starts_with(&format!(
+            "awk: runtime error: cannot open file '{missing}' for writing: {reason}\n"
+        )),
+        "{stderr}"
+    );
+    assert_eq!(status, Some(1));
+    let (_, stderr, _) = awk_args(&["BEGIN { $(-1) }"], "");
+    assert!(
+        stderr.starts_with("awk: runtime error: attempt to access field -1\n"),
+        "{stderr}"
+    );
+    let (_, stderr, status) = awk_args(&["-f", missing], "");
+    assert_eq!(
+        stderr,
+        format!("awk: cannot open file '{missing}': {reason}\n")
+    );
+    assert_eq!(status, Some(1));
+    let (_, stderr, status) = awk_args(&[], "");
+    assert_eq!(stderr, "awk: missing program argument\n");
+    assert_eq!(status, Some(1));
+}
+
+// system() returns 256 plus the signal number for a command killed by a
+// signal, as close() of a pipe does and as gawk and mawk do; it returned
+// 128 plus the number.
+#[test]
+fn awk_system_status_of_a_signalled_command() {
+    assert_awk_cases(&[(
+        "BEGIN { print system(\"kill -9 $$\"); print \"\" | \"kill -9 $$\"; print close(\"kill -9 $$\") }",
+        "",
+        "265\n265\n",
+    )]);
+}
+
+// Dynamic regular expressions are compiled once and reused; many different
+// ones, more than the cache holds, still each match as they should.
+#[test]
+fn awk_dynamic_regexes_stay_correct_past_the_cache() {
+    assert_awk_cases(&[(
+        "{ for (i = 0; i < 200; i++) n += ($0 ~ (\"^\" (i % 100) \"$\")); for (i = 0; i < 3; i++) m += ($0 ~ \"x\") } END { print n, m }",
+        "5\n50\n500\nx\n",
+        "4 3\n",
+    )]);
+}
+
+// A function may recurse tens of thousands of calls deep; the operand
+// stack held 2048 values, so about a thousand calls overflowed it.
+#[test]
+fn awk_deep_recursion() {
+    assert_awk_cases(&[(
+        "function f(k) { if (k == 0) return 0; return 1 + f(k - 1) } BEGIN { print f(20000) }",
+        "",
+        "20000\n",
+    )]);
+}
+
+// A search after an earlier match sees the character before it, so a word
+// boundary is found only where there is one: gsub(/\</, "X") put an X
+// before every letter but the first of each word.  (Apple's regcomp has no
+// \< or \>.)
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn awk_regex_search_after_a_match_sees_the_character_before() {
+    assert_awk_cases(&[(
+        "BEGIN { s = \"ab cd\"; t = s; gsub(/\\</, \"X\", s); gsub(/\\>/, \"Y\", t); print s, t }",
+        "",
+        "Xab Xcd abY cdY\n",
+    ), (
+        "{ gsub(/\\</, \"X\"); print }",
+        "ab cd\0ef gh\n",
+        "Xab Xcd\0Xef Xgh\n",
+    )]);
+}
+
+// regexec cannot be given a NUL byte, so a dynamic regular expression
+// holding one is an error that says so.
+#[test]
+fn awk_regex_with_nul_is_an_error_saying_so() {
+    let (_, stderr, status) = awk_with_deadline("BEGIN { print (\"a\" ~ \"\\0\") }");
+    assert!(
+        stderr
+            .starts_with("awk: runtime error: a regular expression cannot hold a NUL character\n"),
+        "{stderr}"
+    );
+    assert_eq!(status, Some(1));
+}
+
+// Reclaiming the slot a for-in loop emptied costs time for that slot, not
+// for the whole array: deleting one element per loop left by break,
+// 40000 times over, took half a minute.
+#[test]
+fn awk_reclaiming_slots_after_each_loop_is_quick() {
+    assert_awk_cases(&[(
+        "BEGIN { for (i = 0; i < 40000; i++) a[i]; for (j = 0; j < 40000; j++) for (k in a) { delete a[k]; break }; print length(a) }",
+        "",
+        "0\n",
+    )]);
+}
+
+// The call trace of a runtime error in a deep recursion shows the
+// innermost calls and the outermost, not every one of thousands.
+#[test]
+fn awk_call_trace_of_a_deep_recursion_is_short() {
+    let program = "function f(k) { return k == 0 ? $(-1) : f(k - 1) } BEGIN { f(5000) }";
+    let (_, stderr, status) = awk_with_deadline(program);
+    assert_eq!(status, Some(1));
+    let lines: Vec<&str> = stderr.lines().filter(|l| !l.is_empty()).collect();
+    assert!(lines.len() < 20, "{} lines", lines.len());
+    assert_eq!(lines[0], "awk: runtime error: attempt to access field -1");
+    assert!(lines.contains(&"=> ... 4991 more calls"), "{stderr}");
+    assert_eq!(lines.last().copied(), Some("=> <start> at :1:60"));
+}
+
+// A printf field width or precision beyond what C allows (INT_MAX) is a
+// runtime error; it was taken as given, and the allocation for it
+// aborted the process, or a literal one overflowed silently.
+#[test]
+fn awk_huge_printf_width_is_an_error() {
+    for program in [
+        "BEGIN { printf \"%*d\", 1e15, 1 }",
+        "BEGIN { printf \"%.*f\", 1e15, 1 }",
+        "BEGIN { printf \"%99999999999999999999d\", 1 }",
+        "BEGIN { x = sprintf(\"%.3000000000s\", \"a\") }",
+    ] {
+        let (_, stderr, status) = awk_with_deadline(program);
+        assert_eq!(status, Some(1), "{program}: {stderr}");
+        assert!(stderr.contains("too large"), "{program}: {stderr}");
+    }
+}
+
+// fflush of an open output file or pipe returns 0; it required the name to
+// be open as both, so it returned -1 for every one.
+#[test]
+fn awk_fflush_of_an_open_file_or_pipe() {
+    let tmp = plib::tmp::TempDir::new().unwrap();
+    let file = tmp.path().join("out.txt");
+    let program = format!(
+        "BEGIN {{ print \"x\" > \"{0}\"; a = fflush(\"{0}\"); print \"y\" | \"cat\"; b = fflush(\"cat\"); close(\"cat\"); print a, b, fflush(\"nope\") }}",
+        file.display()
+    );
+    assert_awk_cases(&[(&program, "", "y\n0 0 -1\n")]);
+}
+
+// Output reaches its destination in the order awk writes it, also around
+// the commands awk runs: standard output is flushed before a command
+// starts or is waited for, before reading from a command, and at the end
+// of the run, whatever ends it.  /dev/stdout shares awk's standard
+// output and /dev/stderr is its standard error.
+#[test]
+fn awk_output_order_around_commands_and_special_files() {
+    assert_awk_cases(&[
+        ("BEGIN { printf \"a\"; system(\"echo b\") }", "", "ab\n"),
+        (
+            "BEGIN { printf \"a\"; print \"b\" | \"cat\"; close(\"cat\"); print \"c\" }",
+            "",
+            "ab\nc\n",
+        ),
+        (
+            "BEGIN { print \"x\"; print \"b\" | \"sort\"; close(\"sort\"); print \"y\" }",
+            "",
+            "x\nb\ny\n",
+        ),
+        (
+            "BEGIN { printf \"a\"; \"echo b\" | getline v; print v }",
+            "",
+            "ab\n",
+        ),
+        (
+            "BEGIN { print 1; print 2 > \"/dev/stdout\"; printf \"3\" >> \"/dev/stdout\"; print 4; print close(\"/dev/stdout\") }",
+            "",
+            "1\n2\n34\n0\n",
+        ),
+        ("BEGIN { printf \"x\"; exit }", "", "x"),
+        ("{ printf \"%s\", $0 } END { printf \"!\" }", "a\nb\n", "ab!"),
+    ]);
+    let (stdout, stderr, status) = awk_args(
+        &["BEGIN { print \"e\" > \"/dev/stderr\"; print \"o\" }"],
+        "",
+    );
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), status),
+        ("o\n", "e\n", Some(0))
+    );
+    let (stdout, stderr, status) = awk_args(&["BEGIN { printf \"before\"; $(-1) }"], "");
+    assert_eq!(stdout, "before");
+    assert!(stderr.starts_with("awk: runtime error"), "{stderr}");
+    assert_eq!(status, Some(1));
+}
+
+// A failed write to an output file, which may show only when its buffer
+// is flushed at the end, is an error naming the file.
+#[cfg(target_os = "linux")]
+#[test]
+fn awk_write_error_on_an_output_file() {
+    let (_, stderr, status) = awk_args(&["BEGIN { print \"x\" > \"/dev/full\" }"], "");
+    assert!(stderr.contains("/dev/full"), "{stderr}");
+    assert_eq!(status, Some(1));
+    let (_, _, status) = awk_args(
+        &["BEGIN { print \"x\" > \"/dev/full\"; print close(\"/dev/full\") }"],
+        "",
+    );
+    assert_eq!(status, Some(0));
+}
+
+// At the end of the run awk's own output is written before the commands
+// it printed to are waited for, so it comes before what they print then.
+#[test]
+fn awk_output_at_exit_comes_before_the_commands_output() {
+    assert_awk_cases(&[("BEGIN { print \"x\" | \"cat\"; print \"y\" }", "", "y\nx\n")]);
+}
+
+/// Runs awk with `args`, its standard output going to `stdout`, and
+/// returns its standard error and exit status.
+#[cfg(target_os = "linux")]
+fn awk_to(args: &[&str], stdout: std::fs::File) -> (String, Option<i32>) {
+    let out = std::process::Command::new(plib::testing::get_binary_path("awk"))
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(stdout)
+        .output()
+        .unwrap();
+    (
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code(),
+    )
+}
+
+// A failure at the end of the run does not lose the output awk had
+// collected, and a runtime error is reported as itself even when writing
+// out that output fails too.
+#[cfg(target_os = "linux")]
+#[test]
+fn awk_output_survives_a_failure_at_the_end() {
+    let tmp = plib::tmp::TempDir::new().unwrap();
+    let path = tmp.path().join("out");
+    let (stderr, status) = awk_to(
+        &["BEGIN { print \"hello\"; print \"x\" > \"/dev/full\" }"],
+        std::fs::File::create(&path).unwrap(),
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
+    assert!(stderr.contains("/dev/full"), "{stderr}");
+    assert_eq!(status, Some(1));
+    let (stderr, status) = awk_to(
+        &["BEGIN { print \"a\"; $(-1) }"],
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap(),
+    );
+    assert!(
+        stderr.starts_with("awk: runtime error: attempt to access field -1"),
+        "{stderr}"
+    );
+    assert_eq!(status, Some(1));
+}
+
+// getline from a file awk is writing reads what awk has written to it:
+// the file's output buffer is flushed when getline opens it.
+#[test]
+fn awk_getline_reads_what_awk_wrote_to_the_file() {
+    let tmp = plib::tmp::TempDir::new().unwrap();
+    let file = tmp.path().join("t");
+    let program = format!(
+        "BEGIN {{ print \"data\" > \"{0}\"; while ((getline l < \"{0}\") > 0) n++; print n + 0, l }}",
+        file.display()
+    );
+    assert_awk_cases(&[(&program, "", "1 data\n")]);
+}
+
+// Output is written out before awk waits for more input, so a filter in a
+// pipeline fed a line at a time passes each line on when it comes, without
+// fflush, though its standard output is buffered.
+#[test]
+fn awk_output_is_written_before_waiting_for_input() {
+    assert_eq!(
+        awk_first_line_before_eof("{ print \"got \" $0 }", "abc\n").as_deref(),
+        Some("got abc\n")
+    );
+    assert_eq!(
+        awk_first_line_before_eof(
+            "BEGIN { while ((getline l) > 0) print \"got \" l }",
+            "abc\n"
+        )
+        .as_deref(),
+        Some("got abc\n")
+    );
+}
+
+// The precision of %s is the most characters to write, so a large one
+// needs no room: it was reserved, and failed under a memory limit.
+#[test]
+fn awk_large_string_precision_needs_no_room() {
+    let awk = plib::testing::get_binary_path("awk");
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(
+            "ulimit -v 500000; \"$0\" 'BEGIN { printf \"%.2000000000s|%.1999999999c\\n\", \"abc\", \"d\" }'",
+        )
+        .arg(awk)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "abc|d\n");
+    assert_eq!(out.status.code(), Some(0));
+}
+
+// A record read with more fields than an assignment may create on its own
+// may still be extended past them by a few.
+#[test]
+fn awk_huge_input_record_can_grow() {
+    let line = format!("{}\n", vec!["x"; 1_500_000].join(","));
+    assert_awk_cases(&[(
+        "BEGIN { FS = \",\" } { $(NF + 1) = \"y\"; print NF, $NF }",
+        &line,
+        "1500001 y\n",
+    )]);
+}
+
+// The files of several -f options form one program, their concatenation,
+// as POSIX says: a rule may begin in one and end in the next.  Syntax and
+// runtime errors are still reported with the file and line in it.
+#[test]
+fn awk_program_files_are_concatenated() {
+    let tmp = plib::tmp::TempDir::new().unwrap();
+    let write = |name: &str, text: &str| {
+        let path = tmp.path().join(name);
+        std::fs::write(&path, text).unwrap();
+        path.to_string_lossy().into_owned()
+    };
+    let a = write("a.awk", "BEGIN {");
+    let b = write("b.awk", "print \"ok\" }\n");
+    let (stdout, stderr, status) = awk_args(&["-f", &a, "-f", &b], "");
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), status),
+        ("ok\n", "", Some(0))
+    );
+
+    let good = write("good.awk", "BEGIN { x = 1 }\n");
+    let bad = write("bad.awk", "\n\nBEGIN { @ }\n");
+    let (_, stderr, status) = awk_args(&["-f", &good, "-f", &bad], "");
+    assert!(stderr.contains(&format!("--> {bad}:3:9")), "{stderr}");
+    assert_ne!(status, Some(0));
+
+    let main = write("main.awk", "BEGIN { f() }\n");
+    let lib = write("lib.awk", "\nfunction f() { return $(-1) }\n");
+    let (_, stderr, status) = awk_args(&["-f", &main, "-f", &lib], "");
+    assert!(stderr.contains(&format!("=> f at {lib}:2:")), "{stderr}");
+    assert!(
+        stderr.contains(&format!("=> <start> at {main}:1:")),
+        "{stderr}"
+    );
+    assert_eq!(status, Some(1));
+}
+
+// At the end of the run the output files are written before the pipes are
+// closed, as the commands may read them.
+#[test]
+fn awk_files_are_written_before_pipes_close_at_exit() {
+    let tmp = plib::tmp::TempDir::new().unwrap();
+    let file = tmp.path().join("f");
+    let program = format!(
+        "BEGIN {{ print \"cat {0}\" | \"sh\"; print \"hello\" > \"{0}\" }}",
+        file.display()
+    );
+    assert_awk_cases(&[(&program, "", "hello\n")]);
+}
+
+// Standard input named twice is read on from where the first left off:
+// each "-" had its own read-ahead, so nextfile threw away the rest.
+#[test]
+fn awk_stdin_operands_share_their_input() {
+    let (stdout, stderr, status) =
+        awk_args(&["FNR == 1 { print; nextfile }", "-", "-"], "a\nb\nc\n");
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), status),
+        ("a\nb\n", "", Some(0))
+    );
+}
+
+// A failure to write out standard output before reading more input is not
+// a failure of the input: the input is still read, and the write error is
+// reported at the end.
+#[cfg(target_os = "linux")]
+#[test]
+fn awk_stdout_failure_before_a_read_is_not_an_input_error() {
+    use std::io::Write;
+    let mut child = std::process::Command::new(plib::testing::get_binary_path("awk"))
+        .arg("BEGIN { print \"x\" } { n++ } END { print \"n=\" n > \"/dev/stderr\" }")
+        .stdin(std::process::Stdio::piped())
+        .stdout(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap(),
+        )
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"a\nb\nc\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.starts_with("n=3\n"), "{stderr}");
+    assert!(stderr.contains("write error"), "{stderr}");
+    assert_eq!(out.status.code(), Some(1));
+}
+
+// A regular-expression separator in a full read is found at once: only
+// short reads were searched, so a record whose separator came in a full
+// 64 KiB read waited for more input.
+#[test]
+fn awk_regex_rs_in_a_full_read_ends_the_record_at_once() {
+    let input = format!("a;{}", "x".repeat(65534));
+    assert_eq!(
+        awk_first_line_before_eof(
+            "BEGIN { RS = \";|#\" } { print \"got \" $0; fflush() }",
+            &input
+        )
+        .as_deref(),
+        Some("got a\n")
+    );
 }

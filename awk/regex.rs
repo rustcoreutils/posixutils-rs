@@ -11,6 +11,7 @@ use crate::charset;
 use plib::regex::{Match, Regex as PlibRegex, RegexFlags};
 use std::borrow::Cow;
 use std::ffi::CString;
+use std::rc::Rc;
 
 /// A regex wrapper that provides CString-compatible API for AWK.
 /// Internally uses plib::regex for POSIX ERE support.
@@ -48,6 +49,8 @@ pub struct MatchIter<'re> {
     /// offset of each byte, and of the end.
     string_offsets: Option<Vec<usize>>,
     next_start: usize,
+    /// Whether the subject holds a NUL byte (see [`Regex::find_from`]).
+    has_nul: bool,
     regex: &'re Regex,
 }
 
@@ -84,16 +87,10 @@ impl Iterator for MatchIter<'_> {
             return None;
         }
 
-        // Find match starting from current offset
-        let subject = &self.bytes[self.next_start..];
-        let m = if self.next_start == 0 {
-            self.regex.inner.find_bytes(subject)?
-        } else {
-            self.regex.inner.find_notbol_bytes(subject)?
-        };
-
-        let start = self.next_start + m.start;
-        let end = self.next_start + m.end;
+        let m = self
+            .regex
+            .find_from(&self.bytes, self.next_start, self.has_nul)?;
+        let (start, end) = (m.start, m.end);
         let result = RegexMatch {
             start: self.string_offset(start),
             end: self.string_offset(end),
@@ -246,7 +243,36 @@ fn translate_awk_escapes(pattern: &[u8]) -> Cow<'_, [u8]> {
     Cow::Owned(out)
 }
 
+thread_local! {
+    /// The dynamic regular expressions compiled lately, by their text.
+    static DYNAMIC_REGEXES: std::cell::RefCell<std::collections::HashMap<String, Rc<Regex>>> =
+        Default::default();
+}
+
+/// How many dynamic regular expressions are kept compiled; past that the
+/// cache starts over.
+const DYNAMIC_REGEX_CACHE_SIZE: usize = 64;
+
 impl Regex {
+    /// The ERE `pattern`, the value of an expression used as a regular
+    /// expression: compiled once and reused while it stays in a small
+    /// cache, since `$0 ~ pattern` evaluates it for every record.
+    pub fn dynamic(pattern: &str) -> Result<Rc<Self>, String> {
+        if let Some(re) = DYNAMIC_REGEXES.with_borrow(|cache| cache.get(pattern).cloned()) {
+            return Ok(re);
+        }
+        let pattern_bytes = charset::to_cstring(pattern)
+            .map_err(|_| "a regular expression cannot hold a NUL character".to_string())?;
+        let re = Rc::new(Self::new(pattern_bytes)?);
+        DYNAMIC_REGEXES.with_borrow_mut(|cache| {
+            if cache.len() >= DYNAMIC_REGEX_CACHE_SIZE {
+                cache.clear();
+            }
+            cache.insert(pattern.to_string(), re.clone());
+        });
+        Ok(re)
+    }
+
     /// Compile the awk ERE whose bytes are `regex`.
     pub fn new(regex: CString) -> Result<Self, String> {
         let bytes = regex.into_bytes();
@@ -258,24 +284,71 @@ impl Regex {
         })
     }
 
+    /// The first match in the subject `bytes` that starts at or after
+    /// `from`, as byte offsets; `^` matches only at the start of the
+    /// subject.
+    ///
+    /// regexec takes a C string, so a subject holding NUL bytes is searched
+    /// one piece between them at a time, leftmost first, `^` matching only
+    /// in the first piece and `$` only in the last.  No pattern matches a
+    /// NUL byte itself, or a match across one.
+    ///
+    /// `has_nul` says whether `bytes` holds a NUL byte, which the caller
+    /// finds out once for a subject searched many times.
+    fn find_from(&self, bytes: &[u8], from: usize, has_nul: bool) -> Option<RegexMatch> {
+        let found = |m: Match, offset: usize| RegexMatch {
+            start: offset + m.start,
+            end: offset + m.end,
+        };
+        // A search from `from` sees the text before it as context: a word
+        // boundary at `from` looks at the character before it.
+        if !has_nul {
+            return self
+                .inner
+                .find_bytes_at(bytes, from, false)
+                .map(|m| found(m, 0));
+        }
+        // the piece that holds `from`, then those after it
+        let mut start = bytes[..from]
+            .iter()
+            .rposition(|&b| b == 0)
+            .map_or(0, |p| p + 1);
+        let mut from = from;
+        loop {
+            let end = bytes[from..]
+                .iter()
+                .position(|&b| b == 0)
+                .map_or(bytes.len(), |p| from + p);
+            let piece = &bytes[start..end];
+            let not_eol = end < bytes.len();
+            let m = if from > start {
+                // `^` cannot match where the search starts
+                self.inner.find_bytes_at(piece, from - start, not_eol)
+            } else {
+                self.inner.find_bytes_flags(piece, start > 0, not_eol)
+            };
+            if let Some(m) = m {
+                return Some(found(m, start));
+            }
+            if end == bytes.len() {
+                return None;
+            }
+            start = end + 1;
+            from = start;
+        }
+    }
+
     /// Returns the first match in the raw input bytes `bytes` that is not
     /// empty, as byte offsets: an empty match separates nothing.
     pub fn find_nonempty_bytes(&self, bytes: &[u8]) -> Option<RegexMatch> {
+        let has_nul = bytes.contains(&0);
         let mut start = 0;
         while start <= bytes.len() {
-            let subject = &bytes[start..];
-            let m = if start == 0 {
-                self.inner.find_bytes(subject)?
-            } else {
-                self.inner.find_notbol_bytes(subject)?
-            };
+            let m = self.find_from(bytes, start, has_nul)?;
             if m.start != m.end {
-                return Some(RegexMatch {
-                    start: start + m.start,
-                    end: start + m.end,
-                });
+                return Some(m);
             }
-            start = next_char(bytes, start + m.start);
+            start = next_char(bytes, m.start);
         }
         None
     }
@@ -294,6 +367,7 @@ impl Regex {
             ),
         };
         MatchIter {
+            has_nul: bytes.contains(&0),
             bytes: bytes.into_owned(),
             string_offsets,
             next_start: 0,
@@ -305,9 +379,14 @@ impl Regex {
         &self.pattern_string
     }
 
-    /// Whether the regular expression matches the bytes of `string`.
-    pub fn matches(&self, string: &CString) -> bool {
-        self.inner.is_match_bytes(string.as_bytes())
+    /// Whether the regular expression matches the string.
+    pub fn matches(&self, string: &str) -> bool {
+        let bytes = charset::encode(string);
+        if bytes.contains(&0) {
+            self.find_from(&bytes, 0, true).is_some()
+        } else {
+            self.inner.is_match_bytes(&bytes)
+        }
     }
 }
 
@@ -350,7 +429,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     fn test_regex_matches() {
         let ere = regex_from_str("ab*c");
-        assert!(ere.matches(&CString::new("abbbbc").unwrap()));
+        assert!(ere.matches("abbbbc"));
     }
 
     #[test]

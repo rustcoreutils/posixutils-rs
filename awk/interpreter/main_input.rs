@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use super::io::{FileStream, RecordReader, StdinRecordReader};
+use super::io::{FileStream, StdinRecordReader};
 use super::value::{AwkValue, AwkValueRef, AwkValueVariant};
 use super::{maybe_numeric_string, parse_assignment, GlobalEnv};
 use crate::compiler::escape_string_contents;
@@ -22,7 +22,10 @@ pub(super) struct MainInput {
     /// The ARGV index of the next operand.
     next_operand: usize,
     /// The file being read.
-    reader: Option<Box<dyn RecordReader>>,
+    reader: Option<Reader>,
+    /// The reader of standard input, kept for every "-" operand, so that
+    /// what one read ahead is the next one's input.
+    stdin: Option<StdinRecordReader>,
     /// Whether a file operand has been opened; if none is, standard input
     /// is read.
     opened_a_file: bool,
@@ -31,6 +34,13 @@ pub(super) struct MainInput {
     /// The global index of each variable of the program, for assignment
     /// operands.
     program_globals: HashMap<String, u32>,
+}
+
+/// What the main input is reading.
+enum Reader {
+    File(FileStream),
+    /// Standard input, read by `MainInput::stdin`.
+    Stdin,
 }
 
 /// A pointer to the value of `globals[var]`.  The main input is read
@@ -45,6 +55,7 @@ impl MainInput {
         Self {
             next_operand: 1,
             reader: None,
+            stdin: None,
             opened_a_file: false,
             finished: false,
             program_globals,
@@ -68,7 +79,14 @@ impl MainInput {
     ) -> Result<Option<String>, String> {
         loop {
             if let Some(reader) = &mut self.reader {
-                if let Some(record) = reader.read_next_record(&global_env.rs)? {
+                let record = match reader {
+                    Reader::File(file) => file.read_next_record(&global_env.rs)?,
+                    Reader::Stdin => self
+                        .stdin
+                        .get_or_insert_with(StdinRecordReader::default)
+                        .read_next_record(&global_env.rs)?,
+                };
+                if let Some(record) = record {
                     return Ok(Some(record));
                 }
                 self.reader = None;
@@ -126,9 +144,11 @@ impl MainInput {
             }
 
             self.reader = Some(if operand.as_str() == "-" {
-                Box::new(StdinRecordReader::default())
+                Reader::Stdin
             } else {
-                Box::new(FileStream::open(&operand)?)
+                Reader::File(FileStream::open(&operand).map_err(|reason| {
+                    gettextrs::gettext!("cannot open file '{}': {}", operand, reason)
+                })?)
             });
             self.opened_a_file = true;
             unsafe { &mut *global(globals, SpecialVar::Filename) }.value =

@@ -61,9 +61,7 @@ impl Test {
     }
 
     fn run_correct(mut self) -> TestResult {
-        let mut stack = iter::repeat_with(|| StackValue::Invalid)
-            .take(250)
-            .collect::<Vec<StackValue>>();
+        let mut stack = StackMemory::new(250);
         let mut interpreter = Interpreter::new(
             Array::default(),
             Array::default(),

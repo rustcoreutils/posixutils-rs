@@ -351,7 +351,7 @@ impl Default for Record {
 /// The field number the value `number` of a `$` expression designates,
 /// truncated toward zero; a negative one, or one past the limit, is an
 /// error.  (POSIX leaves anything but a non-negative integer unspecified;
-/// gawk, mawk and the one true awk make a negative one fatal.)
+/// gawk and mawk make a negative one fatal.)
 pub(crate) fn record_index(number: f64) -> Result<usize, String> {
     let number = number.trunc();
     if number < 0.0 || number > Record::MAX_FIELDS as f64 {

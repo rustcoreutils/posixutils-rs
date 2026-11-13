@@ -403,8 +403,8 @@ pub fn fmt_write_signed_f64(target: &mut String, value: f64, args: &FormatArgs) 
 
 /// An integer conversion of a value it cannot show (one beyond 64 bits, or
 /// one that is not finite), written as by `%g` with the same flags and
-/// width, as gawk and the one true awk do (though they write an infinity
-/// with a plus sign; this writes it as C's `%g` does).
+/// width, as gawk does (though it writes an infinity with a plus sign;
+/// this writes it as C's `%g` does).
 pub fn fmt_write_integer_as_float(target: &mut String, value: f64, args: &FormatArgs) {
     let args = FormatArgs {
         precision: None,

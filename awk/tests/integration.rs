@@ -2328,8 +2328,7 @@ fn awk_float_conversions_follow_c() {
 // printf's integer conversions take any number: %d writes every digit of a
 // value beyond 64 bits (it saturated), %u, %o and %x write a negative
 // value as its 64-bit two's complement (it was a fatal error), and one
-// beyond what they can show is written as by %g, as gawk and the one true
-// awk do.
+// beyond what they can show is written as by %g, as gawk does.
 #[test]
 fn awk_printf_integer_conversions_of_any_number() {
     assert_awk_cases(&[
@@ -2513,8 +2512,8 @@ fn awk_record_with_more_than_65535_fields() {
     ]);
 }
 
-// A negative field number is an error, as in gawk, mawk and the one true
-// awk; it was taken as $0, so $(-1) = "x" replaced the record.
+// A negative field number is an error, as in gawk and mawk; it was taken
+// as $0, so $(-1) = "x" replaced the record.
 #[test]
 fn awk_negative_field_is_an_error() {
     for program in [
@@ -2725,8 +2724,8 @@ fn awk_diagnostics_name_the_utility_and_the_file() {
 }
 
 // system() returns 256 plus the signal number for a command killed by a
-// signal, as close() of a pipe does and as gawk, mawk and the one true awk
-// do; it returned 128 plus the number.
+// signal, as close() of a pipe does and as gawk and mawk do; it returned
+// 128 plus the number.
 #[test]
 fn awk_system_status_of_a_signalled_command() {
     assert_awk_cases(&[(

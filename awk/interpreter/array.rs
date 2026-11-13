@@ -85,9 +85,24 @@ impl Array {
     }
 
     /// Ends an iterator before it reached its end (`break` or `return` out
-    /// of a `for (k in a)` loop).
+    /// of a `for (k in a)` loop).  When the last iteration ends, the slots
+    /// its deletions emptied are reclaimed.
     pub fn end_iterator(&mut self) {
         self.iterator_count -= 1;
+        if self.iterator_count == 0 && self.empty_slots > 0 {
+            self.compact();
+        }
+    }
+
+    /// Removes the empty slots, moving the elements after them down.  No
+    /// iteration may be going on; a reference to an element by its slot
+    /// finds it again by its key (see [`Array::element`]).
+    fn compact(&mut self) {
+        self.pairs.retain(Option::is_some);
+        for (index, (key, _)) in self.pairs.iter().flatten().enumerate() {
+            *self.key_map.get_mut(key).expect("every element has a slot") = index;
+        }
+        self.empty_slots = 0;
     }
 
     /// Get the `ValueIndex` of the key in the array. If the key does not exist, it will be inserted.
@@ -95,13 +110,7 @@ impl Array {
         match self.key_map.entry(key.clone()) {
             Entry::Occupied(e) => ValueIndex { index: *e.get() },
             Entry::Vacant(e) => {
-                let pair_index = store_pair(
-                    key,
-                    AwkValue::uninitialized_scalar(),
-                    &mut self.pairs,
-                    &mut self.empty_slots,
-                    self.iterator_count,
-                );
+                let pair_index = store_pair(key, AwkValue::uninitialized_scalar(), &mut self.pairs);
                 e.insert(pair_index);
                 ValueIndex { index: pair_index }
             }
@@ -153,13 +162,7 @@ impl Array {
                 Ok(ValueIndex { index: pair_index })
             }
             Entry::Vacant(e) => {
-                let pair_index = store_pair(
-                    key,
-                    value,
-                    &mut self.pairs,
-                    &mut self.empty_slots,
-                    self.iterator_count,
-                );
+                let pair_index = store_pair(key, value, &mut self.pairs);
                 e.insert(pair_index);
                 Ok(ValueIndex { index: pair_index })
             }
@@ -199,47 +202,45 @@ impl<S: Into<String>, A: Into<AwkValue>> FromIterator<(S, A)> for Array {
     }
 }
 
-/// Stores a new element: in an empty slot if there is one, unless an
-/// iteration is going on, which must not visit it.
-fn store_pair(
-    key: Key,
-    value: AwkValue,
-    pairs: &mut Vec<Option<KeyValuePair>>,
-    empty_slots: &mut usize,
-    iterator_count: usize,
-) -> usize {
-    let reuse_a_slot = *empty_slots > 0 && iterator_count == 0;
-    if reuse_a_slot {
-        *empty_slots -= 1;
-    }
-    insert_pair(key, value, pairs, !reuse_a_slot)
-}
-
-fn insert_pair(
-    key: Key,
-    value: AwkValue,
-    pairs: &mut Vec<Option<KeyValuePair>>,
-    no_empty_slots: bool,
-) -> usize {
-    if no_empty_slots {
-        let index = pairs.len();
-        pairs.push(Some((key, value)));
-        index
-    } else {
-        let index = pairs
-            .iter()
-            .enumerate()
-            .filter_map(|(i, v)| if v.is_none() { Some(i) } else { None })
-            .next()
-            .expect("map has no empty key slots");
-        pairs[index] = Some((key, value));
-        index
-    }
+/// Stores a new element at the end of the slots, where an iteration going
+/// on does not visit it.  (Empty slots exist only during an iteration.)
+fn store_pair(key: Key, value: AwkValue, pairs: &mut Vec<Option<KeyValuePair>>) -> usize {
+    pairs.push(Some((key, value)));
+    pairs.len() - 1
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The slots emptied by deletions during an iteration are reclaimed
+    /// when it ends: refilling them scanned for each hole from the start,
+    /// which made `for (k in a) delete a[k]` and a refill quadratic.
+    #[test]
+    fn holes_left_by_an_iteration_are_reclaimed_at_its_end() {
+        let mut array = Array::default();
+        for i in 0..10 {
+            array.set(i.to_string(), i as f64).unwrap();
+        }
+        let mut iter = array.key_iter();
+        while let Some(key) = array.key_iter_next(&mut iter) {
+            if key.parse::<i32>().unwrap() % 2 == 0 {
+                array.delete(&key);
+            }
+        }
+        assert_eq!(array.pairs.len(), 5);
+        assert_eq!(array.empty_slots, 0);
+        for i in (1..10).step_by(2) {
+            assert_eq!(array.get(&i.to_string()), Some(&AwkValue::from(i as f64)));
+        }
+        // a loop left by `break` reclaims them too
+        let mut iter = array.key_iter();
+        let key = array.key_iter_next(&mut iter).unwrap();
+        array.delete(&key);
+        array.end_iterator();
+        assert_eq!(array.pairs.len(), 4);
+        assert_eq!(array.len(), 4);
+    }
 
     #[test]
     fn iterate_through_empty_array() {

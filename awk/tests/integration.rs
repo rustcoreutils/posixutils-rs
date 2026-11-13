@@ -2242,3 +2242,26 @@ fn awk_array_element_assigned_after_rhs_changes_the_array() {
         ),
     ]);
 }
+
+// With RS = "", a last paragraph of one line with no newline after it is
+// still a record; it was dropped.
+#[test]
+fn awk_paragraph_mode_keeps_a_last_line_without_newline() {
+    assert_awk_cases(&[
+        (
+            "BEGIN { RS = \"\" } { print NR \":\" $0 }",
+            "a\n\nb",
+            "1:a\n2:b\n",
+        ),
+        (
+            "BEGIN { RS = \"\" } { print NR \":\" $0 }",
+            "abc",
+            "1:abc\n",
+        ),
+        (
+            "BEGIN { RS = \"\" } { print NR \":\" $0 }",
+            "a\n\n\nb\nc",
+            "1:a\n2:b\nc\n",
+        ),
+    ]);
+}

@@ -160,7 +160,13 @@ pub trait RecordReader: Iterator<Item = ReadResult> {
                 // Skip leading blank lines
                 let mut line_buf = Vec::new();
                 loop {
-                    let next = read_iter_next!(self);
+                    // at the end of the input, a first line with no
+                    // newline after it is the whole record
+                    let next = match self.next() {
+                        Some(byte_result) => byte_result?,
+                        None if line_buf.is_empty() => return Ok(None),
+                        None => return Ok(Some(bytes_to_string(line_buf))),
+                    };
                     if next == b'\n' {
                         if line_buf.is_empty() {
                             // blank line, keep skipping
@@ -623,6 +629,16 @@ mod tests {
     fn split_records_with_paragraph_separator() {
         let records = split_records("record1\nrecord2\n\nrecord3\n", RecordSeparator::Null);
         assert_eq!(records, vec!["record1\nrecord2", "record3"]);
+    }
+
+    #[test]
+    fn split_paragraphs_without_final_newline() {
+        let records = split_records("a\n\nb", RecordSeparator::Null);
+        assert_eq!(records, vec!["a", "b"]);
+        let records = split_records("abc", RecordSeparator::Null);
+        assert_eq!(records, vec!["abc"]);
+        let records = split_records("\n\nabc", RecordSeparator::Null);
+        assert_eq!(records, vec!["abc"]);
     }
 
     #[test]

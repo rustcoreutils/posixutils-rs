@@ -68,15 +68,16 @@ pub fn write_stdout(s: &str) -> Result<(), String> {
 /// failure for [`stdout_write_error`]: before an error is reported, which
 /// such a failure must not replace.
 pub fn flush_stdout_quietly() {
-    let pending = BUFFER.with_borrow_mut(|buffer| buffer.as_mut().map(std::mem::take));
-    let mut stdout = std::io::stdout().lock();
-    let _ = stdout
-        .write_all(&pending.unwrap_or_default())
-        .and_then(|_| stdout.flush());
+    let _ = write_out();
 }
 
 /// Writes out what standard output has collected.
 pub fn flush_stdout() -> Result<(), String> {
+    write_out().map_err(write_error)
+}
+
+/// Writes the collected output to standard output and flushes it.
+fn write_out() -> std::io::Result<()> {
     let pending = BUFFER.with_borrow_mut(|buffer| match buffer {
         Some(buffer) => std::mem::take(buffer),
         None => Vec::new(),
@@ -92,5 +93,5 @@ pub fn flush_stdout() -> Result<(), String> {
             }
         }
     });
-    result.map_err(write_error)
+    result
 }

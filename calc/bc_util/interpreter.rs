@@ -633,8 +633,11 @@ impl Interpreter {
                 call_result
             }
             ExprInstruction::Assignment { named, value } => {
+                // The element is chosen before the value runs, as GNU bc
+                // does and as a compound assignment does.
+                let slot = self.resolve(named, out)?;
                 let value = self.eval_expr(value, out)?;
-                self.write_named(named, out)?.clone_from(&value);
+                self.slot_mut(slot).clone_from(&value);
                 Ok(value)
             }
             ExprInstruction::CompoundAssignment { named, op, value } => {

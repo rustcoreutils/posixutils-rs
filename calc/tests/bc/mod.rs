@@ -234,6 +234,13 @@ fn test_bc_compound_assignment_evaluates_the_target_once() {
     );
 }
 
+/// `a[i] = v` picks its element before `v` runs, as GNU bc does and as
+/// `a[i] op= v` does, so a value that changes `i` does not move the store.
+#[test]
+fn test_bc_assignment_resolves_its_target_first() {
+    test_bc("i=0\nb[i] = (i=2)\nb[0]\nb[2]\nquit\n", "2\n0\n");
+}
+
 /// A mismatch used to bind the missing parameter to the global of the same
 /// name, and silently drop extra arguments without evaluating them.
 #[test]

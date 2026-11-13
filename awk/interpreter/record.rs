@@ -288,14 +288,16 @@ impl Record {
 
     /// # Safety
     /// The caller has to ensure that there are no active references to the fields
-    pub(crate) unsafe fn recompute_fields(&self, global_env: &GlobalEnv) -> Result<(), String> {
+    /// The record is split with the FS in effect, which in paragraph mode
+    /// (RS = "") also separates fields at newlines.
+    pub(crate) unsafe fn recompute_fields(&self, global_env: &mut GlobalEnv) -> Result<(), String> {
         let record_str = self.read_field(0).scalar_to_string(&global_env.convfmt)?;
         let previous_last_field = *self.last_field.borrow();
         let mut fields = self.fields.borrow_mut();
         let last_field = Self::fill_fields(
             &mut fields,
             record_str.clone(),
-            &global_env.fs,
+            global_env.effective_fs()?,
             previous_last_field,
         )?;
         *fields[0].get_mut() = AwkValue::field_ref(record_str.clone(), 0);

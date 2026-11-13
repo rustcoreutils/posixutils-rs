@@ -2466,3 +2466,21 @@ fn awk_record_is_returned_before_more_input() {
         );
     }
 }
+
+// With RS = "", newline separates fields whatever FS is, also when $0 is
+// split again after it is assigned or read by plain getline.
+#[test]
+fn awk_paragraph_mode_resplit_uses_newline_too() {
+    assert_awk_cases(&[
+        (
+            "BEGIN { RS = \"\"; FS = \":\" } { $0 = \"d:e\\nf\"; print NF, $3 }",
+            "x\n",
+            "3 f\n",
+        ),
+        (
+            "BEGIN { RS = \"\"; FS = \":\" } NR == 1 { getline; print NF, $3 }",
+            "a:b\nc\n\nd:e\nf\n",
+            "3 f\n",
+        ),
+    ]);
+}

@@ -2523,3 +2523,20 @@ fn awk_negative_field_is_an_error() {
     }
     assert_awk_cases(&[("{ print $(-0.5), $1.9 }", "a b\n", "a b a\n")]);
 }
+
+// NR and FNR count past 2^32 records; they were 32-bit and wrapped to 0.
+#[test]
+fn awk_record_counters_go_past_32_bits() {
+    assert_awk_cases(&[
+        (
+            "NR == 1 { NR = 4294967295; FNR = 4294967295 } { print NR, FNR }",
+            "a\nb\n",
+            "4294967295 4294967295\n4294967296 4294967296\n",
+        ),
+        (
+            "NR == 1 { NR = 5e9 } END { print NR }",
+            "a\nb\n",
+            "5000000001\n",
+        ),
+    ]);
+}

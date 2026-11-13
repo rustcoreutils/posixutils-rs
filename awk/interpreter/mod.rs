@@ -130,8 +130,8 @@ struct GlobalEnv {
     ors: AwkString,
     ofmt: AwkString,
     rs: RecordSeparator,
-    nr: u32,
-    fnr: u32,
+    nr: i64,
+    fnr: i64,
     nf: usize,
     /// Cached FS combined with newline for paragraph mode (RS="").
     /// Invalidated when FS or RS changes.
@@ -154,8 +154,8 @@ impl GlobalEnv {
                 self.rs = as_string(value)?.try_into()?;
                 self.paragraph_fs_cache = None;
             }
-            SpecialVar::Nr => self.nr = value.scalar_as_f64() as u32,
-            SpecialVar::Fnr => self.fnr = value.scalar_as_f64() as u32,
+            SpecialVar::Nr => self.nr = value.scalar_as_f64() as i64,
+            SpecialVar::Fnr => self.fnr = value.scalar_as_f64() as i64,
             SpecialVar::Nf => self.nf = value.scalar_as_f64() as usize,
             _ => {
                 // not needed

@@ -422,7 +422,9 @@ macro_rules! compare_op {
               	if lhs.is_numeric && rhs.is_numeric {
 									$stack.push_value(bool_to_f64(strtod(lhs) $op strtod(rhs)))?;
               	} else {
-                	$stack.push_value(bool_to_f64(lhs.as_str() $op rhs.as_str()))?;
+                	$stack.push_value(bool_to_f64(
+                        crate::charset::compare_strings(lhs, rhs) $op std::cmp::Ordering::Equal
+                    ))?;
               	}
             }
             (AwkValueVariant::UninitializedScalar, AwkValueVariant::UninitializedScalar) => {
@@ -443,7 +445,11 @@ macro_rules! compare_op {
                 $stack.push_value(bool_to_f64(*x $op rhs.scalar_as_f64()))?;
             }
             (_, _) => {
-                $stack.push_value(bool_to_f64(lhs.scalar_to_string($convfmt)?.as_str() $op rhs.scalar_to_string($convfmt)?.as_str()))?;
+                let lhs = lhs.scalar_to_string($convfmt)?;
+                let rhs = rhs.scalar_to_string($convfmt)?;
+                $stack.push_value(bool_to_f64(
+                    crate::charset::compare_strings(&lhs, &rhs) $op std::cmp::Ordering::Equal
+                ))?;
             }
         }
     };

@@ -2608,3 +2608,36 @@ fn awk_undefined_escape_is_a_warning() {
         assert_eq!(status, Some(0), "{args:?}");
     }
 }
+
+/// Whether the system has the locale `name`, as `locale -a` lists it.
+fn locale_available(name: &str) -> bool {
+    let wanted = name.to_lowercase().replace("utf-8", "utf8");
+    std::process::Command::new("locale")
+        .arg("-a")
+        .output()
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .any(|l| l.to_lowercase().replace("utf-8", "utf8") == wanted)
+        })
+        .unwrap_or(false)
+}
+
+// String comparisons other than == and != follow the collation order of
+// the locale (POSIX); == and != compare the strings themselves.
+#[test]
+fn awk_string_comparison_uses_collation() {
+    let program = "BEGIN { print (\"a\" < \"B\"), (\"B\" > \"a\"), (\"a\" <= \"a\"), (\"a\" == \"A\"), (\"b\" != \"b\") }";
+    let run = |locale: &str| {
+        let out = std::process::Command::new(plib::testing::get_binary_path("awk"))
+            .arg(program)
+            .env("LC_ALL", locale)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    assert_eq!(run("C"), "0 0 1 0 0\n");
+    if locale_available("en_US.UTF-8") {
+        assert_eq!(run("en_US.UTF-8"), "1 1 1 0 0\n");
+    }
+}

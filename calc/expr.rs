@@ -171,6 +171,38 @@ fn tokenize() -> Vec<Token> {
     args.into_iter().map(parse_token).collect()
 }
 
+// Compare two operands that satisfy the integer production by their decimal
+// value, whatever their size: one too large for the arithmetic is still an
+// integer, and comparing it as a string gives the wrong answer.
+fn compare_integer_text(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    // sign and magnitude digits without leading zeros; -0 is zero
+    let split = |t: &[u8]| -> (bool, Vec<u8>) {
+        let (negative, digits) = match t.split_first() {
+            Some((b'-', rest)) => (true, rest),
+            _ => (false, t),
+        };
+        let start = digits
+            .iter()
+            .position(|&d| d != b'0')
+            .unwrap_or(digits.len());
+        let magnitude = digits[start..].to_vec();
+        (negative && !magnitude.is_empty(), magnitude)
+    };
+    let (a_negative, a_digits) = split(a);
+    let (b_negative, b_digits) = split(b);
+    let magnitude = a_digits
+        .len()
+        .cmp(&b_digits.len())
+        .then_with(|| a_digits.cmp(&b_digits));
+    match (a_negative, b_negative) {
+        (false, false) => magnitude,
+        (true, true) => magnitude.reverse(),
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+    }
+}
+
 // perform a comparison operation
 //
 // POSIX: "returns the result of a decimal integer comparison if both arguments
@@ -180,11 +212,12 @@ fn cmpop(lhs: &Token, rhs: &Token, op: CmpOp) -> Result<Token, &'static str> {
     let lhs = operand_bytes(lhs)?;
     let rhs = operand_bytes(rhs)?;
 
-    let ordering = match (integer_value(lhs), integer_value(rhs)) {
-        (Ok(a), Ok(b)) => a.cmp(&b),
+    let ordering = if is_integer_text(lhs) && is_integer_text(rhs) {
+        compare_integer_text(lhs, rhs)
+    } else {
         // Compare the operands as written; canonicalizing an integer first
         // would compare something the caller never passed.
-        _ => plib::locale::strcoll_bytes(lhs, rhs),
+        plib::locale::strcoll_bytes(lhs, rhs)
     };
 
     let result = match op {

@@ -408,3 +408,24 @@ fn expr_string_compare_honors_lc_collate() {
     expr_test_locale(&locale, &["10", ">", "9"], "1\n", 0);
     expr_test_locale(&locale, &["9", "<", "10"], "1\n", 0);
 }
+
+/// Two integers compare as integers whatever their size: one too large for
+/// the arithmetic was compared as a string, so 2^127 > 2 was false.
+#[test]
+fn expr_huge_integers_compare_numerically() {
+    const B: &str = "100000000000000000000000000000000000000000";
+    let zb = format!("0{B}");
+    let mb = format!("-{B}");
+    expr_test(&[B, ">", "99"], "1\n");
+    expr_test(&[&zb, "=", B], "1\n");
+    expr_test(
+        &["170141183460469231731687303715884105728", ">", "2"],
+        "1\n",
+    );
+    expr_test(&["--", &mb, "<", "-99"], "1\n");
+    expr_test_status(&["--", &mb, ">", "5"], "0\n", "", 1);
+    expr_test(&["--", "-0", "=", "0"], "1\n");
+    expr_test(&["--", "-0", "=", "-00"], "1\n");
+    expr_test(&["10", ">", "9"], "1\n");
+    expr_test(&["--", "-10", "<", "-9"], "1\n");
+}

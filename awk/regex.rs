@@ -11,6 +11,7 @@ use crate::charset;
 use plib::regex::{Match, Regex as PlibRegex, RegexFlags};
 use std::borrow::Cow;
 use std::ffi::CString;
+use std::rc::Rc;
 
 /// A regex wrapper that provides CString-compatible API for AWK.
 /// Internally uses plib::regex for POSIX ERE support.
@@ -242,7 +243,34 @@ fn translate_awk_escapes(pattern: &[u8]) -> Cow<'_, [u8]> {
     Cow::Owned(out)
 }
 
+thread_local! {
+    /// The dynamic regular expressions compiled lately, by their text.
+    static DYNAMIC_REGEXES: std::cell::RefCell<std::collections::HashMap<String, Rc<Regex>>> =
+        Default::default();
+}
+
+/// How many dynamic regular expressions are kept compiled; past that the
+/// cache starts over.
+const DYNAMIC_REGEX_CACHE_SIZE: usize = 64;
+
 impl Regex {
+    /// The ERE `pattern`, the value of an expression used as a regular
+    /// expression: compiled once and reused while it stays in a small
+    /// cache, since `$0 ~ pattern` evaluates it for every record.
+    pub fn dynamic(pattern: &str) -> Result<Rc<Self>, String> {
+        if let Some(re) = DYNAMIC_REGEXES.with_borrow(|cache| cache.get(pattern).cloned()) {
+            return Ok(re);
+        }
+        let re = Rc::new(Self::new(charset::to_cstring(pattern)?)?);
+        DYNAMIC_REGEXES.with_borrow_mut(|cache| {
+            if cache.len() >= DYNAMIC_REGEX_CACHE_SIZE {
+                cache.clear();
+            }
+            cache.insert(pattern.to_string(), re.clone());
+        });
+        Ok(re)
+    }
+
     /// Compile the awk ERE whose bytes are `regex`.
     pub fn new(regex: CString) -> Result<Self, String> {
         let bytes = regex.into_bytes();

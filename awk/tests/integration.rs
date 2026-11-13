@@ -2763,3 +2763,14 @@ fn awk_system_status_of_a_signalled_command() {
         "265\n265\n",
     )]);
 }
+
+// Dynamic regular expressions are compiled once and reused; many different
+// ones, more than the cache holds, still each match as they should.
+#[test]
+fn awk_dynamic_regexes_stay_correct_past_the_cache() {
+    assert_awk_cases(&[(
+        "{ for (i = 0; i < 200; i++) n += ($0 ~ (\"^\" (i % 100) \"$\")); for (i = 0; i < 3; i++) m += ($0 ~ \"x\") } END { print n, m }",
+        "5\n50\n500\nx\n",
+        "4 3\n",
+    )]);
+}

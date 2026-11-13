@@ -8,7 +8,6 @@
 //
 
 use std::cell::UnsafeCell;
-use std::ffi::CString;
 use std::rc::Rc;
 
 use super::array::Array;
@@ -175,13 +174,9 @@ impl AwkValue {
     pub(crate) fn into_ere(self, convfmt: &str) -> Result<Rc<Regex>, String> {
         match self.value {
             AwkValueVariant::Regex { ere, .. } => Ok(ere),
-            AwkValueVariant::String(s) => Ok(Rc::new(Regex::new(s.try_into()?)?)),
-            AwkValueVariant::UninitializedScalar => {
-                Ok(Rc::new(Regex::new(CString::new("").unwrap())?))
-            }
-            AwkValueVariant::Number(_) => Ok(Rc::new(Regex::new(
-                self.scalar_to_string(convfmt)?.try_into()?,
-            )?)),
+            AwkValueVariant::String(s) => Regex::dynamic(&s),
+            AwkValueVariant::UninitializedScalar => Regex::dynamic(""),
+            AwkValueVariant::Number(_) => Regex::dynamic(&self.scalar_to_string(convfmt)?),
             _ => Err("expected extended regular expression".to_string()),
         }
     }

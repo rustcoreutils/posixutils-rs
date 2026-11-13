@@ -240,6 +240,35 @@ fn test_bc_working_digit_cap_for_products_and_literals() {
     assert!(String::from_utf8_lossy(&output.stderr).ends_with("number too large\n"));
 }
 
+/// A runtime error inside a function lists the calls that led to it, one
+/// per line, with no trailing blanks or blank line.
+#[test]
+fn test_bc_call_trace_format() {
+    let program = "define f(x) {\nreturn (x/0)\n}\nf(1)\n";
+    run_test(TestPlan {
+        cmd: String::from("bc"),
+        args: vec![],
+        stdin_data: String::from(program),
+        expected_out: String::new(),
+        expected_err: String::from(
+            "bc: runtime error: division by zero\ncall trace:\n=> 'f' at line 2\n=> <global scope> at line 4\n",
+        ),
+        expected_exit_code: 1,
+    });
+    let dir = plib::tmp::tempdir().unwrap();
+    let path = program_file(&dir, program.as_bytes());
+    run_test(TestPlan {
+        cmd: String::from("bc"),
+        args: vec![path.clone()],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: format!(
+            "bc: runtime error: division by zero\ncall trace:\n=> 'f' ({path}) at line 2\n=> <global scope> ({path}) at line 4\n"
+        ),
+        expected_exit_code: 1,
+    });
+}
+
 /// POSIX: "references to any of these names from other functions that are
 /// called from this function also refer to the new value". A callee saw the
 /// global instead of the caller's parameter or auto.

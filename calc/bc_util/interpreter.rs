@@ -93,8 +93,9 @@ impl std::fmt::Display for ExecutionError {
             return write!(f, "runtime error ({file} - line {line}): {}", self.message);
         }
 
-        writeln!(f, "runtime error: {}", self.message)?;
-        writeln!(f, "call trace:",)?;
+        // The caller ends the diagnostic with a newline, so the last line of
+        // the trace has none of its own.
+        write!(f, "runtime error: {}\ncall trace:", self.message)?;
         for call in &self.call_stack {
             let function_name = if call.function_name == '\0' {
                 "<global scope>".to_string()
@@ -102,12 +103,12 @@ impl std::fmt::Display for ExecutionError {
                 format!("'{}'", call.function_name)
             };
             if call.file.is_empty() {
-                writeln!(f, "=> {function_name} at line {}", call.line)?;
+                write!(f, "\n=> {function_name} at line {}", call.line)?;
             } else {
-                writeln!(
+                write!(
                     f,
-                    "=> {function_name} ({}) at line {} ",
-                    call.file, call.line,
+                    "\n=> {function_name} ({}) at line {}",
+                    call.file, call.line
                 )?;
             }
         }

@@ -60,10 +60,10 @@ enum IntOp {
 }
 
 // the bytes of an operand
-fn operand_bytes(t: &Token) -> Result<&[u8], &'static str> {
+fn operand_bytes(t: &Token) -> Result<&[u8], String> {
     match t {
         Token::Operand(bytes) => Ok(bytes),
-        _ => Err("syntax error: not a string"),
+        _ => Err("syntax error: not a string".to_string()),
     }
 }
 
@@ -94,15 +94,15 @@ fn is_integer_text(bytes: &[u8]) -> bool {
 // Distinguishes an argument that is not an integer at all from one that is an
 // integer this implementation cannot represent; reporting the second as a
 // "non-integer argument" says something untrue about the input.
-fn integer_value(bytes: &[u8]) -> Result<i128, &'static str> {
+fn integer_value(bytes: &[u8]) -> Result<i128, String> {
     if !is_integer_text(bytes) {
-        return Err("non-integer argument");
+        return Err("non-integer argument".to_string());
     }
     // ASCII by construction, so the conversion cannot fail.
     std::str::from_utf8(bytes)
-        .map_err(|_| "non-integer argument")?
+        .map_err(|_| "non-integer argument".to_string())?
         .parse::<i128>()
-        .map_err(|_| "integer out of range")
+        .map_err(|_| "integer out of range".to_string())
 }
 
 // Does the operand count as "null or zero"?
@@ -208,7 +208,7 @@ fn compare_integer_text(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
 // POSIX: "returns the result of a decimal integer comparison if both arguments
 // are integers; otherwise, returns the result of a string comparison using the
 // locale-specific collation sequence".
-fn cmpop(lhs: &Token, rhs: &Token, op: CmpOp) -> Result<Token, &'static str> {
+fn cmpop(lhs: &Token, rhs: &Token, op: CmpOp) -> Result<Token, String> {
     let lhs = operand_bytes(lhs)?;
     let rhs = operand_bytes(rhs)?;
 
@@ -233,7 +233,7 @@ fn cmpop(lhs: &Token, rhs: &Token, op: CmpOp) -> Result<Token, &'static str> {
 }
 
 // perform an integer math operation
-fn intop(lhs: &Token, rhs: &Token, op: IntOp) -> Result<Token, &'static str> {
+fn intop(lhs: &Token, rhs: &Token, op: IntOp) -> Result<Token, String> {
     let i1 = integer_value(operand_bytes(lhs)?)?;
     let i2 = integer_value(operand_bytes(rhs)?)?;
 
@@ -243,13 +243,13 @@ fn intop(lhs: &Token, rhs: &Token, op: IntOp) -> Result<Token, &'static str> {
         IntOp::Mul => i1.checked_mul(i2),
         IntOp::Div => {
             if i2 == 0 {
-                return Err("division by zero");
+                return Err("division by zero".to_string());
             }
             i1.checked_div(i2)
         }
         IntOp::Rem => {
             if i2 == 0 {
-                return Err("division by zero");
+                return Err("division by zero".to_string());
             }
             // x % -1 is zero for every x; checked_rem refuses it only because
             // the corresponding division overflows.
@@ -263,7 +263,7 @@ fn intop(lhs: &Token, rhs: &Token, op: IntOp) -> Result<Token, &'static str> {
 
     result
         .map(|value| Token::Operand(value.to_string().into_bytes()))
-        .ok_or("integer overflow")
+        .ok_or_else(|| "integer overflow".to_string())
 }
 
 fn token_is_null(t: &Token) -> bool {
@@ -369,11 +369,11 @@ fn has_subexpr(pattern: &[u8]) -> bool {
 // "\(...\)", the string matched by "\1" is returned (the null string if it
 // did not match); otherwise the number of characters matched is returned (0
 // on failure).
-fn matchop(lhs: &Token, rhs: &Token) -> Result<Token, &'static str> {
+fn matchop(lhs: &Token, rhs: &Token) -> Result<Token, String> {
     let subject = operand_bytes(lhs)?;
     let pattern = operand_bytes(rhs)?;
 
-    let re = Regex::bre_bytes(pattern).map_err(|_| "invalid regex")?;
+    let re = Regex::bre_bytes(pattern).map_err(|e| e.to_string())?;
     let captures = re.captures_bytes(subject);
 
     // The match must be anchored at the start of the string.
@@ -443,7 +443,7 @@ impl Parser {
     }
 
     // top level: '|', lowest precedence
-    fn parse_or(&mut self) -> Result<Token, &'static str> {
+    fn parse_or(&mut self) -> Result<Token, String> {
         let mut lhs = self.parse_and()?;
         while matches!(self.peek(), Some(Token::OpOr)) {
             self.advance();
@@ -454,7 +454,7 @@ impl Parser {
     }
 
     // '&'
-    fn parse_and(&mut self) -> Result<Token, &'static str> {
+    fn parse_and(&mut self) -> Result<Token, String> {
         let mut lhs = self.parse_cmp()?;
         while matches!(self.peek(), Some(Token::OpAnd)) {
             self.advance();
@@ -465,7 +465,7 @@ impl Parser {
     }
 
     // comparison operators: = > >= < <= !=
-    fn parse_cmp(&mut self) -> Result<Token, &'static str> {
+    fn parse_cmp(&mut self) -> Result<Token, String> {
         let mut lhs = self.parse_add()?;
         loop {
             let op = match self.peek() {
@@ -485,7 +485,7 @@ impl Parser {
     }
 
     // additive operators: + -
-    fn parse_add(&mut self) -> Result<Token, &'static str> {
+    fn parse_add(&mut self) -> Result<Token, String> {
         let mut lhs = self.parse_mul()?;
         loop {
             let op = match self.peek() {
@@ -501,7 +501,7 @@ impl Parser {
     }
 
     // multiplicative operators: * / %
-    fn parse_mul(&mut self) -> Result<Token, &'static str> {
+    fn parse_mul(&mut self) -> Result<Token, String> {
         let mut lhs = self.parse_match()?;
         loop {
             let op = match self.peek() {
@@ -518,7 +518,7 @@ impl Parser {
     }
 
     // matching operator ':', highest-precedence binary operator
-    fn parse_match(&mut self) -> Result<Token, &'static str> {
+    fn parse_match(&mut self) -> Result<Token, String> {
         let mut lhs = self.parse_primary()?;
         while matches!(self.peek(), Some(Token::OpMatch)) {
             self.advance();
@@ -529,13 +529,13 @@ impl Parser {
     }
 
     // primary: ( expr ) | operand
-    fn parse_primary(&mut self) -> Result<Token, &'static str> {
+    fn parse_primary(&mut self) -> Result<Token, String> {
         match self.advance() {
             Some(Token::LParen) => {
                 self.depth += 1;
                 if self.depth > MAX_NEST_DEPTH {
                     self.depth -= 1;
-                    return Err("expression nested too deeply");
+                    return Err("expression nested too deeply".to_string());
                 }
                 let val = self.parse_or();
                 self.depth -= 1;
@@ -544,22 +544,22 @@ impl Parser {
                 let val = val?;
                 match self.advance() {
                     Some(Token::RParen) => Ok(val),
-                    _ => Err("syntax error: expected ')'"),
+                    _ => Err("syntax error: expected ')'".to_string()),
                 }
             }
             Some(t) if token_is_lval(&t) => Ok(t),
-            Some(_) => Err("syntax error: unexpected operator"),
-            None => Err("syntax error: missing argument"),
+            Some(_) => Err("syntax error: unexpected operator".to_string()),
+            None => Err("syntax error: missing argument".to_string()),
         }
     }
 }
 
 // evaluate the whole token stream as a single expression
-fn eval_expression(tokens: Vec<Token>) -> Result<Token, &'static str> {
+fn eval_expression(tokens: Vec<Token>) -> Result<Token, String> {
     let mut parser = Parser::new(tokens);
     let result = parser.parse_or()?;
     if parser.pos != parser.tokens.len() {
-        return Err("syntax error: unexpected trailing argument");
+        return Err("syntax error: unexpected trailing argument".to_string());
     }
     Ok(result)
 }
@@ -601,7 +601,7 @@ fn main() {
         }
         Err(msg) => {
             // invalid expression: diagnostic to stderr, exit status 2.
-            diag::error(msg);
+            diag::error(&msg);
             std::process::exit(2);
         }
     }

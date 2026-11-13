@@ -429,3 +429,16 @@ fn expr_huge_integers_compare_numerically() {
     expr_test(&["10", ">", "9"], "1\n");
     expr_test(&["--", "-10", "<", "-9"], "1\n");
 }
+
+/// An invalid regular expression is reported with regcomp's reason.
+#[test]
+fn expr_invalid_regex_gives_the_reason() {
+    let args = ["a".to_string(), ":".to_string(), "\\(".to_string()];
+    let out = plib::testing::run_test_base("expr", &args, b"");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let reason = stderr
+        .strip_prefix("expr: invalid regex '\\(': ")
+        .unwrap_or_else(|| panic!("{stderr:?}"));
+    assert!(reason.trim().len() > 1, "{stderr:?}");
+    assert_eq!(out.status.code(), Some(2));
+}

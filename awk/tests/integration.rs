@@ -2265,3 +2265,22 @@ fn awk_paragraph_mode_keeps_a_last_line_without_newline() {
         ),
     ]);
 }
+
+// An integral number converts to the string of its exact value, as by
+// "%d", also beyond the range of a 64-bit integer: it saturated to
+// 9223372036854775807, so that large subscripts named one element.
+#[test]
+fn awk_large_integers_convert_exactly() {
+    assert_awk_cases(&[
+        (
+            "BEGIN { x = 1e30; print x; print x \"\"; print 2^63, -2^63, -2^64, 2^53 + 1 }",
+            "",
+            "1000000000000000019884624838656\n1000000000000000019884624838656\n9223372036854775808 -9223372036854775808 -18446744073709551616 9007199254740992\n",
+        ),
+        (
+            "BEGIN { a[1e19]; a[2e19]; print length(a); for (k in a) n += (k == 1e19 || k == 2e19); print n }",
+            "",
+            "2\n2\n",
+        ),
+    ]);
+}

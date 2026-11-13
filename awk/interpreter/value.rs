@@ -48,6 +48,19 @@ pub(crate) struct AwkValue {
 
 pub(crate) type AwkValueRef = UnsafeCell<AwkValue>;
 
+/// The decimal digits of the integral number `num`, as `%d` would give
+/// them: exactly, also beyond the range of `i64`, where a conversion to it
+/// would saturate.
+pub(crate) fn integer_to_string(num: f64) -> String {
+    // 2^63; every integral f64 below it in magnitude fits an i64
+    const I64_LIMIT: f64 = 9_223_372_036_854_775_808.0;
+    if num.abs() < I64_LIMIT {
+        (num as i64).to_string()
+    } else {
+        format!("{num:.0}")
+    }
+}
+
 impl AwkValue {
     pub(crate) fn scalar_as_f64(&self) -> f64 {
         match &self.value {
@@ -83,7 +96,7 @@ impl AwkValue {
         match self.value {
             AwkValueVariant::Number(num) => {
                 if is_integer(num) {
-                    Ok((num as i64).to_string().into())
+                    Ok(integer_to_string(num).into())
                 } else {
                     sprintf(num_fmt, &mut [num.into()], num_fmt)
                 }

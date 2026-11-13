@@ -153,10 +153,15 @@ impl<S: Read> RecordInput<S> {
     /// Reads more of the source into the buffer: how many bytes, 0 at the
     /// end of the input.  The bytes before `pos` may be dropped, so callers
     /// keep offsets relative to it.
+    ///
+    /// The read may wait for input, so the output awk has collected is
+    /// written out first: a filter in a pipeline fed a line at a time then
+    /// passes each on as it comes.
     fn fill(&mut self) -> Result<usize, String> {
         if self.eof {
             return Ok(0);
         }
+        output::flush_stdout()?;
         if self.pos > 0 && (self.pos == self.buffer.len() || self.pos >= READ_SIZE) {
             self.buffer.drain(..self.pos);
             self.pos = 0;

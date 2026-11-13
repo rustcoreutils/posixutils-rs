@@ -2978,3 +2978,22 @@ fn awk_getline_reads_what_awk_wrote_to_the_file() {
     );
     assert_awk_cases(&[(&program, "", "1 data\n")]);
 }
+
+// Output is written out before awk waits for more input, so a filter in a
+// pipeline fed a line at a time passes each line on when it comes, without
+// fflush, though its standard output is buffered.
+#[test]
+fn awk_output_is_written_before_waiting_for_input() {
+    assert_eq!(
+        awk_first_line_before_eof("{ print \"got \" $0 }", "abc\n").as_deref(),
+        Some("got abc\n")
+    );
+    assert_eq!(
+        awk_first_line_before_eof(
+            "BEGIN { while ((getline l) > 0) print \"got \" l }",
+            "abc\n"
+        )
+        .as_deref(),
+        Some("got abc\n")
+    );
+}

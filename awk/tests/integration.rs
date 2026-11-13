@@ -2324,3 +2324,34 @@ fn awk_float_conversions_follow_c() {
         ),
     ]);
 }
+
+// printf's integer conversions take any number: %d writes every digit of a
+// value beyond 64 bits (it saturated), %u, %o and %x write a negative
+// value as its 64-bit two's complement (it was a fatal error), and one
+// beyond what they can show is written as by %g, as gawk and the one true
+// awk do.
+#[test]
+fn awk_printf_integer_conversions_of_any_number() {
+    assert_awk_cases(&[
+        (
+            "BEGIN { printf \"%x|%X|%u|%o\\n\", -1, -255, -1, -1 }",
+            "",
+            "ffffffffffffffff|FFFFFFFFFFFFFF01|18446744073709551615|1777777777777777777777\n",
+        ),
+        (
+            "BEGIN { printf \"%d|%i|%5d|%-34d|\\n\", 1e30, -2^64, 2^63, 1e30 }",
+            "",
+            "1000000000000000019884624838656|-18446744073709551616|9223372036854775808|1000000000000000019884624838656   |\n",
+        ),
+        (
+            "BEGIN { printf \"%x|%u|%8o|%u\\n\", 1e30, 2^64, -1e30, 2^64 - 2^12 }",
+            "",
+            "1e+30|1.84467e+19|  -1e+30|18446744073709547520\n",
+        ),
+        (
+            "BEGIN { printf \"%d|%x\\n\", -log(0), log(0) }",
+            "",
+            "inf|-inf\n",
+        ),
+    ]);
+}

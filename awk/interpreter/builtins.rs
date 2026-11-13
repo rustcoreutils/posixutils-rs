@@ -12,8 +12,8 @@ use std::fmt::Write;
 
 use super::format::{
     fmt_write_decimal_float, fmt_write_float_general, fmt_write_hex_float,
-    fmt_write_scientific_float, fmt_write_signed, fmt_write_string, fmt_write_unsigned,
-    parse_conversion_specifier_args, FormatArgs, IntegerFormat,
+    fmt_write_integer_as_float, fmt_write_scientific_float, fmt_write_signed_f64, fmt_write_string,
+    fmt_write_unsigned, parse_conversion_specifier_args, FormatArgs, IntegerFormat,
 };
 use super::record::{split_record, FieldSeparator, FieldsState};
 use super::stack::Stack;
@@ -91,14 +91,22 @@ fn format_one_conversion(
 ) -> Result<(), String> {
     match specifier {
         'd' | 'i' => {
-            let value = value.scalar_as_f64() as i64;
-            fmt_write_signed(result, value, args);
+            fmt_write_signed_f64(result, value.scalar_as_f64().trunc(), args);
         }
         'u' | 'o' | 'x' | 'X' => {
-            let value = value.scalar_as_f64() as i64;
-            if value.is_negative() {
-                return Err("negative value for unsigned format specifier".to_string());
-            }
+            let value = value.scalar_as_f64().trunc();
+            // -2^63 and 2^64: a negative value is written as its 64-bit
+            // two's complement, as in C and the other awks
+            const I64_MIN: f64 = -9_223_372_036_854_775_808.0;
+            const U64_LIMIT: f64 = 18_446_744_073_709_551_616.0;
+            let value = if (0.0..U64_LIMIT).contains(&value) {
+                value as u64
+            } else if (I64_MIN..0.0).contains(&value) {
+                value as i64 as u64
+            } else {
+                fmt_write_integer_as_float(result, value, args);
+                return Ok(());
+            };
             let format = match specifier {
                 'u' => IntegerFormat::Decimal,
                 'o' => IntegerFormat::Octal,
@@ -106,7 +114,7 @@ fn format_one_conversion(
                 'X' => IntegerFormat::HexUpper,
                 _ => unreachable!(),
             };
-            fmt_write_unsigned(result, value as u64, format, args);
+            fmt_write_unsigned(result, value, format, args);
         }
         'a' | 'A' => {
             let value = value.scalar_as_f64();

@@ -383,12 +383,46 @@ pub fn fmt_write_signed(target: &mut String, value: i64, args: &FormatArgs) {
     let mut buffer = [0u8; 20];
     let buffer_length = number_to_digits(&mut buffer, unsigned_value, 10, &BASE_10_DIGITS);
     let buffer_start = buffer.len() - buffer_length;
+    write_signed_digits(target, value.is_negative(), &buffer[buffer_start..], args);
+}
 
+/// `%d` of the integral `value`, of any magnitude: beyond the range of
+/// `i64` its digits are those of the exact value.  A value that is not
+/// finite is written as by `%g`.
+pub fn fmt_write_signed_f64(target: &mut String, value: f64, args: &FormatArgs) {
+    // 2^63; every integral f64 below it in magnitude fits an i64
+    const I64_LIMIT: f64 = 9_223_372_036_854_775_808.0;
+    if !value.is_finite() {
+        fmt_write_integer_as_float(target, value, args);
+    } else if value.abs() < I64_LIMIT {
+        fmt_write_signed(target, value as i64, args);
+    } else {
+        let digits = format!("{:.0}", value.abs());
+        write_signed_digits(target, value < 0.0, digits.as_bytes(), args);
+    }
+}
+
+/// An integer conversion of a value it cannot show (one beyond 64 bits, or
+/// one that is not finite), written as by `%g` with the same flags and
+/// width, as gawk and the one true awk do.
+pub fn fmt_write_integer_as_float(target: &mut String, value: f64, args: &FormatArgs) {
+    let args = FormatArgs {
+        precision: None,
+        alternative_form: false,
+        ..args.clone()
+    };
+    fmt_write_float_general(target, value, true, &args);
+}
+
+/// The decimal `digits` of an integer's magnitude, with its sign, as `%d`
+/// writes them.
+fn write_signed_digits(target: &mut String, is_negative: bool, digits: &[u8], args: &FormatArgs) {
+    let buffer_length = digits.len();
     let precision = args.precision.unwrap_or(1);
     // Per C standard, precision overrides zero-flag for integer conversions
     let zero_padded = args.zero_padded && args.precision.is_none();
 
-    let sign = sign_str(value.is_negative(), args);
+    let sign = sign_str(is_negative, args);
     let number_length = buffer_length.max(precision) + sign.len();
 
     // left justified:
@@ -400,18 +434,18 @@ pub fn fmt_write_signed(target: &mut String, value: i64, args: &FormatArgs) {
     if args.left_justified {
         target.push_str(sign);
         pad_target(target, precision.saturating_sub(buffer_length), b'0');
-        copy_buffer_to_target(&buffer[buffer_start..], target);
+        copy_buffer_to_target(digits, target);
         pad_target(target, args.width.saturating_sub(number_length), b' ');
     } else if zero_padded {
         target.push_str(sign);
         pad_target(target, args.width.saturating_sub(number_length), b'0');
         pad_target(target, precision.saturating_sub(buffer_length), b'0');
-        copy_buffer_to_target(&buffer[buffer_start..], target);
+        copy_buffer_to_target(digits, target);
     } else {
         pad_target(target, args.width.saturating_sub(number_length), b' ');
         target.push_str(sign);
         pad_target(target, precision.saturating_sub(buffer_length), b'0');
-        copy_buffer_to_target(&buffer[buffer_start..], target);
+        copy_buffer_to_target(digits, target);
     }
 }
 

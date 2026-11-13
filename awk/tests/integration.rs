@@ -2457,6 +2457,15 @@ fn awk_record_is_returned_before_more_input() {
             "BEGIN { RS = \"\\n|;\" } { print \"got \" $0; fflush() }",
             "abc\n",
         ),
+        // a separator with no newline in it, read as soon as it comes
+        (
+            "BEGIN { RS = \";;\" } { print \"got \" $0; fflush() }",
+            "abc;;",
+        ),
+        (
+            "BEGIN { RS = \"\" } { print \"got \" $0; fflush() }",
+            "abc\n\n",
+        ),
         // a quoted repetition character repeats nothing
         (
             "BEGIN { RS = \"[+]\\n\" } { print \"got \" $0; fflush() }",

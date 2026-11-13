@@ -14,7 +14,7 @@ use io::{ReadFiles, ReadPipes, RecordSeparator, WriteFiles, WritePipes};
 use main_input::MainInput;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
-use record::{ere_escape_char, is_valid_record_index, FieldSeparator, FieldsState, Record};
+use record::{ere_escape_char, record_index, FieldSeparator, FieldsState, Record};
 use stack::{
     compare_op, numeric_op, ArrayElementRef, ArrayIterator, ExecutionResult, Stack, StackValue,
 };
@@ -649,8 +649,7 @@ impl Interpreter {
                     unsafe { stack.push(StackValue::from_var(value))? };
                 }
                 OpCode::GetField => {
-                    let index = stack.pop_scalar_value()?.scalar_as_f64() as usize;
-                    is_valid_record_index(index)?;
+                    let index = record_index(stack.pop_scalar_value()?.scalar_as_f64())?;
                     stack.push_value(record.read_field(index))?;
                 }
                 OpCode::IndexArrayGetValue => {
@@ -674,8 +673,7 @@ impl Interpreter {
                     unsafe { stack.push_ref(value)? };
                 }
                 OpCode::FieldRef => {
-                    let index = stack.pop_scalar_value()?.scalar_as_f64() as usize;
-                    is_valid_record_index(index)?;
+                    let index = record_index(stack.pop_scalar_value()?.scalar_as_f64())?;
                     // The boxed cell keeps this pointer valid across later field
                     // growth, and fields outlive the stack, so this is safe.
                     unsafe { stack.push_ref(record.field_ref_ptr(index))? };

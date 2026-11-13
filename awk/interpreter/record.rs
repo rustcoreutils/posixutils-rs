@@ -331,10 +331,16 @@ impl Default for Record {
     }
 }
 
-pub(crate) fn is_valid_record_index(index: usize) -> Result<(), String> {
-    if index > Record::MAX_FIELDS {
-        Err("invalid field index".to_string())
+/// The field number the value `number` of a `$` expression designates,
+/// truncated toward zero; a negative one, or one past the limit, is an
+/// error.  (POSIX leaves anything but a non-negative integer unspecified;
+/// gawk, mawk and the one true awk make a negative one fatal.)
+pub(crate) fn record_index(number: f64) -> Result<usize, String> {
+    let number = number.trunc();
+    if number < 0.0 || number > Record::MAX_FIELDS as f64 {
+        Err(format!("attempt to access field {number}"))
     } else {
-        Ok(())
+        // NaN converts to 0
+        Ok(number as usize)
     }
 }

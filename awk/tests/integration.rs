@@ -2503,3 +2503,23 @@ fn awk_record_with_more_than_65535_fields() {
         ),
     ]);
 }
+
+// A negative field number is an error, as in gawk, mawk and the one true
+// awk; it was taken as $0, so $(-1) = "x" replaced the record.
+#[test]
+fn awk_negative_field_is_an_error() {
+    for program in [
+        "{ print $(-1) }",
+        "{ $(-1) = \"x\"; print }",
+        "{ $(NF - 3)++ }",
+    ] {
+        let (stdout, stderr, status) = awk_with_deadline_input(program, "a b\n");
+        assert_eq!(stdout, "", "{program}");
+        assert!(
+            stderr.contains("attempt to access field -"),
+            "{program}: {stderr}"
+        );
+        assert_ne!(status, Some(0), "{program}");
+    }
+    assert_awk_cases(&[("{ print $(-0.5), $1.9 }", "a b\n", "a b a\n")]);
+}

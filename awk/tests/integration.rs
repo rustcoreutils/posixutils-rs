@@ -2484,3 +2484,22 @@ fn awk_paragraph_mode_resplit_uses_newline_too() {
         ),
     ]);
 }
+
+// A record may have more than 65535 fields, the limit a 16-bit field
+// index set: such a record ended the run with "too many fields".
+#[test]
+fn awk_record_with_more_than_65535_fields() {
+    let line = format!("{}\n", vec!["x"; 70_001].join(","));
+    assert_awk_cases(&[
+        (
+            "BEGIN { FS = \",\" } { print NF, $70001, length($0) }",
+            &line,
+            "70001 x 140001\n",
+        ),
+        (
+            "BEGIN { $100000 = \"y\"; print NF, $100000 }",
+            "",
+            "100000 y\n",
+        ),
+    ]);
+}

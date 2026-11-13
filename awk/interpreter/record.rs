@@ -37,7 +37,7 @@ pub(crate) fn ere_escape_char(c: char) -> String {
 /// created from `$0`/FS that "does not contain any characters" has the
 /// uninitialized value (so e.g. an empty field compares numerically equal to 0),
 /// while a non-empty field is a (possibly numeric) string.
-fn make_field(value: AwkString, index: u16) -> AwkValue {
+fn make_field(value: AwkString, index: u32) -> AwkValue {
     if value.is_empty() {
         AwkValue::uninitialized_scalar().into_ref(AwkRefType::Field(index))
     } else {
@@ -124,12 +124,13 @@ pub(crate) struct Record {
 }
 
 impl Record {
-    /// Hard ceiling on the field index, imposed by `AwkRefType::Field(u16)`.
-    pub(crate) const MAX_FIELDS: usize = u16::MAX as usize;
+    /// Ceiling on the field index (that of gawk); `AwkRefType::Field`
+    /// holds it in a `u32`.
+    pub(crate) const MAX_FIELDS: usize = i32::MAX as usize;
 
     fn new_field_cell(index: usize) -> Box<AwkValueRef> {
         Box::new(AwkValueRef::new(
-            AwkValue::uninitialized_scalar().into_ref(AwkRefType::Field(index as u16)),
+            AwkValue::uninitialized_scalar().into_ref(AwkRefType::Field(index as u32)),
         ))
     }
 
@@ -156,7 +157,7 @@ impl Record {
                 let next = fields.len();
                 fields.push(Record::new_field_cell(next));
             }
-            *fields[field_index].get_mut() = make_field(s, field_index as u16);
+            *fields[field_index].get_mut() = make_field(s, field_index as u32);
             last_field = field_index;
             Ok(())
         })?;
@@ -180,7 +181,7 @@ impl Record {
             .skip(new_last + 1)
         {
             *cell.get_mut() =
-                AwkValue::uninitialized_scalar().into_ref(AwkRefType::Field(idx as u16));
+                AwkValue::uninitialized_scalar().into_ref(AwkRefType::Field(idx as u32));
         }
     }
 
@@ -204,7 +205,7 @@ impl Record {
         match fields.get(index) {
             // safe: fields are never arrays
             Some(cell) => unsafe { (*cell.get()).clone() },
-            None => AwkValue::uninitialized_scalar().into_ref(AwkRefType::Field(index as u16)),
+            None => AwkValue::uninitialized_scalar().into_ref(AwkRefType::Field(index as u32)),
         }
     }
 

@@ -36,7 +36,7 @@ pub(crate) enum AwkValueVariant {
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum AwkRefType {
     None,
-    Field(u16),
+    Field(u32),
     SpecialGlobalVar(SpecialVar),
 }
 
@@ -211,7 +211,7 @@ impl AwkValue {
         }
     }
 
-    pub(crate) fn field_ref<V: Into<AwkValue>>(value: V, field_index: u16) -> Self {
+    pub(crate) fn field_ref<V: Into<AwkValue>>(value: V, field_index: u32) -> Self {
         let value = value.into();
         value.into_ref(AwkRefType::Field(field_index))
     }

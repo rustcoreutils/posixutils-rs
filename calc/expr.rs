@@ -151,10 +151,15 @@ const OPERATORS: [(&[u8], Token); 16] = [
     (b":", Token::OpMatch),
 ];
 
-// The argument a token came from, for a diagnostic: control characters and
-// bytes that are not UTF-8 are written as \xHH, so that the message neither
-// drives the terminal nor misquotes the argument.
+// The argument a token came from, shown for a diagnostic so that the
+// message neither drives the terminal nor misquotes the argument: a
+// backslash is doubled; ASCII control bytes, bytes that are not UTF-8, and
+// the characters that steer a terminal's display (C1 controls, bidi and
+// other format characters) are written as \xHH for each of their bytes;
+// other non-ASCII characters are written as themselves only in a UTF-8
+// locale, and as \xHH bytes otherwise.
 fn token_text(t: &Token) -> String {
+    use std::fmt::Write;
     let text = match t {
         Token::Operand(bytes) => bytes.as_slice(),
         operator => OPERATORS
@@ -163,21 +168,40 @@ fn token_text(t: &Token) -> String {
             .map(|(text, _)| *text)
             .expect("every operator is in the table"),
     };
+    let utf8_locale = plib::locale::next_char_offset("\u{e9}".as_bytes(), 0) == Some(2);
     let mut shown = String::new();
+    let escape = |shown: &mut String, bytes: &[u8]| {
+        for byte in bytes {
+            write!(shown, "\\x{byte:02x}").expect("writing to a String");
+        }
+    };
     for chunk in text.utf8_chunks() {
         for c in chunk.valid().chars() {
-            // the control characters are all below U+0100
-            if c.is_control() {
-                shown.push_str(&format!("\\x{:02x}", c as u32));
-            } else {
-                shown.push(c);
+            match c {
+                '\\' => shown.push_str("\\\\"),
+                ' '..='~' => shown.push(c),
+                c if c.is_ascii() || !utf8_locale || steers_display(c) => {
+                    escape(&mut shown, c.encode_utf8(&mut [0; 4]).as_bytes())
+                }
+                c => shown.push(c),
             }
         }
-        for byte in chunk.invalid() {
-            shown.push_str(&format!("\\x{byte:02x}"));
-        }
+        escape(&mut shown, chunk.invalid());
     }
     shown
+}
+
+// Whether a character changes how a terminal shows what follows it: a C1
+// control, or a Unicode format character (zero-width, bidi embedding and
+// override, isolate, byte order mark).
+fn steers_display(c: char) -> bool {
+    matches!(c,
+        '\u{80}'..='\u{9f}'
+        | '\u{ad}'
+        | '\u{200b}'..='\u{200f}'
+        | '\u{202a}'..='\u{202e}'
+        | '\u{2060}'..='\u{206f}'
+        | '\u{feff}')
 }
 
 fn unexpected_argument(t: &Token) -> String {

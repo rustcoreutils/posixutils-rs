@@ -480,33 +480,39 @@ fn expr_invalid_regex_gives_the_reason() {
     assert_eq!(out.status.code(), Some(2));
 }
 
-/// An argument named in a diagnostic has its control characters and the
-/// bytes that are not text escaped, so the message neither drives the
-/// terminal nor misquotes the argument.
+/// An argument named in a diagnostic is shown so that the message neither
+/// drives the terminal nor misquotes the argument: a backslash is doubled,
+/// control bytes, bytes that are not text and format characters are written
+/// as \xHH for each byte, and other characters are written as themselves
+/// only in a UTF-8 locale.
 #[cfg(unix)]
 #[test]
 fn expr_diagnostic_escapes_the_argument() {
-    for (arg, shown) in [
-        (&b"\x1b]0;x\x07"[..], &b"\\x1b]0;x\\x07"[..]),
-        (&b"a\xffb"[..], &b"a\\xffb"[..]),
-        (&b"tab\there"[..], &b"tab\\x09here"[..]),
-        ("é".as_bytes(), "é".as_bytes()),
+    let shown = |locale: &str, arg: &[u8]| {
+        let args = [b"1".as_slice(), b"+", b"2", arg].map(os_bytes).to_vec();
+        let out = plib::testing::run_test_base_os("expr", &args, b"", &[("LC_ALL", locale)]);
+        assert_eq!(out.status.code(), Some(2));
+        out.stderr
+    };
+    let expected =
+        |arg: &str| format!("expr: syntax error: unexpected argument '{arg}'\n").into_bytes();
+    for (arg, text) in [
+        (&b"\x1b]0;x\x07"[..], r"\x1b]0;x\x07"),
+        (b"a\xffb", r"a\xffb"),
+        (b"tab\there", r"tab\x09here"),
+        (b"\\x1b", r"\\x1b"),
+        (b"\xc2\x85", r"\xc2\x85"),
+        ("\u{202e}abc".as_bytes(), r"\xe2\x80\xaeabc"),
+        ("\u{e9}".as_bytes(), r"\xc3\xa9"),
     ] {
-        let mut expected_err = b"expr: syntax error: unexpected argument '".to_vec();
-        expected_err.extend_from_slice(shown);
-        expected_err.extend_from_slice(b"'\n");
-        run_test_os(TestPlanOs {
-            cmd: String::from("expr"),
-            args: vec![
-                os_bytes(b"1"),
-                os_bytes(b"+"),
-                os_bytes(b"2"),
-                os_bytes(arg),
-            ],
-            stdin_data: Vec::new(),
-            expected_out: Vec::new(),
-            expected_err,
-            expected_exit_code: 2,
-        });
+        assert_eq!(shown("C", arg), expected(text), "{arg:?}");
+    }
+    if let Some(utf8) = utf8_locale() {
+        assert_eq!(shown(&utf8, "\u{e9}".as_bytes()), expected("\u{e9}"));
+        assert_eq!(shown(&utf8, b"\xc2\x85"), expected(r"\xc2\x85"));
+        assert_eq!(
+            shown(&utf8, "\u{202e}a".as_bytes()),
+            expected(r"\xe2\x80\xaea")
+        );
     }
 }

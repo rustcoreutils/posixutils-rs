@@ -2284,3 +2284,43 @@ fn awk_large_integers_convert_exactly() {
         ),
     ]);
 }
+
+// %g, and so OFMT and CONVFMT, chooses between %e and %f style from the
+// exponent of the rounded value, as C does, and keeps the zeros of the
+// integer part: 120000.25 printed as "12" and 100000 as "1".  Width and
+// padding apply to the whole number in every float conversion.
+#[test]
+fn awk_float_conversions_follow_c() {
+    assert_awk_cases(&[
+        (
+            "BEGIN { print 100000.5, 120000.25, 999999.5, 300000.1 \"\", 1234567.5, 0.000123456, 123456.7 }",
+            "",
+            "100000 120000 1e+06 300000 1.23457e+06 0.000123456 123457\n",
+        ),
+        (
+            "BEGIN { printf \"%g|%g|%g|%.3g|%g|%G|%#g|%#.3g|%.0g|%g|%g\\n\", 100000, 999999.5, 0.00001, 99950, 9.99999999e-5, 1e-300, 1e30, 100, 123, 0.5, 0 }",
+            "",
+            "100000|1e+06|1e-05|1e+05|0.0001|1E-300|1.00000e+30|100.|1e+02|0.5|0\n",
+        ),
+        (
+            "BEGIN { printf \"%8g|%-8g|%08g|%+g|% g|%8g|%-9g|%08.3g|\\n\", -1e30, -1e30, -1e30, 1e30, 1e-30, -1.5, 120000, -0.0001 }",
+            "",
+            "  -1e+30|-1e+30  |-001e+30|+1e+30| 1e-30|    -1.5|120000   |-00.0001|\n",
+        ),
+        (
+            "BEGIN { printf \"%e|%10.3e|%-12e|%012.2e|%#.0e|%.0e|%E\\n\", 9.9999999e9, -1234.5, 1.5, -1.5, 5e10, 5e10, 1e-300 }",
+            "",
+            "1.000000e+10|-1.234e+03|1.500000e+00|-0001.50e+00|5.e+10|5e+10|1.000000E-300\n",
+        ),
+        (
+            "BEGIN { printf \"%-10.2f|%010.2f|%#.0f|%.0f|%+.1f|%8.3f|\\n\", -1.5, -1.5, 3, 2.5, 0.05, 3.14159 }",
+            "",
+            "-1.50     |-000001.50|3.|2|+0.1|   3.142|\n",
+        ),
+        (
+            "BEGIN { printf \"%5g|%-6f|%05e|%5G|\\n\", -log(0), log(0), -log(0), -log(0) }",
+            "",
+            "  inf|-inf  |  inf|  INF|\n",
+        ),
+    ]);
+}

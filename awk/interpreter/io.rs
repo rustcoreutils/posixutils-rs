@@ -175,14 +175,18 @@ pub trait RecordReader: Iterator<Item = ReadResult> {
                             };
                             if check {
                                 bytes_since_check = 0;
-                                if let RsSearch::Found(record, remainder) =
-                                    ere_try_match(&byte_buf, re, false)
-                                {
-                                    *self.ere_byte_buffer() = remainder;
-                                    return Ok(Some(record));
+                                match ere_try_match(&byte_buf, re, false) {
+                                    RsSearch::Found(record, remainder) => {
+                                        *self.ere_byte_buffer() = remainder;
+                                        return Ok(Some(record));
+                                    }
+                                    // check again at the next newline
+                                    RsSearch::Deferred => {}
+                                    RsSearch::NotFound => {
+                                        let len = byte_buf.len();
+                                        next_newline_check_len = len + len.min(8192);
+                                    }
                                 }
-                                let len = byte_buf.len();
-                                next_newline_check_len = len + len.min(8192);
                             }
                         }
                         None => {

@@ -2663,3 +2663,19 @@ fn awk_huge_field_creation_is_an_error() {
         assert!(stderr.len() < 200, "{program}: {stderr}");
     }
 }
+
+// A record whose separator could still grow is returned once more input
+// shows that it did not, also after a long record: that delay made the
+// next check wait until the read-ahead doubled.
+#[test]
+fn awk_growable_rs_record_is_returned_when_more_input_comes() {
+    let input = format!("{}\nb\n", "a".repeat(1000));
+    assert_eq!(
+        awk_first_line_before_eof(
+            "BEGIN { RS = \"\\n+\" } { print \"got \" length($0); fflush() }",
+            &input
+        )
+        .as_deref(),
+        Some("got 1000\n")
+    );
+}

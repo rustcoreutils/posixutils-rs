@@ -313,13 +313,28 @@ impl Session<'_> {
 /// Whether standard input is a regular file. Such input is all there, so
 /// there is no one waiting on each result as it is made.
 fn stdin_is_regular_file() -> bool {
-    use std::os::fd::AsFd;
-    std::io::stdin()
-        .as_fd()
-        .try_clone_to_owned()
-        .map(std::fs::File::from)
+    stdin_as_file()
         .and_then(|file| file.metadata())
         .is_ok_and(|metadata| metadata.is_file())
+}
+
+/// A duplicate of standard input's descriptor, as a `File` whose metadata can
+/// be read. Dropping it closes only the duplicate.
+#[cfg(unix)]
+fn stdin_as_file() -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsFd;
+    let fd = std::io::stdin().as_fd().try_clone_to_owned()?;
+    Ok(std::fs::File::from(fd))
+}
+
+/// A duplicate of standard input's handle, as a `File` whose metadata can be
+/// read. A console handle has none, and so is not a regular file. Dropping it
+/// closes only the duplicate.
+#[cfg(windows)]
+fn stdin_as_file() -> std::io::Result<std::fs::File> {
+    use std::os::windows::io::AsHandle;
+    let handle = std::io::stdin().as_handle().try_clone_to_owned()?;
+    Ok(std::fs::File::from(handle))
 }
 
 fn run() {

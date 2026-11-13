@@ -3075,3 +3075,15 @@ fn awk_files_are_written_before_pipes_close_at_exit() {
     );
     assert_awk_cases(&[(&program, "", "hello\n")]);
 }
+
+// Standard input named twice is read on from where the first left off:
+// each "-" had its own read-ahead, so nextfile threw away the rest.
+#[test]
+fn awk_stdin_operands_share_their_input() {
+    let (stdout, stderr, status) =
+        awk_args(&["FNR == 1 { print; nextfile }", "-", "-"], "a\nb\nc\n");
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), status),
+        ("a\nb\n", "", Some(0))
+    );
+}

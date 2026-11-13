@@ -304,17 +304,6 @@ impl<S: Read> RecordInput<S> {
     }
 }
 
-/// The readers of records the main input and getline use.
-pub trait RecordReader {
-    fn read_next_record(&mut self, separator: &RecordSeparator) -> Result<Option<String>, String>;
-}
-
-impl<S: Read> RecordReader for RecordInput<S> {
-    fn read_next_record(&mut self, separator: &RecordSeparator) -> Result<Option<String>, String> {
-        RecordInput::read_next_record(self, separator)
-    }
-}
-
 /// A file read for records.
 pub type FileStream = RecordInput<File>;
 

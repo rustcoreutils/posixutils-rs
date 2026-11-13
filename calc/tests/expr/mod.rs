@@ -214,6 +214,13 @@ fn expr_integer_out_of_range() {
         "expr: integer out of range\n",
         2,
     );
+    // A result too large for the arithmetic.
+    expr_test_status(
+        &["170141183460469231731687303715884105727", "+", "1"],
+        "",
+        "expr: integer overflow\n",
+        2,
+    );
     // x % -1 is zero for every x, though the matching division overflows.
     expr_test_status(
         &["--", "-170141183460469231731687303715884105728", "%", "-1"],
@@ -407,4 +414,105 @@ fn expr_string_compare_honors_lc_collate() {
     // when an operand is not an integer.
     expr_test_locale(&locale, &["10", ">", "9"], "1\n", 0);
     expr_test_locale(&locale, &["9", "<", "10"], "1\n", 0);
+}
+
+/// Two integers compare as integers whatever their size: one too large for
+/// the arithmetic was compared as a string, so 2^127 > 2 was false.
+#[test]
+fn expr_huge_integers_compare_numerically() {
+    const B: &str = "100000000000000000000000000000000000000000";
+    let zb = format!("0{B}");
+    let mb = format!("-{B}");
+    expr_test(&[B, ">", "99"], "1\n");
+    expr_test(&[&zb, "=", B], "1\n");
+    expr_test(
+        &["170141183460469231731687303715884105728", ">", "2"],
+        "1\n",
+    );
+    expr_test(&["--", &mb, "<", "-99"], "1\n");
+    expr_test_status(&["--", &mb, ">", "5"], "0\n", "", 1);
+    expr_test(&["--", "-0", "=", "0"], "1\n");
+    expr_test(&["--", "-0", "=", "-00"], "1\n");
+    expr_test(&["10", ">", "9"], "1\n");
+    expr_test(&["--", "-10", "<", "-9"], "1\n");
+}
+
+/// A syntax error names the argument it was found at.
+#[test]
+fn expr_syntax_errors_name_the_argument() {
+    expr_test_status(
+        &["1", "+", "2", "3"],
+        "",
+        "expr: syntax error: unexpected argument '3'\n",
+        2,
+    );
+    expr_test_status(
+        &["-", "1"],
+        "",
+        "expr: syntax error: unexpected argument '-'\n",
+        2,
+    );
+    expr_test_status(
+        &["(", ")"],
+        "",
+        "expr: syntax error: unexpected argument ')'\n",
+        2,
+    );
+    expr_test_status(
+        &["(", "1", "2"],
+        "",
+        "expr: syntax error: expected ')' but found '2'\n",
+        2,
+    );
+    expr_test_status(&["(", "1"], "", "expr: syntax error: missing ')'\n", 2);
+}
+
+/// An invalid regular expression is reported with regcomp's reason.
+#[test]
+fn expr_invalid_regex_gives_the_reason() {
+    let args = ["a".to_string(), ":".to_string(), "\\(".to_string()];
+    let out = plib::testing::run_test_base("expr", &args, b"");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let reason = stderr
+        .strip_prefix("expr: invalid regex '\\(': ")
+        .unwrap_or_else(|| panic!("{stderr:?}"));
+    assert!(reason.trim().len() > 1, "{stderr:?}");
+    assert_eq!(out.status.code(), Some(2));
+}
+
+/// An argument named in a diagnostic is shown so that the message neither
+/// drives the terminal nor misquotes the argument: a backslash is doubled,
+/// control bytes, bytes that are not text and format characters are written
+/// as \xHH for each byte, and other characters are written as themselves
+/// only in a UTF-8 locale.
+#[cfg(unix)]
+#[test]
+fn expr_diagnostic_escapes_the_argument() {
+    let shown = |locale: &str, arg: &[u8]| {
+        let args = [b"1".as_slice(), b"+", b"2", arg].map(os_bytes).to_vec();
+        let out = plib::testing::run_test_base_os("expr", &args, b"", &[("LC_ALL", locale)]);
+        assert_eq!(out.status.code(), Some(2));
+        out.stderr
+    };
+    let expected =
+        |arg: &str| format!("expr: syntax error: unexpected argument '{arg}'\n").into_bytes();
+    for (arg, text) in [
+        (&b"\x1b]0;x\x07"[..], r"\x1b]0;x\x07"),
+        (b"a\xffb", r"a\xffb"),
+        (b"tab\there", r"tab\x09here"),
+        (b"\\x1b", r"\\x1b"),
+        (b"\xc2\x85", r"\xc2\x85"),
+        ("\u{202e}abc".as_bytes(), r"\xe2\x80\xaeabc"),
+        ("\u{e9}".as_bytes(), r"\xc3\xa9"),
+    ] {
+        assert_eq!(shown("C", arg), expected(text), "{arg:?}");
+    }
+    if let Some(utf8) = utf8_locale() {
+        assert_eq!(shown(&utf8, "\u{e9}".as_bytes()), expected("\u{e9}"));
+        assert_eq!(shown(&utf8, b"\xc2\x85"), expected(r"\xc2\x85"));
+        assert_eq!(
+            shown(&utf8, "\u{202e}a".as_bytes()),
+            expected(r"\xe2\x80\xaea")
+        );
+    }
 }

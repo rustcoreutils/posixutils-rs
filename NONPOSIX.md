@@ -488,6 +488,13 @@ but no daemon to run them.  Behavior follows Vixie cron:
  * `#` — null command / comment.
  * `&` — repeat the last substitution.
 
+### expr
+
+ * Arithmetic uses 128-bit integers, wider than the `signed long` of XCU
+   1.1.2.1.  An operand beyond that range is the error "integer out of
+   range", and a result beyond it "integer overflow", both exit status 2.
+   Comparisons of integers work at any size.
+
 ### file
 
  * `-b` / `--brief` — print the type without the `file: ` prefix.

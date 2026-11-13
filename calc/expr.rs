@@ -60,10 +60,10 @@ enum IntOp {
 }
 
 // the bytes of an operand
-fn operand_bytes(t: &Token) -> Result<&[u8], &'static str> {
+fn operand_bytes(t: &Token) -> Result<&[u8], String> {
     match t {
         Token::Operand(bytes) => Ok(bytes),
-        _ => Err("syntax error: not a string"),
+        _ => Err("syntax error: not a string".to_string()),
     }
 }
 
@@ -76,17 +76,18 @@ fn bool_token(value: bool) -> Token {
     Token::Operand(if value { b"1".to_vec() } else { b"0".to_vec() })
 }
 
-// Does this operand satisfy the POSIX integer production?
+// The sign (true if negative) and the digits of an operand that satisfies
+// the POSIX integer production, or None for one that does not.
 //
 // XCU expr: "integer: An argument consisting only of an (optional) unary minus
 // followed by digits." A leading plus does not qualify, so `+5` is a string,
 // and neither do surrounding blanks.
-fn is_integer_text(bytes: &[u8]) -> bool {
-    let digits = match bytes.first() {
-        Some(b'-') => &bytes[1..],
-        _ => bytes,
+fn integer_parts(bytes: &[u8]) -> Option<(bool, &[u8])> {
+    let (negative, digits) = match bytes.split_first() {
+        Some((b'-', rest)) => (true, rest),
+        _ => (false, bytes),
     };
-    !digits.is_empty() && digits.iter().all(u8::is_ascii_digit)
+    (!digits.is_empty() && digits.iter().all(u8::is_ascii_digit)).then_some((negative, digits))
 }
 
 // The integer value of an operand.
@@ -94,15 +95,23 @@ fn is_integer_text(bytes: &[u8]) -> bool {
 // Distinguishes an argument that is not an integer at all from one that is an
 // integer this implementation cannot represent; reporting the second as a
 // "non-integer argument" says something untrue about the input.
-fn integer_value(bytes: &[u8]) -> Result<i128, &'static str> {
-    if !is_integer_text(bytes) {
-        return Err("non-integer argument");
-    }
-    // ASCII by construction, so the conversion cannot fail.
-    std::str::from_utf8(bytes)
-        .map_err(|_| "non-integer argument")?
-        .parse::<i128>()
-        .map_err(|_| "integer out of range")
+fn integer_value(bytes: &[u8]) -> Result<i128, String> {
+    let (negative, digits) =
+        integer_parts(bytes).ok_or_else(|| "non-integer argument".to_string())?;
+    // accumulated with the operand's sign, so that the most negative value
+    // fits as well
+    digits
+        .iter()
+        .try_fold(0i128, |value, &digit| {
+            let digit = i128::from(digit - b'0');
+            let value = value.checked_mul(10)?;
+            if negative {
+                value.checked_sub(digit)
+            } else {
+                value.checked_add(digit)
+            }
+        })
+        .ok_or_else(|| "integer out of range".to_string())
 }
 
 // Does the operand count as "null or zero"?
@@ -122,6 +131,83 @@ fn token_is_null_or_zero(t: &Token) -> bool {
     }
 }
 
+// Each operator, by the argument that spells it.
+const OPERATORS: [(&[u8], Token); 16] = [
+    (b"(", Token::LParen),
+    (b")", Token::RParen),
+    (b"*", Token::OpMul),
+    (b"/", Token::OpDiv),
+    (b"%", Token::OpRem),
+    (b"+", Token::OpAdd),
+    (b"-", Token::OpSub),
+    (b"=", Token::OpEq),
+    (b">", Token::OpGT),
+    (b"<", Token::OpLT),
+    (b">=", Token::OpGE),
+    (b"<=", Token::OpLE),
+    (b"!=", Token::OpNE),
+    (b"&", Token::OpAnd),
+    (b"|", Token::OpOr),
+    (b":", Token::OpMatch),
+];
+
+// The argument a token came from, shown for a diagnostic so that the
+// message neither drives the terminal nor misquotes the argument: a
+// backslash is doubled; ASCII control bytes, bytes that are not UTF-8, and
+// the characters that steer a terminal's display (C1 controls, bidi and
+// other format characters) are written as \xHH for each of their bytes;
+// other non-ASCII characters are written as themselves only in a UTF-8
+// locale, and as \xHH bytes otherwise.
+fn token_text(t: &Token) -> String {
+    use std::fmt::Write;
+    let text = match t {
+        Token::Operand(bytes) => bytes.as_slice(),
+        operator => OPERATORS
+            .iter()
+            .find(|(_, token)| token == operator)
+            .map(|(text, _)| *text)
+            .expect("every operator is in the table"),
+    };
+    let utf8_locale = plib::locale::next_char_offset("\u{e9}".as_bytes(), 0) == Some(2);
+    let mut shown = String::new();
+    let escape = |shown: &mut String, bytes: &[u8]| {
+        for byte in bytes {
+            write!(shown, "\\x{byte:02x}").expect("writing to a String");
+        }
+    };
+    for chunk in text.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            match c {
+                '\\' => shown.push_str("\\\\"),
+                ' '..='~' => shown.push(c),
+                c if c.is_ascii() || !utf8_locale || steers_display(c) => {
+                    escape(&mut shown, c.encode_utf8(&mut [0; 4]).as_bytes())
+                }
+                c => shown.push(c),
+            }
+        }
+        escape(&mut shown, chunk.invalid());
+    }
+    shown
+}
+
+// Whether a character changes how a terminal shows what follows it: a C1
+// control, or a Unicode format character (zero-width, bidi embedding and
+// override, isolate, byte order mark).
+fn steers_display(c: char) -> bool {
+    matches!(c,
+        '\u{80}'..='\u{9f}'
+        | '\u{ad}'
+        | '\u{200b}'..='\u{200f}'
+        | '\u{202a}'..='\u{202e}'
+        | '\u{2060}'..='\u{206f}'
+        | '\u{feff}')
+}
+
+fn unexpected_argument(t: &Token) -> String {
+    format!("syntax error: unexpected argument '{}'", token_text(t))
+}
+
 // parse a single argument into a token
 //
 // POSIX APPLICATION USAGE: expr "is not required to be able to tell the
@@ -129,24 +215,9 @@ fn token_is_null_or_zero(t: &Token) -> bool {
 // `expr = = =`. A word that spells an operator is therefore that operator;
 // this is conformant, not a defect to be fixed with lookahead.
 fn parse_token(arg: Vec<u8>) -> Token {
-    match arg.as_slice() {
-        b"(" => Token::LParen,
-        b")" => Token::RParen,
-        b"*" => Token::OpMul,
-        b"/" => Token::OpDiv,
-        b"%" => Token::OpRem,
-        b"+" => Token::OpAdd,
-        b"-" => Token::OpSub,
-        b"=" => Token::OpEq,
-        b">" => Token::OpGT,
-        b"<" => Token::OpLT,
-        b">=" => Token::OpGE,
-        b"<=" => Token::OpLE,
-        b"!=" => Token::OpNE,
-        b"&" => Token::OpAnd,
-        b"|" => Token::OpOr,
-        b":" => Token::OpMatch,
-        _ => Token::Operand(arg),
+    match OPERATORS.iter().find(|(text, _)| *text == arg.as_slice()) {
+        Some((_, token)) => token.clone(),
+        None => Token::Operand(arg),
     }
 }
 
@@ -171,17 +242,43 @@ fn tokenize() -> Vec<Token> {
     args.into_iter().map(parse_token).collect()
 }
 
+// Compare two integers, given as the sign and digits of `integer_parts`, by
+// their decimal value, whatever their size: one too large for the arithmetic
+// is still an integer, and comparing it as a string gives the wrong answer.
+fn compare_integers(a: (bool, &[u8]), b: (bool, &[u8])) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    // the sign and the digits without leading zeros; -0 is zero
+    fn magnitude((negative, mut digits): (bool, &[u8])) -> (bool, &[u8]) {
+        while let [b'0', rest @ ..] = digits {
+            digits = rest;
+        }
+        (negative && !digits.is_empty(), digits)
+    }
+    let (a_negative, a_digits) = magnitude(a);
+    let (b_negative, b_digits) = magnitude(b);
+    let by_size = a_digits
+        .len()
+        .cmp(&b_digits.len())
+        .then_with(|| a_digits.cmp(b_digits));
+    match (a_negative, b_negative) {
+        (false, false) => by_size,
+        (true, true) => by_size.reverse(),
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+    }
+}
+
 // perform a comparison operation
 //
 // POSIX: "returns the result of a decimal integer comparison if both arguments
 // are integers; otherwise, returns the result of a string comparison using the
 // locale-specific collation sequence".
-fn cmpop(lhs: &Token, rhs: &Token, op: CmpOp) -> Result<Token, &'static str> {
+fn cmpop(lhs: &Token, rhs: &Token, op: CmpOp) -> Result<Token, String> {
     let lhs = operand_bytes(lhs)?;
     let rhs = operand_bytes(rhs)?;
 
-    let ordering = match (integer_value(lhs), integer_value(rhs)) {
-        (Ok(a), Ok(b)) => a.cmp(&b),
+    let ordering = match (integer_parts(lhs), integer_parts(rhs)) {
+        (Some(a), Some(b)) => compare_integers(a, b),
         // Compare the operands as written; canonicalizing an integer first
         // would compare something the caller never passed.
         _ => plib::locale::strcoll_bytes(lhs, rhs),
@@ -200,7 +297,7 @@ fn cmpop(lhs: &Token, rhs: &Token, op: CmpOp) -> Result<Token, &'static str> {
 }
 
 // perform an integer math operation
-fn intop(lhs: &Token, rhs: &Token, op: IntOp) -> Result<Token, &'static str> {
+fn intop(lhs: &Token, rhs: &Token, op: IntOp) -> Result<Token, String> {
     let i1 = integer_value(operand_bytes(lhs)?)?;
     let i2 = integer_value(operand_bytes(rhs)?)?;
 
@@ -210,13 +307,13 @@ fn intop(lhs: &Token, rhs: &Token, op: IntOp) -> Result<Token, &'static str> {
         IntOp::Mul => i1.checked_mul(i2),
         IntOp::Div => {
             if i2 == 0 {
-                return Err("division by zero");
+                return Err("division by zero".to_string());
             }
             i1.checked_div(i2)
         }
         IntOp::Rem => {
             if i2 == 0 {
-                return Err("division by zero");
+                return Err("division by zero".to_string());
             }
             // x % -1 is zero for every x; checked_rem refuses it only because
             // the corresponding division overflows.
@@ -230,7 +327,7 @@ fn intop(lhs: &Token, rhs: &Token, op: IntOp) -> Result<Token, &'static str> {
 
     result
         .map(|value| Token::Operand(value.to_string().into_bytes()))
-        .ok_or("integer overflow")
+        .ok_or_else(|| "integer overflow".to_string())
 }
 
 fn token_is_null(t: &Token) -> bool {
@@ -336,11 +433,11 @@ fn has_subexpr(pattern: &[u8]) -> bool {
 // "\(...\)", the string matched by "\1" is returned (the null string if it
 // did not match); otherwise the number of characters matched is returned (0
 // on failure).
-fn matchop(lhs: &Token, rhs: &Token) -> Result<Token, &'static str> {
+fn matchop(lhs: &Token, rhs: &Token) -> Result<Token, String> {
     let subject = operand_bytes(lhs)?;
     let pattern = operand_bytes(rhs)?;
 
-    let re = Regex::bre_bytes(pattern).map_err(|_| "invalid regex")?;
+    let re = Regex::bre_bytes(pattern).map_err(|e| e.to_string())?;
     let captures = re.captures_bytes(subject);
 
     // The match must be anchored at the start of the string.
@@ -410,7 +507,7 @@ impl Parser {
     }
 
     // top level: '|', lowest precedence
-    fn parse_or(&mut self) -> Result<Token, &'static str> {
+    fn parse_or(&mut self) -> Result<Token, String> {
         let mut lhs = self.parse_and()?;
         while matches!(self.peek(), Some(Token::OpOr)) {
             self.advance();
@@ -421,7 +518,7 @@ impl Parser {
     }
 
     // '&'
-    fn parse_and(&mut self) -> Result<Token, &'static str> {
+    fn parse_and(&mut self) -> Result<Token, String> {
         let mut lhs = self.parse_cmp()?;
         while matches!(self.peek(), Some(Token::OpAnd)) {
             self.advance();
@@ -432,7 +529,7 @@ impl Parser {
     }
 
     // comparison operators: = > >= < <= !=
-    fn parse_cmp(&mut self) -> Result<Token, &'static str> {
+    fn parse_cmp(&mut self) -> Result<Token, String> {
         let mut lhs = self.parse_add()?;
         loop {
             let op = match self.peek() {
@@ -452,7 +549,7 @@ impl Parser {
     }
 
     // additive operators: + -
-    fn parse_add(&mut self) -> Result<Token, &'static str> {
+    fn parse_add(&mut self) -> Result<Token, String> {
         let mut lhs = self.parse_mul()?;
         loop {
             let op = match self.peek() {
@@ -468,7 +565,7 @@ impl Parser {
     }
 
     // multiplicative operators: * / %
-    fn parse_mul(&mut self) -> Result<Token, &'static str> {
+    fn parse_mul(&mut self) -> Result<Token, String> {
         let mut lhs = self.parse_match()?;
         loop {
             let op = match self.peek() {
@@ -485,7 +582,7 @@ impl Parser {
     }
 
     // matching operator ':', highest-precedence binary operator
-    fn parse_match(&mut self) -> Result<Token, &'static str> {
+    fn parse_match(&mut self) -> Result<Token, String> {
         let mut lhs = self.parse_primary()?;
         while matches!(self.peek(), Some(Token::OpMatch)) {
             self.advance();
@@ -496,13 +593,13 @@ impl Parser {
     }
 
     // primary: ( expr ) | operand
-    fn parse_primary(&mut self) -> Result<Token, &'static str> {
+    fn parse_primary(&mut self) -> Result<Token, String> {
         match self.advance() {
             Some(Token::LParen) => {
                 self.depth += 1;
                 if self.depth > MAX_NEST_DEPTH {
                     self.depth -= 1;
-                    return Err("expression nested too deeply");
+                    return Err("expression nested too deeply".to_string());
                 }
                 let val = self.parse_or();
                 self.depth -= 1;
@@ -511,22 +608,26 @@ impl Parser {
                 let val = val?;
                 match self.advance() {
                     Some(Token::RParen) => Ok(val),
-                    _ => Err("syntax error: expected ')'"),
+                    Some(t) => Err(format!(
+                        "syntax error: expected ')' but found '{}'",
+                        token_text(&t)
+                    )),
+                    None => Err("syntax error: missing ')'".to_string()),
                 }
             }
             Some(t) if token_is_lval(&t) => Ok(t),
-            Some(_) => Err("syntax error: unexpected operator"),
-            None => Err("syntax error: missing argument"),
+            Some(t) => Err(unexpected_argument(&t)),
+            None => Err("syntax error: missing argument".to_string()),
         }
     }
 }
 
 // evaluate the whole token stream as a single expression
-fn eval_expression(tokens: Vec<Token>) -> Result<Token, &'static str> {
+fn eval_expression(tokens: Vec<Token>) -> Result<Token, String> {
     let mut parser = Parser::new(tokens);
     let result = parser.parse_or()?;
-    if parser.pos != parser.tokens.len() {
-        return Err("syntax error: unexpected trailing argument");
+    if let Some(t) = parser.peek() {
+        return Err(unexpected_argument(t));
     }
     Ok(result)
 }
@@ -568,7 +669,7 @@ fn main() {
         }
         Err(msg) => {
             // invalid expression: diagnostic to stderr, exit status 2.
-            diag::error(msg);
+            diag::error(&msg);
             std::process::exit(2);
         }
     }

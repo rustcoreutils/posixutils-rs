@@ -91,9 +91,9 @@ impl Array {
     }
 
     /// Get the `ValueIndex` of the key in the array. If the key does not exist, it will be inserted.
-    pub fn get_value_index(&mut self, key: Key) -> Result<ValueIndex, String> {
+    pub fn get_value_index(&mut self, key: Key) -> ValueIndex {
         match self.key_map.entry(key.clone()) {
-            Entry::Occupied(e) => Ok(ValueIndex { index: *e.get() }),
+            Entry::Occupied(e) => ValueIndex { index: *e.get() },
             Entry::Vacant(e) => {
                 let pair_index = store_pair(
                     key,
@@ -103,9 +103,20 @@ impl Array {
                     self.iterator_count,
                 );
                 e.insert(pair_index);
-                Ok(ValueIndex { index: pair_index })
+                ValueIndex { index: pair_index }
             }
         }
+    }
+
+    /// The `ValueIndex` of the element `key`, inserted if it does not
+    /// exist, and the array's own copy of the key, which [`Array::element`]
+    /// recognises by its address.
+    pub fn element_ref(&mut self, key: Key) -> (ValueIndex, Key) {
+        let index = self.get_value_index(key);
+        let (stored_key, _) = self.pairs[index.index]
+            .as_ref()
+            .expect("the slot of an element holds it");
+        (index, stored_key.clone())
     }
 
     pub fn index_to_value(&mut self, index: ValueIndex) -> Option<&mut AwkValue> {
@@ -120,16 +131,14 @@ impl Array {
     pub fn element(&mut self, hint: ValueIndex, key: &Key) -> &mut AwkValue {
         let index = match self.pairs.get(hint.index) {
             Some(Some((slot_key, _))) if Rc::ptr_eq(slot_key, key) || slot_key == key => hint,
-            _ => self
-                .get_value_index(key.clone())
-                .expect("inserting into an array cannot fail"),
+            _ => self.get_value_index(key.clone()),
         };
         self.index_to_value(index)
             .expect("the slot of an element holds it")
     }
 
     pub fn get_value(&mut self, key: Key) -> Result<&mut AwkValue, String> {
-        let index = self.get_value_index(key)?;
+        let index = self.get_value_index(key);
         Ok(self.index_to_value(index).unwrap())
     }
 
@@ -311,7 +320,7 @@ mod tests {
         let mut iter = array.key_iter();
         array.set("c".to_string(), 3.0).unwrap();
         assert_eq!(array.key_iter_next(&mut iter), Some(Rc::from("b")));
-        array.get_value_index(Rc::from("d")).unwrap();
+        array.get_value_index(Rc::from("d"));
         assert_eq!(array.key_iter_next(&mut iter), None);
         assert_eq!(array.len(), 3);
     }

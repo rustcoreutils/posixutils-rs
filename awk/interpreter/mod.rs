@@ -685,11 +685,9 @@ impl Interpreter {
                         .pop_scalar_value()?
                         .scalar_to_string(&global_env.convfmt)?;
                     let array = stack.pop_array_ptr()?;
-                    let key: Rc<str> = key.into();
                     // safe by type invariance
-                    let value_index = unsafe { &mut *array }
-                        .as_array()?
-                        .get_value_index(key.clone())?;
+                    let (value_index, key) =
+                        unsafe { &mut *array }.as_array()?.element_ref(key.into());
                     // array is valid at least until this stack value is popped by stack invariance,
                     // so this is safe
                     unsafe {

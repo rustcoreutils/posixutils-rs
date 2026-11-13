@@ -131,26 +131,35 @@ fn token_is_null_or_zero(t: &Token) -> bool {
     }
 }
 
+// Each operator, by the argument that spells it.
+const OPERATORS: [(&[u8], Token); 16] = [
+    (b"(", Token::LParen),
+    (b")", Token::RParen),
+    (b"*", Token::OpMul),
+    (b"/", Token::OpDiv),
+    (b"%", Token::OpRem),
+    (b"+", Token::OpAdd),
+    (b"-", Token::OpSub),
+    (b"=", Token::OpEq),
+    (b">", Token::OpGT),
+    (b"<", Token::OpLT),
+    (b">=", Token::OpGE),
+    (b"<=", Token::OpLE),
+    (b"!=", Token::OpNE),
+    (b"&", Token::OpAnd),
+    (b"|", Token::OpOr),
+    (b":", Token::OpMatch),
+];
+
 // The argument a token came from, for a diagnostic.
 fn token_text(t: &Token) -> String {
-    let text: &[u8] = match t {
-        Token::LParen => b"(",
-        Token::RParen => b")",
-        Token::OpMul => b"*",
-        Token::OpDiv => b"/",
-        Token::OpRem => b"%",
-        Token::OpAdd => b"+",
-        Token::OpSub => b"-",
-        Token::OpEq => b"=",
-        Token::OpGT => b">",
-        Token::OpLT => b"<",
-        Token::OpGE => b">=",
-        Token::OpLE => b"<=",
-        Token::OpNE => b"!=",
-        Token::OpAnd => b"&",
-        Token::OpOr => b"|",
-        Token::OpMatch => b":",
-        Token::Operand(bytes) => bytes,
+    let text = match t {
+        Token::Operand(bytes) => bytes.as_slice(),
+        operator => OPERATORS
+            .iter()
+            .find(|(_, token)| token == operator)
+            .map(|(text, _)| *text)
+            .expect("every operator is in the table"),
     };
     String::from_utf8_lossy(text).into_owned()
 }
@@ -166,24 +175,9 @@ fn unexpected_argument(t: &Token) -> String {
 // `expr = = =`. A word that spells an operator is therefore that operator;
 // this is conformant, not a defect to be fixed with lookahead.
 fn parse_token(arg: Vec<u8>) -> Token {
-    match arg.as_slice() {
-        b"(" => Token::LParen,
-        b")" => Token::RParen,
-        b"*" => Token::OpMul,
-        b"/" => Token::OpDiv,
-        b"%" => Token::OpRem,
-        b"+" => Token::OpAdd,
-        b"-" => Token::OpSub,
-        b"=" => Token::OpEq,
-        b">" => Token::OpGT,
-        b"<" => Token::OpLT,
-        b">=" => Token::OpGE,
-        b"<=" => Token::OpLE,
-        b"!=" => Token::OpNE,
-        b"&" => Token::OpAnd,
-        b"|" => Token::OpOr,
-        b":" => Token::OpMatch,
-        _ => Token::Operand(arg),
+    match OPERATORS.iter().find(|(text, _)| *text == arg.as_slice()) {
+        Some((_, token)) => token.clone(),
+        None => Token::Operand(arg),
     }
 }
 

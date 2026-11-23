@@ -11,13 +11,13 @@ rust-version.workspace = true
 plib = { path = "../plib" }
 clap.workspace = true
 gettext-rs.workspace = true
-num-traits = "0.2"
+num-traits = "0"
 
 # IPP - blocking client only, no TLS for minimal deps
-ipp = { version = "5.3", default-features = false, features = ["client"] }
+ipp = { version = "5", default-features = false, features = ["client"] }
 
 [dev-dependencies]
-portable-pty = "0.9"
+portable-pty = "0"
 
 [lints]
 workspace = true

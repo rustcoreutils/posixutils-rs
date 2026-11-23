@@ -16,10 +16,10 @@ clap = { workspace = true, features = ["env"] }
 gettext-rs.workspace = true
 libc.workspace = true
 thiserror.workspace = true
-chrono = { version = "0.4", features = ["unstable-locales"] }
+chrono = { version = "0", features = ["unstable-locales"] }
 plib = { path = "../plib" }
 regex.workspace = true
-terminfo = "0.9"
+terminfo = "0"
 unicode-width.workspace = true
 
 [dev-dependencies]

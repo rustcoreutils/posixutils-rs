@@ -44,16 +44,16 @@ rust-version = "1.88.0"
 
 [workspace.dependencies]
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "cargo"] }
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
-chrono-tz = "0.10"
-libc = "0.2"
-regex = "1.10"
+chrono = { version = "0", default-features = false, features = ["clock"] }
+chrono-tz = "0"
+libc = "0"
+regex = "1"
 gettext-rs = { path = "./gettext-rs" }
-errno = "0.3"
+errno = "0"
 thiserror = "2"
 pest = { version = "2", default-features = false }
 pest_derive = "2"
-unicode-width = "0.2"
+unicode-width = "0"
 
 [workspace.lints.rust]
 # Allow `cfg(coverage)` which is set by cargo-llvm-cov during coverage builds

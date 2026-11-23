@@ -10,13 +10,13 @@ rust-version.workspace = true
 [dependencies]
 clap.workspace = true
 gettext-rs.workspace = true
-terminfo = "0.9"
-termios = "0.3"
+terminfo = "0"
+termios = "0"
 libc.workspace = true
 plib = { path = "../plib" }
 
 [dev-dependencies]
-portable-pty = "0.9"
+portable-pty = "0"
 
 [lints]
 workspace = true

@@ -13,14 +13,14 @@ clap.workspace = true
 gettext-rs.workspace = true
 libc.workspace = true
 chrono.workspace = true
-libcrypt-rs = "0.1"
+libcrypt-rs = "0"
 thiserror.workspace = true
-terminfo = "0.9"
+terminfo = "0"
 
 [dev-dependencies]
 libc = { workspace = true }
 regex = { workspace = true }
-portable-pty = "0.9"
+portable-pty = "0"
 
 [lints]
 workspace = true

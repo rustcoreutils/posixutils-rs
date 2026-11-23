@@ -15,7 +15,7 @@ plib = { path = "../plib" }
 thiserror.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
-portable-pty = "0.9"
+portable-pty = "0"
 
 [lints]
 workspace = true

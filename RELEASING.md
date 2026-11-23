@@ -93,10 +93,15 @@ Write this to a scratch file **outside the repository**. The notes are pasted
 into the GitHub release form; they are not checked in, and there is no
 `CHANGELOG.md`.
 
-### 4. Tag and publish
+### 4. Merge, tag and publish
+
+The release commits go to `main` through a pull request. Once it is merged,
+tag the PR's merge commit on `main` — not the version-bump commit on the
+branch:
 
 ```sh
-git tag -a vX.Y.Z -m 'Version X.Y.Z'
+git switch main && git pull
+git tag -a vX.Y.Z -m 'Version X.Y.Z' <merge-commit>
 git push origin vX.Y.Z
 ```
 

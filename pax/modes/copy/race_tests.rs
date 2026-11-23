@@ -13,7 +13,7 @@
 use super::*;
 use crate::modes::race_hook::{self, Point};
 use plib::tmp::TempDir;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 /// A file outside the destination, on the same filesystem, mode 0600 and an
 /// mtime of 1,000,000,000 -- what the swapped-in hard link leads to.
@@ -21,8 +21,14 @@ fn victim(tmp: &TempDir) -> (PathBuf, CString) {
     let path = tmp.path().join("victim");
     std::fs::write(&path, "private").unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let when = filetime::FileTime::from_unix_time(1_000_000_000, 0);
-    filetime::set_file_times(&path, when, when).unwrap();
+    let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    let times = std::fs::FileTimes::new()
+        .set_accessed(when)
+        .set_modified(when);
+    std::fs::File::open(&path)
+        .unwrap()
+        .set_times(times)
+        .unwrap();
     let c = CString::new(path.as_os_str().as_bytes()).unwrap();
     (path, c)
 }
@@ -263,9 +269,18 @@ fn fifo_takes_its_attributes() {
     let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
     std::fs::set_permissions(&fifo, std::fs::Permissions::from_mode(0o4751)).unwrap();
-    let when = filetime::FileTime::from_unix_time(12345, 0);
-    // Not `set_file_times`, which opens the FIFO and waits for a writer.
-    filetime::set_symlink_file_times(&fifo, when, when).unwrap();
+    let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(12345);
+    let times = std::fs::FileTimes::new()
+        .set_accessed(when)
+        .set_modified(when);
+    // Opened without O_NONBLOCK, the FIFO would wait for a writer.
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo)
+        .unwrap()
+        .set_times(times)
+        .unwrap();
 
     let operand = fifo.clone();
     copy_files(&mut std::iter::once(operand), &dest, &preserve_everything()).unwrap();

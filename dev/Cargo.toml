@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-dev"
-version = "0.9.1"
+version = "0.10.0"
 authors = ["Jeff Garzik"]
 repository.workspace = true
 license.workspace = true
@@ -10,11 +10,11 @@ rust-version.workspace = true
 [dependencies]
 clap.workspace = true
 gettext-rs.workspace = true
-object = { version = "0.35", default-features = false, features = ["read", "build", "elf", "std"] }
+object = { version = "0", default-features = false, features = ["read", "build", "elf", "std"] }
 libc.workspace = true
-ar = "0.9"
+ar = "0"
 regex.workspace = true
-regex-syntax = "0.8"
+regex-syntax = "0"
 plib = { path = "../plib" }
 
 [dev-dependencies]

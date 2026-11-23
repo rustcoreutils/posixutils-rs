@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-mailx"
-version = "0.9.1"
+version = "0.10.0"
 authors = ["Jeff Garzik"]
 repository.workspace = true
 license.workspace = true
@@ -12,7 +12,7 @@ chrono.workspace = true
 gettext-rs.workspace = true
 libc.workspace = true
 plib = { path = "../plib" }
-terminfo = "0.9"
+terminfo = "0"
 
 
 [lints]

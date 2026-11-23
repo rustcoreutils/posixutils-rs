@@ -84,6 +84,11 @@ compiler in `cc/` (see [cc/README.md](cc/README.md)).
 3. "only std"  When an external crate is required, avoid mega-crates.  Prefer
    std-only, or tiny crates that perform a single, lightweight function.
    The workspace's standard set is `clap`, `libc`, `regex` and `chrono`.
+   We follow dependency versions upwards.  A version requirement names only
+   the major version (`regex = "1"`, `libc = "0"`, including for 0.x crates),
+   never a minor or micro version; `Cargo.lock` records what was tested.
+   When a newer release breaks the build, fix our code rather than pinning
+   the old version.
 4. Correctness, readability, performance, in that order.
    Code should be readable by unfamiliar developers.  Avoid dense,
    uncommented code.

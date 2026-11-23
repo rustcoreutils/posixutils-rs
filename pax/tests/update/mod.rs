@@ -44,7 +44,7 @@ fn test_update_mode_read_newer() {
 
     // Set the destination file's mtime to an older time
     let old_time = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1000000000); // ~2001
-    filetime::set_file_mtime(&dst_file, filetime::FileTime::from_system_time(old_time)).unwrap();
+    set_mtime(&dst_file, old_time);
 
     // Extract with -u (update mode) - archive is newer, should overwrite
     let output = run_pax_in_dir(&["-r", "-u", "-f", archive.to_str().unwrap()], &dst_dir);
@@ -76,7 +76,7 @@ fn test_update_mode_read_older() {
 
     // Set source file to an old mtime before archiving
     let old_time = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1000000000);
-    filetime::set_file_mtime(&src_file, filetime::FileTime::from_system_time(old_time)).unwrap();
+    set_mtime(&src_file, old_time);
 
     // Create archive (with old mtime preserved)
     run_pax_in_dir(
@@ -125,7 +125,7 @@ fn test_update_mode_copy_newer() {
 
     // Set destination file to old time
     let old_time = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1000000000);
-    filetime::set_file_mtime(&dst_file, filetime::FileTime::from_system_time(old_time)).unwrap();
+    set_mtime(&dst_file, old_time);
 
     // Copy with -u (update mode) - source is newer, should overwrite
     let output = run_pax_in_dir(
@@ -159,7 +159,7 @@ fn test_update_mode_copy_older() {
 
     // Set source to old time
     let old_time = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1000000000);
-    filetime::set_file_mtime(&src_file, filetime::FileTime::from_system_time(old_time)).unwrap();
+    set_mtime(&src_file, old_time);
 
     // Create destination with NEWER file (current time)
     fs::create_dir(&dst_dir).unwrap();
@@ -238,7 +238,7 @@ fn test_reset_atime_write_mode() {
 
     // Set a known access time in the past
     let old_time = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1500000000);
-    filetime::set_file_atime(&src_file, filetime::FileTime::from_system_time(old_time)).unwrap();
+    set_atime(&src_file, old_time);
 
     // Get the atime before archive creation
     let meta_before = fs::metadata(&src_file).unwrap();
@@ -281,7 +281,7 @@ fn test_update_rejection_does_not_use_up_first_match() {
     let file = temp.path().join("f");
     fs::write(&file, "disk\n").unwrap();
     let on_disk = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
-    filetime::set_file_mtime(&file, filetime::FileTime::from_system_time(on_disk)).unwrap();
+    set_mtime(&file, on_disk);
 
     let mut a = Ustar {
         name: b"f",
@@ -314,7 +314,7 @@ fn test_update_compares_the_name_before_substitution() {
     let original = temp.path().join("f");
     fs::write(&original, "disk\n").unwrap();
     let on_disk = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
-    filetime::set_file_mtime(&original, filetime::FileTime::from_system_time(on_disk)).unwrap();
+    set_mtime(&original, on_disk);
 
     let a = Ustar {
         name: b"f",
@@ -336,9 +336,9 @@ fn test_update_compares_subsecond_times() {
     let temp = TempDir::new().unwrap();
     let src = temp.path().join("src");
     fs::create_dir(&src).unwrap();
-    let at = |nsec| filetime::FileTime::from_unix_time(1_600_000_000, nsec);
+    let at = |nsec| unix_time(1_600_000_000, nsec);
     fs::write(src.join("f"), "archived\n").unwrap();
-    filetime::set_file_mtime(src.join("f"), at(700_000_000)).unwrap();
+    set_mtime(src.join("f"), at(700_000_000));
     let output = run_pax_in_dir(&["-w", "-x", "pax", "-f", "../a.pax", "f"], &src);
     assert_success(&output, "pax -w -x pax");
 
@@ -346,7 +346,7 @@ fn test_update_compares_subsecond_times() {
         let dest = temp.path().join(format!("dest{dest_nsec}"));
         fs::create_dir(&dest).unwrap();
         fs::write(dest.join("f"), "disk\n").unwrap();
-        filetime::set_file_mtime(dest.join("f"), at(dest_nsec)).unwrap();
+        set_mtime(dest.join("f"), at(dest_nsec));
         let output = run_pax_in_dir(&["-r", "-u", "-f", "../a.pax"], &dest);
         assert_success(&output, "pax -r -u");
         let want = if replaced { "archived\n" } else { "disk\n" };
@@ -360,7 +360,7 @@ fn test_update_compares_subsecond_times() {
         let copy = temp.path().join(format!("copy{dest_nsec}"));
         fs::create_dir(&copy).unwrap();
         fs::write(copy.join("f"), "disk\n").unwrap();
-        filetime::set_file_mtime(copy.join("f"), at(dest_nsec)).unwrap();
+        set_mtime(copy.join("f"), at(dest_nsec));
         let output = run_pax_in_dir(&["-r", "-w", "-u", "f", copy.to_str().unwrap()], &src);
         assert_success(&output, "pax -rw -u");
         assert_eq!(
@@ -390,11 +390,7 @@ fn test_update_append_distinguishes_non_utf8_names() {
     }
     fs::write(temp.path().join(old), b"old").unwrap();
     let old_time = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
-    filetime::set_file_mtime(
-        temp.path().join(old),
-        filetime::FileTime::from_system_time(old_time),
-    )
-    .unwrap();
+    set_mtime(temp.path().join(old), old_time);
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_pax"))
         .args(["-w", "-x", "ustar", "-f", "a.tar"])
@@ -422,7 +418,7 @@ fn test_update_append_distinguishes_non_utf8_names() {
 #[test]
 fn test_update_append_compares_subsecond_times() {
     let temp = TempDir::new().unwrap();
-    let at = |nsec| filetime::FileTime::from_unix_time(1_600_000_000, nsec);
+    let at = |nsec| unix_time(1_600_000_000, nsec);
     let f = temp.path().join("f");
     let count = |archive: &str| {
         let out = run_pax_in_dir(&["-f", archive], temp.path());
@@ -432,7 +428,7 @@ fn test_update_append_compares_subsecond_times() {
 
     for (format, archive) in [("pax", "a.pax"), ("ustar", "a.tar")] {
         fs::write(&f, "first\n").unwrap();
-        filetime::set_file_mtime(&f, at(300_000_000)).unwrap();
+        set_mtime(&f, at(300_000_000));
         let out = run_pax_in_dir(&["-w", "-x", format, "-f", archive, "f"], temp.path());
         assert_success(&out, "pax -w");
 
@@ -444,7 +440,7 @@ fn test_update_append_compares_subsecond_times() {
 
     // Changed within the same second: only the pax record can tell.
     fs::write(&f, "second\n").unwrap();
-    filetime::set_file_mtime(&f, at(700_000_000)).unwrap();
+    set_mtime(&f, at(700_000_000));
     let out = run_pax_in_dir(&["-w", "-a", "-u", "-f", "a.pax", "f"], temp.path());
     assert_success(&out, "pax -w -a -u, changed");
     assert_eq!(count("a.pax"), 2, "newer file not appended");

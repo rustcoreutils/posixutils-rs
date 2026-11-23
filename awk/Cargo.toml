@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-awk"
-version = "0.9.1"
+version = "0.10.0"
 repository.workspace = true
 license.workspace = true
 edition.workspace = true
@@ -14,7 +14,7 @@ pest.workspace = true
 pest_derive.workspace = true
 lexical = { version = "7", features = ["format"] }
 plib = { path = "../plib" }
-rand = { version = "0.9", default-features = false, features = ["small_rng"] }
+rand = { version = "0", default-features = false, features = ["small_rng"] }
 
 
 [dev-dependencies]

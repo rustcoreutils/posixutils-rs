@@ -184,7 +184,7 @@ fn group_words(builder: &Builder, section: &Section) -> Vec<u32> {
             .as_chunks::<4>()
             .0
             .iter()
-            .map(|w| builder.endian.read_u32_bytes(*w))
+            .map(|w| builder.endian.read_u32(*w))
             .collect(),
         _ => Vec::new(),
     }
@@ -262,7 +262,7 @@ fn restore_groups(builder: &mut Builder, groups: &[usize]) -> raw::Result<()> {
                     None => continue,
                 }
             };
-            bytes.extend_from_slice(&builder.endian.write_u32_bytes(word));
+            bytes.extend_from_slice(&builder.endian.write_u32(word));
         }
         let signature = new_symbol
             .get(&(section.sh_info as usize))

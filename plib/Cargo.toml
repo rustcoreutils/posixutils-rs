@@ -1,6 +1,6 @@
 [package]
 name = "plib"
-version = "0.9.1"
+version = "0.10.0"
 authors = ["Jeff Garzik"]
 repository.workspace = true
 license.workspace = true
@@ -21,7 +21,7 @@ clap.workspace = true
 [target.'cfg(unix)'.dependencies]
 ftw = { path = "../ftw" }
 # Used only by the Unix-only platform.rs and priority.rs.
-cfg-if = "1.0"
+cfg-if = "1"
 errno.workspace = true
 
 # Compiles the vendored musl regex for a Windows target (see build.rs). Not

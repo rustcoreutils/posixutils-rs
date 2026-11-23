@@ -8,7 +8,7 @@
 //
 
 use plib::tmp::TempDir;
-use rand::{distr::StandardUniform, rngs::StdRng, Rng, SeedableRng};
+use rand::{distr::StandardUniform, rngs::StdRng, RngExt, SeedableRng};
 use std::{ffi::CString, fs, io, os::fd::AsRawFd, path::Path, path::PathBuf, sync::Mutex};
 
 static GLOBAL_MUTEX: Mutex<()> = Mutex::new(());

@@ -30,12 +30,12 @@ impl Layout {
         let order = data.get(5);
         match (class, order) {
             (Some(&c), Some(&d))
-                if (c == elf::ELFCLASS32 || c == elf::ELFCLASS64)
-                    && (d == elf::ELFDATA2LSB || d == elf::ELFDATA2MSB) =>
+                if (c == elf::ELFCLASS32.0 || c == elf::ELFCLASS64.0)
+                    && (d == elf::ELFDATA2LSB.0 || d == elf::ELFDATA2MSB.0) =>
             {
                 Ok(Layout {
-                    big_endian: d == elf::ELFDATA2MSB,
-                    is_64: c == elf::ELFCLASS64,
+                    big_endian: d == elf::ELFDATA2MSB.0,
+                    is_64: c == elf::ELFCLASS64.0,
                 })
             }
             _ => Err(gettext("unsupported ELF class or byte order").into()),
@@ -97,7 +97,7 @@ impl Layout {
 #[derive(Clone)]
 pub struct Shdr {
     pub name: u64,
-    pub sh_type: u32,
+    pub sh_type: elf::SectionType,
     pub flags: u64,
     pub offset: u64,
     pub size: u64,
@@ -116,7 +116,7 @@ impl Shdr {
         }
         Ok(Shdr {
             name: raw[0],
-            sh_type: raw[1] as u32,
+            sh_type: elf::SectionType(raw[1] as u32),
             flags: raw[2],
             offset: raw[4],
             size: raw[5],
@@ -130,7 +130,7 @@ impl Shdr {
     pub fn write(&self, layout: Layout, out: &mut Vec<u8>) {
         let mut raw = self.raw;
         raw[0] = self.name;
-        raw[1] = u64::from(self.sh_type);
+        raw[1] = u64::from(self.sh_type.0);
         raw[4] = self.offset;
         raw[5] = self.size;
         raw[6] = u64::from(self.link);
@@ -146,7 +146,7 @@ impl Shdr {
 
     /// Whether `info` holds a section index.
     pub fn info_is_section(&self) -> bool {
-        self.flags & u64::from(elf::SHF_INFO_LINK) != 0 || (self.is_reloc() && self.info != 0)
+        self.flags & elf::SHF_INFO_LINK.0 != 0 || (self.is_reloc() && self.info != 0)
     }
 
     pub fn has_file_bytes(&self) -> bool {
@@ -179,7 +179,7 @@ impl SectionTable {
         if shoff == 0 {
             return Ok(None);
         }
-        if shnum == 0 || shstrndx == elf::SHN_XINDEX as usize || shstrndx >= shnum {
+        if shnum == 0 || shstrndx == elf::SHN_XINDEX.0 as usize || shstrndx >= shnum {
             return Err(gettext("extended section numbering is not supported").into());
         }
         let shdrs = (0..shnum)
@@ -206,7 +206,7 @@ impl SectionTable {
 /// Whether `data` is a linked ELF file (anything but a relocatable object).
 pub fn is_linked(data: &[u8]) -> Result<bool> {
     let layout = Layout::of(data)?;
-    Ok(layout.get(data, 16, 2)? != u64::from(elf::ET_REL))
+    Ok(layout.get(data, 16, 2)? != u64::from(elf::ET_REL.0))
 }
 
 pub fn name_at(strtab: &[u8], offset: u64) -> &[u8] {

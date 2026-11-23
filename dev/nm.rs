@@ -88,7 +88,6 @@ fn classify(symbol: &Symbol<'_, '_>, section_kinds: &HashMap<SectionIndex, Secti
             }
             Some(SectionKind::ReadOnlyData) | Some(SectionKind::ReadOnlyString) => 'r',
             Some(SectionKind::UninitializedData) | Some(SectionKind::UninitializedTls) => 'b',
-            Some(SectionKind::Common) => 'C',
             _ => '?',
         },
         _ => '?',

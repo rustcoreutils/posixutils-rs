@@ -13,7 +13,36 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
+
+/// The instant `secs` seconds and `nsec` nanoseconds from the epoch;
+/// `secs` may be negative.
+pub fn unix_time(secs: i64, nsec: u32) -> SystemTime {
+    let base = if secs >= 0 {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs as u64)
+    } else {
+        SystemTime::UNIX_EPOCH - Duration::from_secs(secs.unsigned_abs())
+    };
+    base + Duration::from_nanos(nsec.into())
+}
+
+/// Set the times of the file or directory `path` names, leaving any not
+/// given unchanged.
+fn set_times(path: &Path, times: fs::FileTimes) {
+    File::open(path)
+        .and_then(|f| f.set_times(times))
+        .unwrap_or_else(|e| panic!("set times of {}: {e}", path.display()));
+}
+
+/// Set the modification time of `path`, leaving its access time alone.
+pub fn set_mtime(path: impl AsRef<Path>, t: SystemTime) {
+    set_times(path.as_ref(), fs::FileTimes::new().set_modified(t));
+}
+
+/// Set the access time of `path`, leaving its modification time alone.
+pub fn set_atime(path: impl AsRef<Path>, t: SystemTime) {
+    set_times(path.as_ref(), fs::FileTimes::new().set_accessed(t));
+}
 
 /// Run pax with given arguments and return output
 pub fn run_pax(args: &[&str]) -> Output {

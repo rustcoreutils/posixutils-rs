@@ -10,11 +10,12 @@
 //! Integration tests for the `tar` compatibility front-end.
 
 use crate::common::{
-    assert_failure, assert_success, front_end, run_system_ok, run_tar, stderr_str, stdout_str,
-    system_tool, writes_before_list_ends,
+    assert_failure, assert_success, front_end, run_system_ok, run_tar, set_mtime, stderr_str,
+    stdout_str, system_tool, unix_time, writes_before_list_ends,
 };
 use plib::tmp::TempDir;
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 /// Build the tree every test archives: a file, a subdirectory with two files
@@ -426,13 +427,8 @@ fn test_tar_append_and_update() {
     );
 
     // ...but a newer copy is appended.
-    let future = filetime::FileTime::from_unix_time(
-        filetime::FileTime::from_last_modification_time(&fs::metadata(src.join("a.txt")).unwrap())
-            .unix_seconds()
-            + 120,
-        0,
-    );
-    filetime::set_file_mtime(src.join("a.txt"), future).unwrap();
+    let future = unix_time(fs::metadata(src.join("a.txt")).unwrap().mtime() + 120, 0);
+    set_mtime(src.join("a.txt"), future);
     assert_success(&run_tar(&["-uf", "../ap.tar", "a.txt"], &src), "tar -uf");
     assert_eq!(
         members(temp.path(), "ap.tar"),
@@ -496,13 +492,8 @@ fn test_tar_update_appends_a_changed_file_under_an_unchanged_directory() {
     // directory's own mtime is left alone, which is the case that used to
     // make -u skip the whole subtree.
     fs::write(src.join("sub/b.txt"), "changed\n").unwrap();
-    let archived =
-        filetime::FileTime::from_last_modification_time(&fs::metadata(src.join("sub")).unwrap());
-    filetime::set_file_mtime(
-        src.join("sub/b.txt"),
-        filetime::FileTime::from_unix_time(archived.unix_seconds() + 120, 0),
-    )
-    .unwrap();
+    let archived = fs::metadata(src.join("sub")).unwrap().mtime();
+    set_mtime(src.join("sub/b.txt"), unix_time(archived + 120, 0));
 
     assert_success(&run_tar(&["-uf", "../d.tar", "sub"], &src), "tar -uf");
     assert_eq!(

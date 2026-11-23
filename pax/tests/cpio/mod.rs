@@ -11,10 +11,11 @@
 
 use crate::common::{
     assert_failure, assert_success, run_cpio, run_front_end, run_pax_with_stdin_bytes_in_dir,
-    run_system_ok, stderr_str, stdout_str, system_tool, CpioNewc,
+    run_system_ok, set_mtime, stderr_str, stdout_str, system_tool, unix_time, CpioNewc,
 };
 use plib::tmp::TempDir;
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 /// The pathname list a real `find .` would produce for the tree below, in the
@@ -280,28 +281,24 @@ fn test_cpio_preserves_mtime_only_with_dash_m() {
     let temp = TempDir::new().unwrap();
     let src = setup(temp.path());
     let archive = copy_out(&src, Some("newc"));
-    let source_mtime =
-        filetime::FileTime::from_last_modification_time(&fs::metadata(src.join("a.txt")).unwrap());
+    let source_mtime = fs::metadata(src.join("a.txt")).unwrap().mtime();
 
     let kept = temp.path().join("kept");
     fs::create_dir(&kept).unwrap();
     assert_success(&run_cpio(&["-idm"], &kept, &archive), "cpio -idm");
     // cpio headers carry whole seconds, so only those can be compared.
     assert_eq!(
-        filetime::FileTime::from_last_modification_time(&fs::metadata(kept.join("a.txt")).unwrap())
-            .unix_seconds(),
-        source_mtime.unix_seconds(),
+        fs::metadata(kept.join("a.txt")).unwrap().mtime(),
+        source_mtime,
         "-m must restore the archived modification time"
     );
 
     let fresh = temp.path().join("fresh");
     fs::create_dir(&fresh).unwrap();
     assert_success(&run_cpio(&["-id"], &fresh, &archive), "cpio -id");
-    let extracted = filetime::FileTime::from_last_modification_time(
-        &fs::metadata(fresh.join("a.txt")).unwrap(),
-    );
+    let extracted = fs::metadata(fresh.join("a.txt")).unwrap().mtime();
     assert!(
-        extracted.unix_seconds() >= source_mtime.unix_seconds(),
+        extracted >= source_mtime,
         "without -m the file takes the time of extraction"
     );
 }
@@ -316,13 +313,8 @@ fn test_cpio_unconditional_overwrite() {
 
     // A newer file on disk survives by default...
     fs::write(dest.join("a.txt"), "newer\n").unwrap();
-    let future = filetime::FileTime::from_unix_time(
-        filetime::FileTime::from_last_modification_time(&fs::metadata(src.join("a.txt")).unwrap())
-            .unix_seconds()
-            + 120,
-        0,
-    );
-    filetime::set_file_mtime(dest.join("a.txt"), future).unwrap();
+    let future = unix_time(fs::metadata(src.join("a.txt")).unwrap().mtime() + 120, 0);
+    set_mtime(dest.join("a.txt"), future);
     run_cpio(&["-idm"], &dest, &archive);
     assert_eq!(fs::read_to_string(dest.join("a.txt")).unwrap(), "newer\n");
 
@@ -672,9 +664,9 @@ fn test_cpio_rename_keeps_newer_file_at_the_new_name() {
     let temp = TempDir::new().unwrap();
     let src = temp.path().join("src");
     fs::create_dir(&src).unwrap();
-    let mtime = |secs| filetime::FileTime::from_unix_time(secs, 0);
+    let mtime = |secs| unix_time(secs, 0);
     fs::write(src.join("f"), "archived\n").unwrap();
-    filetime::set_file_mtime(src.join("f"), mtime(1_000_000_000)).unwrap();
+    set_mtime(src.join("f"), mtime(1_000_000_000));
     let out = run_cpio(&["-o"], &src, b"f\n");
     assert_success(&out, "cpio -o");
     fs::write(temp.path().join("a.cpio"), &out.stdout).unwrap();
@@ -683,7 +675,7 @@ fn test_cpio_rename_keeps_newer_file_at_the_new_name() {
         let dest = temp.path().join(format!("dest-{newer_at}"));
         fs::create_dir(&dest).unwrap();
         fs::write(dest.join(newer_at), "newer\n").unwrap();
-        filetime::set_file_mtime(dest.join(newer_at), mtime(2_000_000_000)).unwrap();
+        set_mtime(dest.join(newer_at), mtime(2_000_000_000));
         let pty = PtyPax::spawn_program(
             &front_end("cpio"),
             &["-i", "-r", "-I", "../a.cpio"],

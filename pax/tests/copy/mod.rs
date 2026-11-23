@@ -1071,8 +1071,8 @@ fn test_copy_update_depth_first_uses_pre_run_directory_time() {
     fs::create_dir_all(src.join("a")).unwrap();
     fs::write(src.join("a/f"), "F\n").unwrap();
     fs::set_permissions(src.join("a"), fs::Permissions::from_mode(0o700)).unwrap();
-    let src_time = filetime::FileTime::from_unix_time(1_577_836_800, 0); // 2020
-    filetime::set_file_mtime(src.join("a"), src_time).unwrap();
+    let src_time = unix_time(1_577_836_800, 0); // 2020
+    set_mtime(src.join("a"), src_time);
 
     let list = b"./a/f\n./a\n.\n";
     let runs: [(&str, &[&str], u32); 2] = [
@@ -1085,8 +1085,8 @@ fn test_copy_update_depth_first_uses_pre_run_directory_time() {
         fs::create_dir_all(dst.join("a")).unwrap();
         fs::set_permissions(dst.join("a"), fs::Permissions::from_mode(0o755)).unwrap();
         fs::set_permissions(&dst, fs::Permissions::from_mode(0o755)).unwrap();
-        let dst_time = filetime::FileTime::from_unix_time(1_546_300_800, 0); // 2019
-        filetime::set_file_mtime(dst.join("a"), dst_time).unwrap();
+        let dst_time = unix_time(1_546_300_800, 0); // 2019
+        set_mtime(dst.join("a"), dst_time);
 
         let out = if tool == "cpio" {
             run_cpio(args, &src, list)

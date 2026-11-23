@@ -37,8 +37,14 @@ fn victim(tmp: &TempDir) -> (PathBuf, CString) {
     let path = tmp.path().join("victim");
     std::fs::write(&path, "private").unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let when = filetime::FileTime::from_unix_time(1_000_000_000, 0);
-    filetime::set_file_times(&path, when, when).unwrap();
+    let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    let times = std::fs::FileTimes::new()
+        .set_accessed(when)
+        .set_modified(when);
+    std::fs::File::open(&path)
+        .unwrap()
+        .set_times(times)
+        .unwrap();
     let c = CString::new(path.as_os_str().as_bytes()).unwrap();
     (path, c)
 }

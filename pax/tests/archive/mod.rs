@@ -1527,7 +1527,7 @@ fn test_pre_epoch_mtime_roundtrips_in_pax() {
     let temp = TempDir::new().unwrap();
     let f = temp.path().join("old");
     fs::write(&f, "O\n").unwrap();
-    filetime::set_file_mtime(&f, filetime::FileTime::from_unix_time(-86400, 0)).unwrap();
+    set_mtime(&f, unix_time(-86400, 0));
 
     let output = run_pax_in_dir(&["-w", "-x", "pax", "old"], temp.path());
     assert_success(&output, "pax -w");
@@ -1579,7 +1579,7 @@ fn test_pax_non_ascii_name_gets_path_record() {
     let f = temp.path().join("café");
     fs::write(&f, "C\n").unwrap();
     // Whole seconds, so no mtime record makes an `x` header on its own.
-    filetime::set_file_mtime(&f, filetime::FileTime::from_unix_time(1_000_000_000, 0)).unwrap();
+    set_mtime(&f, unix_time(1_000_000_000, 0));
 
     let output = run_pax_in_dir(&["-w", "-x", "pax", "café"], temp.path());
     assert_success(&output, "pax -w");
@@ -1607,9 +1607,9 @@ fn test_t_restores_atime_in_copy_and_for_directories() {
     let src = temp.path().join("src");
     fs::create_dir_all(src.join("d")).unwrap();
     fs::write(src.join("d/f"), "F\n").unwrap();
-    let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+    let old = unix_time(1_000_000_000, 0);
     for p in [src.join("d/f"), src.join("d")] {
-        filetime::set_file_atime(&p, old).unwrap();
+        set_atime(&p, old);
     }
     fs::create_dir(temp.path().join("out")).unwrap();
 
@@ -1621,7 +1621,7 @@ fn test_t_restores_atime_in_copy_and_for_directories() {
     }
 
     for p in [src.join("d/f"), src.join("d")] {
-        filetime::set_file_atime(&p, old).unwrap();
+        set_atime(&p, old);
     }
     let output = run_pax_in_dir(&["-w", "-t", "-f", "../a.tar", "d"], &src);
     assert_success(&output, "pax -w -t");
@@ -2090,13 +2090,13 @@ fn test_t_restores_atime_of_directory_reached_through_link() {
     fs::write(real.join("f"), "F\n").unwrap();
     std::os::unix::fs::symlink("real", temp.path().join("lnk")).unwrap();
     fs::create_dir(temp.path().join("out")).unwrap();
-    let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+    let old = unix_time(1_000_000_000, 0);
 
     for args in [
         &["-w", "-L", "-t", "-f", "a.tar", "lnk"][..],
         &["-rw", "-L", "-t", "lnk", "out"][..],
     ] {
-        filetime::set_file_atime(&real, old).unwrap();
+        set_atime(&real, old);
         let output = run_pax_in_dir(args, temp.path());
         assert_success(&output, &format!("pax {args:?}"));
         assert_eq!(
@@ -2157,7 +2157,7 @@ fn test_refused_directory_header_keeps_its_contents() {
     let d = temp.path().join("d");
     fs::create_dir(&d).unwrap();
     fs::write(d.join("f"), "F\n").unwrap();
-    filetime::set_file_mtime(&d, filetime::FileTime::from_unix_time(-86400, 0)).unwrap();
+    set_mtime(&d, unix_time(-86400, 0));
 
     let output = run_pax_in_dir(&["-w", "-x", "ustar", "-f", "a.tar", "d"], temp.path());
     assert_exit_code(&output, 1, "pax -w of a pre-1970 directory");

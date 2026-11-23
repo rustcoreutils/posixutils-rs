@@ -133,7 +133,7 @@ impl<'a> Plan<'a> {
             end = end.max(offset.saturating_add(filesz));
         }
         for (s, &gone) in self.shdrs.iter().zip(&self.delete) {
-            if !gone && s.has_file_bytes() && s.flags & u64::from(elf::SHF_ALLOC) != 0 {
+            if !gone && s.has_file_bytes() && s.flags & elf::SHF_ALLOC.0 != 0 {
                 end = end.max(s.end());
             }
         }
@@ -181,12 +181,12 @@ impl<'a> Plan<'a> {
             let name = name_at(strtab, layout.get(sym, 0, 4)?);
             let st_type = layout.get(sym, info_at, 1)? as u8 & 0xf;
             let shndx = layout.get(sym, shndx_at, 2)? as u32;
-            if shndx == u32::from(elf::SHN_XINDEX) {
+            if shndx == u32::from(elf::SHN_XINDEX.0) {
                 return Err(gettext("extended symbol section indices are not supported").into());
             }
             let regular = shndx != 0 && shndx < u32::from(elf::SHN_LORESERVE);
             let drop = i > 0
-                && (st_type == elf::STT_FILE
+                && (st_type == elf::STT_FILE.0
                     || opts.strips_symbol(name)
                     || (regular && self.delete.get(shndx as usize) == Some(&true)));
             if drop {
@@ -270,7 +270,7 @@ impl<'a> Plan<'a> {
             .filter(|&i| {
                 !self.delete[i]
                     && i != self.shstrndx
-                    && shdrs[i].flags & u64::from(elf::SHF_ALLOC) == 0
+                    && shdrs[i].flags & elf::SHF_ALLOC.0 == 0
                     && shdrs[i].offset >= end as u64
             })
             .collect();

@@ -1493,6 +1493,45 @@ fn write_record<W: Write>(writer: &mut W, prefix: &[u8], text: &[u8]) -> io::Res
     writer.write_all(b"\n")
 }
 
+/// Why some content cannot be the text of a text (not encoded) s-file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotText {
+    /// The last line has no newline to end it.
+    NoFinalNewline,
+    /// It holds a NUL.
+    Nul,
+    /// This line, counted from 1, begins with SOH and would read back as a
+    /// control line.
+    LeadingSoh(usize),
+}
+
+/// What keeps `data` from being stored as the text of an s-file, if anything.
+///
+/// The classic s-file is lines of text: each ends with a newline, none
+/// begins with SOH, and no implementation reads a NUL back out of one. That
+/// is also what POSIX asks of the input (a text file, with a leading SOH
+/// unspecified). `admin` stores such content encoded instead (the `e` flag);
+/// `delta` to a text s-file refuses it, as historical SCCS does ("No newline
+/// at end of file (de18)", de14 for a NUL, de20 for the SOH).
+///
+/// Bytes that are not UTF-8 are text: what a character is belongs to the
+/// locale, and a Latin-1 source file is a text file.
+pub fn not_storable_as_text(data: &[u8]) -> Option<NotText> {
+    if data.is_empty() {
+        return None;
+    }
+    if !data.ends_with(b"\n") {
+        return Some(NotText::NoFinalNewline);
+    }
+    if data.contains(&0x00) {
+        return Some(NotText::Nul);
+    }
+    split_lines(data)
+        .iter()
+        .position(|line| line.first() == Some(&SOH))
+        .map(|n| NotText::LeadingSoh(n + 1))
+}
+
 /// Split text into its lines: each ends at a newline, which is not part of
 /// it. A CR before the newline *is* part of it, and a final line without a
 /// newline is still a line. Empty input has no lines.
@@ -2928,5 +2967,17 @@ mod tests {
     fn delta_stats_are_recorded_capped_at_99999() {
         let stats = DeltaStats::new(100_005, 99_999, 7);
         assert_eq!(stats.to_string(), "99999/99999/00007");
+    }
+
+    #[test]
+    fn not_storable_as_text_names_the_reason() {
+        assert_eq!(not_storable_as_text(b""), None);
+        assert_eq!(not_storable_as_text(b"a\r\ncaf\xe9\nmid\x01soh\n"), None);
+        assert_eq!(not_storable_as_text(b"a\nb"), Some(NotText::NoFinalNewline));
+        assert_eq!(not_storable_as_text(b"a\n\x00\n"), Some(NotText::Nul));
+        assert_eq!(
+            not_storable_as_text(b"a\n\x01b\n"),
+            Some(NotText::LeadingSoh(2))
+        );
     }
 }

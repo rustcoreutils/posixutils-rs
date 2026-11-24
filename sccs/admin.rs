@@ -171,26 +171,6 @@ fn read_input_file(path: Option<&str>) -> Result<Vec<u8>, String> {
     })
 }
 
-/// Whether the initial content must be uuencoded (the `e` flag): what the
-/// line format of an s-file cannot hold as text. That is a NUL, a line
-/// beginning with SOH (it would read as a control line), or a last line with
-/// no newline to end it.
-///
-/// Bytes that are not UTF-8 are text: what a character is belongs to the
-/// locale (POSIX admin 84141), a Latin-1 source file is a text file, and
-/// encoding it turned off keyword expansion and line-by-line deltas for it.
-/// CSSC stores it as text too.
-fn content_needs_encoding(data: &[u8]) -> bool {
-    if data.is_empty() {
-        return false;
-    }
-    !data.ends_with(b"\n")
-        || data.contains(&0x00)
-        || plib::sccsfile::split_lines(data)
-            .iter()
-            .any(|line| line.first() == Some(&0x01))
-}
-
 /// The descriptive text in the `-t` file `path`, as its lines. An error comes
 /// back as the diagnostic's text, naming the file.
 fn read_desc_text(path: &str) -> Result<Vec<Vec<u8>>, String> {
@@ -465,7 +445,9 @@ fn create_new_sccs_file(path: &Path, params: NewFileParams) -> io::Result<()> {
     };
 
     // Decide whether to store the body uuencoded (binary / no trailing newline).
-    let encoded = content_needs_encoding(&content);
+    // What a text s-file cannot hold -- a NUL, a line beginning with SOH, a
+    // last line without its newline -- is stored encoded.
+    let encoded = plib::sccsfile::not_storable_as_text(&content).is_some();
 
     // Warn (non-fatal) when a text body has no SCCS id keyword, matching cssc.
     if !encoded && !idkw::contains(&content) {

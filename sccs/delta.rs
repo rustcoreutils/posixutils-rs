@@ -19,8 +19,8 @@ use clap::Parser;
 use gettextrs::gettext;
 use plib::linediff::LineOp;
 use plib::sccsfile::{
-    paths, BodyRecord, DeltaEntry, DeltaStats, DeltaType, PfileEntry, SccsDateTime, SccsFile,
-    SccsFlag, Sid,
+    paths, BodyRecord, DeltaEntry, DeltaStats, DeltaType, NotText, PfileEntry, SccsDateTime,
+    SccsFile, SccsFlag, Sid,
 };
 use posixutils_sccs::{diag, mrlist, operands, pfile, protect, sfio, zlock};
 
@@ -127,7 +127,7 @@ fn find_pfile_entry(sfile_path: &Path, requested_sid: Option<&Sid>) -> io::Resul
 }
 
 /// Read g-file content
-fn read_gfile(sfile_path: &Path) -> io::Result<Vec<Vec<u8>>> {
+fn read_gfile(sfile_path: &Path) -> io::Result<Vec<u8>> {
     let gfile_path = paths::gfile_from_sfile(sfile_path).ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, gettext("Invalid s-file name"))
     })?;
@@ -144,31 +144,27 @@ fn read_gfile(sfile_path: &Path) -> io::Result<Vec<Vec<u8>>> {
         ));
     }
 
-    let data = fs::read(&gfile_path)?;
-    Ok(plib::sccsfile::split_lines(&data)
-        .into_iter()
-        .map(<[u8]>::to_vec)
-        .collect())
+    fs::read(&gfile_path)
 }
 
-/// Read the g-file as the lines to diff against the stored body.
+/// The g-file's content as the lines to diff against the stored body, or
+/// why it cannot be stored.
 ///
 /// An encoded (binary) s-file stores uuencoded text, and `get` writes the
 /// decoded bytes to the g-file, so the two are only comparable after encoding
-/// the g-file back. `delta` never checked `is_encoded()` at all: it read the
-/// raw bytes as UTF-8 lines and diffed them against uuencoded text, so a
-/// binary file could be created and retrieved but never updated -- it failed
-/// with "stream did not contain valid UTF-8".
-fn read_gfile_for(sccs: &SccsFile, sfile_path: &Path) -> io::Result<Vec<Vec<u8>>> {
-    if !sccs.is_encoded() {
-        return read_gfile(sfile_path);
+/// the g-file back; any bytes can be stored that way. A text s-file stores
+/// the lines themselves, and only what `not_storable_as_text` lets through.
+fn gfile_lines(sccs: &SccsFile, content: &[u8]) -> Result<Vec<Vec<u8>>, NotText> {
+    if sccs.is_encoded() {
+        return Ok(plib::sccsfile::uuencode_sccs(content));
     }
-
-    let gfile_path = paths::gfile_from_sfile(sfile_path).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, gettext("Invalid s-file name"))
-    })?;
-    let raw = fs::read(&gfile_path)?;
-    Ok(plib::sccsfile::uuencode_sccs(&raw))
+    match plib::sccsfile::not_storable_as_text(content) {
+        Some(why) => Err(why),
+        None => Ok(plib::sccsfile::split_lines(content)
+            .into_iter()
+            .map(<[u8]>::to_vec)
+            .collect()),
+    }
 }
 
 /// The set of deltas that made up the version `get -e` handed the user.
@@ -609,26 +605,37 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, gettext("Base SID not found")))?;
     let base_serial = base_delta.serial;
 
-    // Read g-file
-    let new_lines = read_gfile_for(&sccs, sfile_path)?;
-
-    // A text line beginning with SOH would be stored as it is and read back
-    // as a control line -- "^AE 1" would end a block early. The results are
-    // unspecified (POSIX delta); refuse rather than store a file that reads
-    // back differently. An encoded file's lines never begin with SOH.
-    if let Some(n) = new_lines.iter().position(|l| l.first() == Some(&0x01)) {
-        diag::error_path(
-            "delta",
-            sfile_path,
-            &format!(
-                "{} {} {}",
-                gettext("line"),
-                n + 1,
-                gettext("begins with a control character (SOH) and cannot be stored")
-            ),
-        );
-        return Ok(false);
-    }
+    // Read g-file. Input must be a text file (POSIX delta 92274): what a
+    // text s-file cannot hold is refused, as historical SCCS refuses it,
+    // rather than stored as something that reads back differently. The edit
+    // stays pending, to be fixed and retried.
+    let new_lines = match gfile_lines(&sccs, &read_gfile(sfile_path)?) {
+        Ok(lines) => lines,
+        Err(why) => {
+            let reason = match why {
+                NotText::NoFinalNewline => gettext("No newline at end of file"),
+                NotText::Nul => gettext("file contains a NUL character"),
+                NotText::LeadingSoh(line) => format!(
+                    "{} {} {}",
+                    gettext("line"),
+                    line,
+                    gettext("begins with a control character (SOH)")
+                ),
+            };
+            let gfile = paths::gfile_from_sfile(sfile_path).unwrap_or_default();
+            diag::error_path(
+                "delta",
+                sfile_path,
+                &format!(
+                    "{}: {}; {}",
+                    gfile.display(),
+                    reason,
+                    gettext("not a text file, cannot be stored")
+                ),
+            );
+            return Ok(false);
+        }
+    };
 
     // The edit was made against the version `get -e` produced, which means the
     // -i/-x lists it recorded in the p-file, not the plain base.

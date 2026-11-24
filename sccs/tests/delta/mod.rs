@@ -1389,3 +1389,63 @@ fn delta_and_rmdel_keep_overlapping_blocks_intact() {
     assert_eq!(run("get", &["-p", "-k", "-s", "s.o"]), "a\nb\nc\nd\n");
     assert_eq!(run("get", &["-p", "-k", "-s", "-r1.1", "s.o"]), "a\nb\n");
 }
+
+/// What a text s-file cannot hold, delta does not store: a file whose last
+/// line has no newline, or one holding a NUL. Input must be a text file
+/// (POSIX delta 92274), and historical SCCS refuses both ("No newline at end
+/// of file (de18)", and de14 for the NUL); storing them anyway gave back a
+/// file one byte longer, or an s-file no other implementation can read. The
+/// s-file is untouched and the edit stays pending, to be fixed and retried.
+#[test]
+fn delta_refuses_what_is_not_a_text_file() {
+    for (name, content, expect) in [
+        ("nonl", &b"one\ntwo"[..], "newline"),
+        ("nul", &b"one\nt\x00wo\n"[..], "NUL"),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let (sfile, pfile, gfile) = setup_sccs_file(&tmp, name, "one\n");
+        get_for_editing(&sfile);
+        let before = fs::read(&sfile).unwrap();
+        fs::write(&gfile, content).unwrap();
+        let dir = sfile.parent().unwrap();
+        let sname = format!("s.{name}");
+        let out = super::common::run_in("delta", &["-s", "-yc", &sname], dir, "");
+        assert_eq!(out.status.code(), Some(1), "{name}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(expect),
+            "{name}: the reason should be given: {out:?}"
+        );
+        assert_eq!(
+            fs::read(&sfile).unwrap(),
+            before,
+            "{name}: s-file untouched"
+        );
+        assert!(
+            pfile.exists() && gfile.exists(),
+            "{name}: the edit is still pending"
+        );
+
+        // Fixed, the same edit goes in.
+        fs::write(&gfile, b"one\ntwo\n").unwrap();
+        let out = super::common::run_in("delta", &["-s", "-yc", &sname], dir, "");
+        assert!(out.status.success(), "{name}: {out:?}");
+    }
+}
+
+/// An encoded s-file holds any bytes: there a missing final newline is kept
+/// exactly, through a delta.
+#[test]
+fn delta_of_an_encoded_file_keeps_a_missing_final_newline() {
+    let tmp = TempDir::new().unwrap();
+    fs::write(tmp.path().join("in"), b"no newline").unwrap();
+    let run = |cmd: &str, args: &[&str]| {
+        let out = super::common::run_in(cmd, args, tmp.path(), "");
+        assert!(out.status.success(), "{cmd} {args:?}: {out:?}");
+        out.stdout
+    };
+    run("admin", &["-iin", "s.enc"]);
+    run("get", &["-e", "-s", "s.enc"]);
+    fs::write(tmp.path().join("enc"), b"still\nno newline").unwrap();
+    run("delta", &["-s", "-yc", "s.enc"]);
+    assert_eq!(run("get", &["-p", "-s", "s.enc"]), b"still\nno newline");
+}

@@ -58,12 +58,18 @@ impl Sid {
     }
 }
 
+/// The SID as it is written: the components it has. A delta's SID has two
+/// or four. One that names a release (`1`) or a branch (`1.2.1`), as the
+/// `d` flag's may, has one or three: written out with a zero for the
+/// component it lacks, it named no delta and no longer read as what was
+/// given.
 impl fmt::Display for Sid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.br == 0 && self.seq == 0 {
-            write!(f, "{}.{}", self.rel, self.lev)
-        } else {
-            write!(f, "{}.{}.{}.{}", self.rel, self.lev, self.br, self.seq)
+        match (self.lev, self.br, self.seq) {
+            (0, 0, 0) => write!(f, "{}", self.rel),
+            (lev, 0, 0) => write!(f, "{}.{}", self.rel, lev),
+            (lev, br, 0) => write!(f, "{}.{}.{}", self.rel, lev, br),
+            (lev, br, seq) => write!(f, "{}.{}.{}.{}", self.rel, lev, br, seq),
         }
     }
 }

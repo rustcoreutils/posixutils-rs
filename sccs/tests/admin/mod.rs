@@ -1591,3 +1591,37 @@ fn admin_a_flag_given_twice_is_set_once() {
         assert_eq!(flags, [&b"\x01f c 7"[..], b"\x01f b"], "{name}");
     }
 }
+
+/// The `d` flag's SID is stored as it was given: a release alone as `1`,
+/// a branch as `1.2.1`. It was written out to `1.0` and `1.2.1.0`, which
+/// name no delta and which other implementations need not read as a
+/// release or a branch.
+#[test]
+fn admin_stores_a_partial_default_sid_as_given() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str]| super::common::run_in(cmd, args, dir, "");
+    assert!(run("admin", &["-n", "s.d"]).status.success());
+    for (given, stored) in [
+        ("1", "1"),
+        ("1.2", "1.2"),
+        ("1.2.1", "1.2.1"),
+        ("1.2.1.3", "1.2.1.3"),
+    ] {
+        assert!(run("admin", &[&format!("-fd{given}"), "s.d"])
+            .status
+            .success());
+        let data = fs::read(dir.join("s.d")).unwrap();
+        let line = data
+            .split(|&b| b == b'\n')
+            .find(|l| l.starts_with(b"\x01f d"))
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(line),
+            format!("\x01f d {stored}"),
+            "-fd{given}"
+        );
+        let out = run("prs", &["-d:Ds:", "s.d"]);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{stored}\n"));
+    }
+}

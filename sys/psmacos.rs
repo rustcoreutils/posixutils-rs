@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use libc::{c_int, c_void, getpgid, getsid, pid_t, proc_listallpids, proc_pidinfo, proc_pidpath};
+use libc::{c_int, c_void, getsid, pid_t, proc_listallpids, proc_pidinfo, proc_pidpath};
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::fs;
@@ -195,11 +195,13 @@ fn get_process_info(pid: pid_t, dev_map: &HashMap<u64, String>) -> Option<Proces
     // Get BSD info for basic process information
     let mut bsd_info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
     let bsd_info_size = std::mem::size_of::<libc::proc_bsdinfo>();
+    // A nonzero arg makes XNU look up a zombie too; with 0 a zombie is ESRCH
+    // and would be left out of the listing.
     let res = unsafe {
         proc_pidinfo(
             pid,
             libc::PROC_PIDTBSDINFO,
-            0,
+            1,
             bsd_info.as_mut_ptr() as *mut c_void,
             bsd_info_size as c_int,
         )
@@ -281,7 +283,7 @@ fn get_process_info(pid: pid_t, dev_map: &HashMap<u64, String>) -> Option<Proces
     let state = process_state(pid, bsd_info.pbi_status, threads);
 
     // Get process group ID and session ID
-    let pgid = unsafe { getpgid(pid) };
+    let pgid = bsd_info.pbi_pgid as pid_t;
     let sid = unsafe { getsid(pid) };
 
     Some(ProcessInfo {

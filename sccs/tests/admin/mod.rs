@@ -1200,3 +1200,79 @@ fn admin_rejects_out_of_range_releases() {
         assert!(out.status.success(), "admin {good}: {out:?}");
     }
 }
+
+/// `admin -n` refuses to replace an s-file that appears after it started:
+/// the existence check that counts is the one made holding the z-file lock.
+/// It was made only before the lock was taken, so of two creations racing,
+/// the second silently replaced the first's file.
+///
+/// The `-i` input is a FIFO, which holds admin between its first look at the
+/// name and the lock for as long as the test likes.
+#[test]
+fn admin_n_checks_for_the_file_under_the_lock() {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let tmp = TempDir::new().unwrap();
+    let fifo = tmp.path().join("in.fifo");
+    let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+
+    let child = std::process::Command::new(plib::testing::get_binary_path("admin"))
+        .args(["-iin.fifo", "s.race"])
+        .current_dir(tmp.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // The write end opens once admin has the FIFO open to read, which is
+    // after it has seen that s.race is not there.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut writer = loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+        {
+            Ok(w) => break w,
+            Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {
+                assert!(std::time::Instant::now() < deadline, "admin never read -i");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => panic!("open fifo: {e}"),
+        }
+    };
+
+    // Another creation wins the race...
+    let sfile = tmp.path().join("s.race");
+    fs::write(&sfile, b"the other admin's file\n").unwrap();
+    // ...and only then does this one get its input and go on to the lock.
+    writer.write_all(b"late %I%\n").unwrap();
+    drop(writer);
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("already exists"),
+        "{out:?}"
+    );
+    assert_eq!(fs::read(&sfile).unwrap(), b"the other admin's file\n");
+    assert!(!tmp.path().join("z.race").exists(), "the lock was released");
+}
+
+/// A dangling symlink at the s-file's name is something at that name: admin
+/// -n refuses it rather than replacing it.
+#[test]
+fn admin_n_refuses_a_dangling_symlink() {
+    let tmp = TempDir::new().unwrap();
+    std::os::unix::fs::symlink("nowhere", tmp.path().join("s.link")).unwrap();
+    let out = run_in("admin", &["-n", "s.link"], tmp.path(), "");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(fs::symlink_metadata(tmp.path().join("s.link"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}

@@ -328,9 +328,25 @@ struct NewFileParams<'a> {
     mr_numbers: Vec<String>,
 }
 
+/// Whether anything is at `path`: a file, or a symlink even if it dangles.
+fn name_is_taken(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
 fn create_new_sccs_file(path: &Path, params: NewFileParams) -> io::Result<()> {
     // Per-command z-file lock around the create.
     let _zlock = zlock::acquire(path)?;
+
+    // The check that counts is this one, made holding the lock: whoever
+    // creates the file holds it too, so the name cannot be taken between
+    // here and the rename. Checked only before the lock, of two creations
+    // racing the second replaced the first's file.
+    if name_is_taken(path) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            gettext("file already exists"),
+        ));
+    }
 
     let NewFileParams {
         content,
@@ -738,8 +754,9 @@ fn main() -> ExitCode {
                 exit_code = ExitCode::FAILURE;
             }
         } else if creating_new {
-            // Creating a new SCCS file
-            if file_path.exists() {
+            // Creating a new SCCS file. An early look, to refuse before the
+            // input is read; create_new_sccs_file looks again under the lock.
+            if name_is_taken(file_path) {
                 eprintln!(
                     "admin: {}: {}",
                     file_path.display(),

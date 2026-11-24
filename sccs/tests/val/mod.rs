@@ -497,3 +497,34 @@ fn help_write_error_on_full_device() {
         plib::testing::assert_write_error_message_on_full_device(cmd, &[opt], b"", 1);
     }
 }
+
+/// A file holding bytes above 0x7f validates whether its checksum is the
+/// signed sum CSSC and historical SCCS write or the unsigned sum earlier
+/// versions of these utilities wrote; and what admin writes is the signed one,
+/// so CSSC accepts it too.
+#[test]
+fn val_accepts_the_signed_and_unsigned_checksum() {
+    let tmp = TempDir::new().unwrap();
+    let content = super::common::LATIN1_SFILE;
+    let unsigned = content.iter().fold(0u16, |s, &b| s.wrapping_add(b as u16));
+    let signed = content
+        .iter()
+        .fold(0u16, |s, &b| s.wrapping_add(b as i8 as i16 as u16));
+    for sum in [signed, unsigned] {
+        let mut data = format!("\x01h{:05}\n", sum).into_bytes();
+        data.extend_from_slice(content);
+        fs::write(tmp.path().join("s.l1"), &data).unwrap();
+        let out = super::common::run_in("val", &["s.l1"], tmp.path(), "");
+        assert_eq!(out.status.code(), Some(0), "sum {sum}: {out:?}");
+        let out = super::common::run_in("admin", &["-h", "s.l1"], tmp.path(), "");
+        assert_eq!(out.status.code(), Some(0), "sum {sum}: {out:?}");
+    }
+
+    let out = super::common::run_in("admin", &["-z", "s.l1"], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    let data = fs::read(tmp.path().join("s.l1")).unwrap();
+    assert!(
+        data.starts_with(format!("\x01h{:05}\n", signed).as_bytes()),
+        "admin must write the signed sum"
+    );
+}

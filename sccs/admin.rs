@@ -347,8 +347,8 @@ fn check_sccs_file(path: &Path) -> io::Result<bool> {
             // Verify the checksum. A header-only s-file has an empty body,
             // which still has a checksum: skipping the check for it let
             // `admin -h` pass a file `val` rejected.
-            let computed = plib::sccsfile::stored_body_checksum(&data);
-            if computed != sccs.header.checksum {
+            if !plib::sccsfile::stored_checksum_matches(&data, sccs.header.checksum) {
+                let computed = plib::sccsfile::stored_body_checksum(&data);
                 diag::error_path(
                     "admin",
                     path,

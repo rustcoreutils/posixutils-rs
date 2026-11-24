@@ -1871,8 +1871,15 @@ impl<'a> SccsParser<'a> {
 // Checksum
 // =============================================================================
 
-/// The checksum over an s-file's stored bytes: everything after the first
-/// line, which is the `^Ah` checksum line itself.
+/// The stored bytes the checksum covers: everything after the first line,
+/// which is the `^Ah` checksum line itself.
+fn checksummed_bytes(data: &[u8]) -> &[u8] {
+    let newline_pos = data.iter().position(|&b| b == b'\n').unwrap_or(data.len());
+    data.get(newline_pos + 1..).unwrap_or(&[])
+}
+
+/// The checksum over an s-file's stored bytes, as [`compute_checksum`] sums
+/// it: the value a rewrite stores, and the one to report as "computed".
 ///
 /// `admin -h` and `val` each open-coded this, and guarded it differently:
 /// `admin` with `content_start < data.len()`, `val` with `<=`. No s-file that
@@ -1880,18 +1887,35 @@ impl<'a> SccsParser<'a> {
 /// after the checksum line — but two spellings of one rule is how the next
 /// difference becomes reachable.
 pub fn stored_body_checksum(data: &[u8]) -> u16 {
-    let newline_pos = data.iter().position(|&b| b == b'\n').unwrap_or(data.len());
-    let body = data.get(newline_pos + 1..).unwrap_or(&[]);
-    compute_checksum(body)
+    compute_checksum(checksummed_bytes(data))
 }
 
-/// Compute SCCS checksum (sum of all bytes modulo 65536)
+/// Whether `stored`, the checksum an s-file's first line records, is right
+/// for the file `data`.
+///
+/// Either sum is right: the signed one [`compute_checksum`] writes, which is
+/// what historical SCCS and CSSC write and accept, and the unsigned one
+/// earlier versions of these utilities wrote. The two differ only for a file
+/// holding bytes above 0x7f.
+pub fn stored_checksum_matches(data: &[u8], stored: u16) -> bool {
+    let bytes = checksummed_bytes(data);
+    let unsigned = bytes
+        .iter()
+        .fold(0u16, |s, &b| s.wrapping_add(u16::from(b)));
+    compute_checksum(bytes) == stored || unsigned == stored
+}
+
+/// Compute the SCCS checksum: the sum, modulo 65536, of every byte taken as
+/// a signed char.
+///
+/// Historical SCCS summed `char`s, which are signed where it ran, and CSSC
+/// keeps that, so a byte above 0x7f counts below zero. Summing them unsigned
+/// gave a file CSSC rejected as corrupt as soon as it held one such byte --
+/// and rejected CSSC's own files the same way.
 pub fn compute_checksum(data: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
-    for &byte in data {
-        sum = sum.wrapping_add(byte as u32);
-    }
-    (sum & 0xFFFF) as u16
+    data.iter().fold(0u16, |sum, &byte| {
+        sum.wrapping_add(byte as i8 as i16 as u16)
+    })
 }
 
 // =============================================================================
@@ -2779,5 +2803,25 @@ mod tests {
         assert_eq!(split_lines(b"a\r\nb\n"), [&b"a\r"[..], b"b"]);
         assert_eq!(split_lines(b"a\n\nb"), [&b"a"[..], b"", b"b"]);
         assert_eq!(split_lines(b"\n"), [&b""[..]]);
+    }
+
+    /// The checksum sums bytes as signed chars, as historical SCCS and CSSC
+    /// do, so a byte above 0x7f counts below zero; verification also accepts
+    /// the unsigned sum earlier versions of these utilities wrote.
+    #[test]
+    fn checksum_sums_signed_bytes_and_accepts_either_sum() {
+        assert_eq!(compute_checksum(b"ab"), 0x61 + 0x62);
+        assert_eq!(compute_checksum(b"a\xe9"), (0x61u16).wrapping_sub(0x17));
+
+        let file = |sum: u16| {
+            let mut v = format!("\x01h{:05}\n", sum).into_bytes();
+            v.extend_from_slice(b"\xe9\n");
+            v
+        };
+        let signed = (0xe9u16 + 0x0a).wrapping_sub(0x100);
+        let unsigned = 0xe9 + 0x0a;
+        assert!(stored_checksum_matches(&file(signed), signed));
+        assert!(stored_checksum_matches(&file(unsigned), unsigned));
+        assert!(!stored_checksum_matches(&file(1), 1));
     }
 }

@@ -256,12 +256,13 @@ fn get_process_info(pid: pid_t, dev_map: &HashMap<u64, String>) -> Option<Proces
         String::new()
     };
 
-    // Extract command name from path
-    let comm = full_path
-        .rsplit('/')
-        .next()
-        .unwrap_or(&full_path)
-        .to_string();
+    // The command name is the executable's basename.  A process whose path
+    // cannot be read -- a zombie, or one exiting or in exec -- is named by the
+    // name the kernel keeps for it, as Apple's ps does.
+    let comm = match full_path.rsplit('/').next() {
+        Some(base) if !base.is_empty() => base.to_string(),
+        _ => kernel_name(&bsd_info),
+    };
 
     // Retrieve the terminal device ID (TTY)
     let tty_dev = bsd_info.e_tdev;
@@ -308,6 +309,25 @@ fn get_process_info(pid: pid_t, dev_map: &HashMap<u64, String>) -> Option<Proces
         comm,
         args,
     })
+}
+
+/// The kernel's name for a process: `pbi_name` (up to 32 bytes), else the
+/// 16-byte `pbi_comm`.  Neither need be NUL-terminated.
+fn kernel_name(bsd_info: &libc::proc_bsdinfo) -> String {
+    let field = |chars: &[libc::c_char]| {
+        let bytes: Vec<u8> = chars
+            .iter()
+            .map(|&c| c as u8)
+            .take_while(|&b| b != 0)
+            .collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    let name = field(&bsd_info.pbi_name);
+    if name.is_empty() {
+        field(&bsd_info.pbi_comm)
+    } else {
+        name
+    }
 }
 
 /// `proc_pidinfo` flavor listing a process's thread handles (XNU

@@ -297,8 +297,9 @@ fn rmdel_directory_and_stdin_operands() {
         "the delta inside the directory should be marked R"
     );
 
-    // An error on a directory-expanded operand must still be reported.
-    let out = run("rmdel", &["-r", "1.1", "proj"], tmp.path(), "");
+    // An error on a directory-expanded operand must still be reported: here
+    // a SID the file does not have.
+    let out = run("rmdel", &["-r", "1.9", "proj"], tmp.path(), "");
     assert_eq!(
         out.status.code(),
         Some(1),
@@ -328,4 +329,24 @@ fn rmdel_directory_and_stdin_operands() {
 #[test]
 fn option_argument_may_begin_with_hyphen() {
     plib::testing::assert_hyphen_option_argument("rmdel", &["-r", "-zq", "--help"]);
+}
+
+/// A removed delta is no longer anyone's successor: with 1.3 removed, 1.2 is
+/// the newest delta and can be removed in turn (as CSSC allows), and what is
+/// left is the text of 1.1.
+#[test]
+fn rmdel_removes_deltas_one_after_another() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = create_multi_delta(&tmp, "chain", 3);
+    let name = sfile.file_name().unwrap().to_str().unwrap();
+    let before = run("get", &["-p", "-k", "-s", "-r1.1", name], tmp.path(), "").stdout;
+    for sid in ["1.3", "1.2"] {
+        let out = run("rmdel", &["-r", sid, name], tmp.path(), "");
+        assert!(out.status.success(), "rmdel {sid}: {out:?}");
+    }
+    let out = run("get", &["-p", "-k", "-s", name], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(out.stdout, before);
+    let out = run("val", &[name], tmp.path(), "");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
 }

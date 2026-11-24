@@ -105,12 +105,14 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
         return Ok(false);
     }
 
-    // Check that delta is a leaf (no successors)
-    // A delta is a leaf if no other delta has its serial number as predecessor
+    // Check that delta is a leaf: no delta still in the file was made from
+    // it. One already removed does not count -- with 1.3 removed, 1.2 is the
+    // newest delta again and can be removed in turn, as CSSC allows.
     let target_serial = sccs.header.deltas[delta_idx].serial;
     let has_successors = sccs.header.deltas.iter().any(|d| {
-        // Check if any delta's predecessor serial matches this delta's serial
-        d.pred_serial == target_serial && d.serial != target_serial
+        d.pred_serial == target_serial
+            && d.serial != target_serial
+            && d.delta_type != plib::sccsfile::DeltaType::Removed
     });
 
     if has_successors {

@@ -1463,9 +1463,34 @@ pub fn is_line_visible(stack: &[(bool, u16)], applied_set: &HashSet<u16>) -> boo
     true
 }
 
+/// Split text into its lines: each ends at a newline, which is not part of
+/// it. A CR before the newline *is* part of it, and a final line without a
+/// newline is still a line. Empty input has no lines.
+///
+/// This is how SCCS stores text, and the one way the utilities split it:
+/// `str::lines` treats `\r\n` as a terminator and so silently drops the CR
+/// of every line of a CRLF file.
+pub fn split_lines(data: &[u8]) -> Vec<&[u8]> {
+    let mut lines: Vec<&[u8]> = data.split(|&b| b == b'\n').collect();
+    if data.is_empty() || data.ends_with(b"\n") {
+        lines.pop();
+    }
+    lines
+}
+
 // =============================================================================
 // Parser
 // =============================================================================
+
+/// The argument of a control line `^A<c> <arg>`: everything after the
+/// separating blank, or nothing for a line too short to have one.
+///
+/// A line ends where its newline is; a CR before that newline belongs to the
+/// line, so callers that read a number or a name from the argument trim it,
+/// and callers that keep text keep it.
+fn control_arg(line: &[u8]) -> &[u8] {
+    line.get(3..).unwrap_or(&[])
+}
 
 struct SccsParser<'a> {
     data: &'a [u8],
@@ -1544,14 +1569,7 @@ impl<'a> SccsParser<'a> {
         }
         self.line_num += 1;
 
-        // Handle \r\n
-        let line = if end > start && self.data[end - 1] == b'\r' {
-            &self.data[start..end - 1]
-        } else {
-            &self.data[start..end]
-        };
-
-        Some(line)
+        Some(&self.data[start..end])
     }
 
     fn peek_line(&self) -> Option<&'a [u8]> {
@@ -1565,13 +1583,7 @@ impl<'a> SccsParser<'a> {
             end += 1;
         }
 
-        let line = if end > start && self.data[end - 1] == b'\r' {
-            &self.data[start..end - 1]
-        } else {
-            &self.data[start..end]
-        };
-
-        Some(line)
+        Some(&self.data[start..end])
     }
 
     fn parse_checksum(&mut self) -> SccsResult<u16> {
@@ -1627,7 +1639,7 @@ impl<'a> SccsParser<'a> {
         if stats_line.len() < 3 || stats_line[0] != SOH || stats_line[1] != control::STATS {
             return Err(SccsError::InvalidDelta("Expected stats line".into()));
         }
-        let stats_str = std::str::from_utf8(&stats_line[3..])
+        let stats_str = std::str::from_utf8(control_arg(stats_line))
             .map_err(|_| SccsError::InvalidDelta("Invalid stats encoding".into()))?;
         entry.stats = DeltaStats::from_str(stats_str.trim())?;
 
@@ -1638,7 +1650,7 @@ impl<'a> SccsParser<'a> {
         if delta_line.len() < 3 || delta_line[0] != SOH || delta_line[1] != control::DELTA {
             return Err(SccsError::InvalidDelta("Expected delta line".into()));
         }
-        let delta_str = std::str::from_utf8(&delta_line[3..])
+        let delta_str = std::str::from_utf8(control_arg(delta_line))
             .map_err(|_| SccsError::InvalidDelta("Invalid delta encoding".into()))?;
 
         // Parse: <type> <sid> <date> <time> <user> <serial> <pred>
@@ -1674,7 +1686,7 @@ impl<'a> SccsParser<'a> {
             match line[1] {
                 control::END_DELTA => break,
                 control::INCLUDE => {
-                    let serials_str = std::str::from_utf8(&line[3..]).unwrap_or("");
+                    let serials_str = std::str::from_utf8(control_arg(line)).unwrap_or("");
                     for s in serials_str.split_whitespace() {
                         if let Ok(serial) = s.parse() {
                             entry.included.push(serial);
@@ -1682,7 +1694,7 @@ impl<'a> SccsParser<'a> {
                     }
                 }
                 control::EXCLUDE => {
-                    let serials_str = std::str::from_utf8(&line[3..]).unwrap_or("");
+                    let serials_str = std::str::from_utf8(control_arg(line)).unwrap_or("");
                     for s in serials_str.split_whitespace() {
                         if let Ok(serial) = s.parse() {
                             entry.excluded.push(serial);
@@ -1690,7 +1702,7 @@ impl<'a> SccsParser<'a> {
                     }
                 }
                 control::IGNORE => {
-                    let serials_str = std::str::from_utf8(&line[3..]).unwrap_or("");
+                    let serials_str = std::str::from_utf8(control_arg(line)).unwrap_or("");
                     for s in serials_str.split_whitespace() {
                         if let Ok(serial) = s.parse() {
                             entry.ignored.push(serial);
@@ -1698,13 +1710,15 @@ impl<'a> SccsParser<'a> {
                     }
                 }
                 control::MR => {
-                    let mr = std::str::from_utf8(&line[3..]).unwrap_or("").trim();
+                    let mr = std::str::from_utf8(control_arg(line)).unwrap_or("").trim();
                     if !mr.is_empty() {
                         entry.mr_numbers.push(mr.to_string());
                     }
                 }
                 control::COMMENT => {
-                    let comment = std::str::from_utf8(&line[3..]).unwrap_or("").to_string();
+                    let comment = std::str::from_utf8(control_arg(line))
+                        .unwrap_or("")
+                        .to_string();
                     entry.comments.push(comment);
                 }
                 _ => {} // Skip unknown
@@ -1756,14 +1770,10 @@ impl<'a> SccsParser<'a> {
             // Parse ^Af lines
             if line.len() >= 4 && line[0] == SOH && line[1] == control::FLAG {
                 self.next_line();
-                let flag_str = std::str::from_utf8(&line[3..]).unwrap_or("").trim();
+                let flag_str = std::str::from_utf8(control_arg(line)).unwrap_or("").trim();
                 if !flag_str.is_empty() {
                     let flag_char = flag_str.chars().next().unwrap();
-                    let value = if flag_str.len() > 1 {
-                        flag_str[1..].trim()
-                    } else {
-                        ""
-                    };
+                    let value = flag_str[flag_char.len_utf8()..].trim();
                     flags.push(SccsFlag::parse(flag_char, value)?);
                 }
             } else {
@@ -1809,7 +1819,7 @@ impl<'a> SccsParser<'a> {
 
         while let Some(line) = self.next_line() {
             if line.len() >= 2 && line[0] == SOH {
-                let serial_str = std::str::from_utf8(&line[3..]).unwrap_or("").trim();
+                let serial_str = std::str::from_utf8(control_arg(line)).unwrap_or("").trim();
                 let serial: u16 = serial_str.parse().unwrap_or(0);
 
                 match line[1] {
@@ -2694,5 +2704,59 @@ mod tests {
             content1, content2,
             "Content should be identical after round-trip"
         );
+    }
+
+    /// An s-file image: `content` (everything after the `^Ah` line) with
+    /// its correct checksum line prepended.
+    fn with_checksum(content: &[u8]) -> Vec<u8> {
+        let mut out = format!("\x01h{:05}\n", compute_checksum(content)).into_bytes();
+        out.extend_from_slice(content);
+        out
+    }
+
+    const ONE_DELTA: &[u8] = b"\x01s 00001/00000/00000\n\
+\x01d D 1.1 26/01/01 00:00:00 u 1 0\n\
+\x01c c\n\
+\x01e\n\
+\x01u\n\x01U\n";
+
+    /// A CR before a newline is part of the line: a CRLF text file put
+    /// under SCCS must come back with its CRs, and a rewrite of the s-file
+    /// must not drop them.
+    #[test]
+    fn carriage_returns_survive_a_round_trip() {
+        let mut content = ONE_DELTA.to_vec();
+        content.extend_from_slice(b"\x01t\ndesc\r\n\x01T\n\x01I 1\na\r\nb\r\n\x01E 1\n");
+        let data = with_checksum(&content);
+        let sccs = SccsFile::from_bytes(&data).unwrap();
+        let applied = sccs.compute_applied_set(1).unwrap();
+        let body = sccs.evaluate_body(&applied);
+        assert_eq!(body, ["a\r", "b\r"]);
+        assert_eq!(sccs.to_bytes(), data, "a rewrite must be byte-identical");
+    }
+
+    /// Control lines too short to carry an argument, and a flag letter that
+    /// is not ASCII, are malformed input, not a reason to panic.
+    #[test]
+    fn short_control_lines_and_odd_flags_do_not_panic() {
+        let content = b"\x01s 00000/00000/00000\n\
+\x01d D 1.1 26/01/01 00:00:00 u 1 0\n\
+\x01c\n\x01m\n\x01i\n\x01x\n\x01g\n\
+\x01e\n\
+\x01u\n\x01U\n\
+\x01f \xc3\xa9x\n\
+\x01t\n\x01T\n\
+\x01I\n\x01E\n";
+        let sccs = SccsFile::from_bytes(&with_checksum(content)).unwrap();
+        assert_eq!(sccs.body, [BodyRecord::Insert(0), BodyRecord::End(0)]);
+        assert_eq!(sccs.header.flags, [SccsFlag::Unknown('\u{e9}', "x".into())]);
+    }
+
+    #[test]
+    fn split_lines_keeps_carriage_returns() {
+        assert!(split_lines(b"").is_empty());
+        assert_eq!(split_lines(b"a\r\nb\n"), [&b"a\r"[..], b"b"]);
+        assert_eq!(split_lines(b"a\n\nb"), [&b"a"[..], b"", b"b"]);
+        assert_eq!(split_lines(b"\n"), [&b""[..]]);
     }
 }

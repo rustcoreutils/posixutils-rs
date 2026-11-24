@@ -133,3 +133,14 @@ where
     let out = run_plan(&plan);
     checker(&plan, &out);
 }
+
+/// Write the s-file `dir/name` from `content` (everything after the `^Ah`
+/// line), prepending the correct checksum line: for s-files no `admin`
+/// invocation can produce, such as ones holding CRs or non-UTF-8 text.
+pub fn write_sfile(dir: &Path, name: &str, content: &[u8]) -> PathBuf {
+    let mut data = format!("\x01h{:05}\n", plib::sccsfile::compute_checksum(content)).into_bytes();
+    data.extend_from_slice(content);
+    let path = dir.join(name);
+    std::fs::write(&path, data).expect("write s-file");
+    path
+}

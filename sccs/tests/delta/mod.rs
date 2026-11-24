@@ -1237,3 +1237,32 @@ fn option_argument_may_begin_with_hyphen() {
         plib::testing::assert_hyphen_option_argument("delta", &[opt, "-zq", "--help"]);
     }
 }
+
+/// A delta to a CRLF file changes only the lines that changed: the CR is part
+/// of each line on both sides of the diff, so the untouched lines are kept
+/// and every line keeps its CR.
+#[test]
+fn delta_keeps_carriage_returns() {
+    let tmp = TempDir::new().unwrap();
+    super::common::write_sfile(
+        tmp.path(),
+        "s.crlf",
+        b"\x01s 00002/00000/00000\n\x01d D 1.1 26/01/01 00:00:00 u 1 0\n\x01e\n\
+\x01u\n\x01U\n\x01t\n\x01T\n\x01I 1\na\r\nb\r\n\x01E 1\n",
+    );
+    let run = |cmd: &str, args: &[&str]| {
+        let out = super::common::run_in(cmd, args, tmp.path(), "");
+        assert!(out.status.success(), "{cmd} {args:?}: {out:?}");
+        out
+    };
+    run("get", &["-e", "-s", "s.crlf"]);
+    fs::write(tmp.path().join("crlf"), b"a\r\nB\r\n").unwrap();
+    run("delta", &["-s", "-ychange", "s.crlf"]);
+    let out = run("prs", &["-d:Li:/:Ld:/:Lu:", "-r1.2", "s.crlf"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "00001/00001/00001"
+    );
+    let out = run("get", &["-p", "-k", "-s", "s.crlf"]);
+    assert_eq!(out.stdout, b"a\r\nB\r\n");
+}

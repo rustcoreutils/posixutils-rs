@@ -1472,3 +1472,19 @@ fn missing_sccs_file_names_the_system_error() {
         format!("get: {sfile}: I/O error: {reason}\n")
     );
 }
+
+/// A body line ending in CR (a CRLF text file under SCCS) is retrieved with
+/// its CR: the line ends at the newline, and the CR before it is text.
+#[test]
+fn get_keeps_carriage_returns() {
+    let tmp = TempDir::new().unwrap();
+    super::common::write_sfile(
+        tmp.path(),
+        "s.crlf",
+        b"\x01s 00002/00000/00000\n\x01d D 1.1 26/01/01 00:00:00 u 1 0\n\x01e\n\
+\x01u\n\x01U\n\x01t\n\x01T\n\x01I 1\na %I%\r\nb\r\n\x01E 1\n",
+    );
+    let out = super::common::run_in("get", &["-p", "-k", "-s", "s.crlf"], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(out.stdout, b"a %I%\r\nb\r\n");
+}

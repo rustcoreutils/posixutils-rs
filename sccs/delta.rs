@@ -10,8 +10,8 @@
 //! delta - make a delta (change) to an SCCS file
 
 use std::collections::HashSet;
-use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, IsTerminal, Write};
+use std::fs;
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -144,9 +144,14 @@ fn read_gfile(sfile_path: &Path) -> io::Result<Vec<String>> {
         ));
     }
 
-    let file = File::open(&gfile_path)?;
-    let reader = BufReader::new(file);
-    reader.lines().collect()
+    let data = fs::read(&gfile_path)?;
+    plib::sccsfile::split_lines(&data)
+        .into_iter()
+        .map(|line| {
+            String::from_utf8(line.to_vec())
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        })
+        .collect()
 }
 
 /// Read the g-file as the lines to diff against the stored body.

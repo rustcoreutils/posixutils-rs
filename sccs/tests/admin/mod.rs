@@ -1276,3 +1276,63 @@ fn admin_n_refuses_a_dangling_symlink() {
         .file_type()
         .is_symlink());
 }
+
+/// Options group as the Utility Syntax Guidelines allow (XBD 12.2,
+/// Guideline 5): `-i`, `-t` and `-y` may end a group of flag letters, their
+/// optional argument being the rest of the word.
+#[test]
+fn admin_options_may_be_grouped() {
+    let tmp = TempDir::new().unwrap();
+    fs::write(tmp.path().join("in.txt"), b"x %I%\n").unwrap();
+
+    let out = run_in("admin", &["-niin.txt", "s.a"], tmp.path(), "");
+    assert!(out.status.success(), "-niin.txt: {out:?}");
+    let out = run_in("get", &["-p", "-k", "-s", "s.a"], tmp.path(), "");
+    assert_eq!(out.stdout, b"x %I%\n");
+
+    let out = run_in("admin", &["-nycomment here", "s.b"], tmp.path(), "");
+    assert!(out.status.success(), "-ny...: {out:?}");
+    let out = run_in("prs", &["-d:C:", "s.b"], tmp.path(), "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "comment here");
+
+    // A bare -i ending a group reads standard input.
+    let out = run_in("admin", &["-ni", "s.c"], tmp.path(), "stdin %I%\n");
+    assert!(out.status.success(), "-ni: {out:?}");
+    let out = run_in("get", &["-p", "-k", "-s", "s.c"], tmp.path(), "");
+    assert_eq!(out.stdout, b"stdin %I%\n");
+}
+
+/// Only an option is an option: a word that is another option's argument,
+/// or that follows `--`, is not taken for `-i`, `-t` or `-y` because it
+/// begins that way.
+#[test]
+fn admin_option_arguments_are_not_options() {
+    let tmp = TempDir::new().unwrap();
+
+    // "-yMR" is -m's argument: an MR, not a comment.
+    let out = run_in("admin", &["-n", "-fv", "-m", "-yMR", "s.a"], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    let out = run_in("prs", &["-d:MR:", "s.a"], tmp.path(), "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "-yMR");
+    let out = run_in("prs", &["-d:C:", "s.a"], tmp.path(), "");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).starts_with("date and time created"),
+        "the default comment: {out:?}"
+    );
+
+    // "-tuser" is -a's argument: a login, and no descriptive text is read.
+    let out = run_in("admin", &["-n", "-a", "-tuser", "s.b"], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    let out = run_in("prs", &["-d:UN:", "s.b"], tmp.path(), "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "-tuser");
+
+    // After "--" every word is an operand: "-ifoo" is not an s-file name.
+    let out = run_in("admin", &["-n", "--", "-ifoo"], tmp.path(), "");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("-ifoo"),
+        "{out:?}"
+    );
+    let out = run_in("admin", &["-n", "--", "s.c"], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+}

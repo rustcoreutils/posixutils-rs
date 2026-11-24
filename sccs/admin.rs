@@ -33,22 +33,22 @@ struct Args {
     #[arg(short = 'n', help = gettext("Create a new SCCS file"))]
     new_file: bool,
 
-    #[arg(short = 'r', value_name = "SID", help = gettext("Initial SID for new file"))]
+    #[arg(short = 'r', value_name = "SID", allow_hyphen_values = true, help = gettext("Initial SID for new file"))]
     initial_sid: Option<String>,
 
-    #[arg(short = 'm', value_name = "MRLIST", help = gettext("MR numbers for initial delta"))]
+    #[arg(short = 'm', value_name = "MRLIST", allow_hyphen_values = true, help = gettext("MR numbers for initial delta"))]
     mrlist: Option<String>,
 
-    #[arg(short = 'f', value_name = "FLAG", help = gettext("Set flag (can be repeated)"))]
+    #[arg(short = 'f', value_name = "FLAG", allow_hyphen_values = true, help = gettext("Set flag (can be repeated)"))]
     set_flags: Vec<String>,
 
-    #[arg(short = 'd', value_name = "FLAG", help = gettext("Delete flag (can be repeated)"))]
+    #[arg(short = 'd', value_name = "FLAG", allow_hyphen_values = true, help = gettext("Delete flag (can be repeated)"))]
     delete_flags: Vec<String>,
 
-    #[arg(short = 'a', value_name = "LOGIN", help = gettext("Add user to authorized list"))]
+    #[arg(short = 'a', value_name = "LOGIN", allow_hyphen_values = true, help = gettext("Add user to authorized list"))]
     add_users: Vec<String>,
 
-    #[arg(short = 'e', value_name = "LOGIN", help = gettext("Remove user from authorized list"))]
+    #[arg(short = 'e', value_name = "LOGIN", allow_hyphen_values = true, help = gettext("Remove user from authorized list"))]
     erase_users: Vec<String>,
 
     #[arg(short = 'h', help = gettext("Check file structure and checksum"))]
@@ -80,32 +80,73 @@ struct AttachedOpts {
     comment: Option<Option<String>>,
 }
 
+/// Option letters that take an option-argument, attached or as the next word.
+const ARGUMENT_LETTERS: &str = "rmfdae";
+
 /// Split argv into the attached-only options (`-i`/`-t`/`-y`) and the remaining
-/// arguments to be parsed by clap. Recognizes the bare and attached forms; a
-/// bare option never consumes the following argument. Option bundling for these
-/// is not supported (historical admin does not bundle them either).
+/// words, for clap to parse.
+///
+/// The words are read as the Utility Syntax Guidelines read them (XBD 12.2),
+/// so that only an option is taken for one:
+/// - in a group of letters (`-niin.txt`), `-i`, `-t` or `-y` takes the rest
+///   of the word as its argument, and the flags before it stay for clap;
+/// - a letter that takes an argument ends its group, and the argument --
+///   the rest of the word, or the whole next word -- is passed over unread,
+///   so `-m -yMR` is an MR and not a comment;
+/// - after `--` every word is an operand.
+///
+/// Matching every word that begins `-i`, `-t` or `-y`, as this did, took
+/// option-arguments and operands for options, and missed the grouped forms.
 fn extract_attached_opts<I>(argv: I) -> (AttachedOpts, Vec<String>)
 where
     I: IntoIterator<Item = String>,
 {
     let mut opts = AttachedOpts::default();
     let mut rest = Vec::new();
+    let mut words = argv.into_iter();
 
-    for arg in argv {
-        let slot = match arg.as_str() {
-            "-i" => Some((&mut opts.init_file, None)),
-            "-t" => Some((&mut opts.desc_text, None)),
-            "-y" => Some((&mut opts.comment, None)),
-            _ if arg.starts_with("-i") => Some((&mut opts.init_file, Some(arg[2..].to_string()))),
-            _ if arg.starts_with("-t") => Some((&mut opts.desc_text, Some(arg[2..].to_string()))),
-            _ if arg.starts_with("-y") => Some((&mut opts.comment, Some(arg[2..].to_string()))),
-            _ => None,
-        };
+    // argv[0] is the utility's name.
+    rest.extend(words.next());
 
-        match slot {
-            Some((field, value)) => *field = Some(value),
-            None => rest.push(arg),
+    while let Some(word) = words.next() {
+        if word == "--" {
+            rest.push(word);
+            rest.extend(words);
+            break;
         }
+        // An operand, a lone "-", or a long option: not a group of letters.
+        if !word.starts_with('-') || word == "-" || word.starts_with("--") {
+            rest.push(word);
+            continue;
+        }
+
+        // What becomes of the word: it goes to clap whole, unless -i, -t or
+        // -y ends it, which leaves clap only the flags grouped before it.
+        let mut for_clap = Some(word.as_str());
+        let mut argument_word = None;
+        for (at, letter) in word.char_indices().skip(1) {
+            let after = at + letter.len_utf8();
+            if ARGUMENT_LETTERS.contains(letter) {
+                // Its argument is the rest of the word, or the next word,
+                // which is passed over unread.
+                if after == word.len() {
+                    argument_word = words.next();
+                }
+                break;
+            }
+            let field = match letter {
+                'i' => &mut opts.init_file,
+                't' => &mut opts.desc_text,
+                'y' => &mut opts.comment,
+                _ => continue, // a flag, or a letter for clap to refuse
+            };
+            let value = &word[after..];
+            *field = Some((!value.is_empty()).then(|| value.to_string()));
+            for_clap = (at > 1).then(|| &word[..at]);
+            break;
+        }
+        rest.extend(for_clap.map(str::to_string));
+        rest.extend(argument_word);
     }
 
     (opts, rest)

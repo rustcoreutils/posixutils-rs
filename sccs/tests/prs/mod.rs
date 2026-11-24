@@ -733,3 +733,26 @@ fn prs_gotten_body_is_byte_exact() {
     assert!(out.status.success(), "{out:?}");
     assert_eq!(out.stdout, b"caf\xe9 %I%\nline2\n\n");
 }
+
+/// Keywords that print what the s-file stores print it byte for byte.
+#[test]
+fn prs_prints_stored_text_byte_exact() {
+    let tmp = TempDir::new().unwrap();
+    super::common::write_sfile(tmp.path(), "s.l1", super::common::LATIN1_SFILE);
+    let out = run_in("prs", &["-d:C:|:Q:|:FD:", "s.l1"], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(out.stdout, b"caf\xe9 comment\n|caf\xe9|\xe9t\xe9\n\n");
+}
+
+/// `:Dt:` names the delta's author: the composite is built from the same
+/// stored login `:P:` prints.
+#[test]
+fn prs_delta_table_line_names_the_author() {
+    let tmp = TempDir::new().unwrap();
+    super::common::write_sfile(tmp.path(), "s.l1", super::common::LATIN1_SFILE);
+    let out = run_in("prs", &["-d:Dt:", "s.l1"], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "D 1.1 26/01/01 00:00:00 u 1 0\n"
+    );
+}

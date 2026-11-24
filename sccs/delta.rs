@@ -12,6 +12,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -517,7 +518,9 @@ fn gather_mrs(
     // If the v flag names a validation program, run it with the MRs as args.
     if let Some(prog) = v_flag.flatten() {
         if !prog.is_empty() {
-            match Command::new(&prog).args(&mrs).status() {
+            // The program is a pathname the s-file stores as bytes.
+            let prog = std::ffi::OsStr::from_bytes(&prog);
+            match Command::new(prog).args(&mrs).status() {
                 Ok(status) if status.success() => {}
                 Ok(_) => {
                     eprintln!(
@@ -531,7 +534,7 @@ fn gather_mrs(
                     eprintln!(
                         "delta: {}: {}: {}",
                         sfile_path.display(),
-                        prog,
+                        prog.to_string_lossy(),
                         plib::diag::io_error_text(&e)
                     );
                     return Ok(None);
@@ -692,7 +695,7 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
         delta_type: DeltaType::Normal,
         sid: pfile_entry.new_sid,
         datetime: SccsDateTime::now(),
-        user: posixutils_sccs::username(),
+        user: posixutils_sccs::username().into_bytes(),
         serial: new_serial,
         pred_serial: base_serial,
         stats,
@@ -702,11 +705,11 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
         included: forced_in,
         excluded: forced_out,
         ignored,
-        mr_numbers: mrs,
+        mr_numbers: mrs.into_iter().map(String::into_bytes).collect(),
         comments: if comment.is_empty() {
             Vec::new()
         } else {
-            vec![comment]
+            vec![comment.into_bytes()]
         },
     };
 

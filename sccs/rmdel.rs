@@ -81,7 +81,7 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
     let current_user = posixutils_sccs::username();
     let current_uid = unsafe { libc::getuid() };
 
-    let is_delta_author = sccs.header.deltas[delta_idx].user == current_user;
+    let is_delta_author = sccs.header.deltas[delta_idx].user == current_user.as_bytes();
 
     let owns_sfile = fs::metadata(sfile)
         .map(|m| m.uid() == current_uid)

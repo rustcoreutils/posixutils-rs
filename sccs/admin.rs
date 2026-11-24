@@ -134,11 +134,11 @@ fn content_needs_encoding(data: &[u8]) -> bool {
     std::str::from_utf8(data).is_err() || data.iter().any(|&b| b == 0x00 || b == 0x01)
 }
 
-fn read_desc_text(path: Option<&str>) -> io::Result<Vec<String>> {
+fn read_desc_text(path: Option<&str>) -> io::Result<Vec<Vec<u8>>> {
     match path {
         Some(p) => {
             let content = fs::read_to_string(p)?;
-            Ok(content.lines().map(String::from).collect())
+            Ok(content.lines().map(|l| l.as_bytes().to_vec()).collect())
         }
         None => Ok(Vec::new()),
     }
@@ -172,7 +172,7 @@ fn parse_flag(flag_str: &str) -> Result<SccsFlag, String> {
         return Err(format!("{} '{}'", gettext("Unrecognized flag"), flag_char));
     }
 
-    let flag = SccsFlag::parse(flag_char, value).map_err(|e| e.to_string())?;
+    let flag = SccsFlag::parse(flag_char, value.as_bytes()).map_err(|e| e.to_string())?;
 
     // Spec caps ceiling/floor at 9999.
     match &flag {
@@ -195,7 +195,7 @@ struct NewFileParams<'a> {
     content: Vec<u8>,
     initial_sid: Option<&'a str>,
     comment: Option<&'a str>,
-    desc_text: Vec<String>,
+    desc_text: Vec<Vec<u8>>,
     flags: Vec<SccsFlag>,
     users: Vec<String>,
     mr_numbers: Vec<String>,
@@ -292,15 +292,15 @@ fn create_new_sccs_file(path: &Path, params: NewFileParams) -> io::Result<()> {
         delta_type: DeltaType::Normal,
         sid,
         datetime: now,
-        user,
+        user: user.into_bytes(),
         serial: 1,
         pred_serial: 0,
         stats,
         included: Vec::new(),
         excluded: Vec::new(),
         ignored: Vec::new(),
-        mr_numbers,
-        comments: vec![comment_text],
+        mr_numbers: mr_numbers.into_iter().map(String::into_bytes).collect(),
+        comments: vec![comment_text.into_bytes()],
     };
 
     // Create body with insert block
@@ -316,7 +316,7 @@ fn create_new_sccs_file(path: &Path, params: NewFileParams) -> io::Result<()> {
         header: SccsHeader {
             checksum: 0, // Will be computed during serialization
             deltas: vec![delta],
-            users,
+            users: users.into_iter().map(String::into_bytes).collect(),
             flags,
             descriptive_text: desc_text,
         },
@@ -393,7 +393,7 @@ fn recompute_checksum(path: &Path) -> io::Result<()> {
 
 fn modify_existing_file(
     path: &Path,
-    desc_text: Option<Vec<String>>,
+    desc_text: Option<Vec<Vec<u8>>>,
     add_flags: Vec<SccsFlag>,
     delete_flags: Vec<char>,
     add_users: Vec<String>,
@@ -426,6 +426,7 @@ fn modify_existing_file(
 
     // Add users
     for user in add_users {
+        let user = user.into_bytes();
         if !sccs.header.users.contains(&user) {
             sccs.header.users.push(user);
         }
@@ -433,7 +434,7 @@ fn modify_existing_file(
 
     // Remove users
     for user in remove_users {
-        sccs.header.users.retain(|u| u != &user);
+        sccs.header.users.retain(|u| u != user.as_bytes());
     }
 
     // Write atomically

@@ -213,17 +213,73 @@ fn expand_keywords(
     (result, last_was_multiline)
 }
 
-/// The value of one data keyword. Most are text prs composes; `:GB:` is the
-/// delta's body as stored, which need not be UTF-8, so the value is bytes.
+/// The value of one data keyword, as bytes: the keywords that print what the
+/// s-file stores -- comments, MRs, users, descriptive text, flag values, the
+/// body -- print it as stored, which need not be UTF-8. The rest are text prs
+/// composes, from [`keyword_text`].
 fn expand_single_keyword(
     keyword: &str,
     sccs: &SccsFile,
     delta: &DeltaEntry,
     sfile_path: &Path,
 ) -> Vec<u8> {
+    let text = |kw: &str| keyword_text(kw, sccs, delta, sfile_path).into_bytes();
+    let stored = |v: Option<&[u8]>| v.unwrap_or(b"").to_vec();
+    // A list, one entry per line, or "none" when there is no entry.
+    let list_or_none = |v: &[Vec<u8>]| {
+        if v.is_empty() {
+            b"none".to_vec()
+        } else {
+            v.join(&b"\n"[..])
+        }
+    };
+    let module = || match sccs.module_name() {
+        Some(name) => name.to_vec(),
+        None => paths::module_name(sfile_path)
+            .unwrap_or_default()
+            .into_bytes(),
+    };
     match keyword {
+        "FD" => list_or_none(&sccs.header.descriptive_text),
+        "FL" => format_flags(&sccs.header.flags),
+        "KV" => stored(sccs.id_keyword_check().flatten()),
+        "M" => module(),
+        "MP" => stored(sccs.mr_program().flatten()),
+        "Q" => stored(sccs.q_text()),
+        "UN" => list_or_none(&sccs.header.users),
+        "Y" => stored(sccs.module_type()),
+        "A" => [
+            text("Z"),
+            stored(sccs.module_type()),
+            b" ".to_vec(),
+            module(),
+            b" ".to_vec(),
+            text("I"),
+            text("Z"),
+        ]
+        .concat(),
+        "C" => delta.comments.join(&b"\n"[..]),
+        "Dt" => [
+            text("DT"),
+            b" ".to_vec(),
+            text("I"),
+            b" ".to_vec(),
+            text("D"),
+            b" ".to_vec(),
+            text("T"),
+            b" ".to_vec(),
+            delta.user.clone(),
+            b" ".to_vec(),
+            text("DS"),
+            b" ".to_vec(),
+            text("DP"),
+        ]
+        .concat(),
         "GB" => gotten_body(sccs, delta.serial),
-        _ => keyword_text(keyword, sccs, delta, sfile_path).into_bytes(),
+        "MR" => delta.mr_numbers.join(&b"\n"[..]),
+        "P" => delta.user.clone(),
+        "W" => [text("Z"), module(), b"\t".to_vec(), text("I")].concat(),
+        _ => text(keyword),
     }
 }
 
@@ -260,14 +316,6 @@ fn keyword_text(keyword: &str, sccs: &SccsFile, delta: &DeltaEntry, sfile_path: 
                 _ => None,
             })
             .unwrap_or_else(|| "none".to_string()),
-        "FD" => {
-            if sccs.header.descriptive_text.is_empty() {
-                "none".to_string()
-            } else {
-                sccs.header.descriptive_text.join("\n")
-            }
-        }
-        "FL" => format_flags(&sccs.header.flags),
         "J" => flag_yes_no(has_flag(&sccs.header.flags, |f| {
             matches!(f, SccsFlag::JointEdit)
         }))
@@ -276,7 +324,6 @@ fn keyword_text(keyword: &str, sccs: &SccsFile, delta: &DeltaEntry, sfile_path: 
             matches!(f, SccsFlag::IdKeywordError(_))
         }))
         .to_string(),
-        "KV" => sccs.id_keyword_check().flatten().unwrap_or("").to_string(),
         // An absent `l` flag is "none"; `l a` locks every release and renders
         // as "a", matching CSSC. Encoding "all" as an empty list made the most
         // restrictive setting a file can carry report as the least.
@@ -284,40 +331,18 @@ fn keyword_text(keyword: &str, sccs: &SccsFile, delta: &DeltaEntry, sfile_path: 
             .locked_releases()
             .map(|lock| lock.value_string())
             .unwrap_or_else(|| "none".to_string()),
-        "M" => sccs
-            .module_name()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| paths::module_name(sfile_path).unwrap_or_default()),
         "MF" => flag_yes_no(has_flag(&sccs.header.flags, |f| {
             matches!(f, SccsFlag::MrValidation(_))
         }))
         .to_string(),
-        "MP" => sccs.mr_program().flatten().unwrap_or("").to_string(),
         "ND" => flag_yes_no(has_flag(&sccs.header.flags, |f| {
             matches!(f, SccsFlag::NullDelta)
         }))
         .to_string(),
         // POSIX: the SCCS-file pathname as given (the operand), not resolved.
         "PN" => sfile_path.to_string_lossy().to_string(),
-        "Q" => sccs.q_text().unwrap_or("").to_string(),
-        "UN" => {
-            if sccs.header.users.is_empty() {
-                "none".to_string()
-            } else {
-                sccs.header.users.join("\n")
-            }
-        }
-        "Y" => sccs.module_type().unwrap_or("").to_string(),
 
         // Version-specific keywords
-        "A" => format!(
-            "{}{} {} {}{}",
-            keyword_text("Z", sccs, delta, sfile_path),
-            keyword_text("Y", sccs, delta, sfile_path),
-            keyword_text("M", sccs, delta, sfile_path),
-            keyword_text("I", sccs, delta, sfile_path),
-            keyword_text("Z", sccs, delta, sfile_path),
-        ),
         "B" => {
             if delta.sid.br > 0 {
                 delta.sid.br.to_string()
@@ -325,7 +350,6 @@ fn keyword_text(keyword: &str, sccs: &SccsFile, delta: &DeltaEntry, sfile_path: 
                 String::new()
             }
         }
-        "C" => delta.comments.join("\n"),
         // Gotten body: reconstruct this delta's source text.
         "D" => delta.datetime.date_string(),
         "Dd" => format!("{:02}", delta.datetime.day),
@@ -377,16 +401,6 @@ fn keyword_text(keyword: &str, sccs: &SccsFile, delta: &DeltaEntry, sfile_path: 
             .join(" "),
         "DP" => delta.pred_serial.to_string(),
         "DS" => delta.serial.to_string(),
-        "Dt" => format!(
-            "{} {} {} {} {} {} {}",
-            keyword_text("DT", sccs, delta, sfile_path),
-            keyword_text("I", sccs, delta, sfile_path),
-            keyword_text("D", sccs, delta, sfile_path),
-            keyword_text("T", sccs, delta, sfile_path),
-            keyword_text("P", sccs, delta, sfile_path),
-            keyword_text("DS", sccs, delta, sfile_path),
-            keyword_text("DP", sccs, delta, sfile_path),
-        ),
         "DT" => match delta.delta_type {
             DeltaType::Normal => "D",
             DeltaType::Removed => "R",
@@ -404,8 +418,6 @@ fn keyword_text(keyword: &str, sccs: &SccsFile, delta: &DeltaEntry, sfile_path: 
         "Ld" => format!("{:05}", delta.stats.deleted.min(99999)),
         "Li" => format!("{:05}", delta.stats.inserted.min(99999)),
         "Lu" => format!("{:05}", delta.stats.unchanged.min(99999)),
-        "MR" => delta.mr_numbers.join("\n"),
-        "P" => delta.user.clone(),
         "R" => delta.sid.rel.to_string(),
         "S" => {
             if delta.sid.seq > 0 {
@@ -418,12 +430,6 @@ fn keyword_text(keyword: &str, sccs: &SccsFile, delta: &DeltaEntry, sfile_path: 
         "Th" => format!("{:02}", delta.datetime.hour),
         "Tm" => format!("{:02}", delta.datetime.minute),
         "Ts" => format!("{:02}", delta.datetime.second),
-        "W" => format!(
-            "{}{}\t{}",
-            keyword_text("Z", sccs, delta, sfile_path),
-            keyword_text("M", sccs, delta, sfile_path),
-            keyword_text("I", sccs, delta, sfile_path),
-        ),
         "Z" => "@(#)".to_string(),
 
         // Unknown keyword - return as-is
@@ -459,12 +465,12 @@ where
     flags.iter().any(predicate)
 }
 
-fn format_flags(flags: &[SccsFlag]) -> String {
+fn format_flags(flags: &[SccsFlag]) -> Vec<u8> {
     flags
         .iter()
         .filter_map(|f| f.prs_fl_line())
         .collect::<Vec<_>>()
-        .join("\n")
+        .join(&b"\n"[..])
 }
 
 fn prs_file(sfile: &Path, args: &Args) -> io::Result<bool> {

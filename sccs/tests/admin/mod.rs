@@ -715,19 +715,38 @@ fn admin_unreadable_input_names_the_system_error() {
     });
 }
 
-/// Rewriting an s-file (here to set a flag) keeps body text that is not
-/// UTF-8 byte for byte. It used to be decoded as UTF-8 with a fallback of
-/// "", so one `admin -fb` blanked every such line, with a valid checksum.
+/// Every rewrite of an s-file keeps text that is not UTF-8 byte for byte:
+/// body, comments, flag values, descriptive text and the user list. It was
+/// decoded as UTF-8 with a fallback of "", so one `admin -fb` or `admin -z`
+/// blanked all of it, under a valid checksum.
 #[test]
-fn admin_rewrite_keeps_non_utf8_body() {
+fn admin_rewrite_keeps_non_utf8_text() {
+    use super::common::{assert_sfile_holds, write_sfile, LATIN1_RECORDS, LATIN1_SFILE};
     let tmp = TempDir::new().unwrap();
-    let s = super::common::write_sfile(tmp.path(), "s.l1", super::common::LATIN1_SFILE);
-    let out = super::common::run_in("admin", &["-fb", "s.l1"], tmp.path(), "");
+    for args in [&["-fb"][..], &["-z"], &["-dq"], &["-afred"]] {
+        let s = write_sfile(tmp.path(), "s.l1", LATIN1_SFILE);
+        let mut argv = args.to_vec();
+        argv.push("s.l1");
+        let out = super::common::run_in("admin", &argv, tmp.path(), "");
+        assert!(out.status.success(), "admin {args:?}: {out:?}");
+        let kept: Vec<&[u8]> = LATIN1_RECORDS
+            .iter()
+            .copied()
+            .filter(|r| !(args == ["-dq"] && r.starts_with(b"\x01f q")))
+            .collect();
+        assert_sfile_holds(&s, &kept);
+        fs::remove_file(&s).unwrap();
+    }
+
+    // A user list entry that is not UTF-8, from another implementation.
+    let mut content = LATIN1_SFILE.to_vec();
+    let at = content
+        .windows(4)
+        .position(|w| w == b"\x01U\n\x01")
+        .unwrap();
+    content.splice(at..at, b"\xe9ric\n".iter().copied());
+    let s = write_sfile(tmp.path(), "s.u", &content);
+    let out = super::common::run_in("admin", &["-afred", "s.u"], tmp.path(), "");
     assert!(out.status.success(), "{out:?}");
-    let data = fs::read(&s).unwrap();
-    assert!(
-        data.windows(14).any(|w| w == b"\ncaf\xe9 %I%\nline"),
-        "body line lost: {:?}",
-        String::from_utf8_lossy(&data)
-    );
+    assert_sfile_holds(&s, &[b"\xe9ric", b"fred"]);
 }

@@ -588,15 +588,17 @@ pub struct DeltaEntry {
     pub delta_type: DeltaType,
     pub sid: Sid,
     pub datetime: SccsDateTime,
-    pub user: String,
+    /// Login of the delta's author. Like every text an s-file stores, it
+    /// is the bytes written, which need not be UTF-8.
+    pub user: Vec<u8>,
     pub serial: u16,      // Serial number (unique ID within file)
     pub pred_serial: u16, // Predecessor serial (0 for first delta)
     pub stats: DeltaStats,
-    pub included: Vec<u16>,      // Serial numbers of included deltas (^Ai)
-    pub excluded: Vec<u16>,      // Serial numbers of excluded deltas (^Ax)
-    pub ignored: Vec<u16>,       // Serial numbers of ignored deltas (^Ag)
-    pub mr_numbers: Vec<String>, // Modification request numbers (^Am)
-    pub comments: Vec<String>,   // Comment lines (^Ac)
+    pub included: Vec<u16>,       // Serial numbers of included deltas (^Ai)
+    pub excluded: Vec<u16>,       // Serial numbers of excluded deltas (^Ax)
+    pub ignored: Vec<u16>,        // Serial numbers of ignored deltas (^Ag)
+    pub mr_numbers: Vec<Vec<u8>>, // Modification request numbers (^Am)
+    pub comments: Vec<Vec<u8>>,   // Comment lines (^Ac)
 }
 
 // =============================================================================
@@ -653,82 +655,81 @@ pub enum SccsFlag {
     /// 'f' <floor> - Floor release
     Floor(u16),
     /// 'i' [str] - ID keyword error
-    IdKeywordError(Option<String>),
+    IdKeywordError(Option<Vec<u8>>),
     /// 'j' - Joint edit allowed
     JointEdit,
     /// 'l' <list> - Locked releases (`a` == all, see [`ReleaseLock`])
     LockedReleases(ReleaseLock),
     /// 'm' <name> - Module name
-    ModuleName(String),
+    ModuleName(Vec<u8>),
     /// 'n' - Create null deltas
     NullDelta,
     /// 'q' <text> - User-defined flag for %Q%
-    QText(String),
+    QText(Vec<u8>),
     /// 't' <type> - Module type for %Y%
-    ModuleType(String),
+    ModuleType(Vec<u8>),
     /// 'v' [pgm] - MR validation program
-    MrValidation(Option<String>),
+    MrValidation(Option<Vec<u8>>),
     /// Unknown flag (for lossless preservation)
-    Unknown(char, String),
+    Unknown(char, Vec<u8>),
 }
 
 impl SccsFlag {
-    /// Parse a flag from its character and value
-    pub fn parse(flag_char: char, value: &str) -> SccsResult<Self> {
-        let value = value.trim();
+    /// Parse a flag from its character and value. The value is the bytes the
+    /// s-file holds: a text value keeps them as they are, and a numeric one
+    /// that is not a number is an error rather than a zero.
+    pub fn parse(flag_char: char, value: &[u8]) -> SccsResult<Self> {
+        let value = value.trim_ascii();
+        let number = |what: char| -> SccsResult<&str> {
+            std::str::from_utf8(value).map_err(|_| {
+                SccsError::InvalidFlag(format!("{}{}", what, String::from_utf8_lossy(value)))
+            })
+        };
+        let optional = || (!value.is_empty()).then(|| value.to_vec());
         match flag_char {
             'b' => Ok(SccsFlag::BranchEnabled),
             'c' => {
-                let ceil = value
+                let text = number('c')?;
+                let ceil = text
                     .parse()
-                    .map_err(|_| SccsError::InvalidFlag(format!("c{}", value)))?;
+                    .map_err(|_| SccsError::InvalidFlag(format!("c{}", text)))?;
                 Ok(SccsFlag::Ceiling(ceil))
             }
             'd' => {
-                let sid = value.parse()?;
+                let sid = number('d')?.parse()?;
                 Ok(SccsFlag::DefaultSid(sid))
             }
             'e' => {
-                let enc = value.parse().unwrap_or(0);
+                let enc = number('e').ok().and_then(|t| t.parse().ok()).unwrap_or(0);
                 Ok(SccsFlag::Encoded(enc))
             }
             'f' => {
-                let floor = value
+                let text = number('f')?;
+                let floor = text
                     .parse()
-                    .map_err(|_| SccsError::InvalidFlag(format!("f{}", value)))?;
+                    .map_err(|_| SccsError::InvalidFlag(format!("f{}", text)))?;
                 Ok(SccsFlag::Floor(floor))
             }
-            'i' => {
-                if value.is_empty() {
-                    Ok(SccsFlag::IdKeywordError(None))
-                } else {
-                    Ok(SccsFlag::IdKeywordError(Some(value.to_string())))
-                }
-            }
+            'i' => Ok(SccsFlag::IdKeywordError(optional())),
             'j' => Ok(SccsFlag::JointEdit),
             'l' => {
-                if value == "a" {
+                let text = number('l')?;
+                if text == "a" {
                     Ok(SccsFlag::LockedReleases(ReleaseLock::All))
                 } else {
                     let releases: Result<Vec<u16>, _> =
-                        value.split(',').map(|s| s.trim().parse()).collect();
+                        text.split(',').map(|s| s.trim().parse()).collect();
                     Ok(SccsFlag::LockedReleases(ReleaseLock::List(
-                        releases.map_err(|_| SccsError::InvalidFlag(format!("l{}", value)))?,
+                        releases.map_err(|_| SccsError::InvalidFlag(format!("l{}", text)))?,
                     )))
                 }
             }
-            'm' => Ok(SccsFlag::ModuleName(value.to_string())),
+            'm' => Ok(SccsFlag::ModuleName(value.to_vec())),
             'n' => Ok(SccsFlag::NullDelta),
-            'q' => Ok(SccsFlag::QText(value.to_string())),
-            't' => Ok(SccsFlag::ModuleType(value.to_string())),
-            'v' => {
-                if value.is_empty() {
-                    Ok(SccsFlag::MrValidation(None))
-                } else {
-                    Ok(SccsFlag::MrValidation(Some(value.to_string())))
-                }
-            }
-            _ => Ok(SccsFlag::Unknown(flag_char, value.to_string())),
+            'q' => Ok(SccsFlag::QText(value.to_vec())),
+            't' => Ok(SccsFlag::ModuleType(value.to_vec())),
+            'v' => Ok(SccsFlag::MrValidation(optional())),
+            _ => Ok(SccsFlag::Unknown(flag_char, value.to_vec())),
         }
     }
 
@@ -752,23 +753,22 @@ impl SccsFlag {
         }
     }
 
-    /// Get the flag value as string
-    pub fn value_string(&self) -> String {
+    /// The flag's value as the s-file stores it: empty for a flag that
+    /// takes none.
+    pub fn value(&self) -> Vec<u8> {
         match self {
-            SccsFlag::BranchEnabled => String::new(),
-            SccsFlag::Ceiling(n) => n.to_string(),
-            SccsFlag::DefaultSid(sid) => sid.to_string(),
-            SccsFlag::Encoded(n) => n.to_string(),
-            SccsFlag::Floor(n) => n.to_string(),
-            SccsFlag::IdKeywordError(s) => s.clone().unwrap_or_default(),
-            SccsFlag::JointEdit => String::new(),
-            SccsFlag::LockedReleases(lock) => lock.value_string(),
-            SccsFlag::ModuleName(s) => s.clone(),
-            SccsFlag::NullDelta => String::new(),
-            SccsFlag::QText(s) => s.clone(),
-            SccsFlag::ModuleType(s) => s.clone(),
-            SccsFlag::MrValidation(s) => s.clone().unwrap_or_default(),
-            SccsFlag::Unknown(_, s) => s.clone(),
+            SccsFlag::BranchEnabled | SccsFlag::JointEdit | SccsFlag::NullDelta => Vec::new(),
+            SccsFlag::Ceiling(n) | SccsFlag::Floor(n) => n.to_string().into_bytes(),
+            SccsFlag::DefaultSid(sid) => sid.to_string().into_bytes(),
+            SccsFlag::Encoded(n) => n.to_string().into_bytes(),
+            SccsFlag::LockedReleases(lock) => lock.value_string().into_bytes(),
+            SccsFlag::IdKeywordError(s) | SccsFlag::MrValidation(s) => {
+                s.clone().unwrap_or_default()
+            }
+            SccsFlag::ModuleName(s)
+            | SccsFlag::QText(s)
+            | SccsFlag::ModuleType(s)
+            | SccsFlag::Unknown(_, s) => s.clone(),
         }
     }
 
@@ -776,26 +776,29 @@ impl SccsFlag {
     /// keyword, matching historical SCCS / CSSC output. Value-bearing flags
     /// render as `name<tab>value`. Returns `None` for the `e` (encoded) flag,
     /// which is not part of the `:FL:` listing.
-    pub fn prs_fl_line(&self) -> Option<String> {
-        let s = match self {
-            SccsFlag::BranchEnabled => "branch".to_string(),
-            SccsFlag::Ceiling(n) => format!("ceiling\t{}", n),
-            SccsFlag::DefaultSid(sid) => format!("default SID\t{}", sid),
+    pub fn prs_fl_line(&self) -> Option<Vec<u8>> {
+        let (name, has_value) = match self {
+            SccsFlag::BranchEnabled => ("branch".to_string(), false),
+            SccsFlag::Ceiling(_) => ("ceiling".to_string(), true),
+            SccsFlag::DefaultSid(_) => ("default SID".to_string(), true),
             SccsFlag::Encoded(_) => return None,
-            SccsFlag::Floor(n) => format!("floor\t{}", n),
-            SccsFlag::IdKeywordError(_) => "id keywd err/warn".to_string(),
-            SccsFlag::JointEdit => "joint edit".to_string(),
-            SccsFlag::LockedReleases(_) => {
-                format!("locked releases\t{}", self.value_string())
-            }
-            SccsFlag::ModuleName(s) => format!("module\t{}", s),
-            SccsFlag::NullDelta => "null delta".to_string(),
-            SccsFlag::QText(s) => format!("csect name\t{}", s),
-            SccsFlag::ModuleType(s) => format!("type\t{}", s),
-            SccsFlag::MrValidation(s) => format!("validate MRs\t{}", s.clone().unwrap_or_default()),
-            SccsFlag::Unknown(c, val) => format!("{}\t{}", c, val),
+            SccsFlag::Floor(_) => ("floor".to_string(), true),
+            SccsFlag::IdKeywordError(_) => ("id keywd err/warn".to_string(), false),
+            SccsFlag::JointEdit => ("joint edit".to_string(), false),
+            SccsFlag::LockedReleases(_) => ("locked releases".to_string(), true),
+            SccsFlag::ModuleName(_) => ("module".to_string(), true),
+            SccsFlag::NullDelta => ("null delta".to_string(), false),
+            SccsFlag::QText(_) => ("csect name".to_string(), true),
+            SccsFlag::ModuleType(_) => ("type".to_string(), true),
+            SccsFlag::MrValidation(_) => ("validate MRs".to_string(), true),
+            SccsFlag::Unknown(c, _) => (c.to_string(), true),
         };
-        Some(s)
+        let mut line = name.into_bytes();
+        if has_value {
+            line.push(b'\t');
+            line.extend_from_slice(&self.value());
+        }
+        Some(line)
     }
 }
 
@@ -826,9 +829,9 @@ pub enum BodyRecord {
 pub struct SccsHeader {
     pub checksum: u16,
     pub deltas: Vec<DeltaEntry>,
-    pub users: Vec<String>,
+    pub users: Vec<Vec<u8>>,
     pub flags: Vec<SccsFlag>,
-    pub descriptive_text: Vec<String>,
+    pub descriptive_text: Vec<Vec<u8>>,
 }
 
 // =============================================================================
@@ -893,17 +896,16 @@ impl SccsFile {
             writeln!(writer, "\x01s {}", delta.stats)?;
 
             // Delta header line
-            writeln!(
+            write!(
                 writer,
-                "\x01d {} {} {} {} {} {} {}",
+                "\x01d {} {} {} {} ",
                 delta.delta_type.to_char(),
                 delta.sid,
                 delta.datetime.date_string(),
                 delta.datetime.time_string(),
-                delta.user,
-                delta.serial,
-                delta.pred_serial
             )?;
+            writer.write_all(&delta.user)?;
+            writeln!(writer, " {} {}", delta.serial, delta.pred_serial)?;
 
             // Included deltas
             if !delta.included.is_empty() {
@@ -925,12 +927,12 @@ impl SccsFile {
 
             // MR numbers
             for mr in &delta.mr_numbers {
-                writeln!(writer, "\x01m {}", mr)?;
+                write_record(writer, b"\x01m ", mr)?;
             }
 
             // Comments
             for comment in &delta.comments {
-                writeln!(writer, "\x01c {}", comment)?;
+                write_record(writer, b"\x01c ", comment)?;
             }
 
             // End of delta
@@ -940,24 +942,25 @@ impl SccsFile {
         // User list
         writeln!(writer, "\x01u")?;
         for user in &self.header.users {
-            writeln!(writer, "{}", user)?;
+            write_record(writer, b"", user)?;
         }
         writeln!(writer, "\x01U")?;
 
         // Flags
         for flag in &self.header.flags {
-            let value = flag.value_string();
+            let value = flag.value();
             if value.is_empty() {
                 writeln!(writer, "\x01f {}", flag.flag_char())?;
             } else {
-                writeln!(writer, "\x01f {} {}", flag.flag_char(), value)?;
+                write!(writer, "\x01f {} ", flag.flag_char())?;
+                write_record(writer, b"", &value)?;
             }
         }
 
         // Descriptive text
         writeln!(writer, "\x01t")?;
         for line in &self.header.descriptive_text {
-            writeln!(writer, "{}", line)?;
+            write_record(writer, b"", line)?;
         }
         writeln!(writer, "\x01T")?;
 
@@ -967,10 +970,7 @@ impl SccsFile {
                 BodyRecord::Insert(serial) => writeln!(writer, "\x01I {}", serial)?,
                 BodyRecord::Delete(serial) => writeln!(writer, "\x01D {}", serial)?,
                 BodyRecord::End(serial) => writeln!(writer, "\x01E {}", serial)?,
-                BodyRecord::Text(line) => {
-                    writer.write_all(line)?;
-                    writer.write_all(b"\n")?;
-                }
+                BodyRecord::Text(line) => write_record(writer, b"", line)?,
             }
         }
 
@@ -1230,7 +1230,7 @@ impl SccsFile {
     }
 
     /// Get module name (from 'm' flag or derived from filename)
-    pub fn module_name(&self) -> Option<&str> {
+    pub fn module_name(&self) -> Option<&[u8]> {
         for flag in &self.header.flags {
             if let SccsFlag::ModuleName(name) = flag {
                 return Some(name);
@@ -1240,7 +1240,7 @@ impl SccsFile {
     }
 
     /// Get module type (from 't' flag)
-    pub fn module_type(&self) -> Option<&str> {
+    pub fn module_type(&self) -> Option<&[u8]> {
         for flag in &self.header.flags {
             if let SccsFlag::ModuleType(t) = flag {
                 return Some(t);
@@ -1303,7 +1303,7 @@ impl SccsFile {
 
     /// MR-number validation program (`v` flag). The outer `Option` is "flag
     /// absent", the inner one "flag present with no program".
-    pub fn mr_program(&self) -> Option<Option<&str>> {
+    pub fn mr_program(&self) -> Option<Option<&[u8]>> {
         self.header.flags.iter().find_map(|f| match f {
             SccsFlag::MrValidation(p) => Some(p.as_deref()),
             _ => None,
@@ -1311,9 +1311,9 @@ impl SccsFile {
     }
 
     /// User-defined `%Q%` text (`q` flag).
-    pub fn q_text(&self) -> Option<&str> {
+    pub fn q_text(&self) -> Option<&[u8]> {
         self.header.flags.iter().find_map(|f| match f {
-            SccsFlag::QText(s) => Some(s.as_str()),
+            SccsFlag::QText(s) => Some(s.as_slice()),
             _ => None,
         })
     }
@@ -1321,7 +1321,7 @@ impl SccsFile {
     /// ID-keyword check (`i` flag). The outer `Option` is "flag absent" (the
     /// missing-keyword message is only a warning); the inner one is the
     /// optional exact-match string. POSIX 84037-84043.
-    pub fn id_keyword_check(&self) -> Option<Option<&str>> {
+    pub fn id_keyword_check(&self) -> Option<Option<&[u8]>> {
         self.header.flags.iter().find_map(|f| match f {
             SccsFlag::IdKeywordError(s) => Some(s.as_deref()),
             _ => None,
@@ -1464,6 +1464,14 @@ pub fn is_line_visible(stack: &[(bool, u16)], applied_set: &HashSet<u16>) -> boo
         }
     }
     true
+}
+
+/// Write one s-file line: `prefix` (a control code and its blank, or nothing),
+/// the stored bytes, and the newline that ends it.
+fn write_record<W: Write>(writer: &mut W, prefix: &[u8], text: &[u8]) -> io::Result<()> {
+    writer.write_all(prefix)?;
+    writer.write_all(text)?;
+    writer.write_all(b"\n")
 }
 
 /// Split text into its lines: each ends at a newline, which is not part of
@@ -1653,26 +1661,32 @@ impl<'a> SccsParser<'a> {
         if delta_line.len() < 3 || delta_line[0] != SOH || delta_line[1] != control::DELTA {
             return Err(SccsError::InvalidDelta("Expected delta line".into()));
         }
-        let delta_str = std::str::from_utf8(control_arg(delta_line))
-            .map_err(|_| SccsError::InvalidDelta("Invalid delta encoding".into()))?;
-
-        // Parse: <type> <sid> <date> <time> <user> <serial> <pred>
-        let parts: Vec<&str> = delta_str.split_whitespace().collect();
+        // Parse: <type> <sid> <date> <time> <user> <serial> <pred>. The user
+        // is a login and kept as its bytes; every other field is ASCII.
+        let delta_arg = control_arg(delta_line);
+        let parts: Vec<&[u8]> = delta_arg
+            .split(u8::is_ascii_whitespace)
+            .filter(|p| !p.is_empty())
+            .collect();
         if parts.len() < 7 {
             return Err(SccsError::InvalidDelta(format!(
                 "Invalid delta format: {}",
-                delta_str
+                String::from_utf8_lossy(delta_arg)
             )));
         }
+        let field = |i: usize| {
+            std::str::from_utf8(parts[i])
+                .map_err(|_| SccsError::InvalidDelta("Invalid delta encoding".into()))
+        };
 
-        entry.delta_type = DeltaType::from_char(parts[0].chars().next().unwrap_or('D'))?;
-        entry.sid = parts[1].parse()?;
-        entry.datetime = SccsDateTime::parse(parts[2], parts[3])?;
-        entry.user = parts[4].to_string();
-        entry.serial = parts[5]
+        entry.delta_type = DeltaType::from_char(field(0)?.chars().next().unwrap_or('D'))?;
+        entry.sid = field(1)?.parse()?;
+        entry.datetime = SccsDateTime::parse(field(2)?, field(3)?)?;
+        entry.user = parts[4].to_vec();
+        entry.serial = field(5)?
             .parse()
             .map_err(|_| SccsError::InvalidDelta("Invalid serial".into()))?;
-        entry.pred_serial = parts[6]
+        entry.pred_serial = field(6)?
             .parse()
             .map_err(|_| SccsError::InvalidDelta("Invalid predecessor".into()))?;
 
@@ -1713,17 +1727,12 @@ impl<'a> SccsParser<'a> {
                     }
                 }
                 control::MR => {
-                    let mr = std::str::from_utf8(control_arg(line)).unwrap_or("").trim();
+                    let mr = control_arg(line).trim_ascii();
                     if !mr.is_empty() {
-                        entry.mr_numbers.push(mr.to_string());
+                        entry.mr_numbers.push(mr.to_vec());
                     }
                 }
-                control::COMMENT => {
-                    let comment = std::str::from_utf8(control_arg(line))
-                        .unwrap_or("")
-                        .to_string();
-                    entry.comments.push(comment);
-                }
+                control::COMMENT => entry.comments.push(control_arg(line).to_vec()),
                 _ => {} // Skip unknown
             }
         }
@@ -1731,7 +1740,7 @@ impl<'a> SccsParser<'a> {
         Ok(entry)
     }
 
-    fn parse_user_list(&mut self) -> SccsResult<Vec<String>> {
+    fn parse_user_list(&mut self) -> SccsResult<Vec<Vec<u8>>> {
         let mut users = Vec::new();
 
         // Consume ^Au line
@@ -1752,9 +1761,9 @@ impl<'a> SccsParser<'a> {
                 break;
             }
 
-            let user = std::str::from_utf8(line).unwrap_or("").trim();
+            let user = line.trim_ascii();
             if !user.is_empty() {
-                users.push(user.to_string());
+                users.push(user.to_vec());
             }
         }
 
@@ -1773,11 +1782,20 @@ impl<'a> SccsParser<'a> {
             // Parse ^Af lines
             if line.len() >= 4 && line[0] == SOH && line[1] == control::FLAG {
                 self.next_line();
-                let flag_str = std::str::from_utf8(control_arg(line)).unwrap_or("").trim();
-                if !flag_str.is_empty() {
-                    let flag_char = flag_str.chars().next().unwrap();
-                    let value = flag_str[flag_char.len_utf8()..].trim();
-                    flags.push(SccsFlag::parse(flag_char, value)?);
+                let flag = control_arg(line).trim_ascii();
+                if !flag.is_empty() {
+                    // The flag letter is one character; refuse a line that
+                    // does not start with one rather than guess at it.
+                    let letter_len = (1..=flag.len().min(4))
+                        .find(|&n| std::str::from_utf8(&flag[..n]).is_ok())
+                        .ok_or_else(|| {
+                            SccsError::InvalidFlag(String::from_utf8_lossy(flag).into_owned())
+                        })?;
+                    let letter = std::str::from_utf8(&flag[..letter_len])
+                        .ok()
+                        .and_then(|s| s.chars().next())
+                        .unwrap_or('?');
+                    flags.push(SccsFlag::parse(letter, &flag[letter_len..])?);
                 }
             } else {
                 self.next_line();
@@ -1787,7 +1805,7 @@ impl<'a> SccsParser<'a> {
         Ok(flags)
     }
 
-    fn parse_descriptive_text(&mut self) -> SccsResult<Vec<String>> {
+    fn parse_descriptive_text(&mut self) -> SccsResult<Vec<Vec<u8>>> {
         let mut text = Vec::new();
 
         // Consume ^At line
@@ -1810,8 +1828,7 @@ impl<'a> SccsParser<'a> {
                 break;
             }
 
-            let text_line = std::str::from_utf8(line).unwrap_or("");
-            text.push(text_line.to_string());
+            text.push(line.to_vec());
         }
 
         Ok(text)
@@ -2389,23 +2406,23 @@ mod tests {
     fn test_prs_fl_line_canonical() {
         assert_eq!(
             SccsFlag::BranchEnabled.prs_fl_line().as_deref(),
-            Some("branch")
+            Some(&b"branch"[..])
         );
         assert_eq!(
             SccsFlag::ModuleName("mod".into()).prs_fl_line().as_deref(),
-            Some("module\tmod")
+            Some(&b"module\tmod"[..])
         );
         assert_eq!(
             SccsFlag::ModuleType("ty".into()).prs_fl_line().as_deref(),
-            Some("type\tty")
+            Some(&b"type\tty"[..])
         );
         assert_eq!(
             SccsFlag::QText("Q".into()).prs_fl_line().as_deref(),
-            Some("csect name\tQ")
+            Some(&b"csect name\tQ"[..])
         );
         assert_eq!(
             SccsFlag::MrValidation(None).prs_fl_line().as_deref(),
-            Some("validate MRs\t")
+            Some(&b"validate MRs\t"[..])
         );
         // The encoded flag is not part of the :FL: listing.
         assert_eq!(SccsFlag::Encoded(0).prs_fl_line(), None);
@@ -2521,14 +2538,14 @@ mod tests {
 
     #[test]
     fn test_sccs_flag_parse() {
-        let flag = SccsFlag::parse('b', "").unwrap();
+        let flag = SccsFlag::parse('b', b"").unwrap();
         assert!(matches!(flag, SccsFlag::BranchEnabled));
 
-        let flag = SccsFlag::parse('c', "5").unwrap();
+        let flag = SccsFlag::parse('c', b"5").unwrap();
         assert!(matches!(flag, SccsFlag::Ceiling(5)));
 
-        let flag = SccsFlag::parse('m', "mymodule").unwrap();
-        assert!(matches!(flag, SccsFlag::ModuleName(ref s) if s == "mymodule"));
+        let flag = SccsFlag::parse('m', b"mymodule").unwrap();
+        assert!(matches!(flag, SccsFlag::ModuleName(ref s) if s == b"mymodule"));
     }
 
     // Fixture tests - verify parser can read cssc-generated SCCS files
@@ -2750,7 +2767,10 @@ mod tests {
 \x01I\n\x01E\n";
         let sccs = SccsFile::from_bytes(&with_checksum(content)).unwrap();
         assert_eq!(sccs.body, [BodyRecord::Insert(0), BodyRecord::End(0)]);
-        assert_eq!(sccs.header.flags, [SccsFlag::Unknown('\u{e9}', "x".into())]);
+        assert_eq!(
+            sccs.header.flags,
+            [SccsFlag::Unknown('\u{e9}', b"x".to_vec())]
+        );
     }
 
     #[test]

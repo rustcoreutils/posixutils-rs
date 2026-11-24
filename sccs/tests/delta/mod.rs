@@ -1285,3 +1285,22 @@ fn delta_handles_non_utf8_text() {
     let out = run("get", &["-p", "-k", "-s", "s.l1"]);
     assert_eq!(out.stdout, b"caf\xe9 %I%\nna\xefve\n");
 }
+
+/// delta and rmdel rewrite the whole s-file; text another delta stored that
+/// is not UTF-8 -- comments, flag values, descriptive text -- survives both.
+#[test]
+fn delta_and_rmdel_keep_non_utf8_text() {
+    use super::common::{assert_sfile_holds, write_sfile, LATIN1_RECORDS, LATIN1_SFILE};
+    let tmp = TempDir::new().unwrap();
+    let s = write_sfile(tmp.path(), "s.l1", LATIN1_SFILE);
+    let run = |cmd: &str, args: &[&str]| {
+        let out = super::common::run_in(cmd, args, tmp.path(), "");
+        assert!(out.status.success(), "{cmd} {args:?}: {out:?}");
+    };
+    run("get", &["-e", "-s", "s.l1"]);
+    fs::write(tmp.path().join("l1"), b"caf\xe9 %I%\nline2\nline3\n").unwrap();
+    run("delta", &["-s", "-ymore", "s.l1"]);
+    assert_sfile_holds(&s, LATIN1_RECORDS);
+    run("rmdel", &["-r1.2", "s.l1"]);
+    assert_sfile_holds(&s, LATIN1_RECORDS);
+}

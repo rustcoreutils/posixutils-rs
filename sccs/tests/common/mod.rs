@@ -145,16 +145,41 @@ pub fn write_sfile(dir: &Path, name: &str, content: &[u8]) -> PathBuf {
     path
 }
 
-/// An s-file (after its `^Ah` line) whose body, comment and descriptive
-/// text hold Latin-1 bytes that are not valid UTF-8 -- as CSSC or historical
+/// An s-file (after its `^Ah` line) whose body, comment, `q` flag and
+/// descriptive text hold Latin-1 bytes that are not valid UTF-8 -- as CSSC or historical
 /// SCCS writes for a Latin-1 source file -- for [`write_sfile`].
 pub const LATIN1_SFILE: &[u8] = b"\x01s 00002/00000/00000\n\
 \x01d D 1.1 26/01/01 00:00:00 u 1 0\n\
 \x01c caf\xe9 comment\n\
 \x01e\n\
 \x01u\n\x01U\n\
+\x01f q caf\xe9\n\
 \x01t\n\xe9t\xe9\n\x01T\n\
 \x01I 1\n\
 caf\xe9 %I%\n\
 line2\n\
 \x01E 1\n";
+
+/// Assert that the s-file at `path` still holds each of `records` (whole
+/// lines, without their newline) byte for byte.
+pub fn assert_sfile_holds(path: &Path, records: &[&[u8]]) {
+    let data = std::fs::read(path).expect("read s-file");
+    let lines = plib::sccsfile::split_lines(&data);
+    for record in records {
+        assert!(
+            lines.contains(record),
+            "{} lost {:?}:\n{}",
+            path.display(),
+            String::from_utf8_lossy(record),
+            String::from_utf8_lossy(&data)
+        );
+    }
+}
+
+/// The Latin-1 records of [`LATIN1_SFILE`] that a rewrite must keep.
+pub const LATIN1_RECORDS: &[&[u8]] = &[
+    b"\x01c caf\xe9 comment",
+    b"\x01f q caf\xe9",
+    b"\xe9t\xe9",
+    b"caf\xe9 %I%",
+];

@@ -78,14 +78,14 @@ pub fn check_edit(sccs: &SccsFile, release: u16, login: &str) -> Result<(), Refu
 /// permission to make deltas" (POSIX 84088-84090). A denial outranks an
 /// allowance, and a list that names only denials admits nobody -- which is
 /// what CSSC does, and follows from the list being non-empty.
-pub fn is_authorized(users: &[String], login: &str) -> bool {
+pub fn is_authorized(users: &[Vec<u8>], login: &str) -> bool {
     if users.is_empty() {
         return true;
     }
 
     let mut allowed = false;
     for entry in users {
-        match entry.strip_prefix('!') {
+        match entry.strip_prefix(b"!") {
             Some(denied) => {
                 if entry_matches(denied, login) {
                     return false;
@@ -106,12 +106,15 @@ pub fn is_authorized(users: &[String], login: &str) -> bool {
 /// "A group ID shall be equivalent to specifying all login names common to
 /// that group ID" (POSIX 84085-84086), so a numeric entry matches both the
 /// group's supplementary member list and any user whose primary group it is.
-fn entry_matches(entry: &str, login: &str) -> bool {
-    if entry == login {
+fn entry_matches(entry: &[u8], login: &str) -> bool {
+    if entry == login.as_bytes() {
         return true;
     }
 
-    let Ok(gid) = entry.parse::<u32>() else {
+    let Some(gid) = std::str::from_utf8(entry)
+        .ok()
+        .and_then(|e| e.parse::<u32>().ok())
+    else {
         return false;
     };
 
@@ -126,8 +129,8 @@ fn entry_matches(entry: &str, login: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn list(entries: &[&str]) -> Vec<String> {
-        entries.iter().map(|s| s.to_string()).collect()
+    fn list(entries: &[&str]) -> Vec<Vec<u8>> {
+        entries.iter().map(|s| s.as_bytes().to_vec()).collect()
     }
 
     #[test]

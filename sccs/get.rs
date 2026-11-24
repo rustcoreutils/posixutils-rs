@@ -84,23 +84,9 @@ struct KeywordValues([Option<Vec<u8>>; 26]);
 
 impl KeywordValues {
     fn new(sccs_file: &SccsFile, delta: &DeltaEntry, sfile_path: &Path) -> Self {
-        // Module name: the 'm' flag, else the s-file name without its "s."
-        let module_name = sccs_file
-            .module_name()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| {
-                paths::module_name(sfile_path).unwrap_or_else(|| "unknown".to_string())
-            });
-        let module_type = sccs_file.module_type().unwrap_or("");
-        let q_value = sccs_file
-            .header
-            .flags
-            .iter()
-            .find_map(|f| match f {
-                SccsFlag::QText(s) => Some(s.as_str()),
-                _ => None,
-            })
-            .unwrap_or("");
+        let module_name = module_name_of(sccs_file, sfile_path);
+        let module_type = sccs_file.module_type().unwrap_or(b"");
+        let q_value = sccs_file.q_text().unwrap_or(b"");
         let now = SccsDateTime::now();
         let sccs_filename = sfile_path
             .file_name()
@@ -112,30 +98,55 @@ impl KeywordValues {
         let mmddyy = |d: &SccsDateTime| format!("{:02}/{:02}/{:02}", d.month, d.day, d.year);
 
         let mut values: [Option<Vec<u8>>; 26] = Default::default();
-        let mut set = |key: u8, value: String| values[(key - b'A') as usize] = Some(value.into());
-        set(b'Z', "@(#)".to_string());
+        let mut set = |key: u8, value: Vec<u8>| values[(key - b'A') as usize] = Some(value);
+        // "@(#)<a><sep><b>...", the shape of %W% and %A%: text and stored
+        // bytes joined.
+        let what = |parts: &[&[u8]]| -> Vec<u8> {
+            let mut v = b"@(#)".to_vec();
+            parts.iter().for_each(|p| v.extend_from_slice(p));
+            v
+        };
+        let sid = delta.sid.to_string();
+        set(b'Z', b"@(#)".to_vec());
         set(b'M', module_name.clone());
-        set(b'I', delta.sid.to_string());
-        set(b'R', delta.sid.rel.to_string());
-        set(b'L', delta.sid.lev.to_string());
-        set(b'B', delta.sid.br.to_string());
-        set(b'S', delta.sid.seq.to_string());
-        set(b'D', now.date_string());
-        set(b'H', mmddyy(&now));
-        set(b'T', now.time_string());
-        set(b'E', delta.datetime.date_string());
-        set(b'G', mmddyy(&delta.datetime));
-        set(b'U', delta.datetime.time_string());
-        set(b'Y', module_type.to_string());
-        set(b'F', sccs_filename.to_string());
-        set(b'P', abs_path);
-        set(b'Q', q_value.to_string());
-        set(b'W', format!("@(#){}\t{}", module_name, delta.sid));
+        set(b'I', sid.clone().into_bytes());
+        set(b'R', delta.sid.rel.to_string().into_bytes());
+        set(b'L', delta.sid.lev.to_string().into_bytes());
+        set(b'B', delta.sid.br.to_string().into_bytes());
+        set(b'S', delta.sid.seq.to_string().into_bytes());
+        set(b'D', now.date_string().into_bytes());
+        set(b'H', mmddyy(&now).into_bytes());
+        set(b'T', now.time_string().into_bytes());
+        set(b'E', delta.datetime.date_string().into_bytes());
+        set(b'G', mmddyy(&delta.datetime).into_bytes());
+        set(b'U', delta.datetime.time_string().into_bytes());
+        set(b'Y', module_type.to_vec());
+        set(b'F', sccs_filename.as_bytes().to_vec());
+        set(b'P', abs_path.into_bytes());
+        set(b'Q', q_value.to_vec());
+        set(b'W', what(&[&module_name, b"\t", sid.as_bytes()]));
         set(
             b'A',
-            format!("@(#){} {} {}@(#)", module_type, module_name, delta.sid),
+            what(&[
+                module_type,
+                b" ",
+                &module_name,
+                b" ",
+                sid.as_bytes(),
+                b"@(#)",
+            ]),
         );
         KeywordValues(values)
+    }
+}
+
+/// The module name: the `m` flag, else the s-file's name without its `s.`.
+fn module_name_of(sccs: &SccsFile, sfile_path: &Path) -> Vec<u8> {
+    match sccs.module_name() {
+        Some(name) => name.to_vec(),
+        None => paths::module_name(sfile_path)
+            .unwrap_or_else(|| "unknown".to_string())
+            .into_bytes(),
     }
 }
 
@@ -455,8 +466,8 @@ fn evaluate_body_with_sid(sccs: &SccsFile, applied_set: &HashSet<u16>) -> Vec<(V
 /// first. Each entry is a status line followed by comment lines indented one
 /// tab and terminated by a blank line, per the POSIX l-file format:
 ///   "%c%c%c %s\t%s %s\n", code1, code2, code3, SID, date-time, login
-fn render_lfile(sccs: &SccsFile, applied_set: &HashSet<u16>) -> String {
-    let mut out = String::new();
+fn render_lfile(sccs: &SccsFile, applied_set: &HashSet<u16>) -> Vec<u8> {
+    let mut out = Vec::new();
     // Newest delta first: iterate in descending serial order.
     let mut deltas: Vec<&DeltaEntry> = sccs
         .header
@@ -468,28 +479,29 @@ fn render_lfile(sccs: &SccsFile, applied_set: &HashSet<u16>) -> String {
 
     for d in deltas {
         let code1 = if applied_set.contains(&d.serial) {
-            ' '
+            b' '
         } else {
-            '*'
+            b'*'
         };
         // code2/code3 special-reason codes are unsupported here; use spaces.
-        out.push(code1);
-        out.push(' ');
-        out.push(' ');
-        out.push(' ');
-        out.push_str(&format!(
-            "{}\t{} {} {}\n",
-            d.sid,
-            d.datetime.date_string(),
-            d.datetime.time_string(),
-            d.user
-        ));
+        out.extend_from_slice(&[code1, b' ', b' ', b' ']);
+        out.extend_from_slice(
+            format!(
+                "{}\t{} {} ",
+                d.sid,
+                d.datetime.date_string(),
+                d.datetime.time_string()
+            )
+            .as_bytes(),
+        );
+        out.extend_from_slice(&d.user);
+        out.push(b'\n');
         for c in &d.comments {
-            out.push('\t');
-            out.push_str(c);
-            out.push('\n');
+            out.push(b'\t');
+            out.extend_from_slice(c);
+            out.push(b'\n');
         }
-        out.push('\n');
+        out.push(b'\n');
     }
     out
 }
@@ -504,13 +516,13 @@ fn write_lfile(
 ) -> io::Result<()> {
     let table = render_lfile(sccs, applied_set);
     if to_stdout {
-        Stdout.write_all(table.as_bytes())?;
+        Stdout.write_all(&table)?;
     } else {
         // The l-file is read-only, so it must be replaced rather than
         // reopened: writing it a second time in the same directory otherwise
         // fails with EACCES on the file this same code wrote.
         let lfile_path = paths::lfile_from_sfile(sfile_path);
-        sfio::write_replacing(&lfile_path, table.as_bytes(), 0o444)?;
+        sfio::write_replacing(&lfile_path, &table, 0o444)?;
     }
     Ok(())
 }
@@ -765,10 +777,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
     }
 
     // Get module name for -n option
-    let module_name = sccs
-        .module_name()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| paths::module_name(sfile_path).unwrap_or_else(|| "unknown".to_string()));
+    let module_name = module_name_of(&sccs, sfile_path);
 
     // Encoded (binary / no-trailing-newline) bodies: uudecode and emit raw
     // bytes, with no ID-keyword expansion (the content is opaque).
@@ -838,7 +847,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
             // -n and -m prefixes, each followed by a tab, module name first.
             let mut out = Vec::new();
             if args.show_module {
-                out.extend_from_slice(module_name.as_bytes());
+                out.extend_from_slice(&module_name);
                 out.push(b'\t');
             }
             if let Some(sid) = sid {

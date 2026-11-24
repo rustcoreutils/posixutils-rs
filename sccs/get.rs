@@ -395,7 +395,7 @@ fn process_file(
         } else {
             &mut Stdout
         };
-        writeln!(output_stream, "\n{}:", sfile_path.display())?;
+        operands::banner(output_stream, sfile_path)?;
     }
 
     // Validate s-file

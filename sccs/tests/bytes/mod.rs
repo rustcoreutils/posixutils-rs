@@ -198,3 +198,85 @@ fn a_bare_option_leaves_the_next_word_an_operand() {
     let out = ok("prs", &[o("-d:I:"), o("-r1.1"), o("s.f")], dir);
     assert_eq!(out.stdout, b"1.1\n");
 }
+
+/// The `sccs` front end sorts the words of its command line into options
+/// and files and hands them on; it does not need them to be text. It used
+/// to refuse a command line holding any word that was not UTF-8.
+#[test]
+fn the_front_end_passes_bytes_through() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let o = OsStr::new;
+    let name = b"na\xefve.c";
+    let file = word(name);
+    std::fs::write(dir.join(&file), b"one\n").unwrap();
+
+    ok("sccs", &[o("create"), &file], dir);
+    assert!(dir.join("SCCS").join(named("s.", name)).exists());
+    assert!(dir.join(named(",", name)).exists(), "the original is kept");
+
+    ok("sccs", &[o("edit"), &file], dir);
+    let out = ok("sccs", &[o("tell")], dir);
+    assert_eq!(out.stdout, [&name[..], b"\n"].concat());
+    let out = ok("sccs", &[o("info")], dir);
+    assert!(
+        out.stdout.starts_with(&[&name[..], b": "].concat()),
+        "{out:?}"
+    );
+
+    std::fs::write(dir.join(&file), b"one\ntwo\n").unwrap();
+    ok("sccs", &[o("delget"), &word(b"-yfix\xe9"), &file], dir);
+    assert_eq!(std::fs::read(dir.join(&file)).unwrap(), b"one\ntwo\n");
+    let out = ok(
+        "prs",
+        &[
+            o("-d:C:."),
+            o("-r1.2"),
+            &dir.join("SCCS").join(named("s.", name)).into_os_string(),
+        ],
+        dir,
+    );
+    assert_eq!(out.stdout, b"fix\xe9\n.\n");
+
+    // A command that is not text is no command; it is named in the report.
+    let out = run("sccs", &[&word(b"g\xe9t"), &file], dir);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown command"));
+}
+
+/// A pathname written to the output is the pathname: its bytes, not a
+/// rendering of them as text.
+#[test]
+fn a_pathname_is_written_as_its_bytes() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let o = OsStr::new;
+    let mut files = Vec::new();
+    for name in [&b"a\xe9"[..], b"b\xff"] {
+        std::fs::write(dir.join("init"), b"@(#)id\n").unwrap();
+        ok("admin", &[o("-iinit"), o("s.x")], dir);
+        let s = named("s.", name);
+        std::fs::rename(dir.join("s.x"), dir.join(&s)).unwrap();
+        ok("get", &[o("-e"), o("-s"), o("-g"), &s], dir);
+        files.push(s);
+    }
+    let banner = |name: &OsString| [b"\n", name.as_encoded_bytes(), b":\n"].concat();
+    let has = |out: &[u8], what: &[u8]| out.windows(what.len()).any(|w| w == what);
+
+    let out = ok("sact", &[&files[0], &files[1]], dir);
+    assert!(out.stdout.starts_with(&banner(&files[0])), "{out:?}");
+    assert!(has(&out.stdout, &banner(&files[1])), "{out:?}");
+
+    let out = ok("get", &[o("-k"), o("-g"), &files[0], &files[1]], dir);
+    assert!(out.stdout.starts_with(&banner(&files[0])), "{out:?}");
+
+    let out = ok("unget", &[&files[0], &files[1]], dir);
+    assert!(has(&out.stdout, &banner(&files[1])), "{out:?}");
+
+    let out = ok("what", &[&files[0]], dir);
+    assert!(
+        out.stdout
+            .starts_with(&[files[0].as_encoded_bytes(), b":\n"].concat()),
+        "{out:?}"
+    );
+}

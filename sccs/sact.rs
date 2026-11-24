@@ -9,7 +9,7 @@
 
 //! sact - print current SCCS file-editing activity
 
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -44,21 +44,21 @@ fn process_sfile(sfile: &Path, show_header: bool) -> io::Result<bool> {
         return Ok(false);
     }
 
-    // Print header if needed (multiple files)
+    // The pathname and the logins are bytes, and go out as they are.
+    let mut out = io::stdout().lock();
     if show_header {
-        println!("\n{}:", sfile.display());
+        operands::banner(&mut out, sfile)?;
     }
 
     // Output format: old_sid new_sid user date time
     for entry in entries {
-        println!(
-            "{} {} {} {} {}",
-            entry.old_sid,
-            entry.new_sid,
-            entry.user,
+        let sids = format!("{} {} ", entry.old_sid, entry.new_sid);
+        let when = format!(
+            " {} {}\n",
             entry.datetime.date_string(),
             entry.datetime.time_string()
         );
+        out.write_all(&[sids.as_bytes(), &entry.user, when.as_bytes()].concat())?;
     }
 
     Ok(true)

@@ -10,7 +10,7 @@
 //! unget - undo a previous get of an SCCS file
 
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -121,10 +121,11 @@ fn unget_file(sfile: &Path, args: &Args, show_header: bool) -> io::Result<bool> 
     // directory or standard input) is named, each SID is preceded by a
     // "\n%s:\n" pathname header.
     if !args.silent {
+        let mut out = io::stdout().lock();
         if show_header {
-            println!("\n{}:", sfile.display());
+            operands::banner(&mut out, sfile)?;
         }
-        println!("{}", entry.new_sid);
+        writeln!(out, "{}", entry.new_sid)?;
     }
 
     // Remove g-file unless -n specified

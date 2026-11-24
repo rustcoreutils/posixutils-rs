@@ -10,8 +10,10 @@
 //! sccs - front end for the SCCS subsystem
 
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Write;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, ExitCode};
 
@@ -27,6 +29,34 @@ fn usage() -> ! {
     process::exit(2);
 }
 
+/// What the front end asks of an argument word. A word is bytes: a file
+/// name or a comment on its way to a utility need not be UTF-8, and the
+/// front end, which only sorts words into options and files, has no business
+/// refusing one.
+trait Word {
+    /// Whether the word begins with `prefix`.
+    fn starts(&self, prefix: &str) -> bool;
+    /// The word after `prefix`, if it begins with it.
+    fn after(&self, prefix: &str) -> Option<&OsStr>;
+}
+
+impl Word for OsStr {
+    fn starts(&self, prefix: &str) -> bool {
+        self.as_bytes().starts_with(prefix.as_bytes())
+    }
+
+    fn after(&self, prefix: &str) -> Option<&OsStr> {
+        self.as_bytes()
+            .strip_prefix(prefix.as_bytes())
+            .map(OsStr::from_bytes)
+    }
+}
+
+/// `prefix` and then `rest`, as one word.
+fn joined(prefix: &str, rest: &OsStr) -> OsString {
+    OsString::from_vec([prefix.as_bytes(), rest.as_bytes()].concat())
+}
+
 /// Partition `args` into options destined for the delta phase and options
 /// destined for the get phase of a delget/deledit, plus the shared file
 /// operands.
@@ -38,10 +68,10 @@ fn usage() -> ! {
 /// any unrecognized options are appended to both phases so the underlying
 /// utility can diagnose them.
 fn split_delget_opts<'a>(
-    args: &[&'a str],
+    args: &[&'a OsStr],
     delta_letters: &str,
     get_letters: &str,
-) -> (Vec<&'a str>, Vec<&'a str>) {
+) -> (Vec<&'a OsStr>, Vec<&'a OsStr>) {
     let mut delta_opts = Vec::new();
     let mut get_opts = Vec::new();
 
@@ -52,21 +82,21 @@ fn split_delget_opts<'a>(
     // invented-operand failure split_options fixes for the plain subcommands.
     let mut it = args.iter().copied().peekable();
     while let Some(a) = it.next() {
-        let Some(rest) = a.strip_prefix('-') else {
+        let Some(rest) = a.after("-") else {
             // File operand: needed by both phases.
             delta_opts.push(a);
             get_opts.push(a);
             continue;
         };
-        let Some(c) = rest.chars().next() else {
+        let Some(&letter) = rest.as_bytes().first() else {
             // A bare "-" operand.
             delta_opts.push(a);
             get_opts.push(a);
             continue;
         };
 
-        let to_delta = delta_letters.contains(c);
-        let to_get = get_letters.contains(c);
+        let to_delta = delta_letters.as_bytes().contains(&letter);
+        let to_get = get_letters.as_bytes().contains(&letter);
         // Unknown option: let both phases see it (and diagnose).
         let (to_delta, to_get) = if to_delta || to_get {
             (to_delta, to_get)
@@ -84,7 +114,6 @@ fn split_delget_opts<'a>(
         // Does this option consume the next token? Ask the utility that will
         // receive it.
         let attached = rest.len() > 1;
-        let letter = u8::try_from(c).unwrap_or(0);
         let takes_value = (to_delta && Letters::of("delta").takes_next_word(letter))
             || (to_get && Letters::of("get").takes_next_word(letter));
         if !attached && takes_value {
@@ -134,7 +163,7 @@ fn drop_privileges() {
 }
 
 /// Convert a file operand to SCCS file path
-fn to_sfile(file: &str, root_dir: &Path, sccs_dir: &str) -> PathBuf {
+fn to_sfile(file: &OsStr, root_dir: &Path, sccs_dir: &OsStr) -> PathBuf {
     to_sfile_opt(file, root_dir, sccs_dir, false)
 }
 
@@ -145,26 +174,21 @@ fn to_sfile(file: &str, root_dir: &Path, sccs_dir: &str) -> PathBuf {
 /// so the sibling fallback below would put `s.foo.c` in the working directory,
 /// where `sccs clean` and `sccs unedit` -- which address the SCCS directory
 /// directly -- would never find it again.
-fn to_sfile_created(file: &str, root_dir: &Path, sccs_dir: &str) -> PathBuf {
+fn to_sfile_created(file: &OsStr, root_dir: &Path, sccs_dir: &OsStr) -> PathBuf {
     to_sfile_opt(file, root_dir, sccs_dir, true)
 }
 
-fn to_sfile_opt(file: &str, root_dir: &Path, sccs_dir: &str, force_sccs_dir: bool) -> PathBuf {
+fn to_sfile_opt(file: &OsStr, root_dir: &Path, sccs_dir: &OsStr, force_sccs_dir: bool) -> PathBuf {
     let path = Path::new(file);
 
     // If already an s-file, use as-is (but prepend root_dir)
-    if let Some(name) = path.file_name() {
-        if name.to_string_lossy().starts_with("s.") {
-            return root_dir.join(path);
-        }
+    if path.file_name().is_some_and(|name| name.starts("s.")) {
+        return root_dir.join(path);
     }
 
     // Get directory and filename components
     let dir = path.parent().unwrap_or(Path::new(""));
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
+    let name = path.file_name().unwrap_or_default();
 
     // Build: root_dir / dir / sccs_dir / s.name, or root_dir / dir / s.name
     // when there is no SCCS directory to hold it.
@@ -177,7 +201,7 @@ fn to_sfile_opt(file: &str, root_dir: &Path, sccs_dir: &str, force_sccs_dir: boo
     if !dir.as_os_str().is_empty() {
         base = base.join(dir);
     }
-    let sname = format!("s.{}", name);
+    let sname = joined("s.", name);
     let in_sccs_dir = base.join(sccs_dir);
     if force_sccs_dir || in_sccs_dir.is_dir() {
         in_sccs_dir.join(sname)
@@ -187,7 +211,7 @@ fn to_sfile_opt(file: &str, root_dir: &Path, sccs_dir: &str, force_sccs_dir: boo
 }
 
 /// Split argv into options (with their arguments) and file operands.
-fn split_options<'a>(cmd: &str, args: &[&'a str]) -> (Vec<&'a str>, Vec<&'a str>) {
+fn split_options<'a>(cmd: &str, args: &[&'a OsStr]) -> (Vec<&'a OsStr>, Vec<&'a OsStr>) {
     let mut opts = Vec::new();
     let mut files = Vec::new();
     let mut it = args.iter().copied();
@@ -198,7 +222,7 @@ fn split_options<'a>(cmd: &str, args: &[&'a str]) -> (Vec<&'a str>, Vec<&'a str>
             files.extend(it);
             break;
         }
-        if arg == "-" || !arg.starts_with('-') {
+        if arg == "-" || !arg.starts("-") {
             files.push(arg);
             continue;
         }
@@ -233,7 +257,7 @@ fn split_options<'a>(cmd: &str, args: &[&'a str]) -> (Vec<&'a str>, Vec<&'a str>
 ///
 /// This is the file the user is handing to admin, not a g-file that get
 /// produced, so it is the operand as given.
-fn to_source_file(file: &str, root_dir: &Path) -> PathBuf {
+fn to_source_file(file: &OsStr, root_dir: &Path) -> PathBuf {
     root_dir.join(file)
 }
 
@@ -251,17 +275,17 @@ fn to_gfile(sfile: &Path) -> PathBuf {
 /// One editing record, mirroring a p-file entry:
 /// (g-file, old-SID, new-SID, user, date, time).
 struct EditInfo {
-    gfile: String,
+    gfile: OsString,
     old_sid: String,
     new_sid: String,
-    user: String,
+    user: plib::sccsfile::Login,
     date: String,
     time: String,
 }
 
 fn get_editing_info(
     root_dir: &Path,
-    sccs_dir: &str,
+    sccs_dir: &OsStr,
     branch_only: bool,
     user_filter: Option<&[u8]>,
 ) -> Vec<EditInfo> {
@@ -272,8 +296,7 @@ fn get_editing_info(
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some(name) = path.file_name() {
-                let name_str = name.to_string_lossy();
-                if name_str.starts_with("p.") {
+                if let Some(gfile) = name.after("p.") {
                     // Parse with the shared p-file reader rather than by hand.
                     // The hand-rolled version required five whitespace fields
                     // where PfileEntry::parse requires four and defaults the
@@ -296,10 +319,10 @@ fn get_editing_info(
                         }
 
                         results.push(EditInfo {
-                            gfile: name_str.strip_prefix("p.").unwrap().to_string(),
+                            gfile: gfile.to_owned(),
                             old_sid: entry.old_sid.to_string(),
                             new_sid: entry.new_sid.to_string(),
-                            user: entry.user.to_string(),
+                            user: entry.user,
                             date: entry.datetime.date_string(),
                             time: entry.datetime.time_string(),
                         });
@@ -315,20 +338,20 @@ fn get_editing_info(
 fn main() -> ExitCode {
     plib::diag::init_locale("sccs");
 
-    let args = plib::optarg::args_utf8("sccs");
+    let args: Vec<OsString> = env::args_os().collect();
 
     if args.len() < 2 {
         usage();
     }
 
     let mut root_dir = PathBuf::from(".");
-    let mut sccs_dir = "SCCS".to_string();
+    let mut sccs_dir = OsString::from("SCCS");
     let mut use_real_uid = false;
     let mut arg_idx = 1;
 
     // Parse sccs-specific options
     while arg_idx < args.len() {
-        let arg = &args[arg_idx];
+        let arg = args[arg_idx].as_os_str();
         if arg == "-r" {
             use_real_uid = true;
             arg_idx += 1;
@@ -339,7 +362,7 @@ fn main() -> ExitCode {
             }
             root_dir = PathBuf::from(&args[arg_idx]);
             arg_idx += 1;
-        } else if let Some(stripped) = arg.strip_prefix("-d") {
+        } else if let Some(stripped) = arg.after("-d") {
             root_dir = PathBuf::from(stripped);
             arg_idx += 1;
         } else if arg == "-p" {
@@ -349,10 +372,10 @@ fn main() -> ExitCode {
             }
             sccs_dir = args[arg_idx].clone();
             arg_idx += 1;
-        } else if let Some(stripped) = arg.strip_prefix("-p") {
-            sccs_dir = stripped.to_string();
+        } else if let Some(stripped) = arg.after("-p") {
+            sccs_dir = stripped.to_owned();
             arg_idx += 1;
-        } else if arg.starts_with("-") {
+        } else if arg.starts("-") {
             // Unknown option - might be for the subcommand
             break;
         } else {
@@ -375,14 +398,17 @@ fn main() -> ExitCode {
         usage();
     }
 
-    let command = &args[arg_idx];
+    // A command's name is text; one that is not is no command of ours, and
+    // is reported as such below.
+    let command_word = &args[arg_idx];
+    let command = command_word.to_str().unwrap_or_default();
     arg_idx += 1;
 
     // Collect remaining args (options and operands for the command)
-    let remaining_args: Vec<&str> = args[arg_idx..].iter().map(|s| s.as_str()).collect();
+    let remaining_args: Vec<&OsStr> = args[arg_idx..].iter().map(OsString::as_os_str).collect();
 
     // Handle pseudo-utilities
-    match command.as_str() {
+    match command {
         "edit" => {
             // Equivalent to get -e
             run_sccs_command(
@@ -454,14 +480,14 @@ fn main() -> ExitCode {
 
         "create" => {
             // admin -i then rename original
-            let files: Vec<&str> = remaining_args
+            let files: Vec<&OsStr> = remaining_args
                 .iter()
-                .filter(|a| !a.starts_with("-"))
+                .filter(|a| !a.starts("-"))
                 .copied()
                 .collect();
-            let opts: Vec<&str> = remaining_args
+            let opts: Vec<&OsStr> = remaining_args
                 .iter()
-                .filter(|a| a.starts_with("-"))
+                .filter(|a| a.starts("-"))
                 .copied()
                 .collect();
 
@@ -476,7 +502,7 @@ fn main() -> ExitCode {
 
                 // Run admin -i<gfile> <sfile>
                 let mut cmd_args = opts.clone();
-                let init_arg = format!("-i{}", gfile.display());
+                let init_arg = joined("-i", gfile.as_os_str());
                 cmd_args.push(&init_arg);
 
                 if use_real_uid {
@@ -493,7 +519,7 @@ fn main() -> ExitCode {
                         let backup = gfile
                             .parent()
                             .unwrap_or(Path::new("."))
-                            .join(format!(",{}", gfile.file_name().unwrap().to_string_lossy()));
+                            .join(joined(",", gfile.file_name().unwrap_or_default()));
                         fs::rename(&gfile, backup).ok();
                     }
                     Ok(s) => {
@@ -511,19 +537,16 @@ fn main() -> ExitCode {
         "fix" => {
             // Remove delta but leave copy with changes
             // Requires -r SID
-            let sid_opt = remaining_args
-                .iter()
-                .find(|a| a.starts_with("-r"))
-                .map(|s| &s[2..]);
+            let sid_opt = remaining_args.iter().find_map(|a| a.after("-r"));
 
-            if sid_opt.is_none() {
+            let Some(sid) = sid_opt else {
                 eprintln!("sccs: {}", gettext("fix requires -r SID"));
                 return ExitCode::FAILURE;
-            }
+            };
 
-            let files: Vec<&str> = remaining_args
+            let files: Vec<&OsStr> = remaining_args
                 .iter()
-                .filter(|a| !a.starts_with("-"))
+                .filter(|a| !a.starts("-"))
                 .copied()
                 .collect();
 
@@ -537,7 +560,7 @@ fn main() -> ExitCode {
                 // Get the version being fixed
                 let status = Command::new(sibling("get"))
                     .arg("-k")
-                    .arg(format!("-r{}", sid_opt.unwrap()))
+                    .arg(joined("-r", sid))
                     .arg(&sfile)
                     .status();
 
@@ -549,7 +572,7 @@ fn main() -> ExitCode {
 
                 // Remove the delta
                 let status = Command::new(sibling("rmdel"))
-                    .arg(format!("-r{}", sid_opt.unwrap()))
+                    .arg(joined("-r", sid))
                     .arg(&sfile)
                     .status();
 
@@ -570,7 +593,7 @@ fn main() -> ExitCode {
             for arg in &remaining_args {
                 if *arg == "-b" {
                     branch_only = true;
-                } else if let Some(stripped) = arg.strip_prefix("-u") {
+                } else if let Some(stripped) = arg.after("-u") {
                     user_filter = Some(stripped.as_bytes().to_vec());
                 } else if *arg == "-U" {
                     match plib::sccsfile::real_login_name() {
@@ -592,8 +615,10 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             } else if command == "tell" {
+                // File names are bytes, and go out as they are.
+                let mut out = std::io::stdout().lock();
                 for e in &info {
-                    println!("{}", e.gfile);
+                    let _ = out.write_all(&[e.gfile.as_bytes(), b"\n"].concat());
                 }
                 ExitCode::SUCCESS
             } else {
@@ -602,16 +627,23 @@ fn main() -> ExitCode {
                 if info.is_empty() {
                     println!("{}", gettext("Nothing being edited."));
                 } else {
+                    let mut out = std::io::stdout().lock();
                     for e in &info {
-                        println!(
-                            "{}: {} {} {} {} {} {}",
-                            e.gfile,
+                        let rest = format!(
+                            ": {} {} {} ",
                             gettext("being edited:"),
                             e.old_sid,
-                            e.new_sid,
-                            e.user,
-                            e.date,
-                            e.time
+                            e.new_sid
+                        );
+                        let when = format!(" {} {}\n", e.date, e.time);
+                        let _ = out.write_all(
+                            &[
+                                e.gfile.as_bytes(),
+                                rest.as_bytes(),
+                                &e.user,
+                                when.as_bytes(),
+                            ]
+                            .concat(),
                         );
                     }
                 }
@@ -621,9 +653,9 @@ fn main() -> ExitCode {
 
         "clean" => {
             // Remove files that can be recreated from SCCS
-            let branch_only = remaining_args.contains(&"-b");
+            let branch_only = remaining_args.iter().any(|a| *a == "-b");
             let info = get_editing_info(&root_dir, &sccs_dir, branch_only, None);
-            let editing: Vec<&str> = info.iter().map(|e| e.gfile.as_str()).collect();
+            let editing: Vec<&OsStr> = info.iter().map(|e| e.gfile.as_os_str()).collect();
 
             // Find g-files in current directory
             if let Ok(entries) = fs::read_dir(&root_dir) {
@@ -631,10 +663,9 @@ fn main() -> ExitCode {
                     let path = entry.path();
                     if path.is_file() {
                         if let Some(name) = path.file_name() {
-                            let name_str = name.to_string_lossy();
                             // Check if corresponding s-file exists
-                            let sfile = root_dir.join(&sccs_dir).join(format!("s.{}", name_str));
-                            if sfile.exists() && !editing.contains(&name_str.as_ref()) {
+                            let sfile = root_dir.join(&sccs_dir).join(joined("s.", name));
+                            if sfile.exists() && !editing.contains(&name) {
                                 fs::remove_file(&path).ok();
                             }
                         }
@@ -646,40 +677,31 @@ fn main() -> ExitCode {
 
         "diffs" => {
             // Diff current vs SCCS version
-            let files: Vec<&str> = remaining_args
+            let files: Vec<&OsStr> = remaining_args
                 .iter()
-                .filter(|a| !a.starts_with("-"))
+                .filter(|a| !a.starts("-"))
                 .copied()
                 .collect();
 
-            let get_opts: Vec<&str> = remaining_args
+            let get_opts: Vec<&OsStr> = remaining_args
                 .iter()
-                .filter(|a| {
-                    a.starts_with("-r")
-                        || a.starts_with("-c")
-                        || a.starts_with("-i")
-                        || a.starts_with("-x")
-                        || a.starts_with("-t")
-                })
+                .filter(|a| ["-r", "-c", "-i", "-x", "-t"].iter().any(|o| a.starts(o)))
                 .copied()
                 .collect();
 
-            let mut diff_opts: Vec<&str> = remaining_args
+            let mut diff_opts: Vec<&OsStr> = remaining_args
                 .iter()
                 .filter(|a| {
-                    a.starts_with("-l")
-                        || a.starts_with("-s")
-                        || a.starts_with("-e")
-                        || a.starts_with("-f")
-                        || a.starts_with("-h")
-                        || a.starts_with("-b")
+                    ["-l", "-s", "-e", "-f", "-h", "-b"]
+                        .iter()
+                        .any(|o| a.starts(o))
                 })
                 .copied()
                 .collect();
 
             // Handle -C -> -c for diff
-            if remaining_args.contains(&"-C") {
-                diff_opts.push("-c");
+            if remaining_args.iter().any(|a| *a == "-C") {
+                diff_opts.push(OsStr::new("-c"));
             }
 
             if use_real_uid {
@@ -749,7 +771,11 @@ fn main() -> ExitCode {
         }
 
         _ => {
-            eprintln!("sccs: {} '{}'", gettext("unknown command"), command);
+            eprintln!(
+                "sccs: {} '{}'",
+                gettext("unknown command"),
+                command_word.display()
+            );
             ExitCode::FAILURE
         }
     }
@@ -758,9 +784,9 @@ fn main() -> ExitCode {
 fn run_sccs_command(
     cmd: &str,
     extra_opts: &[&str],
-    args: &[&str],
+    args: &[&OsStr],
     root_dir: &Path,
-    sccs_dir: &str,
+    sccs_dir: &OsStr,
     use_real_uid: bool,
 ) -> ExitCode {
     // Separate options (with their arguments) from file operands.

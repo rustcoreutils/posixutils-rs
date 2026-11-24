@@ -173,8 +173,13 @@ impl SccsFlag {
                 if text == "a" {
                     Ok(SccsFlag::LockedReleases(ReleaseLock::All))
                 } else {
-                    let releases: Result<Vec<u16>, _> =
-                        text.split(',').map(|s| s.trim().parse()).collect();
+                    // SCCS and CSSC store the list with blanks between the
+                    // releases; a comma is what the option-argument has.
+                    let releases: Result<Vec<u16>, _> = text
+                        .split(|c: char| c == ',' || c.is_ascii_whitespace())
+                        .filter(|s| !s.is_empty())
+                        .map(str::parse)
+                        .collect();
                     Ok(SccsFlag::LockedReleases(ReleaseLock::List(
                         releases.map_err(|_| SccsError::InvalidFlag(format!("l{}", text)))?,
                     )))

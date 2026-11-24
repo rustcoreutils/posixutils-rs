@@ -757,3 +757,31 @@ fn prs_delta_table_line_names_the_author() {
         "D 1.1 26/01/01 00:00:00 u 1 0\n"
     );
 }
+
+/// The releases of the `l` flag are stored separated by blanks by SCCS and
+/// CSSC (`^Af l 3 4`) and by commas by us; both are read. Only commas
+/// were, and a file with the other form could not be read by any utility:
+/// one flag line took the whole file with it.
+#[test]
+fn the_l_flag_is_read_with_blanks_or_commas() {
+    let tmp = TempDir::new().unwrap();
+    for (name, flag) in [
+        ("s.blank", "l 3 4"),
+        ("s.comma", "l 3,4"),
+        ("s.both", "l 3, 4"),
+    ] {
+        let content = String::from_utf8(super::common::THREE_DELTAS.to_vec())
+            .unwrap()
+            .replace("\x01U\n", &format!("\x01U\n\x01f {flag}\n"));
+        super::common::write_sfile(
+            tmp.path(),
+            name,
+            format!("{content}\x01I 1\none\n\x01E 1\n").as_bytes(),
+        );
+        let out = super::common::run_in("prs", &["-d:LK:", name], tmp.path(), "");
+        assert!(out.status.success(), "{name}: {out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "3,4\n", "{name}");
+        let out = super::common::run_in("val", &[name], tmp.path(), "");
+        assert_eq!(out.status.code(), Some(0), "{name}: {out:?}");
+    }
+}

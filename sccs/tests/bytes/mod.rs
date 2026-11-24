@@ -280,3 +280,41 @@ fn a_pathname_is_written_as_its_bytes() {
         "{out:?}"
     );
 }
+
+/// delta's `-m mrlist` takes its argument like any option that requires one
+/// (POSIX delta SYNOPSIS: `[-m mrlist]`, beside `[-y[comment]]`): attached,
+/// or as the next word. Only `-y`'s is optional.
+#[test]
+fn delta_m_takes_a_separate_argument() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let o = OsStr::new;
+    std::fs::write(dir.join("init"), b"one\n").unwrap();
+    ok(
+        "admin",
+        &[o("-iinit"), o("-fv"), o("-mfirst"), o("s.f")],
+        dir,
+    );
+    for (n, args) in [
+        vec![o("-m"), o("mr1 mr2")],
+        vec![o("-mmr3")],
+        vec![o("-pm"), o("mr4")],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        ok("get", &[o("-e"), o("-s"), o("s.f")], dir);
+        std::fs::write(dir.join("f"), format!("text {n}\n")).unwrap();
+        let args: Vec<&OsStr> = [o("-s"), o("-yc")]
+            .into_iter()
+            .chain(args)
+            .chain([o("s.f")])
+            .collect();
+        ok("delta", &args, dir);
+    }
+    let out = ok("prs", &[o("-e"), o("-d:I: :MR:."), o("s.f")], dir);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1.4 mr4\n.\n1.3 mr3\n.\n1.2 mr1\nmr2\n.\n1.1 first\n.\n"
+    );
+}

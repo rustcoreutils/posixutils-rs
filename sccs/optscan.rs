@@ -9,9 +9,9 @@
 
 //! Options whose argument is optional and attached.
 //!
-//! `admin -i[name]`, `-t[name]`, `-y[comment]`, `delta -y[comment]`,
-//! `-m[mrlist]` and `prs -r[SID]` take an option-argument that may be left
-//! out and, when given, is part of the same word as the option letter:
+//! `admin -i[name]`, `-t[name]`, `-y[comment]`, `delta -y[comment]` and
+//! `prs -r[SID]` take an option-argument that may be left out and, when
+//! given, is part of the same word as the option letter:
 //! `-ifile`, never `-i file`. The word after a bare `-i` is an operand.
 //!
 //! clap cannot say "an attached value only", so these options are taken out
@@ -46,7 +46,7 @@ impl Letters<'static> {
     pub fn of(utility: &str) -> Self {
         let (attached, with_argument): (&[u8], &[u8]) = match utility {
             "admin" => (b"ity", b"rmfdae"),
-            "delta" => (b"ym", b"rg"),
+            "delta" => (b"y", b"rgm"),
             "get" => (b"", b"rcix"),
             "prs" => (b"r", b"cd"),
             "rmdel" | "unget" => (b"", b"r"),

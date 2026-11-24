@@ -57,8 +57,7 @@ struct Args {
     #[arg(skip)]
     comment: Option<OsString>,
 
-    /// `-m[mrlist]`, likewise. A bare `-m` is an empty list.
-    #[arg(skip)]
+    #[arg(short = 'm', allow_hyphen_values = true, value_name = "MRLIST", help = gettext("Modification request (MR) numbers for delta"))]
     mrlist: Option<OsString>,
 
     #[arg(short = 'g', allow_hyphen_values = true, value_name = "LIST", help = gettext("List of deltas to ignore at this change level"))]
@@ -668,18 +667,14 @@ fn main() -> ExitCode {
 
     zlock::install_cleanup();
 
-    // -y and -m take an optional argument, attached: the word after a bare
-    // one is an operand. clap cannot say so, and had it swallow that word.
+    // -y takes an optional argument, attached: the word after a bare -y is
+    // an operand. clap cannot say so, and had it swallow that word.
     let (attached, rest) = optscan::scan(std::env::args_os(), Letters::of("delta"));
     let mut args =
         plib::optarg::parse_from::<Args>(plib::optarg::keep_leading_equals::<Args>(rest));
-    let given = |letter| {
-        attached
-            .get(letter)
-            .map(|value| value.unwrap_or_default().to_owned())
-    };
-    args.comment = given(b'y');
-    args.mrlist = given(b'm');
+    args.comment = attached
+        .get(b'y')
+        .map(|value| value.unwrap_or_default().to_owned());
 
     // When the single operand is '-', the spec requires the comment to be
     // supplied via -y (and the MR list via -m if the v flag is set), since

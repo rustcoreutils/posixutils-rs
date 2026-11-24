@@ -1057,3 +1057,25 @@ fn the_z_file_holds_the_binary_process_id() {
     drop(lock);
     assert!(!zfile.exists(), "released with the lock");
 }
+
+/// While a [`SigintBlock`] is held an interrupt waits: it is pending, and
+/// the process goes on. (Here it is thrown away before the guard goes, the
+/// test not being meant to end at it.)
+#[test]
+fn a_sigint_block_keeps_an_interrupt_waiting() {
+    let is_pending = || unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigpending(&mut set);
+        libc::sigismember(&set, libc::SIGINT) == 1
+    };
+    let guard = SigintBlock::begin();
+    assert!(!is_pending());
+    unsafe { libc::raise(libc::SIGINT) };
+    assert!(is_pending(), "the interrupt waits; we are still here");
+    unsafe {
+        let old = libc::signal(libc::SIGINT, libc::SIG_IGN);
+        drop(guard);
+        libc::signal(libc::SIGINT, old);
+    }
+    assert!(!is_pending(), "delivered when the guard went");
+}

@@ -54,7 +54,7 @@ impl ZLock {
         // registry exists to prevent.
         // Created read-only (POSIX get 99230), which does not stop this
         // descriptor writing to it.
-        let blocked = SigintBlock::new();
+        let blocked = SigintBlock::begin();
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)

@@ -18,6 +18,7 @@ use clap::Parser;
 use gettextrs::gettext;
 use plib::sccsfile::{
     paths, DeltaEntry, PfileEntry, SccsDateTime, SccsFile, SccsFlag, Selection, Sid, SidList,
+    SigintBlock,
 };
 use posixutils_sccs::txn::{self, Txn};
 use posixutils_sccs::{cutoff, diag, idkw, operands, protect, sfio, zlock};
@@ -676,6 +677,14 @@ fn process_file(
     // suppresses the g-file but not the lock, and `get -e -g` announcing a new
     // delta while leaving no p-file behind would hand the caller a lock that
     // does not exist.
+    //
+    // The entry and the g-file mean something only together, so an
+    // interrupt is put off from here until the g-file is in place or the
+    // entry taken back: arriving in between, it left the edit pending with
+    // no g-file. (Not when the text goes to standard output, whose reader
+    // may keep a write waiting for as long as it likes.) The guard goes
+    // before the lock does, so an interrupt put off still removes the lock.
+    let _interrupt_deferred = (txn.is_some() && !args.to_stdout).then(SigintBlock::begin);
     let mut recorded = None;
     if let Some(txn) = &txn {
         if let Some(ns) = new_sid {

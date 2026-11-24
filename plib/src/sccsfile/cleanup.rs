@@ -115,12 +115,18 @@ extern "C" fn sigint_cleanup_handler(_sig: libc::c_int) {
 /// because another process holds the lock, an interrupt arriving in between
 /// would unlink *their* file. Deferring the signal is exact, and costs one
 /// syscall pair.
-pub(super) struct SigintBlock {
+///
+/// It also keeps two files that mean something only together from being
+/// left one without the other: `get -e` holds one from recording the edit in
+/// the p-file until the g-file is in place.
+#[derive(Debug)]
+pub struct SigintBlock {
     saved: libc::sigset_t,
 }
 
 impl SigintBlock {
-    pub(super) fn new() -> Self {
+    /// Defer SIGINT from now until the guard is dropped.
+    pub fn begin() -> Self {
         unsafe {
             let mut mask: libc::sigset_t = std::mem::zeroed();
             libc::sigemptyset(&mut mask);

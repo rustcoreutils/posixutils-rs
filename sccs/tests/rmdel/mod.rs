@@ -350,3 +350,78 @@ fn rmdel_removes_deltas_one_after_another() {
     let out = run("val", &[name], tmp.path(), "");
     assert_eq!(out.status.code(), Some(0), "{out:?}");
 }
+
+/// rmdel "shall remove the delta" (POSIX rmdel), so the version it was made
+/// from has no successor again and the next delta takes the freed SID
+/// ("no trunk successor: R.(L+1)", POSIX get). The scenario is CSSC's
+/// tests/get/removed-delta.sh: historical SCCS reuses the SID, and minting a
+/// branch beside the removed delta was a CSSC bug it fixed.
+#[test]
+fn a_removed_deltas_sid_is_used_again() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = create_multi_delta(&tmp, "again", 2);
+    let name = sfile.file_name().unwrap().to_str().unwrap();
+    let gfile = tmp.path().join("again");
+    let ok = |cmd: &str, args: &[&str]| {
+        let out = run(cmd, args, tmp.path(), "");
+        assert!(out.status.success(), "{cmd} {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    ok("rmdel", &["-r", "1.2", name]);
+    let out = ok("get", &["-e", name]);
+    assert!(out.contains("new delta 1.2"), "the freed SID: {out:?}");
+    assert!(!out.contains("1.1.1.1"), "not a branch: {out:?}");
+
+    // The new 1.2 is a delta like any other, and the old one stays removed.
+    std::fs::write(&gfile, b"the second 1.2\n").unwrap();
+    ok("delta", &["-s", "-yagain", name]);
+    assert_eq!(
+        ok("get", &["-p", "-k", "-s", "-r1.2", name]),
+        "the second 1.2\n"
+    );
+    assert_eq!(ok("get", &["-p", "-k", "-s", name]), "the second 1.2\n");
+    let types: Vec<(String, char)> = delta_types(&sfile)
+        .into_iter()
+        .filter(|(sid, _)| sid == "1.2")
+        .collect();
+    assert_eq!(types.len(), 2, "both entries are kept: {types:?}");
+    assert!(types.contains(&("1.2".to_string(), 'D')) && types.contains(&("1.2".to_string(), 'R')));
+    let out = run("val", &["-r1.2", name], tmp.path(), "");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+
+    // rmdel -r1.2 now means the live delta, and can be done again.
+    ok("rmdel", &["-r", "1.2", name]);
+    let out = run("get", &["-p", "-s", "-r1.2", name], tmp.path(), "");
+    assert!(!out.status.success(), "1.2 is gone again: {out:?}");
+    let out = run("val", &["-r1.2", name], tmp.path(), "");
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "val -r of a removed SID: {out:?}"
+    );
+}
+
+/// The same for a branch: a removed branch delta frees its branch number.
+#[test]
+fn a_removed_branch_deltas_sid_is_used_again() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = create_multi_delta(&tmp, "br", 2);
+    let name = sfile.file_name().unwrap().to_str().unwrap();
+    let ok = |cmd: &str, args: &[&str]| {
+        let out = run(cmd, args, tmp.path(), "");
+        assert!(out.status.success(), "{cmd} {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    // 1.1 has a successor, so editing it branches: 1.1.1.1.
+    let out = ok("get", &["-e", "-r1.1", name]);
+    assert!(out.contains("new delta 1.1.1.1"), "{out:?}");
+    std::fs::write(tmp.path().join("br"), b"branch\n").unwrap();
+    ok("delta", &["-s", "-yb", name]);
+    ok("rmdel", &["-r", "1.1.1.1", name]);
+    let out = ok("get", &["-e", "-g", "-r1.1", name]);
+    assert!(
+        out.contains("new delta 1.1.1.1"),
+        "the freed branch: {out:?}"
+    );
+}

@@ -72,16 +72,6 @@ struct Args {
     files: Vec<PathBuf>,
 }
 
-/// Applied (non-removed) deltas. A delta withdrawn by `rmdel` keeps its place
-/// in the file and its SID stays reserved, but it has no text to retrieve, so
-/// it must never be selected as the target.
-fn applied_deltas(sccs: &SccsFile) -> impl Iterator<Item = &DeltaEntry> {
-    sccs.header
-        .deltas
-        .iter()
-        .filter(|d| d.delta_type == plib::sccsfile::DeltaType::Normal)
-}
-
 /// Find the delta to retrieve based on -r option.
 ///
 /// Implements the "SID Retrieved" column of the POSIX get(1) SID table
@@ -103,17 +93,16 @@ fn find_target_delta<'a>(
                 .parse()
                 .map_err(|_| format!("{}: {}", gettext("Invalid SID"), sid_str))?;
 
-            // Try exact match first, but only for a delta that still has text:
-            // an rmdel'd SID is reserved, not retrievable.
+            // Try exact match first. A removed delta is not found: it has
+            // no text to retrieve.
             if let Some(delta) = sccs.find_delta_by_sid(&sid) {
-                if delta.delta_type == plib::sccsfile::DeltaType::Normal {
-                    return Ok(delta);
-                }
+                return Ok(delta);
             }
 
             if sid.is_partial() {
                 // "R": the highest level within release R (R.mL).
-                if let Some(d) = applied_deltas(sccs)
+                if let Some(d) = sccs
+                    .live_deltas()
                     .filter(|d| d.sid.rel == sid.rel && d.sid.is_trunk())
                     .max_by(|a, b| a.sid.cmp(&b.sid))
                 {
@@ -129,13 +118,13 @@ fn find_target_delta<'a>(
                 if sid.rel > trunk_head.sid.rel {
                     return Ok(trunk_head);
                 }
-                applied_deltas(sccs)
+                sccs.live_deltas()
                     .filter(|d| d.sid.is_trunk() && d.sid.rel < sid.rel)
                     .max_by(|a, b| a.sid.cmp(&b.sid))
                     .ok_or_else(|| format!("{} {}", gettext("No delta found for release"), sid.rel))
             } else if sid.br != 0 && sid.seq == 0 {
                 // "R.L.B": the highest sequence on that branch (R.L.B.mS).
-                applied_deltas(sccs)
+                sccs.live_deltas()
                     .filter(|d| d.sid.same_branch(&sid))
                     .max_by(|a, b| a.sid.cmp(&b.sid))
                     .ok_or_else(|| format!("{} {} {}", gettext("SID"), sid, gettext("not found")))
@@ -169,10 +158,7 @@ fn find_top_delta<'a>(
         }
     };
 
-    sccs.header
-        .deltas
-        .iter()
-        .filter(|d| d.delta_type == plib::sccsfile::DeltaType::Normal)
+    sccs.live_deltas()
         .filter(|d| release.is_none_or(|r| d.sid.rel == r))
         .max_by(|a, b| {
             let ka = (
@@ -204,11 +190,11 @@ fn find_top_delta<'a>(
 /// Does any delta already succeed `target` on the line it sits on?
 ///
 /// For a trunk delta that means any later trunk delta, in this release or a
-/// higher one; for a branch delta, a higher sequence on the same branch. The
-/// scan deliberately includes rmdel'd deltas: their SIDs stay reserved, so a
-/// successor must not be minted on top of one.
+/// higher one; for a branch delta, a higher sequence on the same branch. A
+/// delta removed by rmdel is not one: it is gone, and the next delta takes
+/// its SID (`SccsFile::live_deltas`).
 fn has_successor(sccs: &SccsFile, target: &DeltaEntry) -> bool {
-    sccs.header.deltas.iter().any(|d| {
+    sccs.live_deltas().any(|d| {
         if target.sid.is_trunk() {
             d.sid.is_trunk() && d.sid > target.sid
         } else {
@@ -246,9 +232,7 @@ fn compute_new_sid(
     if branching || has_successor(sccs, target) {
         // Branch off the retrieved delta: R.L.(mB+1).1
         let max_branch = sccs
-            .header
-            .deltas
-            .iter()
+            .live_deltas()
             .filter(|d| d.sid.rel == target.sid.rel && d.sid.lev == target.sid.lev)
             .map(|d| d.sid.br)
             .max()
@@ -347,12 +331,7 @@ fn evaluate_body_with_sid(sccs: &SccsFile, applied_set: &HashSet<u16>) -> Vec<(V
 fn render_lfile(sccs: &SccsFile, applied_set: &HashSet<u16>) -> Vec<u8> {
     let mut out = Vec::new();
     // Newest delta first: iterate in descending serial order.
-    let mut deltas: Vec<&DeltaEntry> = sccs
-        .header
-        .deltas
-        .iter()
-        .filter(|d| d.delta_type == plib::sccsfile::DeltaType::Normal)
-        .collect();
+    let mut deltas: Vec<&DeltaEntry> = sccs.live_deltas().collect();
     deltas.sort_by_key(|d| std::cmp::Reverse(d.serial));
 
     for d in deltas {
@@ -558,10 +537,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
         // Notation set: each excluded delta plus any (applied or not) delta
         // whose predecessor chain passes through an excluded delta.
         excluded_effective = sccs
-            .header
-            .deltas
-            .iter()
-            .filter(|d| d.delta_type == plib::sccsfile::DeltaType::Normal)
+            .live_deltas()
             .map(|d| d.serial)
             .filter(|&s| {
                 excluded_serials

@@ -58,8 +58,16 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
         }
     };
 
-    // Find the delta to remove
-    let delta_idx = sccs.header.deltas.iter().position(|d| &d.sid == sid);
+    // Find the delta to remove: the live one with this SID. A removed delta
+    // may share the SID, the next delta having taken it; it is looked for
+    // only when there is no live one, to say that it is already removed.
+    let entry_of = |wanted: DeltaType| {
+        sccs.header
+            .deltas
+            .iter()
+            .position(|d| &d.sid == sid && d.delta_type == wanted)
+    };
+    let delta_idx = entry_of(DeltaType::Normal).or_else(|| entry_of(DeltaType::Removed));
     let delta_idx = match delta_idx {
         Some(idx) => idx,
         None => {

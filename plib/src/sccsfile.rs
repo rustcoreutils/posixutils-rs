@@ -1036,7 +1036,22 @@ impl SccsFile {
 
     /// Find delta by SID
     pub fn find_delta_by_sid(&self, sid: &Sid) -> Option<&DeltaEntry> {
-        self.header.deltas.iter().find(|d| &d.sid == sid)
+        self.live_deltas().find(|d| &d.sid == sid)
+    }
+
+    /// The deltas the file has: those not removed by `rmdel`.
+    ///
+    /// rmdel "shall remove the delta" (POSIX). Its entry stays in the delta
+    /// table, as type `R`, for the record only: it has no text, it is no
+    /// version's successor, and its SID is free -- the next delta made from
+    /// its predecessor takes it, as in historical SCCS and CSSC, so a file
+    /// may hold a removed and a live entry with one SID. Anything that asks
+    /// what versions exist asks this.
+    pub fn live_deltas(&self) -> impl Iterator<Item = &DeltaEntry> {
+        self.header
+            .deltas
+            .iter()
+            .filter(|d| d.delta_type == DeltaType::Normal)
     }
 
     /// Get the highest (most recent) delta on trunk

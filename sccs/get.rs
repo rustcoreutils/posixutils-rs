@@ -20,7 +20,7 @@ use plib::sccsfile::{
     paths, DeltaEntry, PfileEntry, SccsDateTime, SccsFile, SccsFlag, Selection, Sid, SidList,
 };
 use posixutils_sccs::txn::{self, Txn};
-use posixutils_sccs::{cutoff, diag, idkw, operands, pfile, protect, sfio, zlock};
+use posixutils_sccs::{cutoff, diag, idkw, operands, protect, sfio, zlock};
 
 /// get - get a version of an SCCS file
 #[derive(Parser)]
@@ -274,17 +274,24 @@ fn compute_new_sid(
     }
 }
 
-/// Check if there's an existing p-file entry for this SID
-fn check_pfile_lock(txn: &Txn, new_sid: &Sid) -> Result<(), String> {
+/// Without joint editing, whether the edit of `got` that would make
+/// `new_sid` may be made: -e "shall prevent further gets for editing on the
+/// same SID until delta is executed" (POSIX get), so not while an edit of
+/// `got` is pending, whatever SID it will make; nor while another edit is
+/// to make `new_sid`.
+fn check_pfile_lock(txn: &Txn, got: &Sid, new_sid: &Sid) -> Result<(), String> {
     let entries = txn
         .pending()
         .map_err(|e| format!("{}: {}", gettext("Invalid p-file"), e))?;
 
-    match pfile::find_by_new_sid(&entries, new_sid) {
+    match entries
+        .iter()
+        .find(|e| e.old_sid == *got || e.new_sid == *new_sid)
+    {
         Some(entry) => Err(format!(
             "{} {} {} {}",
             gettext("SID"),
-            new_sid,
+            if entry.old_sid == *got { got } else { new_sid },
             gettext("is being edited by"),
             entry.user
         )),
@@ -542,7 +549,7 @@ fn process_file(
 
         // Check for existing edit lock (unless joint edit is allowed)
         if !sccs.joint_edit() {
-            check_pfile_lock(txn, &new_sid)
+            check_pfile_lock(txn, &target_sid, &new_sid)
                 .map_err(|e| io::Error::new(io::ErrorKind::AlreadyExists, e))?;
         }
 

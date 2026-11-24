@@ -1924,3 +1924,33 @@ fn a_list_naming_no_delta_is_an_error() {
     let out = run("prs", &["-e", "-d:I:", "s.m"], "");
     assert_eq!(out.stdout, b"1.1\n");
 }
+
+/// Without the `j` flag one edit of a delta may be pending: get -e
+/// "shall prevent further gets for editing on the same SID until delta is
+/// executed or the j (joint edit) flag is set" (POSIX get, -e). Only an
+/// edit that would come to the same *new* SID was refused, so `-b` or a
+/// higher `-r` got a second and third edit of the same delta through.
+#[test]
+fn a_delta_being_edited_is_not_edited_again_without_j() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    assert!(run("admin", &["-i", "-fb", "s.e"], "one\n")
+        .status
+        .success());
+    assert!(run("get", &["-e", "-g", "-s", "s.e"], "").status.success());
+    for args in [
+        &["-e", "-g", "s.e"][..],
+        &["-e", "-g", "-b", "s.e"],
+        &["-e", "-g", "-r2", "s.e"],
+    ] {
+        let out = run("get", args, "");
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("being edited"),
+            "{args:?}: {out:?}"
+        );
+    }
+    let pfile = std::fs::read_to_string(dir.join("p.e")).unwrap();
+    assert_eq!(pfile.lines().count(), 1, "{pfile}");
+}

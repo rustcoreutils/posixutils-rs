@@ -19,7 +19,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use plib::sccsfile::{paths, PfileEntry, Sid};
+use plib::sccsfile::{paths, PfileEntry};
 
 /// The mode a p-file carries. It records a pending edit for other users to
 /// see, so it is world-readable and owner-writable.
@@ -67,12 +67,4 @@ pub(crate) fn write(sfile: &Path, entries: &[PfileEntry]) -> io::Result<()> {
         body.push(b'\n');
     }
     crate::sfio::write_via(&path, &paths::qfile_from_sfile(sfile), &body, PFILE_MODE)
-}
-
-/// The entry whose new SID is `new_sid`, if the edit is already pending.
-///
-/// `get -e` uses this to refuse a second edit of the same SID; the `j` flag is
-/// what allows the concurrent case, and it is checked by the caller.
-pub fn find_by_new_sid<'a>(entries: &'a [PfileEntry], new_sid: &Sid) -> Option<&'a PfileEntry> {
-    entries.iter().find(|e| e.new_sid == *new_sid)
 }

@@ -24,7 +24,10 @@
 //! checks to editing, and CSSC does the same.
 
 use gettextrs::gettext;
-use plib::sccsfile::SccsFile;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
+
+use plib::sccsfile::{Login, SccsFile};
 
 /// Why an edit was refused. The wording matches CSSC 1.4.1, which is what
 /// existing scripts match against.
@@ -50,7 +53,7 @@ impl Refusal {
 }
 
 /// Check whether `login` may create a delta in `release` of this file.
-pub fn check_edit(sccs: &SccsFile, release: u16, login: &str) -> Result<(), Refusal> {
+pub fn check_edit(sccs: &SccsFile, release: u16, login: &Login) -> Result<(), Refusal> {
     if sccs
         .locked_releases()
         .is_some_and(|lock| lock.locks(release))
@@ -64,7 +67,7 @@ pub fn check_edit(sccs: &SccsFile, release: u16, login: &str) -> Result<(), Refu
         return Err(Refusal::ReleaseLocked);
     }
 
-    if !is_authorized(&sccs.header.users, login) {
+    if !is_authorized(&sccs.header().users, login) {
         return Err(Refusal::NotAuthorized);
     }
 
@@ -78,14 +81,14 @@ pub fn check_edit(sccs: &SccsFile, release: u16, login: &str) -> Result<(), Refu
 /// permission to make deltas" (POSIX 84088-84090). A denial outranks an
 /// allowance, and a list that names only denials admits nobody -- which is
 /// what CSSC does, and follows from the list being non-empty.
-pub fn is_authorized(users: &[String], login: &str) -> bool {
+pub fn is_authorized(users: &[Vec<u8>], login: &[u8]) -> bool {
     if users.is_empty() {
         return true;
     }
 
     let mut allowed = false;
     for entry in users {
-        match entry.strip_prefix('!') {
+        match entry.strip_prefix(b"!") {
             Some(denied) => {
                 if entry_matches(denied, login) {
                     return false;
@@ -106,15 +109,19 @@ pub fn is_authorized(users: &[String], login: &str) -> bool {
 /// "A group ID shall be equivalent to specifying all login names common to
 /// that group ID" (POSIX 84085-84086), so a numeric entry matches both the
 /// group's supplementary member list and any user whose primary group it is.
-fn entry_matches(entry: &str, login: &str) -> bool {
+fn entry_matches(entry: &[u8], login: &[u8]) -> bool {
     if entry == login {
         return true;
     }
 
-    let Ok(gid) = entry.parse::<u32>() else {
+    let Some(gid) = std::str::from_utf8(entry)
+        .ok()
+        .and_then(|e| e.parse::<u32>().ok())
+    else {
         return false;
     };
 
+    let login = OsStr::from_bytes(login);
     if plib::user::get_by_name(login).is_some_and(|u| u.gid == gid) {
         return true;
     }
@@ -126,32 +133,32 @@ fn entry_matches(entry: &str, login: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn list(entries: &[&str]) -> Vec<String> {
-        entries.iter().map(|s| s.to_string()).collect()
+    fn list(entries: &[&str]) -> Vec<Vec<u8>> {
+        entries.iter().map(|s| s.as_bytes().to_vec()).collect()
     }
 
     #[test]
     fn an_empty_list_admits_everyone() {
-        assert!(is_authorized(&[], "anyone"));
+        assert!(is_authorized(&[], b"anyone"));
     }
 
     #[test]
     fn a_named_user_is_admitted_and_others_are_not() {
         let users = list(&["alice"]);
-        assert!(is_authorized(&users, "alice"));
-        assert!(!is_authorized(&users, "bob"));
+        assert!(is_authorized(&users, b"alice"));
+        assert!(!is_authorized(&users, b"bob"));
     }
 
     #[test]
     fn a_denial_outranks_an_allowance() {
-        assert!(!is_authorized(&list(&["alice", "!alice"]), "alice"));
-        assert!(!is_authorized(&list(&["!alice", "alice"]), "alice"));
+        assert!(!is_authorized(&list(&["alice", "!alice"]), b"alice"));
+        assert!(!is_authorized(&list(&["!alice", "alice"]), b"alice"));
     }
 
     /// A list holding only denials is still a list, so it admits nobody.
     #[test]
     fn a_deny_only_list_admits_nobody() {
-        assert!(!is_authorized(&list(&["!alice"]), "bob"));
-        assert!(!is_authorized(&list(&["!alice"]), "alice"));
+        assert!(!is_authorized(&list(&["!alice"]), b"bob"));
+        assert!(!is_authorized(&list(&["!alice"]), b"alice"));
     }
 }

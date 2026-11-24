@@ -27,15 +27,21 @@ pub mod diag;
 pub mod idkw;
 pub mod mrlist;
 pub mod operands;
+pub mod optscan;
 pub mod pfile;
 pub mod protect;
 pub mod sfio;
+pub mod txn;
 pub mod zlock;
 
-/// The login name to stamp into p-files and delta entries.
-///
-/// Five binaries wrapped `plib::sccsfile::real_login_name` in a private
-/// one-line helper, under two different names.
-pub fn username() -> String {
-    plib::sccsfile::real_login_name()
+/// The login name to stamp into p-files and delta entries: the real user's,
+/// checked as fit to be written (see `plib::sccsfile::real_login_name`).
+pub fn username() -> std::io::Result<plib::sccsfile::Login> {
+    plib::sccsfile::real_login_name().map_err(invalid_input)
+}
+
+/// The I/O error for a value given to a command that cannot be stored: a
+/// login, comment, MR number or list refused by its type.
+pub fn invalid_input(e: plib::sccsfile::SccsError) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
 }

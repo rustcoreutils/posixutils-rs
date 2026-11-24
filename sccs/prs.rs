@@ -9,14 +9,17 @@
 
 //! prs - print SCCS file information
 
-use std::io;
+use std::ffi::{OsStr, OsString};
+use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
 use gettextrs::gettext;
 use plib::sccsfile::{paths, DeltaEntry, DeltaType, SccsFile, SccsFlag, Sid};
-use posixutils_sccs::{cutoff, diag, operands};
+use posixutils_sccs::optscan::{self, Letters};
+use posixutils_sccs::{cutoff, diag, idkw, operands};
 
 /// prs - print SCCS file information
 #[derive(Parser)]
@@ -29,7 +32,7 @@ struct Args {
     cutoff: Option<String>,
 
     #[arg(short = 'd', allow_hyphen_values = true, value_name = "DATASPEC", help = gettext("Data format specification"))]
-    dataspec: Option<String>,
+    dataspec: Option<OsString>,
 
     #[arg(short = 'e', help = gettext("Select deltas earlier than or equal to -c or -r"))]
     earlier: bool,
@@ -37,13 +40,10 @@ struct Args {
     #[arg(short = 'l', help = gettext("Select deltas later than or equal to -c or -r"))]
     later: bool,
 
-    #[arg(
-        short = 'r',
-        value_name = "SID",
-        num_args = 0..=1,
-        default_missing_value = "",
-        help = gettext("SID to report on (defaults to most recent delta)")
-    )]
+    /// `-r[SID]`: taken from the command line by [`optscan`], its argument
+    /// being optional and attached. A bare `-r` is the empty string, the
+    /// most recently created delta.
+    #[arg(skip)]
     sid: Option<String>,
 
     #[arg(required = true, help = gettext("SCCS files to process (use - for stdin)"))]
@@ -51,8 +51,8 @@ struct Args {
 }
 
 // Default output format (per POSIX, there's a header and per-delta format)
-const DEFAULT_HEADER_FORMAT: &str = ":PN::\n\n";
-const DEFAULT_DELTA_FORMAT: &str = ":Dt:\t:DL:\nMRs:\n:MR:COMMENTS:\n:C:\n";
+const DEFAULT_HEADER_FORMAT: &[u8] = b":PN::\n\n";
+const DEFAULT_DELTA_FORMAT: &[u8] = b":Dt:\t:DL:\nMRs:\n:MR:COMMENTS:\n:C:\n";
 
 fn flag_yes_no(val: bool) -> &'static str {
     if val {
@@ -63,17 +63,18 @@ fn flag_yes_no(val: bool) -> &'static str {
 }
 
 /// Multi-line ("M-format") keywords. Their values are emitted with each line
-/// terminated by a <newline>, and an M-format keyword appearing as the final
-/// token of a dataspec forces a trailing <newline> on the delta's output.
+/// terminated by a `<newline>`, and an M-format keyword appearing as the final
+/// token of a dataspec forces a trailing `<newline>` on the delta's output.
 fn is_multiline_keyword(keyword: &str) -> bool {
-    matches!(keyword, "MR" | "C" | "UN" | "FL" | "FD" | "GB")
+    matches!(keyword, "MR" | "C" | "UN" | "FL" | "FD" | "BD" | "GB")
 }
 
 /// Whether `keyword` is a recognized prs data keyword.
 fn is_known_keyword(keyword: &str) -> bool {
     matches!(
         keyword,
-        "BF" | "CB"
+        "BD" | "BF"
+            | "CB"
             | "Ds"
             | "F"
             | "FB"
@@ -130,45 +131,47 @@ fn is_known_keyword(keyword: &str) -> bool {
 /// expanded text along with a flag indicating whether the last token emitted
 /// was a multi-line ("M-format") keyword.
 fn expand_keywords(
-    format: &str,
+    format: &[u8],
     sccs: &SccsFile,
     delta: &DeltaEntry,
     sfile_path: &Path,
-) -> (String, bool) {
-    let mut result = String::new();
+) -> (Vec<u8>, bool) {
+    let mut result: Vec<u8> = Vec::new();
     let mut last_was_multiline = false;
-    let chars: Vec<char> = format.chars().collect();
+    // The specification is bytes: what is not a keyword or an escape is
+    // written as it stands.
+    let chars = format;
     let mut i = 0;
 
     while i < chars.len() {
         let c = chars[i];
-        if c == ':' {
+        if c == b':' {
             // Try to match a recognized keyword: ':' kw ':'.
             let mut j = i + 1;
             while j < chars.len() && chars[j].is_ascii_alphanumeric() {
                 j += 1;
             }
-            let keyword: String = chars[i + 1..j].iter().collect();
+            let keyword = std::str::from_utf8(&chars[i + 1..j]).unwrap_or_default();
             if !keyword.is_empty()
                 && j < chars.len()
-                && chars[j] == ':'
-                && is_known_keyword(&keyword)
+                && chars[j] == b':'
+                && is_known_keyword(keyword)
             {
                 // Recognized keyword - expand it.
-                let value = expand_single_keyword(&keyword, sccs, delta, sfile_path);
-                let multiline = is_multiline_keyword(&keyword);
+                let value = expand_single_keyword(keyword, sccs, delta, sfile_path);
+                let multiline = is_multiline_keyword(keyword);
                 if multiline {
                     // Each value line is newline-terminated; an empty value
                     // (e.g. :MR: for a delta with no MRs) emits nothing, not a
                     // blank line.
                     if !value.is_empty() {
-                        for line in value.split('\n') {
-                            result.push_str(line);
-                            result.push('\n');
+                        for line in value.split(|&b| b == b'\n') {
+                            result.extend_from_slice(line);
+                            result.push(b'\n');
                         }
                     }
                 } else {
-                    result.push_str(&value);
+                    result.extend_from_slice(&value);
                 }
                 last_was_multiline = multiline && !value.is_empty();
                 i = j + 1;
@@ -176,22 +179,22 @@ fn expand_keywords(
             }
             // Not a recognized keyword - emit the ':' literally and continue
             // scanning from the next character (so "::" prints verbatim).
-            result.push(':');
+            result.push(b':');
             last_was_multiline = false;
             i += 1;
-        } else if c == '\\' {
+        } else if c == b'\\' {
             // Handle escape sequences.
             match chars.get(i + 1) {
-                Some('n') => {
-                    result.push('\n');
+                Some(b'n') => {
+                    result.push(b'\n');
                     i += 2;
                 }
-                Some('t') => {
-                    result.push('\t');
+                Some(b't') => {
+                    result.push(b'\t');
                     i += 2;
                 }
-                Some('\\') => {
-                    result.push('\\');
+                Some(b'\\') => {
+                    result.push(b'\\');
                     i += 2;
                 }
                 _ => {
@@ -210,20 +213,94 @@ fn expand_keywords(
     (result, last_was_multiline)
 }
 
+/// The value of one data keyword, as bytes: the keywords that print what the
+/// s-file stores -- comments, MRs, users, descriptive text, flag values, the
+/// body -- print it as stored, which need not be UTF-8. The rest are text prs
+/// composes, from [`keyword_text`].
 fn expand_single_keyword(
     keyword: &str,
     sccs: &SccsFile,
     delta: &DeltaEntry,
     sfile_path: &Path,
-) -> String {
+) -> Vec<u8> {
+    let text = |kw: &str| keyword_text(kw, sccs, delta).into_bytes();
+    let stored = |v: Option<&[u8]>| v.unwrap_or(b"").to_vec();
+    // A list, one entry per line, or "none" when there is no entry.
+    let list_or_none = |v: &[Vec<u8>]| {
+        if v.is_empty() {
+            b"none".to_vec()
+        } else {
+            v.join(&b"\n"[..])
+        }
+    };
+    let module = || idkw::module_name_of(sccs, sfile_path);
+    match keyword {
+        "FD" => list_or_none(&sccs.header().descriptive_text),
+        "FL" => format_flags(&sccs.header().flags),
+        "KV" => stored(sccs.id_keyword_check().flatten()),
+        "M" => module(),
+        // Names are bytes. :PN: is "the SCCS-file pathname" as given (the
+        // operand), not resolved.
+        "F" => sfile_path
+            .file_name()
+            .unwrap_or_default()
+            .as_bytes()
+            .to_vec(),
+        "PN" => sfile_path.as_os_str().as_bytes().to_vec(),
+        "MP" => stored(sccs.mr_program().flatten()),
+        "Q" => stored(sccs.q_text()),
+        "UN" => list_or_none(&sccs.header().users),
+        "Y" => stored(sccs.module_type()),
+        "A" => [
+            text("Z"),
+            stored(sccs.module_type()),
+            b" ".to_vec(),
+            module(),
+            b" ".to_vec(),
+            text("I"),
+            text("Z"),
+        ]
+        .concat(),
+        "C" => delta.comments.join(&b"\n"[..]),
+        "Dt" => [
+            text("DT"),
+            b" ".to_vec(),
+            text("I"),
+            b" ".to_vec(),
+            text("D"),
+            b" ".to_vec(),
+            text("T"),
+            b" ".to_vec(),
+            delta.user.to_vec(),
+            b" ".to_vec(),
+            text("DS"),
+            b" ".to_vec(),
+            text("DP"),
+        ]
+        .concat(),
+        // The body as it is stored: every line, control records included.
+        // (The M-format expander ends each line with its newline.)
+        "BD" => {
+            let body = sccs.stored_body();
+            body.strip_suffix(b"\n").unwrap_or(body).to_vec()
+        }
+        "GB" => gotten_body(sccs, delta, sfile_path),
+        "MR" => delta.mr_numbers.join(&b"\n"[..]),
+        "P" => delta.user.to_vec(),
+        "W" => [text("Z"), module(), b"\t".to_vec(), text("I")].concat(),
+        _ => text(keyword),
+    }
+}
+
+fn keyword_text(keyword: &str, sccs: &SccsFile, delta: &DeltaEntry) -> String {
     match keyword {
         // Global keywords
-        "BF" => flag_yes_no(has_flag(&sccs.header.flags, |f| {
+        "BF" => flag_yes_no(has_flag(&sccs.header().flags, |f| {
             matches!(f, SccsFlag::BranchEnabled)
         }))
         .to_string(),
         "CB" => sccs
-            .header
+            .header()
             .flags
             .iter()
             .find_map(|f| match f {
@@ -235,12 +312,8 @@ fn expand_single_keyword(
             .default_sid()
             .map(|s| s.to_string())
             .unwrap_or_else(|| "none".to_string()),
-        "F" => sfile_path
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default(),
         "FB" => sccs
-            .header
+            .header()
             .flags
             .iter()
             .find_map(|f| match f {
@@ -248,23 +321,14 @@ fn expand_single_keyword(
                 _ => None,
             })
             .unwrap_or_else(|| "none".to_string()),
-        "FD" => {
-            if sccs.header.descriptive_text.is_empty() {
-                "none".to_string()
-            } else {
-                sccs.header.descriptive_text.join("\n")
-            }
-        }
-        "FL" => format_flags(&sccs.header.flags),
-        "J" => flag_yes_no(has_flag(&sccs.header.flags, |f| {
+        "J" => flag_yes_no(has_flag(&sccs.header().flags, |f| {
             matches!(f, SccsFlag::JointEdit)
         }))
         .to_string(),
-        "KF" => flag_yes_no(has_flag(&sccs.header.flags, |f| {
+        "KF" => flag_yes_no(has_flag(&sccs.header().flags, |f| {
             matches!(f, SccsFlag::IdKeywordError(_))
         }))
         .to_string(),
-        "KV" => sccs.id_keyword_check().flatten().unwrap_or("").to_string(),
         // An absent `l` flag is "none"; `l a` locks every release and renders
         // as "a", matching CSSC. Encoding "all" as an empty list made the most
         // restrictive setting a file can carry report as the least.
@@ -272,40 +336,16 @@ fn expand_single_keyword(
             .locked_releases()
             .map(|lock| lock.value_string())
             .unwrap_or_else(|| "none".to_string()),
-        "M" => sccs
-            .module_name()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| paths::module_name(sfile_path).unwrap_or_default()),
-        "MF" => flag_yes_no(has_flag(&sccs.header.flags, |f| {
+        "MF" => flag_yes_no(has_flag(&sccs.header().flags, |f| {
             matches!(f, SccsFlag::MrValidation(_))
         }))
         .to_string(),
-        "MP" => sccs.mr_program().flatten().unwrap_or("").to_string(),
-        "ND" => flag_yes_no(has_flag(&sccs.header.flags, |f| {
+        "ND" => flag_yes_no(has_flag(&sccs.header().flags, |f| {
             matches!(f, SccsFlag::NullDelta)
         }))
         .to_string(),
-        // POSIX: the SCCS-file pathname as given (the operand), not resolved.
-        "PN" => sfile_path.to_string_lossy().to_string(),
-        "Q" => sccs.q_text().unwrap_or("").to_string(),
-        "UN" => {
-            if sccs.header.users.is_empty() {
-                "none".to_string()
-            } else {
-                sccs.header.users.join("\n")
-            }
-        }
-        "Y" => sccs.module_type().unwrap_or("").to_string(),
 
         // Version-specific keywords
-        "A" => format!(
-            "{}{} {} {}{}",
-            expand_single_keyword("Z", sccs, delta, sfile_path),
-            expand_single_keyword("Y", sccs, delta, sfile_path),
-            expand_single_keyword("M", sccs, delta, sfile_path),
-            expand_single_keyword("I", sccs, delta, sfile_path),
-            expand_single_keyword("Z", sccs, delta, sfile_path),
-        ),
         "B" => {
             if delta.sid.br > 0 {
                 delta.sid.br.to_string()
@@ -313,9 +353,7 @@ fn expand_single_keyword(
                 String::new()
             }
         }
-        "C" => delta.comments.join("\n"),
         // Gotten body: reconstruct this delta's source text.
-        "GB" => gotten_body(sccs, delta.serial),
         "D" => delta.datetime.date_string(),
         "Dd" => format!("{:02}", delta.datetime.day),
         "Dg" => delta
@@ -366,16 +404,6 @@ fn expand_single_keyword(
             .join(" "),
         "DP" => delta.pred_serial.to_string(),
         "DS" => delta.serial.to_string(),
-        "Dt" => format!(
-            "{} {} {} {} {} {} {}",
-            expand_single_keyword("DT", sccs, delta, sfile_path),
-            expand_single_keyword("I", sccs, delta, sfile_path),
-            expand_single_keyword("D", sccs, delta, sfile_path),
-            expand_single_keyword("T", sccs, delta, sfile_path),
-            expand_single_keyword("P", sccs, delta, sfile_path),
-            expand_single_keyword("DS", sccs, delta, sfile_path),
-            expand_single_keyword("DP", sccs, delta, sfile_path),
-        ),
         "DT" => match delta.delta_type {
             DeltaType::Normal => "D",
             DeltaType::Removed => "R",
@@ -393,8 +421,6 @@ fn expand_single_keyword(
         "Ld" => format!("{:05}", delta.stats.deleted.min(99999)),
         "Li" => format!("{:05}", delta.stats.inserted.min(99999)),
         "Lu" => format!("{:05}", delta.stats.unchanged.min(99999)),
-        "MR" => delta.mr_numbers.join("\n"),
-        "P" => delta.user.clone(),
         "R" => delta.sid.rel.to_string(),
         "S" => {
             if delta.sid.seq > 0 {
@@ -407,12 +433,6 @@ fn expand_single_keyword(
         "Th" => format!("{:02}", delta.datetime.hour),
         "Tm" => format!("{:02}", delta.datetime.minute),
         "Ts" => format!("{:02}", delta.datetime.second),
-        "W" => format!(
-            "{}{}\t{}",
-            expand_single_keyword("Z", sccs, delta, sfile_path),
-            expand_single_keyword("M", sccs, delta, sfile_path),
-            expand_single_keyword("I", sccs, delta, sfile_path),
-        ),
         "Z" => "@(#)".to_string(),
 
         // Unknown keyword - return as-is
@@ -420,25 +440,35 @@ fn expand_single_keyword(
     }
 }
 
-/// Reconstruct the gotten body (source text) of the delta with `serial`.
-fn gotten_body(sccs: &SccsFile, serial: u16) -> String {
-    let applied_set = match sccs.compute_applied_set(serial) {
-        Ok(set) => set,
-        Err(_) => return String::new(),
+/// The gotten body of `delta`: its text as `get` retrieves it, with the
+/// identification keywords expanded. An encoded file's bytes are opaque and
+/// have none.
+///
+/// The body is known to be readable: `prs_file` checks the weave before it
+/// expands a dataspec that asks for `:GB:`.
+fn gotten_body(sccs: &SccsFile, delta: &DeltaEntry, sfile_path: &Path) -> Vec<u8> {
+    let Ok(applied_set) = sccs.compute_applied_set(delta.serial) else {
+        return Vec::new();
     };
+    let lines = sccs.evaluate_body(&applied_set).unwrap_or_default();
 
     if sccs.is_encoded() {
-        let encoded = sccs.evaluate_body(&applied_set);
-        let raw = plib::sccsfile::uudecode_sccs(&encoded);
-        let mut s = String::from_utf8_lossy(&raw).into_owned();
+        let encoded = lines;
+        let mut raw = plib::sccsfile::uudecode_sccs(&encoded);
         // The M-format expander newline-terminates each line, so drop a single
         // trailing newline to avoid emitting a spurious blank line.
-        if s.ends_with('\n') {
-            s.pop();
+        if raw.ends_with(b"\n") {
+            raw.pop();
         }
-        s
+        raw
     } else {
-        sccs.evaluate_body(&applied_set).join("\n")
+        let values = idkw::KeywordValues::new(sccs, delta, sfile_path);
+        lines
+            .iter()
+            .enumerate()
+            .map(|(i, line)| idkw::expand(line, &values, i + 1))
+            .collect::<Vec<_>>()
+            .join(&b"\n"[..])
     }
 }
 
@@ -449,12 +479,12 @@ where
     flags.iter().any(predicate)
 }
 
-fn format_flags(flags: &[SccsFlag]) -> String {
+fn format_flags(flags: &[SccsFlag]) -> Vec<u8> {
     flags
         .iter()
         .filter_map(|f| f.prs_fl_line())
         .collect::<Vec<_>>()
-        .join("\n")
+        .join(&b"\n"[..])
 }
 
 fn prs_file(sfile: &Path, args: &Args) -> io::Result<bool> {
@@ -474,26 +504,38 @@ fn prs_file(sfile: &Path, args: &Args) -> io::Result<bool> {
     };
 
     let use_default_format = args.dataspec.is_none();
-    let format = args.dataspec.as_deref().unwrap_or(DEFAULT_DELTA_FORMAT);
+    let format = args
+        .dataspec
+        .as_deref()
+        .map_or(DEFAULT_DELTA_FORMAT, OsStr::as_bytes);
+
+    // :GB: reads the body, which a damaged weave makes unreadable.
+    if format.windows(4).any(|w| w == b":GB:") {
+        if let Err(e) = sccs.check_weave() {
+            diag::error_path("prs", sfile, &e.to_string());
+            return Ok(false);
+        }
+    }
 
     // The default header (":PN::\n\n") is only emitted when neither -d nor -r
     // is specified (POSIX SYNOPSIS).
     if use_default_format && args.sid.is_none() {
         // We need a dummy delta to expand the header format
         // Since :PN: doesn't depend on delta, use the first one
-        if let Some(first_delta) = sccs.header.deltas.first() {
+        if let Some(first_delta) = sccs.header().deltas.first() {
             let (header, _) = expand_keywords(DEFAULT_HEADER_FORMAT, &sccs, first_delta, sfile);
-            print!("{}", header);
+            io::stdout().write_all(&header)?;
         }
     }
 
-    // Parse target SID if specified. An empty -r option-argument (i.e. bare
-    // "-r") selects the most recently created delta (the trunk head).
+    // Parse target SID if specified. With no SID, -r is "the most recently
+    // created delta" (POSIX 112228): the one with the highest serial, on
+    // the trunk or not.
     let target_sid: Option<Sid> = match args.sid {
         Some(ref sid_str) if sid_str.is_empty() => {
-            match sccs.get_trunk_head() {
-                Some(head) => Some(head.sid),
-                // No trunk head: nothing to report on.
+            match sccs.live_deltas().max_by_key(|d| d.serial) {
+                Some(newest) => Some(newest.sid),
+                // No delta: nothing to report on.
                 None => return Ok(true),
             }
         }
@@ -519,8 +561,24 @@ fn prs_file(sfile: &Path, args: &Args) -> io::Result<bool> {
     };
 
     // Determine which deltas to process
+    // -e and -l are "created earlier than" and "created later than" the
+    // delta -r names (POSIX 112230-112233): by serial, the order of
+    // creation. SIDs do not order deltas in time, a branch being made after
+    // the trunk deltas its SID sorts before. The delta named is the live one
+    // of that SID, or with -a a removed one if no live one has it.
+    let target_serial: Option<u16> = target_sid.and_then(|target| {
+        let named = |d: &&DeltaEntry| d.sid == target;
+        sccs.live_deltas()
+            .find(named)
+            .map(|d| d.serial)
+            .or_else(|| {
+                let removed = sccs.header().deltas.iter().find(named);
+                removed.filter(|_| args.all_deltas).map(|d| d.serial)
+            })
+    });
+
     let deltas: Vec<&DeltaEntry> = sccs
-        .header
+        .header()
         .deltas
         .iter()
         .filter(|d| {
@@ -531,14 +589,12 @@ fn prs_file(sfile: &Path, args: &Args) -> io::Result<bool> {
 
             // Filter by SID
             if let Some(ref target) = target_sid {
-                if args.earlier {
-                    // Include deltas at or before target SID
-                    if d.sid > *target {
+                if args.earlier || args.later {
+                    // A SID that names no delta selects nothing.
+                    let Some(at) = target_serial else {
                         return false;
-                    }
-                } else if args.later {
-                    // Include deltas at or after target SID
-                    if d.sid < *target {
+                    };
+                    if (args.earlier && d.serial > at) || (!args.earlier && d.serial < at) {
                         return false;
                     }
                 } else {
@@ -583,10 +639,10 @@ fn prs_file(sfile: &Path, args: &Args) -> io::Result<bool> {
     // token was not a multi-line keyword.
     for delta in deltas_to_print {
         let (mut output, last_was_multiline) = expand_keywords(format, &sccs, delta, sfile);
-        if last_was_multiline || !output.ends_with('\n') {
-            output.push('\n');
+        if last_was_multiline || !output.ends_with(b"\n") {
+            output.push(b'\n');
         }
-        print!("{}", output);
+        io::stdout().write_all(&output)?;
     }
 
     Ok(true)
@@ -595,13 +651,15 @@ fn prs_file(sfile: &Path, args: &Args) -> io::Result<bool> {
 fn main() -> ExitCode {
     plib::diag::init_locale("prs");
 
-    // The -r option-argument is optional and "cannot be presented as a separate
-    // argument" (POSIX). Rewrite a bare "-r" to "-r=" so clap treats it as an
-    // empty attached value rather than greedily consuming the following operand.
-    let argv = plib::optarg::keep_leading_equals::<Args>(std::env::args_os())
-        .into_iter()
-        .map(|a| if a == "-r" { "-r=".into() } else { a });
-    let args = plib::optarg::parse_from::<Args>(argv);
+    // The -r option-argument is optional and "cannot be presented as a
+    // separate argument" (POSIX): the word after a bare -r is an operand.
+    let (attached, rest) = optscan::scan(std::env::args_os(), Letters::of("prs"));
+    let mut args =
+        plib::optarg::parse_from::<Args>(plib::optarg::keep_leading_equals::<Args>(rest));
+    if let Some(sid) = attached.get(b'r') {
+        // A SID is ASCII; one that is not text is not a SID.
+        args.sid = Some(sid.unwrap_or_default().to_string_lossy().into_owned());
+    }
 
     let mut success = true;
     for path in operands::expand(&args.files) {

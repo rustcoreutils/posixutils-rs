@@ -17,8 +17,9 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use gettextrs::gettext;
-use plib::sccsfile::{paths, DeltaType, SccsFile, Sid};
-use posixutils_sccs::{diag, operands, pfile, sfio, zlock};
+use plib::sccsfile::{paths, DeltaType, Sid};
+use posixutils_sccs::txn::{self, Txn};
+use posixutils_sccs::{diag, operands, zlock};
 
 /// rmdel - remove a delta from an SCCS file
 #[derive(Parser)]
@@ -38,11 +39,11 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
         return Ok(false);
     }
 
-    // Acquire the per-command z-file lock around the read-modify-write. If
-    // another SCCS command already holds it, report and skip.
-    let _zlock = match zlock::acquire(sfile) {
-        Ok(z) => z,
-        Err(e) if zlock::is_held(&e) => {
+    // Take the lock before anything is read. If another SCCS command already
+    // holds it, report and skip.
+    let txn = match Txn::begin(sfile) {
+        Ok(txn) => txn,
+        Err(e) if txn::is_locked(&e) => {
             diag::error_path("rmdel", sfile, &gettext("being edited"));
             return Ok(false);
         }
@@ -50,16 +51,24 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
     };
 
     // Parse the SCCS file
-    let mut sccs = match SccsFile::from_path(sfile) {
+    let mut sccs = match txn.read() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("{}: {}", sfile.display(), e);
+            eprintln!("{}: {}", sfile.display(), plib::diag::io_error_text(&e));
             return Ok(false);
         }
     };
 
-    // Find the delta to remove
-    let delta_idx = sccs.header.deltas.iter().position(|d| &d.sid == sid);
+    // Find the delta to remove: the live one with this SID. A removed delta
+    // may share the SID, the next delta having taken it; it is looked for
+    // only when there is no live one, to say that it is already removed.
+    let entry_of = |wanted: DeltaType| {
+        sccs.header()
+            .deltas
+            .iter()
+            .position(|d| &d.sid == sid && d.delta_type == wanted)
+    };
+    let delta_idx = entry_of(DeltaType::Normal).or_else(|| entry_of(DeltaType::Removed));
     let delta_idx = match delta_idx {
         Some(idx) => idx,
         None => {
@@ -78,10 +87,10 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
     //   1. the user who made the delta,
     //   2. the owner of the SCCS file, or
     //   3. the owner of the directory containing the SCCS file.
-    let current_user = posixutils_sccs::username();
+    let current_user = posixutils_sccs::username()?;
     let current_uid = unsafe { libc::getuid() };
 
-    let is_delta_author = sccs.header.deltas[delta_idx].user == current_user;
+    let is_delta_author = sccs.header().deltas[delta_idx].user == current_user;
 
     let owns_sfile = fs::metadata(sfile)
         .map(|m| m.uid() == current_uid)
@@ -105,12 +114,14 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
         return Ok(false);
     }
 
-    // Check that delta is a leaf (no successors)
-    // A delta is a leaf if no other delta has its serial number as predecessor
-    let target_serial = sccs.header.deltas[delta_idx].serial;
-    let has_successors = sccs.header.deltas.iter().any(|d| {
-        // Check if any delta's predecessor serial matches this delta's serial
-        d.pred_serial == target_serial && d.serial != target_serial
+    // Check that delta is a leaf: no delta still in the file was made from
+    // it. One already removed does not count -- with 1.3 removed, 1.2 is the
+    // newest delta again and can be removed in turn, as CSSC allows.
+    let target_serial = sccs.header().deltas[delta_idx].serial;
+    let has_successors = sccs.header().deltas.iter().any(|d| {
+        d.pred_serial == target_serial
+            && d.serial != target_serial
+            && d.delta_type != plib::sccsfile::DeltaType::Removed
     });
 
     if has_successors {
@@ -124,9 +135,40 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
         return Ok(false);
     }
 
-    // Check that delta is not checked out for editing
-    for entry in pfile::read(sfile)? {
-        if entry.old_sid == *sid || entry.new_sid == *sid {
+    // A delta that another delta includes, excludes or ignores by name is
+    // part of what that delta's text is, so it stays (as in CSSC).
+    let named_by = sccs.live_deltas().find(|d| {
+        d.serial != target_serial
+            && [&d.included, &d.excluded, &d.ignored]
+                .iter()
+                .any(|list| list.contains(&target_serial))
+    });
+    if let Some(other) = named_by {
+        diag::error_path(
+            "rmdel",
+            sfile,
+            &format!(
+                "{} {} {} {}",
+                gettext("delta"),
+                sid,
+                gettext("is included or excluded by delta"),
+                other.sid
+            ),
+        );
+        return Ok(false);
+    }
+
+    // Check that delta is not checked out for editing: not the delta an
+    // edit was made from or will make, and not one an edit includes or
+    // excludes, which is as much a part of the version being edited.
+    let serial = sccs.header().deltas[delta_idx].serial;
+    for entry in txn.pending()? {
+        let listed = [&entry.included, &entry.excluded]
+            .into_iter()
+            .flatten()
+            .filter_map(|list| sccs.resolve_sid_list(list.as_str()).ok())
+            .any(|serials| serials.contains(&serial));
+        if entry.old_sid == *sid || entry.new_sid == *sid || listed {
             diag::error_path(
                 "rmdel",
                 sfile,
@@ -142,7 +184,7 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
     }
 
     // Check delta type - can't remove already removed delta
-    if sccs.header.deltas[delta_idx].delta_type == DeltaType::Removed {
+    if sccs.header().deltas[delta_idx].delta_type == DeltaType::Removed {
         eprintln!(
             "{}: {} {} {}",
             sfile.display(),
@@ -153,19 +195,11 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
         return Ok(false);
     }
 
-    // Preserve the s-file's own mode across the rewrite.
-    let perms = sfio::sfile_perms(sfile);
-
     // Mark delta as removed and reweave the body so its footprint is undone.
-    let serial = sccs.header.deltas[delta_idx].serial;
-    sccs.remove_delta(serial);
+    sccs.remove_delta(serial)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
-    sfio::write_xfile_atomic(
-        sfile,
-        &paths::xfile_from_sfile(sfile),
-        &sccs.to_bytes(),
-        perms,
-    )?;
+    txn.write(&sccs)?;
 
     Ok(true)
 }

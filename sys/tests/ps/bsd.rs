@@ -130,6 +130,35 @@ fn letters_combine_in_any_order_and_word() {
     }
 }
 
+/// A process whose path and arguments can no longer be read -- here a zombie,
+/// left unreaped -- is still named in COMMAND, by the name the kernel keeps
+/// for it, rather than shown with an empty COMMAND column.
+#[test]
+fn a_zombie_keeps_its_command_name() {
+    let mut child = Command::new("true").spawn().expect("spawn true");
+    let pid = child.id();
+    // Wait for it to exit, but leave it unreaped.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT,
+        )
+    };
+    assert_eq!(rc, 0, "waitid: {}", std::io::Error::last_os_error());
+
+    let lines = ok_lines(&["aux"]);
+    child.wait().expect("reap true");
+    check_u_rows(&lines);
+    let row = row_for(&lines, 1, pid).expect("zombie row");
+    let f: Vec<&str> = row.split_whitespace().collect();
+    assert!(f[7].starts_with('Z'), "STAT: {row:?}");
+    assert!(f[10].contains("true"), "COMMAND: {row:?}");
+    assert_eq!(f.last(), Some(&"<defunct>"), "{row:?}");
+}
+
 #[test]
 fn ax_uses_the_bsd_default_format() {
     let lines = ok_lines(&["ax"]);

@@ -15,6 +15,7 @@
 //! ordering was whatever the filesystem happened to hand back.
 
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use plib::sccsfile::paths;
@@ -43,7 +44,9 @@ pub fn is_stdin_form(files: &[PathBuf]) -> bool {
     files.len() == 1 && files[0].as_os_str() == "-"
 }
 
-/// Write the `\n<path>:` banner.
+/// Write the `\n<path>:` banner. The pathname is written as it is, in
+/// bytes: get, sact and unget each wrote it through `Display`, which turns
+/// what is not UTF-8 into replacement characters.
 pub fn banner(out: &mut dyn Write, path: &Path) -> std::io::Result<()> {
-    writeln!(out, "\n{}:", path.display())
+    out.write_all(&[b"\n", path.as_os_str().as_bytes(), b":\n"].concat())
 }

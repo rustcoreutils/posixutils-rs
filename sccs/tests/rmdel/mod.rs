@@ -121,12 +121,7 @@ fn create_multi_delta(tmp: &TempDir, name: &str, n: usize) -> std::path::PathBuf
             String::from_utf8_lossy(&out.stderr)
         );
         std::fs::write(tmp.path().join(name), format!("v{i}\n")).unwrap();
-        let out = run(
-            "delta",
-            &["-y", "next", &format!("s.{name}")],
-            tmp.path(),
-            "",
-        );
+        let out = run("delta", &["-ynext", &format!("s.{name}")], tmp.path(), "");
         assert!(
             out.status.success(),
             "delta failed: {}",
@@ -297,8 +292,9 @@ fn rmdel_directory_and_stdin_operands() {
         "the delta inside the directory should be marked R"
     );
 
-    // An error on a directory-expanded operand must still be reported.
-    let out = run("rmdel", &["-r", "1.1", "proj"], tmp.path(), "");
+    // An error on a directory-expanded operand must still be reported: here
+    // a SID the file does not have.
+    let out = run("rmdel", &["-r", "1.9", "proj"], tmp.path(), "");
     assert_eq!(
         out.status.code(),
         Some(1),
@@ -328,4 +324,179 @@ fn rmdel_directory_and_stdin_operands() {
 #[test]
 fn option_argument_may_begin_with_hyphen() {
     plib::testing::assert_hyphen_option_argument("rmdel", &["-r", "-zq", "--help"]);
+}
+
+/// A removed delta is no longer anyone's successor: with 1.3 removed, 1.2 is
+/// the newest delta and can be removed in turn (as CSSC allows), and what is
+/// left is the text of 1.1.
+#[test]
+fn rmdel_removes_deltas_one_after_another() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = create_multi_delta(&tmp, "chain", 3);
+    let name = sfile.file_name().unwrap().to_str().unwrap();
+    let before = run("get", &["-p", "-k", "-s", "-r1.1", name], tmp.path(), "").stdout;
+    for sid in ["1.3", "1.2"] {
+        let out = run("rmdel", &["-r", sid, name], tmp.path(), "");
+        assert!(out.status.success(), "rmdel {sid}: {out:?}");
+    }
+    let out = run("get", &["-p", "-k", "-s", name], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(out.stdout, before);
+    let out = run("val", &[name], tmp.path(), "");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+}
+
+/// rmdel "shall remove the delta" (POSIX rmdel), so the version it was made
+/// from has no successor again and the next delta takes the freed SID
+/// ("no trunk successor: R.(L+1)", POSIX get). The scenario is CSSC's
+/// tests/get/removed-delta.sh: historical SCCS reuses the SID, and minting a
+/// branch beside the removed delta was a CSSC bug it fixed.
+#[test]
+fn a_removed_deltas_sid_is_used_again() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = create_multi_delta(&tmp, "again", 2);
+    let name = sfile.file_name().unwrap().to_str().unwrap();
+    let gfile = tmp.path().join("again");
+    let ok = |cmd: &str, args: &[&str]| {
+        let out = run(cmd, args, tmp.path(), "");
+        assert!(out.status.success(), "{cmd} {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    ok("rmdel", &["-r", "1.2", name]);
+    let out = ok("get", &["-e", name]);
+    assert!(out.contains("new delta 1.2"), "the freed SID: {out:?}");
+    assert!(!out.contains("1.1.1.1"), "not a branch: {out:?}");
+
+    // The new 1.2 is a delta like any other, and the old one stays removed.
+    std::fs::write(&gfile, b"the second 1.2\n").unwrap();
+    ok("delta", &["-s", "-yagain", name]);
+    assert_eq!(
+        ok("get", &["-p", "-k", "-s", "-r1.2", name]),
+        "the second 1.2\n"
+    );
+    assert_eq!(ok("get", &["-p", "-k", "-s", name]), "the second 1.2\n");
+    let types: Vec<(String, char)> = delta_types(&sfile)
+        .into_iter()
+        .filter(|(sid, _)| sid == "1.2")
+        .collect();
+    assert_eq!(types.len(), 2, "both entries are kept: {types:?}");
+    assert!(types.contains(&("1.2".to_string(), 'D')) && types.contains(&("1.2".to_string(), 'R')));
+    let out = run("val", &["-r1.2", name], tmp.path(), "");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+
+    // rmdel -r1.2 now means the live delta, and can be done again.
+    ok("rmdel", &["-r", "1.2", name]);
+    let out = run("get", &["-p", "-s", "-r1.2", name], tmp.path(), "");
+    assert!(!out.status.success(), "1.2 is gone again: {out:?}");
+    let out = run("val", &["-r1.2", name], tmp.path(), "");
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "val -r of a removed SID: {out:?}"
+    );
+}
+
+/// The same for a branch: a removed branch delta frees its branch number.
+#[test]
+fn a_removed_branch_deltas_sid_is_used_again() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = create_multi_delta(&tmp, "br", 2);
+    let name = sfile.file_name().unwrap().to_str().unwrap();
+    let ok = |cmd: &str, args: &[&str]| {
+        let out = run(cmd, args, tmp.path(), "");
+        assert!(out.status.success(), "{cmd} {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    // 1.1 has a successor, so editing it branches: 1.1.1.1.
+    let out = ok("get", &["-e", "-r1.1", name]);
+    assert!(out.contains("new delta 1.1.1.1"), "{out:?}");
+    std::fs::write(tmp.path().join("br"), b"branch\n").unwrap();
+    ok("delta", &["-s", "-yb", name]);
+    ok("rmdel", &["-r", "1.1.1.1", name]);
+    let out = ok("get", &["-e", "-g", "-r1.1", name]);
+    assert!(
+        out.contains("new delta 1.1.1.1"),
+        "the freed branch: {out:?}"
+    );
+}
+
+/// A delta that another delta includes or excludes by name cannot be
+/// removed: that delta's text is defined in terms of it. (CSSC refuses the
+/// same.) The delta naming it is reported, and nothing is written.
+#[test]
+fn rmdel_refuses_a_delta_another_delta_names() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = create_multi_delta(&tmp, "ref", 2);
+    let name = sfile.file_name().unwrap().to_str().unwrap();
+    // A branch from 1.1 that includes 1.2 records "^Ai 2".
+    let out = run("get", &["-e", "-s", "-r1.1", "-i1.2", name], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    std::fs::write(tmp.path().join("ref"), b"branch\n").unwrap();
+    let out = run("delta", &["-s", "-yb", name], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+
+    let before = std::fs::read(&sfile).unwrap();
+    // 1.2 is the newest delta on the trunk, but 1.1.1.1 includes it.
+    let out = run("rmdel", &["-r", "1.2", name], tmp.path(), "");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("1.1.1.1"),
+        "the delta naming it should be reported: {out:?}"
+    );
+    assert_eq!(std::fs::read(&sfile).unwrap(), before);
+
+    // With the delta that names it gone, it can be removed.
+    let out = run("rmdel", &["-r", "1.1.1.1", name], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    let out = run("rmdel", &["-r", "1.2", name], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+}
+
+/// A delta that a pending edit includes or excludes is part of the version
+/// being edited: rmdel refuses it, as it refuses the delta being edited.
+/// Removed, it left the edit's recorded list naming nothing (or, the SID
+/// being free again, some later delta), and `delta` then said "no such
+/// delta" and committed all the same, counting the included delta's lines
+/// as the user's own.
+#[test]
+fn rmdel_refuses_a_delta_a_pending_edit_names() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    assert!(run("admin", &["-i", "-fb", "s.n"], "one\n")
+        .status
+        .success());
+    // 1.1.1.1, a branch, to include.
+    assert!(run("get", &["-e", "-s", "-b", "s.n"], "").status.success());
+    std::fs::write(dir.join("n"), "one\nbranch\n").unwrap();
+    assert!(run("delta", &["-s", "-yb", "s.n"], "").status.success());
+
+    assert!(run("get", &["-e", "-s", "-i1.1.1.1", "s.n"], "")
+        .status
+        .success());
+    let out = run("rmdel", &["-r1.1.1.1", "s.n"], "");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("being edited"),
+        "{out:?}"
+    );
+
+    // Should the named delta be gone all the same (removed by a tool that
+    // does not look), delta does not make a delta out of half an edit.
+    let pfile = dir.join("p.n");
+    let line = std::fs::read_to_string(&pfile).unwrap();
+    std::fs::write(&pfile, line.replace("-i1.1.1.1", "-i1.1.9.1")).unwrap();
+    let out = run("delta", &["-s", "-yc", "s.n"], "");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("1.1.9.1"),
+        "{out:?}"
+    );
+    assert!(
+        pfile.exists() && dir.join("n").exists(),
+        "the edit is still pending"
+    );
+    let out = run("prs", &["-e", "-d:I:", "s.n"], "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1.1.1.1\n1.1\n");
 }

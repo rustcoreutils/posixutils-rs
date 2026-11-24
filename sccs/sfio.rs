@@ -34,40 +34,42 @@ pub fn write_replacing(path: &Path, data: &[u8], mode: u32) -> io::Result<()> {
     plib::io::write_atomic_mode(path, data, mode)
 }
 
-/// Write `serialized` to the x-file, apply `perms`, and atomically rename over
-/// `path`. The x-file is registered for SIGINT cleanup for the duration of the
-/// write+rename, and removed on error.
+/// Replace `path` with `data`, through the temporary file `temp` beside it,
+/// leaving it with mode `mode`.
 ///
-/// `admin` factored this out; `delta` and `rmdel` each kept an inline copy,
-/// and the three disagreed about whether a failure to read the s-file's own
-/// mode was fatal.
-pub fn write_xfile_atomic(
+/// The temporary is always a new file (`plib::io::write_atomic_named`):
+/// whatever is at its name -- one left by a crash, or a symlink planted there
+/// -- is removed, never opened. It is registered for SIGINT cleanup for the
+/// length of the write, so an interrupt does not leave it behind. The caller
+/// holds the z-file lock, which makes the name its own.
+pub(crate) fn write_via(path: &Path, temp: &Path, data: &[u8], mode: u32) -> io::Result<()> {
+    debug_assert_eq!(
+        temp.parent(),
+        path.parent(),
+        "the temporary is beside the file"
+    );
+    let temp_name = temp
+        .file_name()
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    plib::sccsfile::register_cleanup(temp);
+    let res = plib::io::write_atomic_named(path, temp_name, data, mode);
+    plib::sccsfile::unregister_cleanup(temp);
+    res
+}
+
+/// Write `serialized` to the x-file and rename it over the s-file `path`,
+/// which ends with the mode `perms`.
+///
+/// The x-file was opened with `fs::write`, which follows a symlink and
+/// truncates what it points at, and then chmodded by name, which follows it
+/// too: a symlink planted at `x.<name>` by anyone able to write the directory
+/// had the next admin, delta or rmdel overwrite its target with the s-file
+/// and make it read-only.
+pub(crate) fn write_xfile_atomic(
     path: &Path,
     x_file: &Path,
     serialized: &[u8],
     perms: fs::Permissions,
 ) -> io::Result<()> {
-    plib::sccsfile::register_cleanup(x_file);
-    let res = (|| -> io::Result<()> {
-        fs::write(x_file, serialized)?;
-        fs::set_permissions(x_file, perms)?;
-        fs::rename(x_file, path)?;
-        Ok(())
-    })();
-    plib::sccsfile::unregister_cleanup(x_file);
-    if res.is_err() {
-        let _ = fs::remove_file(x_file);
-    }
-    res
-}
-
-/// The mode to give a rewritten s-file: whatever the original carried.
-///
-/// A missing or unreadable s-file mode is not a reason to abandon the write,
-/// but it is a reason not to invent a permissive one, so it falls back to
-/// read-only.
-pub fn sfile_perms(path: &Path) -> fs::Permissions {
-    fs::metadata(path)
-        .map(|m| m.permissions())
-        .unwrap_or_else(|_| fs::Permissions::from_mode(0o444))
+    write_via(path, x_file, serialized, perms.mode() & 0o7777)
 }

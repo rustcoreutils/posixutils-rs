@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use libc::{c_int, c_void, getpgid, getsid, pid_t, proc_listallpids, proc_pidinfo, proc_pidpath};
+use libc::{c_int, c_void, getsid, pid_t, proc_listallpids, proc_pidinfo, proc_pidpath};
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::fs;
@@ -195,11 +195,13 @@ fn get_process_info(pid: pid_t, dev_map: &HashMap<u64, String>) -> Option<Proces
     // Get BSD info for basic process information
     let mut bsd_info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
     let bsd_info_size = std::mem::size_of::<libc::proc_bsdinfo>();
+    // A nonzero arg makes XNU look up a zombie too; with 0 a zombie is ESRCH
+    // and would be left out of the listing.
     let res = unsafe {
         proc_pidinfo(
             pid,
             libc::PROC_PIDTBSDINFO,
-            0,
+            1,
             bsd_info.as_mut_ptr() as *mut c_void,
             bsd_info_size as c_int,
         )
@@ -256,12 +258,13 @@ fn get_process_info(pid: pid_t, dev_map: &HashMap<u64, String>) -> Option<Proces
         String::new()
     };
 
-    // Extract command name from path
-    let comm = full_path
-        .rsplit('/')
-        .next()
-        .unwrap_or(&full_path)
-        .to_string();
+    // The command name is the executable's basename.  A process whose path
+    // cannot be read -- a zombie, or one exiting or in exec -- is named by the
+    // name the kernel keeps for it, as Apple's ps does.
+    let comm = match full_path.rsplit('/').next() {
+        Some(base) if !base.is_empty() => base.to_string(),
+        _ => kernel_name(&bsd_info),
+    };
 
     // Retrieve the terminal device ID (TTY)
     let tty_dev = bsd_info.e_tdev;
@@ -280,8 +283,11 @@ fn get_process_info(pid: pid_t, dev_map: &HashMap<u64, String>) -> Option<Proces
     let state = process_state(pid, bsd_info.pbi_status, threads);
 
     // Get process group ID and session ID
-    let pgid = unsafe { getpgid(pid) };
-    let sid = unsafe { getsid(pid) };
+    let pgid = bsd_info.pbi_pgid as pid_t;
+    // getsid fails for a zombie, as getpgid did; the kernel's process info
+    // has no session ID to take instead, so it is 0, as Apple's ps shows it,
+    // rather than -1.
+    let sid = unsafe { getsid(pid) }.max(0);
 
     Some(ProcessInfo {
         pid: bsd_info.pbi_pid as pid_t,
@@ -308,6 +314,25 @@ fn get_process_info(pid: pid_t, dev_map: &HashMap<u64, String>) -> Option<Proces
         comm,
         args,
     })
+}
+
+/// The kernel's name for a process: `pbi_name` (up to 32 bytes), else the
+/// 16-byte `pbi_comm`.  Neither need be NUL-terminated.
+fn kernel_name(bsd_info: &libc::proc_bsdinfo) -> String {
+    let field = |chars: &[libc::c_char]| {
+        let bytes: Vec<u8> = chars
+            .iter()
+            .map(|&c| c as u8)
+            .take_while(|&b| b != 0)
+            .collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    let name = field(&bsd_info.pbi_name);
+    if name.is_empty() {
+        field(&bsd_info.pbi_comm)
+    } else {
+        name
+    }
 }
 
 /// `proc_pidinfo` flavor listing a process's thread handles (XNU

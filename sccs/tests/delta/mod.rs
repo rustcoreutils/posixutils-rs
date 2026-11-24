@@ -636,9 +636,10 @@ fn delta_r_selects_among_multiple_pending_edits() {
         "",
     );
     super::common::run_in("get", &["-e", sfile.to_str().unwrap()], tmp.path(), "");
+    // -g: the first edit's g-file is there, writable, and is not replaced.
     super::common::run_in(
         "get",
-        &["-e", "-b", sfile.to_str().unwrap()],
+        &["-e", "-b", "-g", sfile.to_str().unwrap()],
         tmp.path(),
         "",
     );
@@ -1236,4 +1237,444 @@ fn option_argument_may_begin_with_hyphen() {
     for opt in ["-r", "-g"] {
         plib::testing::assert_hyphen_option_argument("delta", &[opt, "-zq", "--help"]);
     }
+}
+
+/// A delta to a CRLF file changes only the lines that changed: the CR is part
+/// of each line on both sides of the diff, so the untouched lines are kept
+/// and every line keeps its CR.
+#[test]
+fn delta_keeps_carriage_returns() {
+    let tmp = TempDir::new().unwrap();
+    super::common::write_sfile(
+        tmp.path(),
+        "s.crlf",
+        b"\x01s 00002/00000/00000\n\x01d D 1.1 26/01/01 00:00:00 u 1 0\n\x01e\n\
+\x01u\n\x01U\n\x01t\n\x01T\n\x01I 1\na\r\nb\r\n\x01E 1\n",
+    );
+    let run = |cmd: &str, args: &[&str]| {
+        let out = super::common::run_in(cmd, args, tmp.path(), "");
+        assert!(out.status.success(), "{cmd} {args:?}: {out:?}");
+        out
+    };
+    run("get", &["-e", "-s", "s.crlf"]);
+    fs::write(tmp.path().join("crlf"), b"a\r\nB\r\n").unwrap();
+    run("delta", &["-s", "-ychange", "s.crlf"]);
+    let out = run("prs", &["-d:Li:/:Ld:/:Lu:", "-r1.2", "s.crlf"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "00001/00001/00001"
+    );
+    let out = run("get", &["-p", "-k", "-s", "s.crlf"]);
+    assert_eq!(out.stdout, b"a\r\nB\r\n");
+}
+
+/// A delta to a file whose text is not UTF-8 diffs and records it byte for
+/// byte, and `delta -p` prints the changed lines as they are.
+#[test]
+fn delta_handles_non_utf8_text() {
+    let tmp = TempDir::new().unwrap();
+    super::common::write_sfile(tmp.path(), "s.l1", super::common::LATIN1_SFILE);
+    let run = |cmd: &str, args: &[&str]| {
+        let out = super::common::run_in(cmd, args, tmp.path(), "");
+        assert!(out.status.success(), "{cmd} {args:?}: {out:?}");
+        out
+    };
+    run("get", &["-e", "-s", "s.l1"]);
+    fs::write(tmp.path().join("l1"), b"caf\xe9 %I%\nna\xefve\n").unwrap();
+    let out = run("delta", &["-s", "-p", "-ychange", "s.l1"]);
+    assert_eq!(out.stdout, b"2c2\n< line2\n---\n> na\xefve\n");
+    let out = run("get", &["-p", "-k", "-s", "s.l1"]);
+    assert_eq!(out.stdout, b"caf\xe9 %I%\nna\xefve\n");
+}
+
+/// delta and rmdel rewrite the whole s-file; text another delta stored that
+/// is not UTF-8 -- comments, flag values, descriptive text -- survives both.
+#[test]
+fn delta_and_rmdel_keep_non_utf8_text() {
+    use super::common::{assert_sfile_holds, write_sfile, LATIN1_RECORDS, LATIN1_SFILE};
+    let tmp = TempDir::new().unwrap();
+    let s = write_sfile(tmp.path(), "s.l1", LATIN1_SFILE);
+    let run = |cmd: &str, args: &[&str]| {
+        let out = super::common::run_in(cmd, args, tmp.path(), "");
+        assert!(out.status.success(), "{cmd} {args:?}: {out:?}");
+    };
+    run("get", &["-e", "-s", "s.l1"]);
+    fs::write(tmp.path().join("l1"), b"caf\xe9 %I%\nline2\nline3\n").unwrap();
+    run("delta", &["-s", "-ymore", "s.l1"]);
+    assert_sfile_holds(&s, LATIN1_RECORDS);
+    run("rmdel", &["-r1.2", "s.l1"]);
+    assert_sfile_holds(&s, LATIN1_RECORDS);
+}
+
+/// A `-y` comment of several lines is stored as several comment lines.
+#[test]
+fn delta_multi_line_comment_is_kept() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _, gfile) = setup_sccs_file(&tmp, "ml", "one\n");
+    get_for_editing(&sfile);
+    fs::write(&gfile, "two\n").unwrap();
+    let dir = sfile.parent().unwrap();
+    let name = sfile.file_name().unwrap().to_str().unwrap();
+    let out = super::common::run_in("delta", &["-s", "-yline1\nline2", name], dir, "");
+    assert!(out.status.success(), "{out:?}");
+    let out = super::common::run_in("prs", &["-d:C:", "-r1.2", name], dir, "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "line1\nline2\n\n");
+    let out = super::common::run_in("val", &[name], dir, "");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+}
+
+/// A text line beginning with SOH cannot be stored in a text s-file: it would
+/// read back as a control line, and one such as `^AE 1` would end a block
+/// early. delta refuses it and changes nothing, rather than store a file
+/// that reads back differently.
+#[test]
+fn delta_refuses_a_line_beginning_with_soh() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, pfile, gfile) = setup_sccs_file(&tmp, "soh", "one\ntwo\n");
+    get_for_editing(&sfile);
+    let before = fs::read(&sfile).unwrap();
+    fs::write(&gfile, b"one\n\x01E 1\ntwo\n").unwrap();
+    let dir = sfile.parent().unwrap();
+    let out = super::common::run_in("delta", &["-s", "-yc", "s.soh"], dir, "");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("line 2"),
+        "the line should be named: {out:?}"
+    );
+    assert_eq!(
+        fs::read(&sfile).unwrap(),
+        before,
+        "the s-file must be untouched"
+    );
+    assert!(
+        pfile.exists() && gfile.exists(),
+        "the edit is still pending"
+    );
+}
+
+/// delta and rmdel reweave a body whose blocks overlap without disturbing
+/// the versions already in it.
+#[test]
+fn delta_and_rmdel_keep_overlapping_blocks_intact() {
+    let tmp = TempDir::new().unwrap();
+    super::common::write_sfile(tmp.path(), "s.o", super::common::OVERLAP_SFILE);
+    let run = |cmd: &str, args: &[&str]| {
+        let out = super::common::run_in(cmd, args, tmp.path(), "");
+        assert!(out.status.success(), "{cmd} {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let versions = |with_14: bool| {
+        assert_eq!(run("get", &["-p", "-k", "-s", "-r1.1", "s.o"]), "a\nb\n");
+        assert_eq!(
+            run("get", &["-p", "-k", "-s", "-r1.2", "s.o"]),
+            "a\nb\nc\nd\n"
+        );
+        assert_eq!(run("get", &["-p", "-k", "-s", "-r1.3", "s.o"]), "a\nd\n");
+        if with_14 {
+            assert_eq!(
+                run("get", &["-p", "-k", "-s", "-r1.4", "s.o"]),
+                "a\nx\nd\ne\n"
+            );
+        }
+    };
+
+    run("get", &["-e", "-s", "s.o"]);
+    fs::write(tmp.path().join("o"), b"a\nx\nd\ne\n").unwrap();
+    run("delta", &["-s", "-yfour", "s.o"]);
+    versions(true);
+
+    run("rmdel", &["-r1.4", "s.o"]);
+    versions(false);
+    // And the delta whose blocks overlap can itself be removed.
+    run("rmdel", &["-r1.3", "s.o"]);
+    assert_eq!(run("get", &["-p", "-k", "-s", "s.o"]), "a\nb\nc\nd\n");
+    assert_eq!(run("get", &["-p", "-k", "-s", "-r1.1", "s.o"]), "a\nb\n");
+}
+
+/// What a text s-file cannot hold, delta does not store: a file whose last
+/// line has no newline, or one holding a NUL. Input must be a text file
+/// (POSIX delta 92274), and historical SCCS refuses both ("No newline at end
+/// of file (de18)", and de14 for the NUL); storing them anyway gave back a
+/// file one byte longer, or an s-file no other implementation can read. The
+/// s-file is untouched and the edit stays pending, to be fixed and retried.
+#[test]
+fn delta_refuses_what_is_not_a_text_file() {
+    for (name, content, expect) in [
+        ("nonl", &b"one\ntwo"[..], "newline"),
+        ("nul", &b"one\nt\x00wo\n"[..], "NUL"),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let (sfile, pfile, gfile) = setup_sccs_file(&tmp, name, "one\n");
+        get_for_editing(&sfile);
+        let before = fs::read(&sfile).unwrap();
+        fs::write(&gfile, content).unwrap();
+        let dir = sfile.parent().unwrap();
+        let sname = format!("s.{name}");
+        let out = super::common::run_in("delta", &["-s", "-yc", &sname], dir, "");
+        assert_eq!(out.status.code(), Some(1), "{name}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(expect),
+            "{name}: the reason should be given: {out:?}"
+        );
+        assert_eq!(
+            fs::read(&sfile).unwrap(),
+            before,
+            "{name}: s-file untouched"
+        );
+        assert!(
+            pfile.exists() && gfile.exists(),
+            "{name}: the edit is still pending"
+        );
+
+        // Fixed, the same edit goes in.
+        fs::write(&gfile, b"one\ntwo\n").unwrap();
+        let out = super::common::run_in("delta", &["-s", "-yc", &sname], dir, "");
+        assert!(out.status.success(), "{name}: {out:?}");
+    }
+}
+
+/// An encoded s-file holds any bytes: there a missing final newline is kept
+/// exactly, through a delta.
+#[test]
+fn delta_of_an_encoded_file_keeps_a_missing_final_newline() {
+    let tmp = TempDir::new().unwrap();
+    fs::write(tmp.path().join("in"), b"no newline").unwrap();
+    let run = |cmd: &str, args: &[&str]| {
+        let out = super::common::run_in(cmd, args, tmp.path(), "");
+        assert!(out.status.success(), "{cmd} {args:?}: {out:?}");
+        out.stdout
+    };
+    run("admin", &["-iin", "s.enc"]);
+    run("get", &["-e", "-s", "s.enc"]);
+    fs::write(tmp.path().join("enc"), b"still\nno newline").unwrap();
+    run("delta", &["-s", "-yc", "s.enc"]);
+    assert_eq!(run("get", &["-p", "-s", "s.enc"]), b"still\nno newline");
+}
+
+/// delta weaves a change the way SCCS and CSSC lay it out: one delete block
+/// around each run of deleted lines, opened right before the first of them
+/// and closed at the next line the version keeps, and the lines inserted
+/// there in a block of their own just before that line. (It used to wrap
+/// every deleted line in a block of its own.) The body expected here is the
+/// one CSSC writes for the same six steps, byte for byte.
+#[test]
+fn delta_weaves_runs_as_sccs_does() {
+    let tmp = TempDir::new().unwrap();
+    let run = |cmd: &str, args: &[&str], stdin: &str| {
+        let out = super::common::run_in(cmd, args, tmp.path(), stdin);
+        assert!(out.status.success(), "{cmd} {args:?}: {out:?}");
+    };
+    run("admin", &["-i", "-fb", "s.f"], "a\nb\nc\nd\ne\nf\n");
+    let edit = |get_args: &[&str], text: &str, comment: &str| {
+        let mut argv = vec!["-e", "-s"];
+        argv.extend_from_slice(get_args);
+        argv.push("s.f");
+        run("get", &argv, "");
+        fs::write(tmp.path().join("f"), text).unwrap();
+        run("delta", &["-s", &format!("-y{comment}"), "s.f"], "");
+    };
+    edit(&[], "a\nB1\nB2\nc\nd\ne\nf\n", "replace one line with two");
+    edit(&["-r1.1"], "a\nb\nc\nf\n", "delete a run of two");
+    edit(&[], "a\nB1\nc\nd\nX\ne\nf\nZ\n", "delete, insert, append");
+    edit(
+        &["-r1.1.1.1"],
+        "f\n",
+        "delete a run across other deltas' records",
+    );
+    edit(
+        &[],
+        "P\na\nB1\nc\nf\nZ\n",
+        "prepend, and delete across an insert",
+    );
+
+    let data = fs::read(tmp.path().join("s.f")).unwrap();
+    let at = data.windows(3).position(|w| w == b"\x01T\n").unwrap();
+    let body = String::from_utf8_lossy(&data[at + 3..]).replace('\x01', "^A");
+    let cssc = "^AI 1\n^AD 5\n^AI 6\nP\n^AE 6\na\n^AD 2\nb\n^AE 2\n^AI 2\nB1\n^AD 4\nB2\n\
+^AE 2\n^AE 4\nc\n^AD 3\n^AD 6\nd\n^AI 4\nX\n^AE 4\ne\n^AE 3\n^AE 5\n^AE 6\nf\n^AE 1\n\
+^AI 4\nZ\n^AE 4\n";
+    assert_eq!(body, cssc);
+
+    // Every version still reads as it was checked in.
+    for (sid, text) in [
+        ("1.1", "a\nb\nc\nd\ne\nf\n"),
+        ("1.2", "a\nB1\nB2\nc\nd\ne\nf\n"),
+        ("1.1.1.1", "a\nb\nc\nf\n"),
+        ("1.3", "a\nB1\nc\nd\nX\ne\nf\nZ\n"),
+        ("1.1.1.2", "f\n"),
+        ("1.4", "P\na\nB1\nc\nf\nZ\n"),
+    ] {
+        let out = super::common::run_in(
+            "get",
+            &["-p", "-k", "-s", &format!("-r{sid}"), "s.f"],
+            tmp.path(),
+            "",
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), text, "version {sid}");
+    }
+}
+
+/// The MR list and the comment read from standard input end at the first
+/// newline that is not escaped; "the escape character is <backslash>"
+/// (POSIX delta, -m and -y). An escaped newline separates MRs, and in a
+/// comment it begins the next line. Reading one line and no more, as this
+/// did, kept the backslash and took the rest of the reply for the answer to
+/// the next question.
+#[test]
+fn delta_reads_escaped_newlines_in_its_replies() {
+    let tmp = TempDir::new().unwrap();
+    let run =
+        |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, tmp.path(), stdin);
+    assert!(run("admin", &["-i", "-fv", "-mfirst", "s.r"], "one\n")
+        .status
+        .success());
+    assert!(run("get", &["-e", "-s", "s.r"], "").status.success());
+    std::fs::write(tmp.path().join("r"), "two\n").unwrap();
+
+    // MRs first, then the comment; each reply may run over several lines.
+    let out = run(
+        "delta",
+        &["-s", "s.r"],
+        "mr1 mr2\\\nmr3\nwhy: \\ a backslash\\\nand a second line\\\n\nnot read\n",
+    );
+    assert!(out.status.success(), "{out:?}");
+    let out = run("prs", &["-d:MR:|:C:|", "-r1.2", "s.r"], "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "mr1\nmr2\nmr3\n|why: \\ a backslash\nand a second line\n|\n"
+    );
+
+    // A reply cut short by the end of the input is taken as far as it goes.
+    assert!(run("get", &["-e", "-s", "s.r"], "").status.success());
+    std::fs::write(tmp.path().join("r"), "three\n").unwrap();
+    let out = run("delta", &["-s", "-mmr9", "s.r"], "unfinished\\\n");
+    assert!(out.status.success(), "{out:?}");
+    let out = run("prs", &["-d:C:|", "-r1.3", "s.r"], "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "unfinished\n|\n");
+}
+
+/// The comment and the MR list read from standard input are read once, and
+/// are those of every file named: delta of several files asks one question.
+/// It read standard input afresh for each file, so the first got the comment
+/// and the rest got the end of the input, an empty one.
+#[test]
+fn delta_gives_every_file_the_reply_it_read() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    for name in ["a", "b", "c"] {
+        let s = format!("s.{name}");
+        assert!(run("admin", &["-i", "-fv", "-mfirst", &s], "one\n")
+            .status
+            .success());
+        assert!(run("get", &["-e", "-s", &s], "").status.success());
+        std::fs::write(dir.join(name), "two\n").unwrap();
+    }
+    let out = run("delta", &["-s", "s.a", "s.b", "s.c"], "mr7\nthe comment\n");
+    assert!(out.status.success(), "{out:?}");
+    for name in ["a", "b", "c"] {
+        let out = run("prs", &["-d:MR:|:C:|", "-r1.2", &format!("s.{name}")], "");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "mr7\n|the comment\n|\n",
+            "s.{name}"
+        );
+    }
+}
+
+/// A delta is made once. Should the p-file still hold an edit whose delta
+/// is already in the s-file -- delta stopped between writing the one and
+/// the other -- running delta again does not make a second delta with the
+/// same SID; it did, and the file then had two live deltas named 1.2.
+#[test]
+fn delta_does_not_make_a_sid_twice() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    assert!(run("admin", &["-i", "s.d"], "one\n").status.success());
+    assert!(run("get", &["-e", "-s", "s.d"], "").status.success());
+    let pending = fs::read(dir.join("p.d")).unwrap();
+    fs::write(dir.join("d"), "two\n").unwrap();
+    assert!(run("delta", &["-s", "-n", "-yc", "s.d"], "")
+        .status
+        .success());
+
+    // As if the p-file had not been updated.
+    fs::write(dir.join("p.d"), &pending).unwrap();
+    let out = run("delta", &["-s", "-yagain", "s.d"], "");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("1.2"),
+        "{out:?}"
+    );
+    let out = run("prs", &["-e", "-d:I:", "s.d"], "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1.2\n1.1\n");
+}
+
+/// With several edits of one delta pending (the `j` flag), the SID they
+/// were made from does not say which is meant: `-r` must name the SID to be
+/// made. The first such edit was taken, whichever one the g-file was.
+#[test]
+fn delta_r_naming_several_edits_is_ambiguous() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    assert!(run("admin", &["-i", "-fj", "s.a"], "one\n")
+        .status
+        .success());
+    assert!(run("get", &["-e", "-s", "s.a"], "").status.success());
+    assert!(run("get", &["-e", "-s", "-g", "s.a"], "").status.success());
+    fs::write(dir.join("a"), "two\n").unwrap();
+
+    let out = run("delta", &["-s", "-yc", "-r1.1", "s.a"], "");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(
+        fs::read_to_string(dir.join("p.a")).unwrap().lines().count(),
+        2
+    );
+    // The SID to be made names one edit.
+    let out = run("delta", &["-s", "-yc", "-r1.1.1.1", "s.a"], "");
+    assert!(out.status.success(), "{out:?}");
+    let out = run("prs", &["-e", "-d:I:", "s.a"], "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1.1.1.1\n1.1\n");
+}
+
+/// The `v` flag's program is run as SCCS and CSSC run it: with the name of
+/// the g-file first, and the MR numbers after it. A validator written for
+/// them drops its first argument as the file name; given the MRs alone, it
+/// dropped the first MR, which went in unchecked.
+#[test]
+fn the_mr_validator_is_given_the_file_name_first() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    let checker = dir.join("check");
+    let log = dir.join("log");
+    fs::write(
+        &checker,
+        format!("#!/bin/sh\necho \"$*\" >> {}\nshift\nfor mr; do case $mr in BAD*) exit 1;; esac; done\n", log.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&checker, fs::Permissions::from_mode(0o755)).unwrap();
+    let v = format!("-fv{}", checker.display());
+
+    assert!(run("admin", &["-i", &v, "-mMR1 MR2", "s.v"], "one\n")
+        .status
+        .success());
+    assert!(run("get", &["-e", "-s", "s.v"], "").status.success());
+    fs::write(dir.join("v"), "two\n").unwrap();
+    let out = run("delta", &["-s", "-yc", "-mBAD1 OK2", "s.v"], "");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a bad first MR is caught: {out:?}"
+    );
+    assert!(run("delta", &["-s", "-yc", "-mMR3", "s.v"], "")
+        .status
+        .success());
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        "v MR1 MR2\nv BAD1 OK2\nv MR3\n"
+    );
 }

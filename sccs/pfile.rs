@@ -19,7 +19,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use plib::sccsfile::{paths, PfileEntry, Sid};
+use plib::sccsfile::{paths, PfileEntry};
 
 /// The mode a p-file carries. It records a pending edit for other users to
 /// see, so it is world-readable and owner-writable.
@@ -28,7 +28,7 @@ const PFILE_MODE: u32 = 0o644;
 /// Read the p-file beside `sfile`, or an empty list if there is none.
 pub fn read(sfile: &Path) -> io::Result<Vec<PfileEntry>> {
     let path = paths::pfile_from_sfile(sfile);
-    let contents = match fs::read_to_string(&path) {
+    let contents = match fs::read(&path) {
         Ok(c) => c,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
@@ -43,10 +43,15 @@ pub fn path(sfile: &Path) -> PathBuf {
 }
 
 /// Replace the p-file with `entries`, removing it entirely when none remain.
+/// Only a [`Txn`](crate::txn::Txn), which holds the lock, can do this.
+///
+/// The new p-file is written as the q-file, "a working copy of the p-file"
+/// (POSIX unget 119295-119296), and renamed into place, so the p-file is
+/// never seen half written.
 ///
 /// An empty p-file and an absent one mean different things to `sact` and to
 /// `get -e`, so the empty case must unlink rather than truncate.
-pub fn write(sfile: &Path, entries: &[PfileEntry]) -> io::Result<()> {
+pub(crate) fn write(sfile: &Path, entries: &[PfileEntry]) -> io::Result<()> {
     let path = paths::pfile_from_sfile(sfile);
     if entries.is_empty() {
         return match fs::remove_file(&path) {
@@ -56,25 +61,10 @@ pub fn write(sfile: &Path, entries: &[PfileEntry]) -> io::Result<()> {
         };
     }
 
-    let mut body = String::new();
+    let mut body = Vec::new();
     for e in entries {
-        body.push_str(&e.to_line());
-        body.push('\n');
+        body.extend_from_slice(&e.to_line());
+        body.push(b'\n');
     }
-    crate::sfio::write_replacing(&path, body.as_bytes(), PFILE_MODE)
-}
-
-/// Append one pending-edit record.
-pub fn append(sfile: &Path, entry: &PfileEntry) -> io::Result<()> {
-    let mut entries = read(sfile)?;
-    entries.push(entry.clone());
-    write(sfile, &entries)
-}
-
-/// The entry whose new SID is `new_sid`, if the edit is already pending.
-///
-/// `get -e` uses this to refuse a second edit of the same SID; the `j` flag is
-/// what allows the concurrent case, and it is checked by the caller.
-pub fn find_by_new_sid<'a>(entries: &'a [PfileEntry], new_sid: &Sid) -> Option<&'a PfileEntry> {
-    entries.iter().find(|e| e.new_sid == *new_sid)
+    crate::sfio::write_via(&path, &paths::qfile_from_sfile(sfile), &body, PFILE_MODE)
 }

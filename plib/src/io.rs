@@ -135,8 +135,54 @@ fn parent_of(path: &Path) -> &Path {
 /// on the one directory, whatever happens to its path meanwhile.
 #[cfg(unix)]
 fn write_atomic_with(path: &Path, bytes: &[u8], mode: Option<u32>) -> io::Result<()> {
-    let c_string =
-        |bytes: &[u8]| CString::new(bytes).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL));
+    let (dir, name) = open_parent(path)?;
+
+    // Made in the same directory as `path` so the final rename stays within
+    // one filesystem and is atomic. A file created takes what the kernel gives
+    // `0o666` there; one replaced is held at 0600 until it has its mode.
+    let tmp = TempAt::new(dir.as_fd(), if mode.is_some() { 0o600 } else { 0o666 })?;
+    publish(tmp, &dir, &name, bytes, mode)
+}
+
+/// `write_atomic_mode`, the temporary having the fixed name `temp_name` in
+/// `path`'s directory rather than a fresh one.
+///
+/// For a format that names its temporary, as SCCS names the x-file
+/// `x.<name>` (admin, POSIX 83997-84002). Whatever is at that name is
+/// removed first -- a temporary a crash left behind, or a symlink someone who
+/// can write the directory planted there -- and the temporary is then created
+/// with `O_EXCL|O_NOFOLLOW`, so it is always a new file and never the target
+/// of a link. The caller must hold whatever lock makes the name its own; SCCS
+/// holds the z-file.
+#[cfg(unix)]
+pub fn write_atomic_named(
+    path: &Path,
+    temp_name: &std::ffi::OsStr,
+    bytes: &[u8],
+    mode: u32,
+) -> io::Result<()> {
+    let (dir, name) = open_parent(path)?;
+    let temp = c_string(temp_name.as_bytes())?;
+    if unsafe { libc::unlinkat(dir.as_raw_fd(), temp.as_ptr(), 0) } != 0 {
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::NotFound {
+            return Err(e);
+        }
+    }
+    let tmp = TempAt::named(dir.as_fd(), temp, 0o600)?;
+    publish(tmp, &dir, &name, bytes, Some(mode))
+}
+
+/// `bytes` as a C string, or EINVAL for one holding a NUL.
+#[cfg(unix)]
+fn c_string(bytes: &[u8]) -> io::Result<CString> {
+    CString::new(bytes).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
+}
+
+/// The directory `path` is in, opened for the `*at` calls, and `path`'s name
+/// within it.
+#[cfg(unix)]
+fn open_parent(path: &Path) -> io::Result<(OwnedFd, CString)> {
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
@@ -147,12 +193,19 @@ fn write_atomic_with(path: &Path, bytes: &[u8], mode: Option<u32>) -> io::Result
     if dirfd < 0 {
         return Err(io::Error::last_os_error());
     }
-    let dir = unsafe { OwnedFd::from_raw_fd(dirfd) };
+    Ok((unsafe { OwnedFd::from_raw_fd(dirfd) }, name))
+}
 
-    // Made in the same directory as `path` so the final rename stays within
-    // one filesystem and is atomic. A file created takes what the kernel gives
-    // `0o666` there; one replaced is held at 0600 until it has its mode.
-    let mut tmp = TempAt::new(dir.as_fd(), if mode.is_some() { 0o600 } else { 0o666 })?;
+/// Fill the temporary `tmp` with `bytes`, sync it, give it `mode`, and rename
+/// it over `name` in `dir`.
+#[cfg(unix)]
+fn publish(
+    mut tmp: TempAt<'_>,
+    dir: &OwnedFd,
+    name: &CString,
+    bytes: &[u8],
+    mode: Option<u32>,
+) -> io::Result<()> {
     tmp.file.write_all(bytes)?;
     tmp.file.sync_all()?;
 
@@ -183,31 +236,34 @@ struct TempAt<'a> {
 #[cfg(unix)]
 impl<'a> TempAt<'a> {
     fn new(dir: BorrowedFd<'a>, mode: libc::c_uint) -> io::Result<Self> {
+        for _ in 0..100 {
+            match Self::named(dir, temp_name(), mode) {
+                Err(e) if e.raw_os_error() == Some(libc::EEXIST) => continue,
+                made => return made,
+            }
+        }
+        Err(io::Error::from_raw_os_error(libc::EEXIST))
+    }
+
+    /// The temporary `name`, which must not exist yet.
+    fn named(dir: BorrowedFd<'a>, name: CString, mode: libc::c_uint) -> io::Result<Self> {
         let flags = libc::O_WRONLY
             | libc::O_CREAT
             | libc::O_EXCL
             | libc::O_NOFOLLOW
             | libc::O_NOCTTY
             | libc::O_CLOEXEC;
-        for _ in 0..100 {
-            let name = temp_name();
-            let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags, mode) };
-            if fd >= 0 {
-                let file = unsafe { fs::File::from_raw_fd(fd) };
-                let renamed = false;
-                return Ok(TempAt {
-                    dir,
-                    name,
-                    file,
-                    renamed,
-                });
-            }
-            let e = io::Error::last_os_error();
-            if e.raw_os_error() != Some(libc::EEXIST) {
-                return Err(e);
-            }
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags, mode) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
         }
-        Err(io::Error::from_raw_os_error(libc::EEXIST))
+        let file = unsafe { fs::File::from_raw_fd(fd) };
+        Ok(TempAt {
+            dir,
+            name,
+            file,
+            renamed: false,
+        })
     }
 }
 
@@ -549,6 +605,34 @@ mod tests {
         // A real (non-"-") path that does not exist must surface the open error,
         // not be silently treated as stdin.
         assert!(input_stream_dashed(&path).is_err());
+    }
+
+    /// The named temporary is always a new file: a stale one is replaced, a
+    /// symlink at its name is removed rather than followed, and the result
+    /// has the mode asked for.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_named_never_reuses_what_is_at_the_name() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = crate::tmp::tempdir().unwrap();
+        let path = dir.path().join("s.f");
+        let temp = std::ffi::OsStr::new("x.f");
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"precious").unwrap();
+
+        symlink(&victim, dir.path().join(temp)).unwrap();
+        write_atomic_named(&path, temp, b"one", 0o444).unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"precious");
+        assert_eq!(fs::read(&path).unwrap(), b"one");
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o444);
+        assert!(!dir.path().join(temp).exists(), "the temporary was renamed");
+
+        fs::write(dir.path().join(temp), b"stale").unwrap();
+        write_atomic_named(&path, temp, b"two", 0o640).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"two");
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o640);
     }
 
     #[test]

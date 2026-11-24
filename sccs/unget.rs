@@ -10,14 +10,15 @@
 //! unget - undo a previous get of an SCCS file
 
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
 use gettextrs::gettext;
 use plib::sccsfile::{paths, Sid};
-use posixutils_sccs::{diag, operands, pfile, zlock};
+use posixutils_sccs::txn::{self, Txn};
+use posixutils_sccs::{diag, operands, zlock};
 
 /// unget - undo a previous get of an SCCS file
 #[derive(Parser)]
@@ -47,16 +48,16 @@ fn unget_file(sfile: &Path, args: &Args, show_header: bool) -> io::Result<bool> 
     // it needs the same lock every other mutating utility takes. Without it a
     // concurrent `get -e` appending to the p-file between the read and the
     // write had its edit record silently dropped.
-    let _zlock = match zlock::acquire(sfile) {
-        Ok(z) => z,
-        Err(e) if zlock::is_held(&e) => {
+    let txn = match Txn::begin(sfile) {
+        Ok(txn) => txn,
+        Err(e) if txn::is_locked(&e) => {
             diag::error_path("unget", sfile, &gettext("being edited"));
             return Ok(false);
         }
         Err(e) => return Err(e),
     };
 
-    let mut entries = pfile::read(sfile)?;
+    let mut entries = txn.pending()?;
     if entries.is_empty() {
         diag::error_path(
             "unget",
@@ -66,7 +67,7 @@ fn unget_file(sfile: &Path, args: &Args, show_header: bool) -> io::Result<bool> 
         return Ok(false);
     }
 
-    let current_user = posixutils_sccs::username();
+    let current_user = posixutils_sccs::username()?;
 
     // Find the entry to remove
     let target_sid: Option<Sid> = if let Some(ref sid_str) = args.sid {
@@ -120,10 +121,11 @@ fn unget_file(sfile: &Path, args: &Args, show_header: bool) -> io::Result<bool> 
     // directory or standard input) is named, each SID is preceded by a
     // "\n%s:\n" pathname header.
     if !args.silent {
+        let mut out = io::stdout().lock();
         if show_header {
-            println!("\n{}:", sfile.display());
+            operands::banner(&mut out, sfile)?;
         }
-        println!("{}", entry.new_sid);
+        writeln!(out, "{}", entry.new_sid)?;
     }
 
     // Remove g-file unless -n specified
@@ -138,7 +140,7 @@ fn unget_file(sfile: &Path, args: &Args, show_header: bool) -> io::Result<bool> 
 
     // Update or remove the p-file. An empty p-file and an absent one are
     // different states, so the writer unlinks rather than truncating.
-    pfile::write(sfile, &entries)?;
+    txn.set_pending(&entries)?;
 
     Ok(true)
 }

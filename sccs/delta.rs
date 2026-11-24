@@ -10,34 +10,61 @@
 //! delta - make a delta (change) to an SCCS file
 
 use std::collections::HashSet;
-use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, IsTerminal, Write};
+use std::ffi::OsString;
+use std::fs;
+use std::io::{self, BufRead, IsTerminal, Write};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
 use clap::Parser;
 use gettextrs::gettext;
 use plib::linediff::LineOp;
 use plib::sccsfile::{
-    paths, BodyRecord, DeltaEntry, DeltaStats, DeltaType, PfileEntry, SccsDateTime, SccsFile,
-    SccsFlag, Sid,
+    paths, CommentLine, DeltaEntry, DeltaStats, DeltaType, MrNumber, NotText, PfileEntry,
+    SccsDateTime, SccsFile, SccsFlag, Selection, Sid, SidList, SigintBlock,
 };
-use posixutils_sccs::{diag, mrlist, operands, pfile, protect, sfio, zlock};
+use posixutils_sccs::optscan::{self, Letters};
+use posixutils_sccs::txn::{self, Txn};
+use posixutils_sccs::{diag, mrlist, operands, protect, zlock};
 
 /// True if standard input is a terminal.
 fn stdin_is_tty() -> bool {
     io::stdin().is_terminal()
 }
 
-/// Read a single line from standard input, stripping the trailing newline.
-/// Returns an empty string at EOF.
-fn read_stdin_line() -> String {
-    let mut line = String::new();
-    let _ = io::stdin().lock().read_line(&mut line);
-    while line.ends_with('\n') || line.ends_with('\r') {
-        line.pop();
+/// Read a reply -- an MR list or a comment -- from standard input.
+///
+/// "An unescaped `<newline>` shall terminate" it, and "the escape character
+/// is `<backslash>`" (POSIX delta, -m and -y): a line ending in a backslash
+/// goes on to the next, the backslash dropped and the newline kept, where
+/// it separates two MRs or two lines of a comment. A backslash anywhere
+/// else is itself. The end of the input ends the reply too; nothing read
+/// is an empty reply. The reply is bytes: a comment need not be UTF-8.
+fn read_reply(input: &mut impl BufRead) -> Vec<u8> {
+    let mut reply = Vec::new();
+    loop {
+        let before = reply.len();
+        let _ = input.read_until(b'\n', &mut reply);
+        if reply.len() == before {
+            break; // end of input
+        }
+        if reply.ends_with(b"\\\n") {
+            reply.truncate(reply.len() - 2);
+            reply.push(b'\n');
+            continue;
+        }
+        while reply.ends_with(b"\n") || reply.ends_with(b"\r") {
+            reply.pop();
+        }
+        break;
     }
-    line
+    reply
+}
+
+/// [`read_reply`] from the standard input.
+fn read_stdin_reply() -> Vec<u8> {
+    read_reply(&mut io::stdin().lock())
 }
 
 /// delta - make a delta (change) to an SCCS file
@@ -47,11 +74,13 @@ struct Args {
     #[arg(short = 'r', allow_hyphen_values = true, value_name = "SID", help = gettext("SID of delta to create (if multiple edits pending)"))]
     sid: Option<String>,
 
-    #[arg(short = 'y', value_name = "COMMENT", num_args = 0..=1, default_missing_value = "", help = gettext("Comment for delta"))]
-    comment: Option<String>,
+    /// `-y[comment]`: taken from the command line by [`optscan`], its
+    /// argument being optional and attached. A bare `-y` is an empty comment.
+    #[arg(skip)]
+    comment: Option<OsString>,
 
-    #[arg(short = 'm', value_name = "MRLIST", num_args = 0..=1, default_missing_value = "", help = gettext("Modification request (MR) numbers for delta"))]
-    mrlist: Option<String>,
+    #[arg(short = 'm', allow_hyphen_values = true, value_name = "MRLIST", help = gettext("Modification request (MR) numbers for delta"))]
+    mrlist: Option<OsString>,
 
     #[arg(short = 'g', allow_hyphen_values = true, value_name = "LIST", help = gettext("List of deltas to ignore at this change level"))]
     glist: Option<String>,
@@ -70,8 +99,9 @@ struct Args {
 }
 
 /// Find the p-file entry for this user
-fn find_pfile_entry(sfile_path: &Path, requested_sid: Option<&Sid>) -> io::Result<PfileEntry> {
-    let entries = pfile::read(sfile_path)?;
+fn find_pfile_entry(txn: &Txn, requested_sid: Option<&Sid>) -> io::Result<PfileEntry> {
+    let sfile_path = txn.sfile();
+    let entries = txn.pending()?;
     if entries.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -84,7 +114,7 @@ fn find_pfile_entry(sfile_path: &Path, requested_sid: Option<&Sid>) -> io::Resul
         ));
     }
 
-    let user = posixutils_sccs::username();
+    let user = posixutils_sccs::username()?;
 
     // Filter to this user's entries
     let user_entries: Vec<_> = entries.into_iter().filter(|e| e.user == user).collect();
@@ -96,17 +126,34 @@ fn find_pfile_entry(sfile_path: &Path, requested_sid: Option<&Sid>) -> io::Resul
         ));
     }
 
-    // If SID specified, find matching entry
+    // If SID specified, find matching entry: the edit that will make that
+    // SID, or the one made from it -- if there is one such. With joint
+    // editing several edits may have been made from one delta, and that
+    // delta's SID then does not say which is meant.
     if let Some(sid) = requested_sid {
-        for entry in user_entries {
-            if &entry.new_sid == sid || &entry.old_sid == sid {
-                return Ok(entry);
-            }
+        if let Some(entry) = user_entries.iter().find(|e| &e.new_sid == sid) {
+            return Ok(entry.clone());
         }
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("{} {}", gettext("No edit pending for SID"), sid),
-        ));
+        let mut from: Vec<_> = user_entries
+            .into_iter()
+            .filter(|e| &e.old_sid == sid)
+            .collect();
+        return match from.len() {
+            1 => Ok(from.remove(0)),
+            0 => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} {}", gettext("No edit pending for SID"), sid),
+            )),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} {}{}",
+                    gettext("Several edits of SID"),
+                    sid,
+                    gettext(" are pending; use -r with the SID to be created")
+                ),
+            )),
+        };
     }
 
     // If only one entry, use it
@@ -127,7 +174,7 @@ fn find_pfile_entry(sfile_path: &Path, requested_sid: Option<&Sid>) -> io::Resul
 }
 
 /// Read g-file content
-fn read_gfile(sfile_path: &Path) -> io::Result<Vec<String>> {
+fn read_gfile(sfile_path: &Path) -> io::Result<Vec<u8>> {
     let gfile_path = paths::gfile_from_sfile(sfile_path).ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, gettext("Invalid s-file name"))
     })?;
@@ -144,29 +191,27 @@ fn read_gfile(sfile_path: &Path) -> io::Result<Vec<String>> {
         ));
     }
 
-    let file = File::open(&gfile_path)?;
-    let reader = BufReader::new(file);
-    reader.lines().collect()
+    fs::read(&gfile_path)
 }
 
-/// Read the g-file as the lines to diff against the stored body.
+/// The g-file's content as the lines to diff against the stored body, or
+/// why it cannot be stored.
 ///
 /// An encoded (binary) s-file stores uuencoded text, and `get` writes the
 /// decoded bytes to the g-file, so the two are only comparable after encoding
-/// the g-file back. `delta` never checked `is_encoded()` at all: it read the
-/// raw bytes as UTF-8 lines and diffed them against uuencoded text, so a
-/// binary file could be created and retrieved but never updated -- it failed
-/// with "stream did not contain valid UTF-8".
-fn read_gfile_for(sccs: &SccsFile, sfile_path: &Path) -> io::Result<Vec<String>> {
-    if !sccs.is_encoded() {
-        return read_gfile(sfile_path);
+/// the g-file back; any bytes can be stored that way. A text s-file stores
+/// the lines themselves, and only what `not_storable_as_text` lets through.
+fn gfile_lines(sccs: &SccsFile, content: &[u8]) -> Result<Vec<Vec<u8>>, NotText> {
+    if sccs.is_encoded() {
+        return Ok(plib::sccsfile::uuencode_sccs(content));
     }
-
-    let gfile_path = paths::gfile_from_sfile(sfile_path).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, gettext("Invalid s-file name"))
-    })?;
-    let raw = fs::read(&gfile_path)?;
-    Ok(plib::sccsfile::uuencode_sccs(&raw))
+    match plib::sccsfile::not_storable_as_text(content) {
+        Some(why) => Err(why),
+        None => Ok(plib::sccsfile::split_lines(content)
+            .into_iter()
+            .map(<[u8]>::to_vec)
+            .collect()),
+    }
 }
 
 /// The set of deltas that made up the version `get -e` handed the user.
@@ -182,7 +227,12 @@ fn base_applied_set(
     included: &[u16],
     excluded: &[u16],
 ) -> io::Result<HashSet<u16>> {
-    sccs.applied_set_with(base_serial, included, excluded)
+    let selection = Selection {
+        included,
+        excluded,
+        cutoff: None,
+    };
+    sccs.applied_set(base_serial, &selection)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
 }
 
@@ -190,23 +240,15 @@ fn base_applied_set(
 ///
 /// The list was written by `get -e`, which already validated it, so an
 /// unresolvable token here means the s-file changed underneath the edit.
-fn resolve_pfile_list(
-    sccs: &SccsFile,
-    list: Option<&str>,
-    sfile_path: &Path,
-) -> Result<Vec<u16>, String> {
+fn resolve_pfile_list(sccs: &SccsFile, list: Option<&SidList>) -> Result<Vec<u16>, String> {
     let Some(list) = list else {
         return Ok(Vec::new());
     };
-    let (serials, unresolved) = sccs.resolve_sid_list(list)?;
-    for tok in unresolved {
-        diag::error_path(
-            "delta",
-            sfile_path,
-            &format!("{}: {}", tok, gettext("no such delta")),
-        );
-    }
-    Ok(serials)
+    // Every delta the edit was made with must still be there. With one
+    // gone the text edited is no longer the version the list describes, and
+    // a delta made regardless counted the missing delta's lines as the
+    // user's own.
+    sccs.resolve_sid_list(list.as_str())
 }
 
 /// Diff the base version against the g-file.
@@ -216,7 +258,7 @@ fn resolve_pfile_list(
 /// next matching line lay outside that window, and indexed the new text
 /// unguarded once it had run past the end, panicking on any change that
 /// deleted two or more trailing lines.
-fn compute_diff(base_lines: &[String], new_lines: &[String]) -> (DeltaStats, Vec<LineOp>) {
+fn compute_diff(base_lines: &[Vec<u8>], new_lines: &[Vec<u8>]) -> (DeltaStats, Vec<LineOp>) {
     let ops = plib::linediff::diff(base_lines, new_lines);
 
     let mut stats = DeltaStats::default();
@@ -231,7 +273,18 @@ fn compute_diff(base_lines: &[String], new_lines: &[String]) -> (DeltaStats, Vec
     (stats, ops)
 }
 
-fn print_normal_diff(base_lines: &[String], new_lines: &[String], ops: &[LineOp]) {
+fn print_normal_diff(
+    base_lines: &[Vec<u8>],
+    new_lines: &[Vec<u8>],
+    ops: &[LineOp],
+) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    // One "< " or "> " line: the text as stored, which need not be UTF-8.
+    let line = |out: &mut io::StdoutLock, mark: &[u8], text: &[u8]| -> io::Result<()> {
+        out.write_all(mark)?;
+        out.write_all(text)?;
+        out.write_all(b"\n")
+    };
     // Render a single line-range as "a" or "a,b".
     fn range(start: usize, count: usize) -> String {
         if count == 0 {
@@ -261,13 +314,13 @@ fn print_normal_diff(base_lines: &[String], new_lines: &[String], ops: &[LineOp]
                 // or just deletes, or just inserts.
                 let del_start = bi;
                 let ins_start = ni;
-                let mut dels: Vec<String> = Vec::new();
-                let mut inss: Vec<String> = Vec::new();
+                let mut dels: Vec<&[u8]> = Vec::new();
+                let mut inss: Vec<&[u8]> = Vec::new();
 
                 while k < ops.len() {
                     match &ops[k] {
                         LineOp::Delete => {
-                            dels.push(base_lines[bi].clone());
+                            dels.push(&base_lines[bi]);
                             bi += 1;
                             k += 1;
                         }
@@ -277,7 +330,7 @@ fn print_normal_diff(base_lines: &[String], new_lines: &[String], ops: &[LineOp]
                 while k < ops.len() {
                     match &ops[k] {
                         LineOp::Insert(_) => {
-                            inss.push(new_lines[ni].clone());
+                            inss.push(&new_lines[ni]);
                             ni += 1;
                             k += 1;
                         }
@@ -289,148 +342,64 @@ fn print_normal_diff(base_lines: &[String], new_lines: &[String], ops: &[LineOp]
                 let np = inss.len();
                 if nd > 0 && np > 0 {
                     // Change.
-                    println!("{}c{}", range(del_start + 1, nd), range(ins_start + 1, np));
+                    writeln!(
+                        out,
+                        "{}c{}",
+                        range(del_start + 1, nd),
+                        range(ins_start + 1, np)
+                    )?;
                     for l in &dels {
-                        println!("< {}", l);
+                        line(&mut out, b"< ", l)?;
                     }
-                    println!("---");
+                    writeln!(out, "---")?;
                     for l in &inss {
-                        println!("> {}", l);
+                        line(&mut out, b"> ", l)?;
                     }
                 } else if nd > 0 {
                     // Deletion: lines del_start+1..del_start+nd removed after
                     // new line ins_start.
-                    println!("{}d{}", range(del_start + 1, nd), ins_start);
+                    writeln!(out, "{}d{}", range(del_start + 1, nd), ins_start)?;
                     for l in &dels {
-                        println!("< {}", l);
+                        line(&mut out, b"< ", l)?;
                     }
                 } else if np > 0 {
                     // Addition: lines added after base line del_start.
-                    println!("{}a{}", del_start, range(ins_start + 1, np));
+                    writeln!(out, "{}a{}", del_start, range(ins_start + 1, np))?;
                     for l in &inss {
-                        println!("> {}", l);
+                        line(&mut out, b"> ", l)?;
                     }
                 }
             }
         }
     }
-}
-
-/// Apply diff operations to the SCCS body
-fn apply_diff_to_body(
-    sccs: &SccsFile,
-    applied_set: &HashSet<u16>,
-    new_serial: u16,
-    new_lines: &[String],
-    diff_ops: &[LineOp],
-) -> Vec<BodyRecord> {
-    // First, collect all lines that need to be deleted or kept
-    let mut delete_set = HashSet::new();
-    let mut insert_after: Vec<(usize, Vec<String>)> = Vec::new();
-
-    let mut base_idx = 0;
-    let mut inserts_at_pos: Vec<String> = Vec::new();
-
-    for op in diff_ops {
-        match op {
-            LineOp::Keep => {
-                if !inserts_at_pos.is_empty() {
-                    insert_after.push((base_idx, inserts_at_pos.clone()));
-                    inserts_at_pos.clear();
-                }
-                base_idx += 1;
-            }
-            LineOp::Delete => {
-                delete_set.insert(base_idx);
-                base_idx += 1;
-            }
-            LineOp::Insert(j) => {
-                inserts_at_pos.push(new_lines[*j].clone());
-            }
-        }
-    }
-    // Handle trailing inserts
-    if !inserts_at_pos.is_empty() {
-        insert_after.push((base_idx, inserts_at_pos));
-    }
-
-    // Now rebuild the body with new control records
-    let mut new_body = Vec::new();
-    let mut stack: Vec<(bool, u16)> = Vec::new();
-    let mut current_base_line = 0;
-
-    for record in &sccs.body {
-        match record {
-            BodyRecord::Insert(serial) => {
-                stack.push((true, *serial));
-                new_body.push(record.clone());
-            }
-            BodyRecord::Delete(serial) => {
-                stack.push((false, *serial));
-                new_body.push(record.clone());
-            }
-            BodyRecord::End(_serial) => {
-                stack.pop();
-                new_body.push(record.clone());
-            }
-            BodyRecord::Text(_line) => {
-                let visible = plib::sccsfile::is_line_visible(&stack, applied_set);
-
-                if visible {
-                    // Check for inserts before this position
-                    for (pos, lines) in &insert_after {
-                        if *pos == current_base_line && !lines.is_empty() {
-                            new_body.push(BodyRecord::Insert(new_serial));
-                            for insert_line in lines {
-                                new_body.push(BodyRecord::Text(insert_line.clone()));
-                            }
-                            new_body.push(BodyRecord::End(new_serial));
-                        }
-                    }
-
-                    // Check if this line should be deleted
-                    if delete_set.contains(&current_base_line) {
-                        new_body.push(BodyRecord::Delete(new_serial));
-                        new_body.push(record.clone());
-                        new_body.push(BodyRecord::End(new_serial));
-                    } else {
-                        new_body.push(record.clone());
-                    }
-
-                    current_base_line += 1;
-                } else {
-                    new_body.push(record.clone());
-                }
-            }
-        }
-    }
-
-    // Handle inserts at the end
-    for (pos, lines) in &insert_after {
-        if *pos == current_base_line && !lines.is_empty() {
-            new_body.push(BodyRecord::Insert(new_serial));
-            for line in lines {
-                new_body.push(BodyRecord::Text(line.clone()));
-            }
-            new_body.push(BodyRecord::End(new_serial));
-        }
-    }
-
-    new_body
+    Ok(())
 }
 
 /// Remove entry from p-file
-fn remove_pfile_entry(sfile_path: &Path, entry_to_remove: &PfileEntry) -> io::Result<()> {
-    let remaining: Vec<_> = pfile::read(sfile_path)?
-        .into_iter()
-        .filter(|e| {
-            !(e.old_sid == entry_to_remove.old_sid
-                && e.new_sid == entry_to_remove.new_sid
-                && e.user == entry_to_remove.user)
-        })
-        .collect();
+///
+/// One delta settles one edit: exactly one entry goes, even if a p-file
+/// written by something else holds several alike.
+fn remove_pfile_entry(txn: &Txn, entry_to_remove: &PfileEntry) -> io::Result<()> {
+    let mut remaining = txn.pending()?;
+    let same = |e: &PfileEntry| {
+        e.old_sid == entry_to_remove.old_sid
+            && e.new_sid == entry_to_remove.new_sid
+            && e.user == entry_to_remove.user
+    };
+    if let Some(at) = remaining.iter().position(same) {
+        remaining.remove(at);
+    }
+    txn.set_pending(&remaining)
+}
 
-    pfile::write(sfile_path, &remaining)
+/// What was read from standard input in reply to delta's two questions.
+/// Each is asked once, when a file first needs it, and its reply is every
+/// file's: read again for the next file, the input had nothing left, and
+/// only the first file got the comment.
+#[derive(Default)]
+struct Replies {
+    mrs: Option<OsString>,
+    comment: Option<Vec<u8>>,
 }
 
 /// Determine the MR list for the new delta, honoring the `v` flag.
@@ -446,31 +415,35 @@ fn gather_mrs(
     sccs: &SccsFile,
     sfile_path: &Path,
     stdin_consumed: bool,
-) -> io::Result<Option<Vec<String>>> {
+    replies: &mut Replies,
+) -> io::Result<Option<Vec<MrNumber>>> {
     // Locate the v flag, if any.
-    let v_flag = sccs.header.flags.iter().find_map(|f| match f {
+    let v_flag = sccs.header().flags.iter().find_map(|f| match f {
         SccsFlag::MrValidation(prog) => Some(prog.clone()),
         _ => None,
     });
     let v_set = v_flag.is_some();
 
     // Source the raw MR list: -m argument, else (if v is set) a prompt/stdin.
-    let raw: Option<String> = match &args.mrlist {
+    let raw: Option<OsString> = match &args.mrlist {
         Some(s) => Some(s.clone()),
         None => {
             if v_set && !stdin_consumed {
-                if stdin_is_tty() {
-                    print!("{}", gettext("MRs? "));
-                    io::stdout().flush().ok();
-                }
-                Some(read_stdin_line())
+                let reply = replies.mrs.get_or_insert_with(|| {
+                    if stdin_is_tty() {
+                        print!("{}", gettext("MRs? "));
+                        io::stdout().flush().ok();
+                    }
+                    OsString::from_vec(read_stdin_reply())
+                });
+                Some(reply.clone())
             } else {
                 None
             }
         }
     };
 
-    let mrs: Vec<String> = mrlist::parse(raw.as_deref());
+    let mrs = mrlist::parse(raw.as_deref());
 
     if !v_set {
         // MRs are only meaningful when the v flag is set.
@@ -497,27 +470,8 @@ fn gather_mrs(
 
     // If the v flag names a validation program, run it with the MRs as args.
     if let Some(prog) = v_flag.flatten() {
-        if !prog.is_empty() {
-            match Command::new(&prog).args(&mrs).status() {
-                Ok(status) if status.success() => {}
-                Ok(_) => {
-                    eprintln!(
-                        "delta: {}: {}",
-                        sfile_path.display(),
-                        gettext("MR validation failed.")
-                    );
-                    return Ok(None);
-                }
-                Err(e) => {
-                    eprintln!(
-                        "delta: {}: {}: {}",
-                        sfile_path.display(),
-                        prog,
-                        plib::diag::io_error_text(&e)
-                    );
-                    return Ok(None);
-                }
-            }
+        if !prog.is_empty() && !mrlist::validate("delta", sfile_path, &prog, &mrs) {
+            return Ok(None);
         }
     }
 
@@ -529,24 +483,29 @@ fn gather_mrs(
 /// Uses `-y` if supplied; otherwise prompts on a terminal (or reads stdin
 /// silently when not a terminal). When the operand was `-`, stdin is already
 /// consumed and the comment defaults to empty.
-fn gather_comment(args: &Args, stdin_consumed: bool) -> String {
+fn gather_comment(args: &Args, stdin_consumed: bool, replies: &mut Replies) -> Vec<u8> {
     match &args.comment {
-        Some(c) => c.clone(),
-        None => {
-            if stdin_consumed {
-                String::new()
-            } else {
+        Some(c) => c.as_bytes().to_vec(),
+        None if stdin_consumed => Vec::new(),
+        None => replies
+            .comment
+            .get_or_insert_with(|| {
                 if stdin_is_tty() {
                     print!("{}", gettext("comments? "));
                     io::stdout().flush().ok();
                 }
-                read_stdin_line()
-            }
-        }
+                read_stdin_reply()
+            })
+            .clone(),
     }
 }
 
-fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Result<bool> {
+fn process_file(
+    args: &Args,
+    sfile_path: &Path,
+    stdin_consumed: bool,
+    replies: &mut Replies,
+) -> io::Result<bool> {
     // Validate s-file
     if !paths::is_sfile(sfile_path) {
         eprintln!(
@@ -557,11 +516,11 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
         return Ok(false);
     }
 
-    // Acquire the per-command z-file lock around the s-file rewrite (POSIX
-    // `shall`). If another SCCS command holds it, report and skip.
-    let _zlock = match zlock::acquire(sfile_path) {
-        Ok(z) => z,
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+    // Take the lock before anything of the s-file or p-file is read. If
+    // another SCCS command holds it, report and skip.
+    let txn = match Txn::begin(sfile_path) {
+        Ok(txn) => txn,
+        Err(e) if txn::is_locked(&e) => {
             eprintln!(
                 "delta: {}: {}",
                 sfile_path.display(),
@@ -580,11 +539,9 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
         .transpose()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, gettext("Invalid SID")))?;
 
-    let pfile_entry = find_pfile_entry(sfile_path, requested_sid.as_ref())?;
+    let pfile_entry = find_pfile_entry(&txn, requested_sid.as_ref())?;
 
-    // Parse SCCS file
-    let mut sccs = SccsFile::from_path(sfile_path)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let mut sccs = txn.read()?;
 
     // The user list can be narrowed while an edit is outstanding, so the
     // p-file lock taken by an earlier `get -e` is no evidence of present
@@ -596,9 +553,8 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
     // then made the resulting delta permanently uncommittable, stranding the
     // work behind a p-file lock nothing would clear. CSSC gates the retrieved
     // release too.
-    if let Err(refusal) =
-        protect::check_edit(&sccs, pfile_entry.old_sid.rel, &posixutils_sccs::username())
-    {
+    let user = posixutils_sccs::username()?;
+    if let Err(refusal) = protect::check_edit(&sccs, pfile_entry.old_sid.rel, &user) {
         diag::error_path("delta", sfile_path, &refusal.message());
         return Ok(false);
     }
@@ -609,19 +565,48 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, gettext("Base SID not found")))?;
     let base_serial = base_delta.serial;
 
-    // Read g-file
-    let new_lines = read_gfile_for(&sccs, sfile_path)?;
+    // Read g-file. Input must be a text file (POSIX delta 92274): what a
+    // text s-file cannot hold is refused, as historical SCCS refuses it,
+    // rather than stored as something that reads back differently. The edit
+    // stays pending, to be fixed and retried.
+    let new_lines = match gfile_lines(&sccs, &read_gfile(sfile_path)?) {
+        Ok(lines) => lines,
+        Err(why) => {
+            let reason = match why {
+                NotText::NoFinalNewline => gettext("No newline at end of file"),
+                NotText::Nul => gettext("file contains a NUL character"),
+                NotText::LeadingSoh(line) => format!(
+                    "{} {} {}",
+                    gettext("line"),
+                    line,
+                    gettext("begins with a control character (SOH)")
+                ),
+            };
+            let gfile = paths::gfile_from_sfile(sfile_path).unwrap_or_default();
+            diag::error_path(
+                "delta",
+                sfile_path,
+                &format!(
+                    "{}: {}; {}",
+                    gfile.display(),
+                    reason,
+                    gettext("not a text file, cannot be stored")
+                ),
+            );
+            return Ok(false);
+        }
+    };
 
     // The edit was made against the version `get -e` produced, which means the
     // -i/-x lists it recorded in the p-file, not the plain base.
-    let forced_in = match resolve_pfile_list(&sccs, pfile_entry.included.as_deref(), sfile_path) {
+    let forced_in = match resolve_pfile_list(&sccs, pfile_entry.included.as_ref()) {
         Ok(v) => v,
         Err(e) => {
             diag::error_path("delta", sfile_path, &e);
             return Ok(false);
         }
     };
-    let forced_out = match resolve_pfile_list(&sccs, pfile_entry.excluded.as_deref(), sfile_path) {
+    let forced_out = match resolve_pfile_list(&sccs, pfile_entry.excluded.as_ref()) {
         Ok(v) => v,
         Err(e) => {
             diag::error_path("delta", sfile_path, &e);
@@ -631,34 +616,28 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
 
     // Reconstruct base version
     let applied_set = base_applied_set(&sccs, base_serial, &forced_in, &forced_out)?;
-    let base_lines = sccs.evaluate_body(&applied_set);
+    let base_lines = sccs
+        .evaluate_body(&applied_set)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
     // Compute diff
     let (stats, diff_ops) = compute_diff(&base_lines, &new_lines);
 
     // Gather MRs (honoring the v flag) and the comment. The MR prompt, if any,
     // must precede the comment prompt.
-    let mrs = match gather_mrs(args, &sccs, sfile_path, stdin_consumed)? {
+    let mrs = match gather_mrs(args, &sccs, sfile_path, stdin_consumed, replies)? {
         Some(m) => m,
         None => return Ok(false),
     };
-    let comment = gather_comment(args, stdin_consumed);
+    let comment = gather_comment(args, stdin_consumed, replies);
 
     // Resolve -g list (SIDs, ranges or serial numbers) into serials to ignore.
-    // A malformed range aborts before anything is written: recording the delta
-    // with a silently wrong ignore-list would bake the mistake into history.
+    // A malformed range, or a name that is no delta's, aborts before anything
+    // is written: recording the delta with a silently wrong ignore-list
+    // would bake the mistake into history.
     let ignored = match &args.glist {
         Some(list) => match sccs.resolve_ignore_list(list) {
-            Ok((serials, unresolved)) => {
-                for tok in unresolved {
-                    diag::error_path(
-                        "delta",
-                        sfile_path,
-                        &format!("{}: {}", tok, gettext("no such delta")),
-                    );
-                }
-                serials
-            }
+            Ok(serials) => serials,
             Err(e) => {
                 diag::error_path("delta", sfile_path, &e);
                 return Ok(false);
@@ -670,12 +649,6 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
     // Create new delta entry
     let new_serial = sccs.max_serial() + 1;
     let new_delta = DeltaEntry {
-        delta_type: DeltaType::Normal,
-        sid: pfile_entry.new_sid,
-        datetime: SccsDateTime::now(),
-        user: posixutils_sccs::username(),
-        serial: new_serial,
-        pred_serial: base_serial,
         stats,
         // The forced inclusions and exclusions belong to this delta's
         // provenance: POSIX mandates prs :Dn:/:Dx: report them, and without
@@ -687,8 +660,16 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
         comments: if comment.is_empty() {
             Vec::new()
         } else {
-            vec![comment]
+            CommentLine::lines(&comment)
         },
+        ..DeltaEntry::new(
+            DeltaType::Normal,
+            pfile_entry.new_sid,
+            SccsDateTime::now(),
+            user,
+            new_serial,
+            base_serial,
+        )
     };
 
     // Print info. The new SID is printed first, then (with -p) the diff in
@@ -697,7 +678,7 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
         println!("{}", new_delta.sid);
     }
     if args.print_diff {
-        print_normal_diff(&base_lines, &new_lines, &diff_ops);
+        print_normal_diff(&base_lines, &new_lines, &diff_ops)?;
     }
     if !args.silent {
         println!("{} {}", new_delta.stats.inserted, gettext("inserted"));
@@ -706,23 +687,18 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
     }
 
     // Apply diff to body
-    let new_body = apply_diff_to_body(&sccs, &applied_set, new_serial, &new_lines, &diff_ops);
-    sccs.body = new_body;
+    sccs.add_delta(new_delta, &applied_set, &diff_ops, &new_lines)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
-    // Add new delta to header (at the beginning - deltas are stored newest first)
-    sccs.header.deltas.insert(0, new_delta);
-
-    // Write atomically via the x-file, which is registered for SIGINT cleanup
-    // around the write+rename so an interrupt removes the temporary.
-    sfio::write_xfile_atomic(
-        sfile_path,
-        &paths::xfile_from_sfile(sfile_path),
-        &sccs.to_bytes(),
-        sfio::sfile_perms(sfile_path),
-    )?;
-
-    // Remove p-file entry
-    remove_pfile_entry(sfile_path, &pfile_entry)?;
+    // The s-file first, then the p-file, as SCCS orders them: an edit that
+    // has become a delta must not be left looking pending for want of the
+    // s-file, and the other way round the delta would be lost. An interrupt
+    // waits until both are written: between the two it left the edit
+    // pending beside its own delta. (Were that to happen all the same,
+    // add_delta refuses to make the SID a second time.)
+    let _interrupt_deferred = SigintBlock::begin();
+    txn.write(&sccs)?;
+    remove_pfile_entry(&txn, &pfile_entry)?;
 
     // Remove g-file (unless -n)
     if !args.keep_gfile {
@@ -739,7 +715,14 @@ fn main() -> ExitCode {
 
     zlock::install_cleanup();
 
-    let args = plib::optarg::parse::<Args>();
+    // -y takes an optional argument, attached: the word after a bare -y is
+    // an operand. clap cannot say so, and had it swallow that word.
+    let (attached, rest) = optscan::scan(std::env::args_os(), Letters::of("delta"));
+    let mut args =
+        plib::optarg::parse_from::<Args>(plib::optarg::keep_leading_equals::<Args>(rest));
+    args.comment = attached
+        .get(b'y')
+        .map(|value| value.unwrap_or_default().to_owned());
 
     // When the single operand is '-', the spec requires the comment to be
     // supplied via -y (and the MR list via -m if the v flag is set), since
@@ -758,9 +741,10 @@ fn main() -> ExitCode {
     let files = operands::expand(&args.files);
 
     let mut exit_code = ExitCode::SUCCESS;
+    let mut replies = Replies::default();
 
     for file_path in &files {
-        match process_file(&args, file_path, stdin_consumed) {
+        match process_file(&args, file_path, stdin_consumed, &mut replies) {
             Ok(true) => {}
             Ok(false) => exit_code = ExitCode::FAILURE,
             Err(e) => {

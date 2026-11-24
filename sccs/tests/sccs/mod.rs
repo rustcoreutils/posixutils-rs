@@ -468,7 +468,9 @@ fn sccs_keeps_a_detached_option_argument_out_of_the_file_list() {
     );
 }
 
-/// The same shape with a comment that looks nothing like a filename.
+/// The same shape beside a comment that looks nothing like a filename. The
+/// comment is attached to its `-y`, as delta takes it; `-r`'s argument is the
+/// detached one.
 #[test]
 fn sccs_keeps_a_detached_comment_out_of_the_file_list() {
     let tmp = TempDir::new().unwrap();
@@ -484,7 +486,7 @@ fn sccs_keeps_a_detached_comment_out_of_the_file_list() {
 
     let out = run(
         "sccs",
-        &["delta", "-y", "some comment", "c.txt"],
+        &["delta", "-ysome comment", "-r", "1.2", "c.txt"],
         tmp.path(),
         "",
     );
@@ -546,7 +548,10 @@ fn sccs_info_reports_a_pfile_line_without_a_time_field() {
     // What a p-file written by an older SCCS looks like: no time.
     std::fs::write(
         tmp.path().join("SCCS/p.t.txt"),
-        format!("1.1 1.2 {} 26/08/28\n", plib::sccsfile::real_login_name()),
+        format!(
+            "1.1 1.2 {} 26/08/28\n",
+            plib::sccsfile::real_login_name().unwrap()
+        ),
     )
     .unwrap();
 
@@ -653,8 +658,8 @@ fn sccs_create_puts_the_sfile_in_the_sccs_directory() {
 /// option-argument must follow its option rather than being copied into both
 /// phases as a file operand.
 ///
-/// `sccs delget -y c1 g` committed the delta and then ran the get phase on a
-/// nonexistent SCCS/s.c1, exiting 1 -- the same invented-operand failure the
+/// `sccs delget -r 1.2 g` committed the delta and then ran the get phase on a
+/// nonexistent SCCS/s.1.2, exiting 1 -- the same invented-operand failure the
 /// plain subcommands were fixed for.
 #[test]
 fn sccs_delget_keeps_a_detached_option_argument_out_of_the_file_list() {
@@ -669,10 +674,15 @@ fn sccs_delget_keeps_a_detached_option_argument_out_of_the_file_list() {
     );
     std::fs::write(tmp.path().join("dg.txt"), "one\ntwo\n").unwrap();
 
-    let out = run("sccs", &["delget", "-y", "c1", "dg.txt"], tmp.path(), "");
+    let out = run(
+        "sccs",
+        &["delget", "-yc1", "-r", "1.2", "dg.txt"],
+        tmp.path(),
+        "",
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        !stderr.contains("s.c1"),
+        !stderr.contains("s.1.2"),
         "the option-argument must not become an operand: {stderr}"
     );
     assert!(out.status.success(), "sccs delget failed: {stderr}");
@@ -686,8 +696,68 @@ fn sccs_delget_keeps_a_detached_option_argument_out_of_the_file_list() {
     );
 }
 
-// An argument that is not valid UTF-8 is reported, not a panic.
+/// A p-file that cannot be read says an edit may be pending; it does not say
+/// none is. `sccs clean` took an unreadable p-file for "not being edited"
+/// and removed the working file, with the work in it; `sccs check` reported
+/// nothing being edited.
 #[test]
-fn sccs_non_utf8_argument_is_reported() {
-    plib::testing::assert_non_utf8_argument_rejected("sccs", &["get"]);
+fn sccs_treats_an_unreadable_pfile_as_an_edit() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    setup_project(&tmp, "g", "one\n");
+    assert!(run("sccs", &["edit", "g"], dir, "").status.success());
+    std::fs::write(dir.join("g"), "work in progress\n").unwrap();
+    // Damage the p-file's line: a list that is no list.
+    let pfile = dir.join("SCCS/p.g");
+    let line = std::fs::read_to_string(&pfile).unwrap();
+    std::fs::write(&pfile, format!("{} -xHEAD\n", line.trim_end())).unwrap();
+
+    for command in ["check", "clean", "info", "tell"] {
+        let out = run("sccs", &[command], dir, "");
+        assert_eq!(out.status.code(), Some(1), "sccs {command}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("p.g"),
+            "sccs {command} names the p-file: {out:?}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.join("g")).unwrap(),
+        "work in progress\n",
+        "clean keeps a file that may be being edited"
+    );
+}
+
+/// `-b` ignores branches: "to get a list of files being edited that are not
+/// on branches: sccs info -b" (POSIX sccs, EXAMPLES). It listed the edits on
+/// branches and ignored the others.
+#[test]
+fn sccs_b_ignores_edits_on_branches() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    setup_project(&tmp, "trunk", "one\n");
+    setup_project(&tmp, "branch", "one\n");
+    assert!(run("admin", &["-fb", "SCCS/s.branch"], dir, "")
+        .status
+        .success());
+    assert!(run("sccs", &["edit", "trunk"], dir, "").status.success());
+    assert!(run("sccs", &["edit", "-b", "branch"], dir, "")
+        .status
+        .success());
+
+    let tell = |args: &[&str]| {
+        let out = run("sccs", args, dir, "");
+        let mut names: Vec<String> = String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(tell(&["tell"]), ["branch", "trunk"]);
+    assert_eq!(tell(&["tell", "-b"]), ["trunk"]);
+
+    // clean -b: the branch edit does not count, so its working file goes.
+    assert!(run("sccs", &["clean", "-b"], dir, "").status.success());
+    assert!(dir.join("trunk").exists() && !dir.join("branch").exists());
 }

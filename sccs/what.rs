@@ -9,6 +9,7 @@
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
@@ -130,7 +131,9 @@ fn main() {
         match File::open(path) {
             Ok(f) => {
                 // Print the pathname first per POSIX format.
-                let result = writeln!(out, "{}:", file.display())
+                // The pathname as it is, in bytes.
+                let result = out
+                    .write_all(&[file.as_os_str().as_bytes(), b":\n"].concat())
                     .map_err(Failure::Output)
                     .and_then(|()| process_file(BufReader::new(f), args.single, &mut out));
                 match result {

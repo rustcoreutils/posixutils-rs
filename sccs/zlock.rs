@@ -30,14 +30,14 @@ pub fn install_cleanup() {
 }
 
 /// Whether an error from [`acquire`] means another command holds the lock.
-pub fn is_held(e: &io::Error) -> bool {
+pub(crate) fn is_held(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::AlreadyExists
 }
 
 /// Take the per-command z-file lock, mapping the "already locked" case to a
 /// clear diagnostic so callers report that the s-file is being edited rather
 /// than a raw "File exists".
-pub fn acquire(sfile: &Path) -> io::Result<ZLock> {
+pub(crate) fn acquire(sfile: &Path) -> io::Result<ZLock> {
     ZLock::acquire(sfile).map_err(|e| {
         if e.kind() == io::ErrorKind::AlreadyExists {
             // Localized here rather than at the call sites: `admin` propagates

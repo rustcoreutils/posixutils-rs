@@ -721,3 +721,127 @@ fn option_argument_may_begin_with_hyphen() {
         plib::testing::assert_hyphen_option_argument("prs", &[opt, "-zq", "--help"]);
     }
 }
+
+/// `:GB:` is the gotten body: the delta's text as `get` retrieves it, its
+/// identification keywords expanded, and written byte for byte even where it
+/// is not UTF-8. Like every multi-line keyword ending the dataspec, it is
+/// followed by a blank line. (CSSC prints the same.)
+#[test]
+fn prs_gotten_body_is_byte_exact() {
+    let tmp = TempDir::new().unwrap();
+    super::common::write_sfile(tmp.path(), "s.l1", super::common::LATIN1_SFILE);
+    let out = run_in("prs", &["-d:GB:", "s.l1"], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(out.stdout, b"caf\xe9 1.1\nline2\n\n");
+}
+
+/// Keywords that print what the s-file stores print it byte for byte.
+#[test]
+fn prs_prints_stored_text_byte_exact() {
+    let tmp = TempDir::new().unwrap();
+    super::common::write_sfile(tmp.path(), "s.l1", super::common::LATIN1_SFILE);
+    let out = run_in("prs", &["-d:C:|:Q:|:FD:", "s.l1"], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(out.stdout, b"caf\xe9 comment\n|caf\xe9|\xe9t\xe9\n\n");
+}
+
+/// `:Dt:` names the delta's author: the composite is built from the same
+/// stored login `:P:` prints.
+#[test]
+fn prs_delta_table_line_names_the_author() {
+    let tmp = TempDir::new().unwrap();
+    super::common::write_sfile(tmp.path(), "s.l1", super::common::LATIN1_SFILE);
+    let out = run_in("prs", &["-d:Dt:", "s.l1"], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "D 1.1 26/01/01 00:00:00 u 1 0\n"
+    );
+}
+
+/// The releases of the `l` flag are stored separated by blanks by SCCS and
+/// CSSC (`^Af l 3 4`) and by commas by us; both are read. Only commas
+/// were, and a file with the other form could not be read by any utility:
+/// one flag line took the whole file with it.
+#[test]
+fn the_l_flag_is_read_with_blanks_or_commas() {
+    let tmp = TempDir::new().unwrap();
+    for (name, flag) in [
+        ("s.blank", "l 3 4"),
+        ("s.comma", "l 3,4"),
+        ("s.both", "l 3, 4"),
+    ] {
+        let content = String::from_utf8(super::common::THREE_DELTAS.to_vec())
+            .unwrap()
+            .replace("\x01U\n", &format!("\x01U\n\x01f {flag}\n"));
+        super::common::write_sfile(
+            tmp.path(),
+            name,
+            format!("{content}\x01I 1\none\n\x01E 1\n").as_bytes(),
+        );
+        let out = super::common::run_in("prs", &["-d:LK:", name], tmp.path(), "");
+        assert!(out.status.success(), "{name}: {out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "3,4\n", "{name}");
+        let out = super::common::run_in("val", &[name], tmp.path(), "");
+        assert_eq!(out.status.code(), Some(0), "{name}: {out:?}");
+    }
+}
+
+/// Deltas in order of creation: 1.1, 1.1.1.1, 1.2, 1.1.1.2.
+fn branchy(dir: &std::path::Path) {
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    assert!(run("admin", &["-i", "-fb", "s.o"], "1.1\n")
+        .status
+        .success());
+    for (args, text) in [
+        (&["-r1.1", "-b"][..], "1.1.1.1"),
+        (&["-r1.1"], "1.2"),
+        (&["-r1.1.1.1"], "1.1.1.2"),
+    ] {
+        let args = [&["-e", "-s"], args, &["s.o"]].concat();
+        assert!(run("get", &args, "").status.success(), "{args:?}");
+        std::fs::write(dir.join("o"), format!("{text}\n")).unwrap();
+        assert!(run("delta", &["-s", "-yc", "s.o"], "").status.success());
+    }
+}
+
+/// `-e` and `-l` select the deltas "created earlier than and including" and
+/// "created later than and including" the one `-r` names (POSIX prs): by
+/// when they were made. They compared SIDs, which puts a branch delta made
+/// last before a trunk delta made earlier.
+#[test]
+fn prs_e_and_l_go_by_order_of_creation() {
+    let tmp = TempDir::new().unwrap();
+    branchy(tmp.path());
+    let ids = |args: &[&str]| {
+        let args = [args, &["-d:I:", "s.o"]].concat();
+        let out = super::common::run_in("prs", &args, tmp.path(), "");
+        String::from_utf8(out.stdout).unwrap().replace('\n', " ")
+    };
+    assert_eq!(ids(&["-e", "-r1.2"]), "1.2 1.1.1.1 1.1 ");
+    assert_eq!(ids(&["-l", "-r1.2"]), "1.1.1.2 1.2 ");
+    assert_eq!(ids(&["-l", "-r1.1.1.1"]), "1.1.1.2 1.2 1.1.1.1 ");
+    assert_eq!(ids(&["-e", "-r1.1.1.1"]), "1.1.1.1 1.1 ");
+}
+
+/// `-r` with no SID is "the most recently created delta" (POSIX prs), which
+/// need not be on the trunk. It was taken for the newest trunk delta.
+#[test]
+fn prs_r_alone_is_the_most_recently_created_delta() {
+    let tmp = TempDir::new().unwrap();
+    branchy(tmp.path());
+    let out = super::common::run_in("prs", &["-r", "-d:I:", "s.o"], tmp.path(), "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1.1.1.2\n");
+}
+
+/// `:BD:` is the body of the s-file as it is stored (POSIX prs, Data
+/// Keywords): the text of every version, with the records that mark who
+/// inserted and deleted it. It was not a keyword, and printed as itself.
+#[test]
+fn prs_bd_is_the_stored_body() {
+    let tmp = TempDir::new().unwrap();
+    let body = b"\x01I 1\none\n\x01D 2\ntwo\n\x01E 2\n\x01I 2\n2\n\x01E 2\n\x01E 1\n";
+    super::common::write_weave(tmp.path(), "s.bd", body);
+    let out = super::common::run_in("prs", &["-d:BD:", "-r1.3", "s.bd"], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(out.stdout, [&body[..], b"\n"].concat());
+}

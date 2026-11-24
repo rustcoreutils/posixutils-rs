@@ -497,3 +497,121 @@ fn help_write_error_on_full_device() {
         plib::testing::assert_write_error_message_on_full_device(cmd, &[opt], b"", 1);
     }
 }
+
+/// A file holding bytes above 0x7f validates whether its checksum is the
+/// signed sum CSSC and historical SCCS write or the unsigned sum earlier
+/// versions of these utilities wrote; and what admin writes is the signed one,
+/// so CSSC accepts it too.
+#[test]
+fn val_accepts_the_signed_and_unsigned_checksum() {
+    let tmp = TempDir::new().unwrap();
+    let content = super::common::LATIN1_SFILE;
+    let unsigned = content.iter().fold(0u16, |s, &b| s.wrapping_add(b as u16));
+    let signed = content
+        .iter()
+        .fold(0u16, |s, &b| s.wrapping_add(b as i8 as i16 as u16));
+    for sum in [signed, unsigned] {
+        let mut data = format!("\x01h{:05}\n", sum).into_bytes();
+        data.extend_from_slice(content);
+        fs::write(tmp.path().join("s.l1"), &data).unwrap();
+        let out = super::common::run_in("val", &["s.l1"], tmp.path(), "");
+        assert_eq!(out.status.code(), Some(0), "sum {sum}: {out:?}");
+        let out = super::common::run_in("admin", &["-h", "s.l1"], tmp.path(), "");
+        assert_eq!(out.status.code(), Some(0), "sum {sum}: {out:?}");
+    }
+
+    let out = super::common::run_in("admin", &["-z", "s.l1"], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    let data = fs::read(tmp.path().join("s.l1")).unwrap();
+    assert!(
+        data.starts_with(format!("\x01h{:05}\n", signed).as_bytes()),
+        "admin must write the signed sum"
+    );
+}
+
+/// Every command that reads an s-file checks its checksum first and refuses
+/// a file that fails it, as SCCS does ("Corrupted file"). Only `admin -z`,
+/// whose job is to set the checksum, reads past it. Before, only val and
+/// admin -h looked: get returned text from a damaged file, and an edit by
+/// admin, delta or rmdel gave it a fresh, valid checksum.
+#[test]
+fn a_bad_checksum_is_refused_by_every_reader() {
+    let tmp = TempDir::new().unwrap();
+    let s = create_sccs_file(&tmp, "sum", "one %I%\n");
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str]| super::common::run_in(cmd, args, dir, "");
+
+    // An edit is pending, so that delta has something to do.
+    assert!(run("get", &["-e", "-s", "s.sum"]).status.success());
+    fs::write(dir.join("sum"), b"two\n").unwrap();
+
+    // Damage the body without touching the checksum line.
+    let mut data = fs::read(&s).unwrap();
+    let at = data.windows(3).position(|w| w == b"one").unwrap();
+    data[at..at + 3].copy_from_slice(b"ONE");
+    let mut perms = fs::metadata(&s).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    fs::set_permissions(&s, perms).unwrap();
+    fs::write(&s, &data).unwrap();
+
+    for (cmd, args) in [
+        ("get", &["-p", "-s", "s.sum"][..]),
+        ("prs", &["s.sum"]),
+        ("delta", &["-s", "-yc", "s.sum"]),
+        ("rmdel", &["-r1.1", "s.sum"]),
+        ("admin", &["-fb", "s.sum"]),
+        ("admin", &["-h", "s.sum"]),
+    ] {
+        let out = run(cmd, args);
+        assert_eq!(out.status.code(), Some(1), "{cmd} {args:?}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr)
+                .to_lowercase()
+                .contains("checksum"),
+            "{cmd} {args:?} should name the checksum: {out:?}"
+        );
+        assert_eq!(fs::read(&s).unwrap(), data, "{cmd} {args:?} wrote the file");
+    }
+    assert_eq!(run("val", &["s.sum"]).status.code(), Some(0x20));
+    assert!(dir.join("p.sum").exists(), "the pending edit is untouched");
+
+    // admin -z is the repair; after it everything reads the file again.
+    assert!(run("admin", &["-z", "s.sum"]).status.success());
+    let out = run("get", &["-p", "-k", "-s", "s.sum"]);
+    assert_eq!(out.stdout, b"ONE %I%\n");
+    assert!(run("delta", &["-s", "-yc", "s.sum"]).status.success());
+}
+
+/// A delta's predecessor is an older delta: its serial is smaller. A file
+/// that says otherwise is corrupt, and is refused by every command when it
+/// is read. Nothing checked, so a table whose predecessors formed a cycle
+/// passed `val` and `admin -h`, and `get -i`/`-x`, which follow predecessors,
+/// never returned.
+#[test]
+fn a_predecessor_that_is_not_older_is_corruption() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    // 1.2 (serial 2) names serial 3 as its predecessor: 2 -> 3 -> 2.
+    let table = String::from_utf8(super::common::THREE_DELTAS.to_vec())
+        .unwrap()
+        .replace("26/01/02 00:00:00 u 2 1", "26/01/02 00:00:00 u 2 3");
+    let body = "\x01I 1\none\n\x01E 1\n";
+    super::common::write_sfile(dir, "s.cyc", format!("{table}{body}").as_bytes());
+    let run = |cmd: &str, args: &[&str]| super::common::run_in(cmd, args, dir, "");
+
+    assert_eq!(run("val", &["s.cyc"]).status.code(), Some(0x20));
+    for (cmd, args) in [
+        ("admin", &["-h", "s.cyc"][..]),
+        ("get", &["-p", "-s", "-i1.1-1.3", "s.cyc"]),
+        ("get", &["-p", "-s", "-x1.1", "s.cyc"]),
+        ("prs", &["s.cyc"]),
+    ] {
+        let out = run(cmd, args);
+        assert_eq!(out.status.code(), Some(1), "{cmd} {args:?}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("predecessor"),
+            "{cmd} {args:?}: {out:?}"
+        );
+    }
+}

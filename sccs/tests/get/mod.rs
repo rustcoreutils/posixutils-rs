@@ -435,29 +435,28 @@ fn get_cutoff_invalid_field_rejected() {
 
 #[test]
 fn get_lfile_to_stdout() {
-    // -L writes the delta summary table to standard output.
-    let fixture = fixture_path("s.multi");
-    let plan = TestPlan {
-        cmd: String::from("get"),
-        args: vec!["-L".into(), fixture.to_string_lossy().into()],
-        stdin_data: String::new(),
-        expected_out: String::new(),
-        expected_err: String::new(),
-        expected_exit_code: 0,
-    };
-    run_test_with_checker(plan, |_plan: &TestPlan, output: &Output| {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        // Status line: three status columns, a space, the SID, a tab, then
-        // date-time and login.
-        assert!(
-            stdout.contains("    1.3\t25/12/12 22:25:05 jgarzik\n"),
-            "l-file summary line mismatch, got: {stdout}"
-        );
-        assert!(
-            stdout.contains("\tmodified line2\n"),
-            "l-file comment line missing, got: {stdout}"
-        );
-    });
+    // -L writes the delta summary table to standard output. The g-file is
+    // still retrieved, so the fixture is read from a temporary directory:
+    // run beside the fixture, the g-file landed in the source tree.
+    let tmp = TempDir::new().unwrap();
+    std::fs::copy(fixture_path("s.multi"), tmp.path().join("s.multi")).unwrap();
+    let out = super::common::run_in("get", &["-L", "s.multi"], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Status line: three status columns, a space, the SID, a tab, then
+    // date-time and login.
+    assert!(
+        stdout.contains("    1.3\t25/12/12 22:25:05 jgarzik\n"),
+        "l-file summary line mismatch, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("\tmodified line2\n"),
+        "l-file comment line missing, got: {stdout}"
+    );
+    assert!(
+        tmp.path().join("multi").exists(),
+        "the g-file is retrieved too"
+    );
 }
 
 #[test]
@@ -1296,7 +1295,7 @@ fn get_e_refuses_a_user_not_on_the_authorized_list() {
 fn get_e_refuses_a_user_denied_with_a_bang() {
     let tmp = TempDir::new().unwrap();
     let sfile = three_delta_file(tmp.path(), "bang");
-    let me = plib::sccsfile::real_login_name();
+    let me = plib::sccsfile::real_login_name().unwrap();
 
     let out = super::common::run_in("admin", &[&format!("-a!{me}"), &sfile], tmp.path(), "");
     assert!(out.status.success());
@@ -1315,7 +1314,7 @@ fn get_e_refuses_a_user_denied_with_a_bang() {
 #[test]
 fn get_e_allows_a_listed_user_and_a_listed_group() {
     let tmp = TempDir::new().unwrap();
-    let me = plib::sccsfile::real_login_name();
+    let me = plib::sccsfile::real_login_name().unwrap();
 
     let sfile = three_delta_file(tmp.path(), "byname");
     let out = super::common::run_in("admin", &[&format!("-a{me}"), &sfile], tmp.path(), "");
@@ -1344,19 +1343,16 @@ fn get_e_allows_a_listed_user_and_a_listed_group() {
 /// Sharing one list resolver between `get -i`/`-x` and `delta -g` brought
 /// delta's historical bare-serial convenience with it, so `get -x2` silently
 /// excluded delta 1.2 -- serial 2 -- and handed back a different version than
-/// the user asked for, with no diagnostic. CSSC treats `-x2` as naming no
-/// delta.
+/// the user asked for, with no diagnostic. `-x2` names no delta, and a list
+/// that names no delta is refused.
 #[test]
 fn get_x_with_a_bare_number_names_a_sid_not_a_serial() {
     let tmp = TempDir::new().unwrap();
     let sfile = three_delta_file(tmp.path(), "bare");
 
     let out = super::common::run_in("get", &["-p", "-s", "-x2", &sfile], tmp.path(), "");
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
-        "a\nb\nc\n",
-        "-x2 names no delta, so nothing is excluded"
-    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.stdout.is_empty(), "-x2 names no delta: {out:?}");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("no such delta"),
         "an unresolvable token must be diagnosed, got {:?}",
@@ -1471,4 +1467,629 @@ fn missing_sccs_file_names_the_system_error() {
         String::from_utf8_lossy(&out.stderr),
         format!("get: {sfile}: I/O error: {reason}\n")
     );
+}
+
+/// A body line ending in CR (a CRLF text file under SCCS) is retrieved with
+/// its CR: the line ends at the newline, and the CR before it is text.
+#[test]
+fn get_keeps_carriage_returns() {
+    let tmp = TempDir::new().unwrap();
+    super::common::write_sfile(
+        tmp.path(),
+        "s.crlf",
+        b"\x01s 00002/00000/00000\n\x01d D 1.1 26/01/01 00:00:00 u 1 0\n\x01e\n\
+\x01u\n\x01U\n\x01t\n\x01T\n\x01I 1\na %I%\r\nb\r\n\x01E 1\n",
+    );
+    let out = super::common::run_in("get", &["-p", "-k", "-s", "s.crlf"], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(out.stdout, b"a %I%\r\nb\r\n");
+}
+
+/// A body line that is not UTF-8 is retrieved byte for byte, keywords and
+/// all.
+#[test]
+fn get_retrieves_non_utf8_text() {
+    let tmp = TempDir::new().unwrap();
+    super::common::write_sfile(tmp.path(), "s.l1", super::common::LATIN1_SFILE);
+    let out = super::common::run_in("get", &["-p", "-s", "s.l1"], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(out.stdout, b"caf\xe9 1.1\nline2\n");
+}
+
+/// Keywords expand in one pass: a keyword's value is not itself expanded,
+/// so an `m` flag of `mod%R%` yields `mod%R%` for `%M%`, as CSSC writes it.
+#[test]
+fn get_expands_keywords_in_one_pass() {
+    let tmp = TempDir::new().unwrap();
+    let out = super::common::run_in(
+        "admin",
+        &["-i", "-fmmod%R%", "-fq%I%", "s.kw"],
+        tmp.path(),
+        "m=%M% q=%Q% w=%W%\n",
+    );
+    assert!(out.status.success(), "{out:?}");
+    let out = super::common::run_in("get", &["-p", "-s", "s.kw"], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "m=mod%R% q=%I% w=@(#)mod%R%\t1.1\n"
+    );
+}
+
+/// Blocks in an s-file need not nest: a delete may open in one delta's
+/// insert and end in another's, and `^AE n` ends block n, not whichever block
+/// opened last. Every version of such a file -- CSSC writes them -- is
+/// retrieved as it was stored.
+#[test]
+fn get_reads_overlapping_blocks() {
+    let tmp = TempDir::new().unwrap();
+    super::common::write_sfile(tmp.path(), "s.o", super::common::OVERLAP_SFILE);
+    for (rev, want) in [
+        ("-r1.1", "a\nb\n"),
+        ("-r1.2", "a\nb\nc\nd\n"),
+        ("-r1.3", "a\nd\n"),
+    ] {
+        let out = super::common::run_in("get", &["-p", "-k", "-s", rev, "s.o"], tmp.path(), "");
+        assert!(out.status.success(), "{rev}: {out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), want, "get {rev}");
+    }
+    // -m names the delta that inserted each line.
+    let out = super::common::run_in(
+        "get",
+        &["-p", "-k", "-s", "-m", "-r1.2", "s.o"],
+        tmp.path(),
+        "",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1.1\ta\n1.1\tb\n1.2\tc\n1.2\td\n"
+    );
+    let out = super::common::run_in("val", &["s.o"], tmp.path(), "");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+}
+
+/// Of the blocks open around a line, the one with the highest serial that
+/// has a say decides whether the line is in the version: an applied insert
+/// keeps it, an insert not applied or an applied delete drops it, and a
+/// delete not applied has no say. That is historical SCCS's rule, and
+/// CSSC's; ours was "every open insert applied and no open delete applied",
+/// which gives another answer as soon as blocks of several deltas are open
+/// at once. The expected text and inserting SIDs are CSSC's.
+#[test]
+fn get_keeps_a_line_by_the_newest_open_block() {
+    let tmp = TempDir::new().unwrap();
+    let get = |file: &str, args: &[&str]| -> String {
+        let mut argv = vec!["-p", "-k", "-s"];
+        argv.extend_from_slice(args);
+        argv.push(file);
+        let out = super::common::run_in("get", &argv, tmp.path(), "");
+        assert!(out.status.success(), "get {args:?} {file}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).replace('\n', ",")
+    };
+
+    // Delta 3 inserted a line inside a block delta 2 deleted.
+    super::common::write_weave(
+        tmp.path(),
+        "s.b",
+        b"\x01I 1\na\n\x01D 2\nb\n\x01I 3\nc\n\x01E 3\nd\n\x01E 2\ne\n\x01E 1\n",
+    );
+    assert_eq!(get("s.b", &["-r1.3"]), "a,c,e,");
+    assert_eq!(get("s.b", &["-r1.3", "-m"]), "1.1\ta,1.3\tc,1.1\te,");
+    assert_eq!(get("s.b", &["-r1.2"]), "a,e,");
+    assert_eq!(get("s.b", &["-r1.3", "-x1.2"]), "a,b,c,d,e,");
+    assert_eq!(get("s.b", &["-r1.3", "-x1.1"]), "c,");
+
+    // Delta 2 inserted a line inside delta 1's block; with 1 excluded, the
+    // line delta 2 inserted is still there.
+    super::common::write_weave(
+        tmp.path(),
+        "s.a",
+        b"\x01I 1\na\n\x01I 2\nb\n\x01E 2\nc\n\x01E 1\n",
+    );
+    assert_eq!(get("s.a", &["-r1.3"]), "a,b,c,");
+    assert_eq!(get("s.a", &["-r1.3", "-x1.1"]), "b,");
+    assert_eq!(get("s.a", &["-r1.3", "-x1.1", "-m"]), "1.2\tb,");
+    assert_eq!(get("s.a", &["-r1.3", "-x1.2"]), "a,c,");
+}
+
+/// `-i` applies the deltas it names and no others: including 1.3 into 1.1
+/// does not bring 1.2 with it. (It used to pull in the whole chain of
+/// ancestors of each included delta.) The expected text is CSSC's.
+#[test]
+fn get_i_includes_only_the_deltas_named() {
+    let tmp = TempDir::new().unwrap();
+    let get = |file: &str, args: &[&str]| -> String {
+        let mut argv = vec!["-p", "-k", "-s"];
+        argv.extend_from_slice(args);
+        argv.push(file);
+        let out = super::common::run_in("get", &argv, tmp.path(), "");
+        assert!(out.status.success(), "get {args:?} {file}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).replace('\n', ",")
+    };
+    // 1.2 inserted b inside 1.1's block; 1.3 changed nothing.
+    super::common::write_weave(
+        tmp.path(),
+        "s.a",
+        b"\x01I 1\na\n\x01I 2\nb\n\x01E 2\nc\n\x01E 1\n",
+    );
+    assert_eq!(get("s.a", &["-r1.1", "-i1.3"]), "a,c,");
+    assert_eq!(get("s.a", &["-r1.1", "-i1.2"]), "a,b,c,");
+
+    // 1.2 deleted b..d; 1.3 inserted c inside that.
+    super::common::write_weave(
+        tmp.path(),
+        "s.b",
+        b"\x01I 1\na\n\x01D 2\nb\n\x01I 3\nc\n\x01E 3\nd\n\x01E 2\ne\n\x01E 1\n",
+    );
+    assert_eq!(get("s.b", &["-r1.1", "-i1.3"]), "a,b,c,d,e,");
+    assert_eq!(get("s.b", &["-r1.1", "-i1.2"]), "a,e,");
+    // Named by both, a delta is applied: -i outranks -x.
+    assert_eq!(get("s.b", &["-r1.3", "-x1.2", "-i1.2"]), "a,c,e,");
+}
+
+/// A body whose block structure is broken cannot be read reliably: which
+/// lines belong to a version depends on which blocks are open. Historical
+/// SCCS treats it as a format error in every command that reads the body,
+/// and so do get, prs :GB:, delta and rmdel here, instead of reading the
+/// text under whatever blocks happened to be open.
+#[test]
+fn a_damaged_weave_is_refused_by_every_reader() {
+    let tmp = TempDir::new().unwrap();
+    let bodies: [(&str, &[u8]); 7] = [
+        (
+            "unknown control line",
+            b"\x01I 1\nbody\n\x01X junk\n\x01E 1\n",
+        ),
+        ("marker without a serial", b"\x01I x\nbody\n\x01E x\n"),
+        (
+            "end of a block not open",
+            b"\x01I 1\nbody\n\x01E 2\n\x01E 1\n",
+        ),
+        ("block never closed", b"\x01I 1\nbody\n"),
+        ("block closed twice", b"\x01I 1\nbody\n\x01E 1\n\x01E 1\n"),
+        (
+            "block opened twice",
+            b"\x01I 1\n\x01I 1\nbody\n\x01E 1\n\x01E 1\n",
+        ),
+        (
+            "serial of no delta",
+            b"\x01I 1\nbody\n\x01D 9\nx\n\x01E 9\n\x01E 1\n",
+        ),
+    ];
+    for (what, body) in bodies {
+        let s = super::common::write_weave(tmp.path(), "s.w", body);
+        let refused = |cmd: &str, args: &[&str]| {
+            let out = super::common::run_in(cmd, args, tmp.path(), "");
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "{what}: {cmd} {args:?}: {out:?}"
+            );
+            assert!(!out.stderr.is_empty(), "{what}: {cmd} must say why");
+        };
+        refused("get", &["-p", "-s", "s.w"]);
+        refused("get", &["-p", "-s", "-m", "s.w"]);
+        refused("prs", &["-d:GB:", "s.w"]);
+        let before = std::fs::read(&s).unwrap();
+        refused("rmdel", &["-r1.3", "s.w"]);
+        assert_eq!(
+            std::fs::read(&s).unwrap(),
+            before,
+            "{what}: rmdel wrote the file"
+        );
+        // What does not read the body is not affected.
+        let out = super::common::run_in("prs", &["-d:I:", "s.w"], tmp.path(), "");
+        assert!(
+            out.status.success(),
+            "{what}: prs without the body: {out:?}"
+        );
+        std::fs::remove_file(&s).unwrap();
+    }
+}
+
+/// `get -e` takes the lock before it opens the s-file, as every command that
+/// changes SCCS state does: what it decides (the new SID, whether the edit
+/// is allowed) must come from the file as it is while it holds the lock. It
+/// used to read the file first and lock afterwards, so a delta committed in
+/// between was never seen.
+///
+/// The order shows when the lock is held by someone else and the s-file
+/// cannot be parsed: a command that locks first reports the lock.
+#[test]
+fn get_e_locks_before_it_reads_the_s_file() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("s.f"), b"not an s-file at all\n").unwrap();
+    std::fs::write(tmp.path().join("z.f"), b"held").unwrap();
+    let out = super::common::run_in("get", &["-e", "s.f"], tmp.path(), "");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("being edited"),
+        "the lock should be reported, not the file: {out:?}"
+    );
+    assert!(
+        tmp.path().join("z.f").exists(),
+        "someone else's lock is left alone"
+    );
+
+    // A plain get changes nothing, takes no lock, and reads the file.
+    let out = super::common::run_in("get", &["-p", "s.f"], tmp.path(), "");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("being edited"),
+        "{out:?}"
+    );
+}
+
+/// The `-i` and `-x` lists of an edit are recorded in the p-file for delta,
+/// one line per edit. A list is SIDs and ranges separated by commas (blanks
+/// or a newline are accepted too); it is recorded with commas, so that what
+/// delta reads back is what get resolved, on one line: recorded as given, a
+/// newline cut the p-file line in two and left the p-file unreadable to
+/// every command. A list holding anything else is refused, and nothing is
+/// recorded.
+#[test]
+fn get_e_records_only_a_well_formed_list() {
+    let tmp = TempDir::new().unwrap();
+    let run =
+        |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, tmp.path(), stdin);
+    assert!(run("admin", &["-i", "-fj", "s.l"], "one\n")
+        .status
+        .success());
+    for text in ["two\n", "three\n"] {
+        assert!(run("get", &["-e", "-s", "s.l"], "").status.success());
+        std::fs::write(tmp.path().join("l"), text).unwrap();
+        assert!(run("delta", &["-s", "-yc", "s.l"], "").status.success());
+    }
+
+    for bad in ["1.2;rm", "", "1.2 -x1.1", "1.2\n-junk"] {
+        let out = run("get", &["-e", "-s", "-g", "-x", bad, "s.l"], "");
+        assert_eq!(out.status.code(), Some(1), "-x {bad:?}: {out:?}");
+        assert!(!out.stderr.is_empty(), "-x {bad:?} must say why");
+        assert!(
+            !tmp.path().join("p.l").exists(),
+            "-x {bad:?} recorded an edit"
+        );
+    }
+
+    // SIDs separated by a blank and a newline are one list, recorded with
+    // commas.
+    let out = run("get", &["-e", "-s", "-g", "-x", "1.1 1.2\n1.3", "s.l"], "");
+    assert!(out.status.success(), "{out:?}");
+    let pfile = std::fs::read_to_string(tmp.path().join("p.l")).unwrap();
+    assert_eq!(pfile.lines().count(), 1, "{pfile:?}");
+    assert!(pfile.trim_end().ends_with(" -x1.1,1.2,1.3"), "{pfile:?}");
+    // And every command still reads the p-file.
+    let out = run("sact", &["s.l"], "");
+    assert!(out.status.success(), "{out:?}");
+}
+
+/// An edit that cannot be given its g-file is not left pending. `get -e`
+/// records the edit in the p-file before it retrieves the text; when the
+/// retrieval then failed -- a damaged body, a g-file that cannot be made --
+/// the entry stayed, with no g-file to go with it, and every later `get -e`
+/// was refused until someone ran `unget`.
+#[test]
+fn get_e_that_fails_leaves_no_pending_edit() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |args: &[&str], cwd: &std::path::Path| super::common::run_in("get", args, cwd, "");
+
+    // A body whose first block is never closed.
+    super::common::write_weave(dir, "s.bad", b"\x01I 1\none\n");
+    let out = run(&["-e", "s.bad"], dir);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.stdout.is_empty(), "no new delta is announced: {out:?}");
+    assert!(!dir.join("p.bad").exists(), "no edit is pending");
+    assert!(!dir.join("bad").exists() && !dir.join("z.bad").exists());
+
+    // A sound file, in a directory where the g-file cannot be created.
+    super::common::write_weave(dir, "s.ok", b"\x01I 1\none\n\x01E 1\n");
+    let cwd = dir.join("ro");
+    std::fs::create_dir(&cwd).unwrap();
+    std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // (Root creates files anywhere; the case cannot arise for it.)
+    if std::fs::write(cwd.join("probe"), b"").is_err() {
+        let out = run(&["-e", "-s", "../s.ok"], &cwd);
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert!(!dir.join("p.ok").exists(), "no edit is pending: {out:?}");
+    }
+    std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // The same edit, where it can be made, is pending afterwards.
+    assert!(run(&["-e", "-s", "s.ok"], dir).status.success());
+    assert!(dir.join("p.ok").exists());
+}
+
+/// A g-file that is writable holds someone's work: `get` does not replace
+/// it. (SCCS: "writable `f' exists".) It used to be overwritten in silence,
+/// by a plain `get` and by `get -e` alike. `-p` and `-g` write no g-file and
+/// are not affected; a read-only g-file is a previous retrieval and is
+/// replaced.
+#[test]
+fn get_does_not_replace_a_writable_g_file() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    assert!(run("admin", &["-i", "-fj", "s.w"], "one\n")
+        .status
+        .success());
+
+    assert!(run("get", &["-s", "s.w"], "").status.success());
+    assert!(
+        run("get", &["-s", "s.w"], "").status.success(),
+        "read-only: replaced"
+    );
+    assert!(run("get", &["-e", "-s", "s.w"], "").status.success());
+    std::fs::write(dir.join("w"), "my edits\n").unwrap();
+
+    for args in [
+        &["-s", "s.w"][..],
+        &["-e", "-s", "s.w"],
+        &["-k", "-s", "s.w"],
+    ] {
+        let out = run("get", args, "");
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("writable"),
+            "{out:?}"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("w")).unwrap(),
+            b"my edits\n",
+            "{args:?}"
+        );
+    }
+    let pfile = std::fs::read_to_string(dir.join("p.w")).unwrap();
+    assert_eq!(pfile.lines().count(), 1, "the refused edit is not pending");
+
+    let out = run("get", &["-p", "-s", "s.w"], "");
+    assert_eq!(out.stdout, b"one\n");
+    assert!(run("get", &["-e", "-g", "-s", "s.w"], "").status.success());
+    assert_eq!(std::fs::read(dir.join("w")).unwrap(), b"my edits\n");
+}
+
+/// With the `j` flag several edits of one delta may be pending, and each
+/// is given a SID of its own: the first the next on the line, the others
+/// branches (as SCCS and CSSC do, "creating a branch due to concurrent
+/// edit"). They were all given the same SID; the first delta then removed
+/// every one of the p-file's identical entries, and the other edits were no
+/// longer pending.
+#[test]
+fn joint_edits_of_one_delta_get_different_sids() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    assert!(run("admin", &["-i", "-fj", "s.j"], "one\n")
+        .status
+        .success());
+
+    let mut announced = Vec::new();
+    for _ in 0..3 {
+        let out = run("get", &["-e", "-g", "s.j"], "");
+        assert!(out.status.success(), "{out:?}");
+        announced.push(String::from_utf8(out.stdout).unwrap());
+    }
+    assert_eq!(
+        announced,
+        [
+            "1.1\nnew delta 1.2\n",
+            "1.1\nnew delta 1.1.1.1\n",
+            "1.1\nnew delta 1.1.2.1\n"
+        ]
+    );
+    let pending = |dir: &std::path::Path| -> Vec<String> {
+        std::fs::read_to_string(dir.join("p.j"))
+            .unwrap()
+            .lines()
+            .map(|l| l.split(' ').nth(1).unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(pending(dir), ["1.2", "1.1.1.1", "1.1.2.1"]);
+
+    // One delta settles one edit; the others stay pending.
+    std::fs::write(dir.join("j"), "two\n").unwrap();
+    let out = run("delta", &["-s", "-r1.1.1.1", "-yc", "s.j"], "");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(pending(dir), ["1.2", "1.1.2.1"]);
+}
+
+/// A list that names a delta the file does not have is an error, for get's
+/// `-i` and `-x` and for delta's `-g`: the version asked for cannot be
+/// made, and nothing is retrieved, recorded or committed. Each said "no such
+/// delta" and went on with the rest of the list, exit status 0 -- `get -e`
+/// recording in the p-file a list that delta would then refuse for good.
+#[test]
+fn a_list_naming_no_delta_is_an_error() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    assert!(run("admin", &["-i", "s.m"], "one\n").status.success());
+    let refused = |out: std::process::Output, what: &str| {
+        assert_eq!(out.status.code(), Some(1), "{what}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("9.9"),
+            "{what}: {out:?}"
+        );
+        assert!(out.stdout.is_empty(), "{what}: {out:?}");
+    };
+
+    refused(run("get", &["-p", "-s", "-i9.9", "s.m"], ""), "get -i");
+    refused(run("get", &["-p", "-s", "-x1.1,9.9", "s.m"], ""), "get -x");
+    refused(run("get", &["-e", "-i9.9", "s.m"], ""), "get -e -i");
+    assert!(!dir.join("p.m").exists() && !dir.join("m").exists());
+
+    assert!(run("get", &["-e", "-s", "s.m"], "").status.success());
+    std::fs::write(dir.join("m"), "two\n").unwrap();
+    refused(run("delta", &["-yc", "-g9.9", "s.m"], ""), "delta -g");
+    assert!(dir.join("p.m").exists(), "the edit is still pending");
+    let out = run("prs", &["-e", "-d:I:", "s.m"], "");
+    assert_eq!(out.stdout, b"1.1\n");
+}
+
+/// Without the `j` flag one edit of a delta may be pending: get -e
+/// "shall prevent further gets for editing on the same SID until delta is
+/// executed or the j (joint edit) flag is set" (POSIX get, -e). Only an
+/// edit that would come to the same *new* SID was refused, so `-b` or a
+/// higher `-r` got a second and third edit of the same delta through.
+#[test]
+fn a_delta_being_edited_is_not_edited_again_without_j() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    assert!(run("admin", &["-i", "-fb", "s.e"], "one\n")
+        .status
+        .success());
+    assert!(run("get", &["-e", "-g", "-s", "s.e"], "").status.success());
+    for args in [
+        &["-e", "-g", "s.e"][..],
+        &["-e", "-g", "-b", "s.e"],
+        &["-e", "-g", "-r2", "s.e"],
+    ] {
+        let out = run("get", args, "");
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("being edited"),
+            "{args:?}: {out:?}"
+        );
+    }
+    let pfile = std::fs::read_to_string(dir.join("p.e")).unwrap();
+    assert_eq!(pfile.lines().count(), 1, "{pfile}");
+}
+
+/// `-t` is the most recently created delta "in a given release (for example,
+/// -r1) or release and level (for example, -r1.2)" (POSIX get). The level
+/// was ignored: `-t -r1.2` gave the newest delta anywhere in release 1.
+#[test]
+fn get_t_keeps_to_the_release_and_level_named() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    assert!(run("admin", &["-i", "-fb", "s.t"], "1.1\n")
+        .status
+        .success());
+    // 1.2, 1.3 on the trunk; then, later, 1.1.1.1 and 1.2.1.1 on branches.
+    for (from, text) in [
+        ("1.1", "1.2"),
+        ("1.2", "1.3"),
+        ("1.1", "1.1.1.1"),
+        ("1.2", "1.2.1.1"),
+    ] {
+        let r = format!("-r{from}");
+        assert!(
+            run("get", &["-e", "-s", &r, "s.t"], "").status.success(),
+            "{from}"
+        );
+        std::fs::write(dir.join("t"), format!("{text}\n")).unwrap();
+        assert!(run("delta", &["-s", "-yc", "s.t"], "").status.success());
+    }
+    let top = |args: &[&str]| {
+        let out = run("get", &[&["-p", "-s", "-t"], args, &["s.t"]].concat(), "");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert_eq!(top(&[]), "1.2.1.1\n");
+    assert_eq!(top(&["-r1"]), "1.2.1.1\n");
+    assert_eq!(top(&["-r1.3"]), "1.3\n");
+    assert_eq!(top(&["-r1.2"]), "1.2.1.1\n");
+    assert_eq!(top(&["-r1.1"]), "1.1.1.1\n");
+}
+
+/// `-t` is for a release, or a release and level. A SID that names a
+/// branch or a delta on one is that branch or delta, with -t as without:
+/// `-t -r1.1.1.1` retrieved, and with -e edited, the newest delta of some
+/// other branch of 1.1.
+#[test]
+fn get_t_does_not_leave_the_branch_named() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    assert!(run("admin", &["-i", "-fb", "s.b"], "1.1\n")
+        .status
+        .success());
+    for (args, text) in [
+        (&["-r1.1"][..], "1.2"),
+        (&["-r1.1", "-b"], "1.1.1.1"),
+        (&["-r1.1", "-b"], "1.1.2.1"),
+    ] {
+        let args = [&["-e", "-s"], args, &["s.b"]].concat();
+        assert!(run("get", &args, "").status.success(), "{args:?}");
+        std::fs::write(dir.join("b"), format!("{text}\n")).unwrap();
+        assert!(run("delta", &["-s", "-yc", "s.b"], "").status.success());
+    }
+    for sid in ["-r1.1.1.1", "-r1.1.1"] {
+        let out = run("get", &["-p", "-s", "-t", sid, "s.b"], "");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "1.1.1.1\n", "{sid}");
+    }
+    let out = run("get", &["-e", "-g", "-t", "-r1.1.1.1", "s.b"], "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1.1.1.1\nnew delta 1.1.1.2\n"
+    );
+}
+
+/// `-e -rR` where release R does not exist and a higher one does: the
+/// delta retrieved is hR.mL and the one to be created hR.mL.(mB+1).1, a
+/// branch (POSIX get, the table of SIDs). The first delta of release R
+/// was created instead, on the trunk between two releases that exist.
+#[test]
+fn get_e_of_a_skipped_release_branches() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    assert!(run("admin", &["-i", "s.s"], "1.1\n").status.success());
+    assert!(run("get", &["-e", "-s", "-r3", "s.s"], "").status.success());
+    std::fs::write(dir.join("s"), "3.1\n").unwrap();
+    assert!(run("delta", &["-s", "-yc", "s.s"], "").status.success());
+
+    let out = run("get", &["-e", "-g", "-r2", "s.s"], "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1.1\nnew delta 1.1.1.1\n"
+    );
+    assert!(run("unget", &["-s", "s.s"], "").status.success());
+    // A release above the newest still begins that release.
+    let out = run("get", &["-e", "-g", "-r4", "s.s"], "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3.1\nnew delta 4.1\n");
+}
+
+/// A g-file made with `-k` is writable by its owner, like one made for
+/// editing (POSIX get: read-only "unless -k is used or implied"): it is
+/// what one edits after losing an edit's g-file. It was made read-only.
+#[test]
+fn get_k_makes_a_writable_g_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    assert!(run("admin", &["-i", "s.k"], "%I%\n").status.success());
+    let mode = |name: &str| {
+        std::fs::metadata(dir.join(name))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    assert!(run("get", &["-s", "s.k"], "").status.success());
+    assert_eq!(mode("k"), 0o444);
+    assert!(run("get", &["-s", "-k", "s.k"], "").status.success());
+    assert_eq!(mode("k"), 0o644);
+    assert_eq!(std::fs::read(dir.join("k")).unwrap(), b"%I%\n");
+}
+
+/// The l-file lists each delta with "the comments and MR data ... on
+/// subsequent lines, indented one <tab>" (POSIX get). The MRs were left out.
+#[test]
+fn get_l_lists_the_mrs() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    assert!(run(
+        "admin",
+        &["-i", "-fv", "-mMR7 MR8", "-yinit", "s.l"],
+        "one\n"
+    )
+    .status
+    .success());
+    let out = run("get", &["-s", "-L", "-g", "s.l"], "");
+    let text = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(&lines[1..], ["\tMR7", "\tMR8", "\tinit", ""], "{text:?}");
 }

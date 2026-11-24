@@ -16,8 +16,12 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use gettextrs::gettext;
-use plib::sccsfile::{paths, DeltaEntry, PfileEntry, SccsDateTime, SccsFile, SccsFlag, Sid};
-use posixutils_sccs::{cutoff, diag, idkw, operands, pfile, protect, sfio, zlock};
+use plib::sccsfile::{
+    paths, DeltaEntry, PfileEntry, SccsDateTime, SccsFile, SccsFlag, Selection, Sid, SidList,
+    SigintBlock,
+};
+use posixutils_sccs::txn::{self, Txn};
+use posixutils_sccs::{cutoff, diag, idkw, operands, protect, sfio, zlock};
 
 /// get - get a version of an SCCS file
 #[derive(Parser)]
@@ -72,137 +76,6 @@ struct Args {
     files: Vec<PathBuf>,
 }
 
-/// Expand SCCS keywords in a line
-fn expand_keywords(
-    line: &str,
-    sccs_file: &SccsFile,
-    delta: &DeltaEntry,
-    sfile_path: &Path,
-    line_number: usize,
-) -> String {
-    let mut result = line.to_string();
-
-    // Get module name (from 'm' flag or filename)
-    let module_name = sccs_file
-        .module_name()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| paths::module_name(sfile_path).unwrap_or_else(|| "unknown".to_string()));
-
-    // Get module type from 't' flag
-    let module_type = sccs_file.module_type().unwrap_or("");
-
-    // Get Q flag value
-    let q_value = sccs_file
-        .header
-        .flags
-        .iter()
-        .find_map(|f| {
-            if let SccsFlag::QText(s) = f {
-                Some(s.as_str())
-            } else {
-                None
-            }
-        })
-        .unwrap_or("");
-
-    // Current date/time
-    let now = SccsDateTime::now();
-
-    // SCCS filename
-    let sccs_filename = sfile_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("s.unknown");
-
-    // Absolute path
-    let abs_path = std::fs::canonicalize(sfile_path)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| sfile_path.to_string_lossy().to_string());
-
-    // %Z% = @(#)
-    result = result.replace("%Z%", "@(#)");
-
-    // %M% = module name
-    result = result.replace("%M%", &module_name);
-
-    // %I% = SID (full)
-    result = result.replace("%I%", &delta.sid.to_string());
-
-    // %R% = release
-    result = result.replace("%R%", &delta.sid.rel.to_string());
-
-    // %L% = level
-    result = result.replace("%L%", &delta.sid.lev.to_string());
-
-    // %B% = branch
-    result = result.replace("%B%", &delta.sid.br.to_string());
-
-    // %S% = sequence
-    result = result.replace("%S%", &delta.sid.seq.to_string());
-
-    // %D% = current date YY/MM/DD
-    result = result.replace("%D%", &now.date_string());
-
-    // %H% = current date MM/DD/YY
-    result = result.replace(
-        "%H%",
-        &format!("{:02}/{:02}/{:02}", now.month, now.day, now.year),
-    );
-
-    // %T% = current time HH:MM:SS
-    result = result.replace("%T%", &now.time_string());
-
-    // %E% = delta date YY/MM/DD
-    result = result.replace("%E%", &delta.datetime.date_string());
-
-    // %G% = delta date MM/DD/YY
-    result = result.replace(
-        "%G%",
-        &format!(
-            "{:02}/{:02}/{:02}",
-            delta.datetime.month, delta.datetime.day, delta.datetime.year
-        ),
-    );
-
-    // %U% = delta time HH:MM:SS
-    result = result.replace("%U%", &delta.datetime.time_string());
-
-    // %Y% = module type
-    result = result.replace("%Y%", module_type);
-
-    // %F% = SCCS filename
-    result = result.replace("%F%", sccs_filename);
-
-    // %P% = SCCS absolute pathname
-    result = result.replace("%P%", &abs_path);
-
-    // %Q% = q flag value
-    result = result.replace("%Q%", q_value);
-
-    // %C% = current line number
-    result = result.replace("%C%", &line_number.to_string());
-
-    // %W% = @(#)module<tab>SID (shorthand)
-    let w_value = format!("@(#){}\t{}", module_name, delta.sid);
-    result = result.replace("%W%", &w_value);
-
-    // %A% = @(#)type module SID@(#) (shorthand)
-    let a_value = format!("@(#){} {} {}@(#)", module_type, module_name, delta.sid);
-    result = result.replace("%A%", &a_value);
-
-    result
-}
-
-/// Applied (non-removed) deltas. A delta withdrawn by `rmdel` keeps its place
-/// in the file and its SID stays reserved, but it has no text to retrieve, so
-/// it must never be selected as the target.
-fn applied_deltas(sccs: &SccsFile) -> impl Iterator<Item = &DeltaEntry> {
-    sccs.header
-        .deltas
-        .iter()
-        .filter(|d| d.delta_type == plib::sccsfile::DeltaType::Normal)
-}
-
 /// Find the delta to retrieve based on -r option.
 ///
 /// Implements the "SID Retrieved" column of the POSIX get(1) SID table
@@ -224,17 +97,16 @@ fn find_target_delta<'a>(
                 .parse()
                 .map_err(|_| format!("{}: {}", gettext("Invalid SID"), sid_str))?;
 
-            // Try exact match first, but only for a delta that still has text:
-            // an rmdel'd SID is reserved, not retrievable.
+            // Try exact match first. A removed delta is not found: it has
+            // no text to retrieve.
             if let Some(delta) = sccs.find_delta_by_sid(&sid) {
-                if delta.delta_type == plib::sccsfile::DeltaType::Normal {
-                    return Ok(delta);
-                }
+                return Ok(delta);
             }
 
             if sid.is_partial() {
                 // "R": the highest level within release R (R.mL).
-                if let Some(d) = applied_deltas(sccs)
+                if let Some(d) = sccs
+                    .live_deltas()
                     .filter(|d| d.sid.rel == sid.rel && d.sid.is_trunk())
                     .max_by(|a, b| a.sid.cmp(&b.sid))
                 {
@@ -250,13 +122,13 @@ fn find_target_delta<'a>(
                 if sid.rel > trunk_head.sid.rel {
                     return Ok(trunk_head);
                 }
-                applied_deltas(sccs)
+                sccs.live_deltas()
                     .filter(|d| d.sid.is_trunk() && d.sid.rel < sid.rel)
                     .max_by(|a, b| a.sid.cmp(&b.sid))
                     .ok_or_else(|| format!("{} {}", gettext("No delta found for release"), sid.rel))
             } else if sid.br != 0 && sid.seq == 0 {
                 // "R.L.B": the highest sequence on that branch (R.L.B.mS).
-                applied_deltas(sccs)
+                sccs.live_deltas()
                     .filter(|d| d.sid.same_branch(&sid))
                     .max_by(|a, b| a.sid.cmp(&b.sid))
                     .ok_or_else(|| format!("{} {} {}", gettext("SID"), sid, gettext("not found")))
@@ -273,28 +145,33 @@ fn find_target_delta<'a>(
     }
 }
 
-/// Find the most recently created (top) delta. With a requested release, the
-/// search is restricted to deltas in that release; otherwise it considers all
-/// applied (non-removed) deltas in the file.
+/// Find the most recently created (top) delta "in a given release (for
+/// example, -r1) or release and level (for example, -r1.2)" (POSIX get, -t):
+/// among the deltas of that release, and of that level if one is named,
+/// their branches included; among all the file's deltas with no -r.
 fn find_top_delta<'a>(
     sccs: &'a SccsFile,
     requested_sid: Option<&str>,
 ) -> Result<&'a DeltaEntry, String> {
-    let release: Option<u16> = match requested_sid {
+    let named: Option<Sid> = match requested_sid {
         None => None,
-        Some(s) => {
-            let sid: Sid = s
-                .parse()
-                .map_err(|_| format!("{}: {}", gettext("Invalid SID"), s))?;
-            Some(sid.rel)
-        }
+        Some(s) => Some(
+            s.parse()
+                .map_err(|_| format!("{}: {}", gettext("Invalid SID"), s))?,
+        ),
+    };
+    // A SID that names a branch, or a delta on one, is that branch or
+    // delta: there is no "top" to look for beyond it.
+    if named.is_some_and(|sid| sid.br != 0) {
+        return find_target_delta(sccs, requested_sid);
+    }
+    let release = named.map(|sid| sid.rel);
+    let within = |d: &DeltaEntry| {
+        named.is_none_or(|sid| d.sid.rel == sid.rel && (sid.is_partial() || d.sid.lev == sid.lev))
     };
 
-    sccs.header
-        .deltas
-        .iter()
-        .filter(|d| d.delta_type == plib::sccsfile::DeltaType::Normal)
-        .filter(|d| release.is_none_or(|r| d.sid.rel == r))
+    sccs.live_deltas()
+        .filter(|d| within(d))
         .max_by(|a, b| {
             let ka = (
                 cutoff::full_year(&a.datetime),
@@ -325,11 +202,11 @@ fn find_top_delta<'a>(
 /// Does any delta already succeed `target` on the line it sits on?
 ///
 /// For a trunk delta that means any later trunk delta, in this release or a
-/// higher one; for a branch delta, a higher sequence on the same branch. The
-/// scan deliberately includes rmdel'd deltas: their SIDs stay reserved, so a
-/// successor must not be minted on top of one.
+/// higher one; for a branch delta, a higher sequence on the same branch. A
+/// delta removed by rmdel is not one: it is gone, and the next delta takes
+/// its SID (`SccsFile::live_deltas`).
 fn has_successor(sccs: &SccsFile, target: &DeltaEntry) -> bool {
-    sccs.header.deltas.iter().any(|d| {
+    sccs.live_deltas().any(|d| {
         if target.sid.is_trunk() {
             d.sid.is_trunk() && d.sid > target.sid
         } else {
@@ -346,60 +223,99 @@ fn has_successor(sccs: &SccsFile, target: &DeltaEntry) -> bool {
 /// retrieved delta already has a successor; otherwise extend its line. The
 /// special case is a release-only -r naming a release above the newest one,
 /// which forces the first delta of that new release.
+///
+/// `pending` is the new SIDs of the edits already pending, when the `j` flag
+/// lets several edits of one delta be: each must come to a SID of its own.
+/// A SID that is pending is taken, like a delta's, and an edit that would
+/// get one branches instead, as SCCS and CSSC have it ("creating a branch
+/// due to concurrent edit").
 fn compute_new_sid(
     sccs: &SccsFile,
     target: &DeltaEntry,
     create_branch: bool,
     requested_sid: Option<&Sid>,
+    pending: &[Sid],
 ) -> Sid {
     let branching = create_branch && sccs.branch_enabled();
+    // Branch off the retrieved delta: R.L.(mB+1).1
+    let branch_off = || {
+        let max_branch = sccs
+            .live_deltas()
+            .map(|d| &d.sid)
+            .chain(pending)
+            .filter(|sid| sid.rel == target.sid.rel && sid.lev == target.sid.lev)
+            .map(|sid| sid.br)
+            .max()
+            .unwrap_or(0);
+        Sid::new(target.sid.rel, target.sid.lev, max_branch + 1, 1)
+    };
+    let unless_pending = |sid: Sid| {
+        if pending.contains(&sid) {
+            branch_off()
+        } else {
+            sid
+        }
+    };
 
-    // "R > mR": force creation of the first delta in a new release (99237).
-    // -b outranks it, per 99239.
+    // A release-only -r naming a release above the delta retrieved, which
+    // is then the newest delta of the nearest release below. -b outranks
+    // both rows, per 99239.
     if !branching {
         if let Some(req) = requested_sid {
             if req.is_partial() && req.rel > target.sid.rel {
-                return Sid::trunk(req.rel, 1);
+                let newest_release = sccs
+                    .live_deltas()
+                    .filter(|d| d.sid.is_trunk())
+                    .map(|d| d.sid.rel)
+                    .max()
+                    .unwrap_or(0);
+                return if req.rel > newest_release {
+                    // "R > mR": the first delta of a new release (99237).
+                    unless_pending(Sid::trunk(req.rel, 1))
+                } else {
+                    // "R < mR and R does not exist": hR.mL.(mB+1).1, a
+                    // branch (99241). R.1 here would be a trunk delta
+                    // between two releases, made from neither's newest.
+                    branch_off()
+                };
             }
         }
     }
 
     if branching || has_successor(sccs, target) {
-        // Branch off the retrieved delta: R.L.(mB+1).1
-        let max_branch = sccs
-            .header
-            .deltas
-            .iter()
-            .filter(|d| d.sid.rel == target.sid.rel && d.sid.lev == target.sid.lev)
-            .map(|d| d.sid.br)
-            .max()
-            .unwrap_or(0);
-
-        Sid::new(target.sid.rel, target.sid.lev, max_branch + 1, 1)
+        branch_off()
     } else if !target.sid.is_trunk() {
         // From branch: increment sequence
-        Sid::new(
+        unless_pending(Sid::new(
             target.sid.rel,
             target.sid.lev,
             target.sid.br,
             target.sid.seq + 1,
-        )
+        ))
     } else {
         // From trunk: increment level
-        Sid::trunk(target.sid.rel, target.sid.lev + 1)
+        unless_pending(Sid::trunk(target.sid.rel, target.sid.lev + 1))
     }
 }
 
-/// Check if there's an existing p-file entry for this SID
-fn check_pfile_lock(sfile_path: &Path, new_sid: &Sid) -> Result<(), String> {
-    let entries =
-        pfile::read(sfile_path).map_err(|e| format!("{}: {}", gettext("Invalid p-file"), e))?;
+/// Without joint editing, whether the edit of `got` that would make
+/// `new_sid` may be made: -e "shall prevent further gets for editing on the
+/// same SID until delta is executed" (POSIX get), so not while an edit of
+/// `got` is pending, whatever SID it will make; nor while another edit is
+/// to make `new_sid`.
+fn check_pfile_lock(txn: &Txn, got: &Sid, new_sid: &Sid) -> Result<(), String> {
+    let entries = txn
+        .pending()
+        .map_err(|e| format!("{}: {}", gettext("Invalid p-file"), e))?;
 
-    match pfile::find_by_new_sid(&entries, new_sid) {
+    match entries
+        .iter()
+        .find(|e| e.old_sid == *got || e.new_sid == *new_sid)
+    {
         Some(entry) => Err(format!(
             "{} {} {} {}",
             gettext("SID"),
-            new_sid,
+            if entry.old_sid == *got { got } else { new_sid },
             gettext("is being edited by"),
             entry.user
         )),
@@ -407,113 +323,101 @@ fn check_pfile_lock(sfile_path: &Path, new_sid: &Sid) -> Result<(), String> {
     }
 }
 
-/// Create or append to p-file
+/// The mode of the g-file: "read-only unless -k is used or implied" (POSIX
+/// get), -e implying it. One made with -k is for editing too: it is how
+/// the g-file of an edit is got back.
+fn gfile_mode(args: &Args) -> u32 {
+    if args.edit || args.no_keywords {
+        0o644
+    } else {
+        0o444
+    }
+}
+
+/// Whether `path` is a file someone may write: a g-file being edited.
+fn is_writable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o222 != 0)
+}
+
+/// Take back the edit [`create_pfile_entry`] recorded: the retrieval it was
+/// for did not happen. The last entry like it goes; with joint editing
+/// there may be others, which are other people's.
+fn withdraw_pfile_entry(txn: &Txn, entry: &PfileEntry) -> io::Result<()> {
+    let mut entries = txn.pending()?;
+    let same = |e: &PfileEntry| {
+        e.old_sid == entry.old_sid && e.new_sid == entry.new_sid && e.user == entry.user
+    };
+    if let Some(at) = entries.iter().rposition(same) {
+        entries.remove(at);
+        txn.set_pending(&entries)?;
+    }
+    Ok(())
+}
+
+/// Record the edit in the p-file, after those already pending.
 fn create_pfile_entry(
-    sfile_path: &Path,
+    txn: &Txn,
     old_sid: &Sid,
     new_sid: &Sid,
-    included: Option<String>,
-    excluded: Option<String>,
-) -> io::Result<()> {
+    included: Option<SidList>,
+    excluded: Option<SidList>,
+) -> io::Result<PfileEntry> {
     let entry = PfileEntry {
         old_sid: *old_sid,
         new_sid: *new_sid,
-        user: posixutils_sccs::username(),
+        user: posixutils_sccs::username()?,
         datetime: SccsDateTime::now(),
         included,
         excluded,
     };
 
-    pfile::append(sfile_path, &entry)
-}
-
-/// Evaluate body with SID tracking for -m option
-fn evaluate_body_with_sid(sccs: &SccsFile, applied_set: &HashSet<u16>) -> Vec<(String, Sid)> {
-    use plib::sccsfile::BodyRecord;
-
-    let mut output = Vec::new();
-    let mut stack: Vec<(bool, u16)> = Vec::new(); // (is_insert, serial)
-    let mut current_insert_serial: Option<u16> = None;
-
-    for record in &sccs.body {
-        match record {
-            BodyRecord::Insert(serial) => {
-                stack.push((true, *serial));
-                if applied_set.contains(serial) {
-                    current_insert_serial = Some(*serial);
-                }
-            }
-            BodyRecord::Delete(serial) => {
-                stack.push((false, *serial));
-            }
-            BodyRecord::End(_) => {
-                if let Some((is_insert, serial)) = stack.pop() {
-                    if is_insert && Some(serial) == current_insert_serial {
-                        // Find next innermost insert
-                        current_insert_serial = stack
-                            .iter()
-                            .rev()
-                            .find(|(is_ins, s)| *is_ins && applied_set.contains(s))
-                            .map(|(_, s)| *s);
-                    }
-                }
-            }
-            BodyRecord::Text(line) => {
-                if plib::sccsfile::is_line_visible(&stack, applied_set) {
-                    // Find which delta inserted this line
-                    let inserting_serial = current_insert_serial.unwrap_or(1);
-                    let sid = sccs
-                        .find_delta_by_serial(inserting_serial)
-                        .map(|d| d.sid)
-                        .unwrap_or(Sid::trunk(1, 1));
-                    output.push((line.clone(), sid));
-                }
-            }
-        }
-    }
-
-    output
+    let mut entries = txn.pending()?;
+    entries.push(entry.clone());
+    txn.set_pending(&entries)?;
+    Ok(entry)
 }
 
 /// Render the delta-summary table (the l-file body). Deltas are listed newest
 /// first. Each entry is a status line followed by comment lines indented one
 /// tab and terminated by a blank line, per the POSIX l-file format:
 ///   "%c%c%c %s\t%s %s\n", code1, code2, code3, SID, date-time, login
-fn render_lfile(sccs: &SccsFile, applied_set: &HashSet<u16>) -> String {
-    let mut out = String::new();
+fn render_lfile(sccs: &SccsFile, applied_set: &HashSet<u16>) -> Vec<u8> {
+    let mut out = Vec::new();
     // Newest delta first: iterate in descending serial order.
-    let mut deltas: Vec<&DeltaEntry> = sccs
-        .header
-        .deltas
-        .iter()
-        .filter(|d| d.delta_type == plib::sccsfile::DeltaType::Normal)
-        .collect();
+    let mut deltas: Vec<&DeltaEntry> = sccs.live_deltas().collect();
     deltas.sort_by_key(|d| std::cmp::Reverse(d.serial));
 
     for d in deltas {
         let code1 = if applied_set.contains(&d.serial) {
-            ' '
+            b' '
         } else {
-            '*'
+            b'*'
         };
         // code2/code3 special-reason codes are unsupported here; use spaces.
-        out.push(code1);
-        out.push(' ');
-        out.push(' ');
-        out.push(' ');
-        out.push_str(&format!(
-            "{}\t{} {} {}\n",
-            d.sid,
-            d.datetime.date_string(),
-            d.datetime.time_string(),
-            d.user
-        ));
-        for c in &d.comments {
-            out.push('\t');
-            out.push_str(c);
-            out.push('\n');
+        out.extend_from_slice(&[code1, b' ', b' ', b' ']);
+        out.extend_from_slice(
+            format!(
+                "{}\t{} {} ",
+                d.sid,
+                d.datetime.date_string(),
+                d.datetime.time_string()
+            )
+            .as_bytes(),
+        );
+        out.extend_from_slice(&d.user);
+        out.push(b'\n');
+        // "The comments and MR data shall follow on subsequent lines,
+        // indented one <tab>" (99209): in the order the s-file has them,
+        // MRs and then comments.
+        let mrs = d.mr_numbers.iter().map(|mr| mr.as_bytes());
+        for line in mrs.chain(d.comments.iter().map(|c| c.as_bytes())) {
+            out.push(b'\t');
+            out.extend_from_slice(line);
+            out.push(b'\n');
         }
-        out.push('\n');
+        out.push(b'\n');
     }
     out
 }
@@ -528,18 +432,49 @@ fn write_lfile(
 ) -> io::Result<()> {
     let table = render_lfile(sccs, applied_set);
     if to_stdout {
-        Stdout.write_all(table.as_bytes())?;
+        Stdout.write_all(&table)?;
     } else {
         // The l-file is read-only, so it must be replaced rather than
         // reopened: writing it a second time in the same directory otherwise
         // fails with EACCES on the file this same code wrote.
         let lfile_path = paths::lfile_from_sfile(sfile_path);
-        sfio::write_replacing(&lfile_path, table.as_bytes(), 0o444)?;
+        sfio::write_replacing(&lfile_path, &table, 0o444)?;
     }
     Ok(())
 }
 
-fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Result<bool> {
+/// An s-file that cannot be read, as the error get reports.
+fn unreadable(e: plib::sccsfile::SccsError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+}
+
+/// The `-i` and `-x` lists of the command line, checked: what the version is
+/// made from, and what an edit records in the p-file for delta.
+struct Lists {
+    include: Option<SidList>,
+    exclude: Option<SidList>,
+}
+
+impl Lists {
+    fn from_args(args: &Args) -> Result<Lists, plib::sccsfile::SccsError> {
+        let list = |arg: &Option<String>| {
+            arg.as_deref()
+                .map(|l| SidList::new(l.as_bytes()))
+                .transpose()
+        };
+        Ok(Lists {
+            include: list(&args.include)?,
+            exclude: list(&args.exclude)?,
+        })
+    }
+}
+
+fn process_file(
+    args: &Args,
+    lists: &Lists,
+    sfile_path: &Path,
+    multiple_files: bool,
+) -> io::Result<bool> {
     // Print filename if multiple files
     if multiple_files && !args.silent {
         let output_stream: &mut dyn Write = if args.to_stdout || args.lfile_stdout {
@@ -547,7 +482,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
         } else {
             &mut Stdout
         };
-        writeln!(output_stream, "\n{}:", sfile_path.display())?;
+        operands::banner(output_stream, sfile_path)?;
     }
 
     // Validate s-file
@@ -560,9 +495,55 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
         return Ok(false);
     }
 
-    // Parse SCCS file
-    let sccs = SccsFile::from_path(sfile_path)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    // An edit changes SCCS state (the p-file), so it takes the lock before
+    // the s-file is opened and holds it until this function returns: the
+    // new SID, the edit's permission and the p-file entry are all decided
+    // from the file as it is under the lock. A plain retrieval changes
+    // nothing and takes no lock.
+    let txn = if args.edit {
+        match Txn::begin(sfile_path) {
+            Ok(txn) => Some(txn),
+            Err(e) if txn::is_locked(&e) => {
+                diag::error_path("get", sfile_path, &gettext("being edited"));
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
+        }
+    } else {
+        None
+    };
+    let sccs = match &txn {
+        Some(txn) => txn.read()?,
+        None => SccsFile::from_path(sfile_path).map_err(unreadable)?,
+    };
+
+    // What would stop the retrieval is looked for before anything is
+    // announced or recorded. A body that cannot be read: found only when
+    // the text was produced, it left an edit announced and pending with no
+    // g-file to go with it.
+    if txn.is_some() {
+        sccs.check_weave().map_err(unreadable)?;
+    }
+    // And a g-file that is writable, which is someone's work in progress
+    // and is not replaced (SCCS: "writable `f' exists"). A read-only one is
+    // an earlier retrieval.
+    if !args.to_stdout && !args.no_get {
+        if let Some(gfile) = paths::gfile_from_sfile(sfile_path) {
+            if is_writable_file(&gfile) {
+                diag::error_path(
+                    "get",
+                    sfile_path,
+                    &format!(
+                        "{} `{}' {}",
+                        gettext("writable"),
+                        gfile.display(),
+                        gettext("exists")
+                    ),
+                );
+                return Ok(false);
+            }
+        }
+    }
 
     // The `d` flag names "the default delta number (SID) to be used by a get
     // command" (POSIX 84036), so it stands in for -r when -r is absent. An
@@ -583,40 +564,31 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
     let target_serial = target.serial;
     let target_sid = target.sid;
 
-    // If editing, acquire the per-command z-file lock (held until this
-    // function returns, then released so a later delta/unget can run), compute
-    // the new SID and check for the p-file edit lock.
-    //
-    // `_zlock` is bound at function scope so the z-file persists across the
-    // early-return (encoded) path below and is removed on every return.
-    let _zlock;
-    let new_sid = if args.edit {
+    // If editing, compute the new SID and check for the p-file edit lock.
+    let new_sid = if let Some(txn) = &txn {
         // Ceiling, floor, locked releases and the authorized-user list are
         // enforced here and not for a plain retrieval: POSIX 99077-99078
-        // attaches them to -e. Checked before the lock is taken so a refusal
-        // leaves no z-file and no p-file entry behind.
-        if let Err(refusal) =
-            protect::check_edit(&sccs, target_sid.rel, &posixutils_sccs::username())
-        {
+        // attaches them to -e. A refusal leaves no p-file entry behind, and
+        // the lock goes when this function returns.
+        let user = posixutils_sccs::username()?;
+        if let Err(refusal) = protect::check_edit(&sccs, target_sid.rel, &user) {
             diag::error_path("get", sfile_path, &refusal.message());
             return Ok(false);
         }
 
-        _zlock = match zlock::acquire(sfile_path) {
-            Ok(z) => z,
-            Err(e) if zlock::is_held(&e) => {
-                diag::error_path("get", sfile_path, &gettext("being edited"));
-                return Ok(false);
-            }
-            Err(e) => return Err(e),
-        };
-
         let requested: Option<Sid> = requested_sid.and_then(|s| s.parse().ok());
-        let new_sid = compute_new_sid(&sccs, target, args.branch, requested.as_ref());
+        // With joint editing the SIDs of the pending edits are taken;
+        // without it an edit that would get one is refused, below.
+        let pending: Vec<Sid> = if sccs.joint_edit() {
+            txn.pending()?.iter().map(|e| e.new_sid).collect()
+        } else {
+            Vec::new()
+        };
+        let new_sid = compute_new_sid(&sccs, target, args.branch, requested.as_ref(), &pending);
 
         // Check for existing edit lock (unless joint edit is allowed)
         if !sccs.joint_edit() {
-            check_pfile_lock(sfile_path, &new_sid)
+            check_pfile_lock(txn, &target_sid, &new_sid)
                 .map_err(|e| io::Error::new(io::ErrorKind::AlreadyExists, e))?;
         }
 
@@ -630,22 +602,14 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
     let info_to_stderr = args.to_stdout || args.lfile_stdout;
 
     // Resolve -i / -x SID lists into delta serials.
-    // A malformed range is fatal: silently retrieving a version the caller did
-    // not ask for is worse than refusing, and the g-file would otherwise be
-    // written from the wrong delta set.
+    // A malformed range, or a SID that names no delta, is fatal: silently
+    // retrieving a version the caller did not ask for is worse than
+    // refusing, and the g-file would otherwise be written from the wrong
+    // delta set.
     let mut list_error = None;
-    let mut resolve = |list: Option<&str>| -> Vec<u16> {
-        match list.map(|l| sccs.resolve_sid_list(l)) {
-            Some(Ok((serials, unresolved))) => {
-                for tok in unresolved {
-                    diag::error_path(
-                        "get",
-                        sfile_path,
-                        &format!("{}: {}", tok, gettext("no such delta")),
-                    );
-                }
-                serials
-            }
+    let mut resolve = |list: &Option<SidList>| -> Vec<u16> {
+        match list.as_ref().map(|l| sccs.resolve_sid_list(l.as_str())) {
+            Some(Ok(serials)) => serials,
             Some(Err(e)) => {
                 list_error.get_or_insert(e);
                 Vec::new()
@@ -653,49 +617,41 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
             None => Vec::new(),
         }
     };
-    let included_serials: Vec<u16> = resolve(args.include.as_deref());
-    let excluded_serials: Vec<u16> = resolve(args.exclude.as_deref());
+    let included_serials: Vec<u16> = resolve(&lists.include);
+    let excluded_serials: Vec<u16> = resolve(&lists.exclude);
     if let Some(e) = list_error {
         diag::error_path("get", sfile_path, &e);
         return Ok(false);
     }
 
-    // Compute applied set, then apply -c cutoff and -i/-x adjustments.
-    let mut applied_set = sccs
-        .compute_applied_set(target_serial)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
-    // -c cutoff: drop any applied delta created after the cutoff date-time.
-    if let Some(cutoff_str) = args.cutoff.as_deref() {
-        let cutoff = cutoff::parse(cutoff_str).ok_or_else(|| {
+    // The deltas applied: the target's line of predecessors, as cut off by
+    // -c and adjusted by -i and -x.
+    let cutoff = match args.cutoff.as_deref() {
+        Some(text) => Some(cutoff::parse(text).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("{}: '{}'", gettext("Invalid cutoff date"), cutoff_str),
+                format!("{}: '{}'", gettext("Invalid cutoff date"), text),
             )
-        })?;
-        applied_set.retain(|&serial| {
-            sccs.find_delta_by_serial(serial)
-                .map(|d| !cutoff.is_after(d))
-                .unwrap_or(false)
-        });
-    }
+        })?),
+        None => None,
+    };
+    let after_cutoff = |delta: &DeltaEntry| cutoff.is_some_and(|c| c.is_after(delta));
+    let selection = Selection {
+        included: &included_serials,
+        excluded: &excluded_serials,
+        cutoff: Some(&after_cutoff),
+    };
+    let applied_set = sccs
+        .applied_set(target_serial, &selection)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
-    // -x: force-exclude the listed deltas. Only the named deltas are dropped
-    // from the applied set (descendant deltas remain applied); the Excluded:
-    // notation, however, additionally lists descendants of the excluded
-    // deltas, matching historical SCCS bookkeeping.
+    // The Excluded: notation lists each excluded delta and every delta made
+    // from one, matching historical SCCS bookkeeping; only the deltas named
+    // are left out of the version.
     let mut excluded_effective: Vec<u16> = Vec::new();
     if !excluded_serials.is_empty() {
-        for &x in &excluded_serials {
-            applied_set.remove(&x);
-        }
-        // Notation set: each excluded delta plus any (applied or not) delta
-        // whose predecessor chain passes through an excluded delta.
         excluded_effective = sccs
-            .header
-            .deltas
-            .iter()
-            .filter(|d| d.delta_type == plib::sccsfile::DeltaType::Normal)
+            .live_deltas()
             .map(|d| d.serial)
             .filter(|&s| {
                 excluded_serials
@@ -708,21 +664,6 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
                 .map(|d| d.sid)
                 .unwrap_or_default()
         });
-    }
-
-    // -i: force-include the listed deltas and their predecessor chains. This
-    // runs after -x, not before: -i is "forced to be applied" (99084), so a
-    // delta named by both options ends up applied. CSSC resolves the overlap
-    // the same way.
-    for &inc in &included_serials {
-        let mut cur = inc;
-        while cur != 0 {
-            applied_set.insert(cur);
-            match sccs.find_delta_by_serial(cur) {
-                Some(d) => cur = d.pred_serial,
-                None => break,
-            }
-        }
     }
 
     // Print SID info and -i/-x notation (unless silent)
@@ -771,47 +712,183 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
     // suppresses the g-file but not the lock, and `get -e -g` announcing a new
     // delta while leaving no p-file behind would hand the caller a lock that
     // does not exist.
-    if args.edit {
+    //
+    // The entry and the g-file mean something only together, so an
+    // interrupt is put off from here until the g-file is in place or the
+    // entry taken back: arriving in between, it left the edit pending with
+    // no g-file. (Not when the text goes to standard output, whose reader
+    // may keep a write waiting for as long as it likes.) The guard goes
+    // before the lock does, so an interrupt put off still removes the lock.
+    let _interrupt_deferred = (txn.is_some() && !args.to_stdout).then(SigintBlock::begin);
+    let mut recorded = None;
+    if let Some(txn) = &txn {
         if let Some(ns) = new_sid {
-            create_pfile_entry(
-                sfile_path,
+            recorded = Some(create_pfile_entry(
+                txn,
                 &target_sid,
                 &ns,
-                args.include.clone(),
-                args.exclude.clone(),
-            )?;
+                lists.include.clone(),
+                lists.exclude.clone(),
+            )?);
         }
     }
 
-    // If -g, skip actual retrieval
-    if args.no_get {
-        return Ok(true);
-    }
+    // The retrieval. If it does not happen -- the g-file cannot be made, the
+    // `i` flag refuses a text without keywords -- the edit recorded for it
+    // is taken back, still under the lock: left pending with no g-file, it
+    // refused every later `get -e` until someone ran `unget`.
+    let retrieved = (|| -> io::Result<bool> {
+        // If -g, skip actual retrieval
+        if args.no_get {
+            return Ok(true);
+        }
 
-    // Get module name for -n option
-    let module_name = sccs
-        .module_name()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| paths::module_name(sfile_path).unwrap_or_else(|| "unknown".to_string()));
+        // Get module name for -n option
+        let module_name = idkw::module_name_of(&sccs, sfile_path);
 
-    // Encoded (binary / no-trailing-newline) bodies: uudecode and emit raw
-    // bytes, with no ID-keyword expansion (the content is opaque).
-    if sccs.is_encoded() {
-        let encoded_lines = sccs.evaluate_body(&applied_set);
-        let raw = plib::sccsfile::uudecode_sccs(&encoded_lines);
+        // Encoded (binary / no-trailing-newline) bodies: uudecode and emit raw
+        // bytes, with no ID-keyword expansion (the content is opaque).
+        if sccs.is_encoded() {
+            let encoded_lines = sccs.evaluate_body(&applied_set).map_err(unreadable)?;
+            let raw = plib::sccsfile::uudecode_sccs(&encoded_lines);
 
-        if args.to_stdout {
-            Stdout.write_all(&raw)?;
+            if args.to_stdout {
+                Stdout.write_all(&raw)?;
+            } else {
+                let gfile_path = paths::gfile_from_sfile(sfile_path).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, gettext("Invalid s-file name"))
+                })?;
+                let mode = gfile_mode(args);
+                sfio::write_replacing(&gfile_path, &raw, mode)?;
+            }
+
+            if !args.silent {
+                let line_count = raw.iter().filter(|&&b| b == b'\n').count();
+                let output_stream: &mut dyn Write = if info_to_stderr {
+                    &mut io::stderr()
+                } else {
+                    &mut Stdout
+                };
+                writeln!(output_stream, "{} {}", line_count, gettext("lines"))?;
+            }
+
+            return Ok(true);
+        }
+
+        // Evaluate body
+        let suppress_keywords = args.no_keywords || args.edit;
+
+        // Track whether any ID keyword (%X%) appeared in the retrieved text.
+        let mut had_keyword = false;
+
+        let target_delta = sccs.find_delta_by_serial(target_serial).unwrap();
+        let keyword_values = idkw::KeywordValues::new(&sccs, target_delta, sfile_path);
+
+        // The body, each line paired with the SID of the delta that inserted it
+        // when -m wants that prefix.
+        let body: Vec<(Vec<u8>, Option<Sid>)> = if args.show_sid {
+            sccs.evaluate_body_annotated(&applied_set)
+                .map_err(unreadable)?
+                .into_iter()
+                .map(|(serial, line)| {
+                    // The inserting delta, as its SID.
+                    let sid = sccs
+                        .find_delta_by_serial(serial)
+                        .map_or(Sid::trunk(1, 1), |d| d.sid);
+                    (line, Some(sid))
+                })
+                .collect()
         } else {
+            sccs.evaluate_body(&applied_set)
+                .map_err(unreadable)?
+                .into_iter()
+                .map(|line| (line, None))
+                .collect()
+        };
+
+        let lines: Vec<Vec<u8>> = body
+            .into_iter()
+            .enumerate()
+            .map(|(i, (line, sid))| {
+                if idkw::contains(&line) {
+                    had_keyword = true;
+                }
+                let expanded = if suppress_keywords {
+                    line
+                } else {
+                    idkw::expand(&line, &keyword_values, i + 1)
+                };
+
+                // -n and -m prefixes, each followed by a tab, module name first.
+                let mut out = Vec::new();
+                if args.show_module {
+                    out.extend_from_slice(&module_name);
+                    out.push(b'\t');
+                }
+                if let Some(sid) = sid {
+                    out.extend_from_slice(sid.to_string().as_bytes());
+                    out.push(b'\t');
+                }
+                out.extend_from_slice(&expanded);
+                out
+            })
+            .collect();
+
+        // "No id keywords" handling. When no keyword was present (and keyword
+        // expansion was not suppressed), SCCS warns. If the s-file has the 'i'
+        // flag set, this is escalated to a fatal error: no g-file is written.
+        if !had_keyword && !suppress_keywords {
+            let has_i_flag = sccs
+                .header()
+                .flags
+                .iter()
+                .any(|f| matches!(f, SccsFlag::IdKeywordError(_)));
+            if has_i_flag {
+                // Fatal: always reported, even under -s; no g-file is written.
+                eprintln!(
+                    "get: {}: {}",
+                    sfile_path.display(),
+                    gettext("No id keywords.")
+                );
+                return Ok(false);
+            } else if !args.silent {
+                // Warning: suppressed by -s along with other informative output.
+                eprintln!(
+                    "get: warning: {}: {}",
+                    sfile_path.display(),
+                    gettext("No id keywords.")
+                );
+            }
+        }
+
+        let line_count = lines.len();
+
+        // Write output
+        if args.to_stdout {
+            for line in &lines {
+                Stdout.write_all(line)?;
+                Stdout.write_all(b"\n")?;
+            }
+        } else {
+            // Write to g-file
             let gfile_path = paths::gfile_from_sfile(sfile_path).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, gettext("Invalid s-file name"))
             })?;
-            let mode = if args.edit { 0o644 } else { 0o444 };
-            sfio::write_replacing(&gfile_path, &raw, mode)?;
+
+            // A non-edit g-file is read-only, so the previous run's g-file must be
+            // replaced rather than reopened: `File::create` on it fails EACCES,
+            // which made a second `get` of any file impossible.
+            let mut content = Vec::new();
+            for line in &lines {
+                content.extend_from_slice(line);
+                content.push(b'\n');
+            }
+            let mode = gfile_mode(args);
+            sfio::write_replacing(&gfile_path, &content, mode)?;
         }
 
+        // Print line count (unless silent)
         if !args.silent {
-            let line_count = raw.iter().filter(|&&b| b == b'\n').count();
             let output_stream: &mut dyn Write = if info_to_stderr {
                 &mut io::stderr()
             } else {
@@ -820,129 +897,14 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
             writeln!(output_stream, "{} {}", line_count, gettext("lines"))?;
         }
 
-        return Ok(true);
-    }
-
-    // Evaluate body
-    let suppress_keywords = args.no_keywords || args.edit;
-
-    // Track whether any ID keyword (%X%) appeared in the retrieved text.
-    let mut had_keyword = false;
-
-    let lines: Vec<String> = if args.show_sid {
-        // Need to track which delta inserted each line
-        let lines_with_sid = evaluate_body_with_sid(&sccs, &applied_set);
-        let target_delta = sccs.find_delta_by_serial(target_serial).unwrap();
-
-        lines_with_sid
-            .into_iter()
-            .enumerate()
-            .map(|(i, (line, sid))| {
-                if idkw::in_line(&line) {
-                    had_keyword = true;
-                }
-                let expanded = if suppress_keywords {
-                    line
-                } else {
-                    expand_keywords(&line, &sccs, target_delta, sfile_path, i + 1)
-                };
-
-                if args.show_module {
-                    format!("{}\t{}\t{}", module_name, sid, expanded)
-                } else {
-                    format!("{}\t{}", sid, expanded)
-                }
-            })
-            .collect()
-    } else {
-        let content = sccs.evaluate_body(&applied_set);
-        let target_delta = sccs.find_delta_by_serial(target_serial).unwrap();
-
-        content
-            .into_iter()
-            .enumerate()
-            .map(|(i, line)| {
-                if idkw::in_line(&line) {
-                    had_keyword = true;
-                }
-                let expanded = if suppress_keywords {
-                    line
-                } else {
-                    expand_keywords(&line, &sccs, target_delta, sfile_path, i + 1)
-                };
-
-                if args.show_module {
-                    format!("{}\t{}", module_name, expanded)
-                } else {
-                    expanded
-                }
-            })
-            .collect()
-    };
-
-    // "No id keywords" handling. When no keyword was present (and keyword
-    // expansion was not suppressed), SCCS warns. If the s-file has the 'i'
-    // flag set, this is escalated to a fatal error: no g-file is written.
-    if !had_keyword && !suppress_keywords {
-        let has_i_flag = sccs
-            .header
-            .flags
-            .iter()
-            .any(|f| matches!(f, SccsFlag::IdKeywordError(_)));
-        if has_i_flag {
-            // Fatal: always reported, even under -s; no g-file is written.
-            eprintln!(
-                "get: {}: {}",
-                sfile_path.display(),
-                gettext("No id keywords.")
-            );
-            return Ok(false);
-        } else if !args.silent {
-            // Warning: suppressed by -s along with other informative output.
-            eprintln!(
-                "get: warning: {}: {}",
-                sfile_path.display(),
-                gettext("No id keywords.")
-            );
+        Ok(true)
+    })();
+    if !matches!(retrieved, Ok(true)) {
+        if let (Some(txn), Some(entry)) = (&txn, &recorded) {
+            withdraw_pfile_entry(txn, entry)?;
         }
     }
-
-    let line_count = lines.len();
-
-    // Write output
-    if args.to_stdout {
-        for line in &lines {
-            writeln!(Stdout, "{}", line)?;
-        }
-    } else {
-        // Write to g-file
-        let gfile_path = paths::gfile_from_sfile(sfile_path).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, gettext("Invalid s-file name"))
-        })?;
-
-        // A non-edit g-file is read-only, so the previous run's g-file must be
-        // replaced rather than reopened: `File::create` on it fails EACCES,
-        // which made a second `get` of any file impossible.
-        let mut content = Vec::new();
-        for line in &lines {
-            content.extend_from_slice(line.as_bytes());
-            content.push(b'\n');
-        }
-        let mode = if args.edit { 0o644 } else { 0o444 };
-        sfio::write_replacing(&gfile_path, &content, mode)?;
-    }
-
-    // Print line count (unless silent)
-    if !args.silent {
-        let output_stream: &mut dyn Write = if info_to_stderr {
-            &mut io::stderr()
-        } else {
-            &mut Stdout
-        };
-        writeln!(output_stream, "{} {}", line_count, gettext("lines"))?;
-    }
-
-    Ok(true)
+    retrieved
 }
 
 /// Standard output, whose write failures are marked as [`StdoutWriteError`]
@@ -986,6 +948,13 @@ fn main() -> ExitCode {
     zlock::install_cleanup();
 
     let args = plib::optarg::parse::<Args>();
+    let lists = match Lists::from_args(&args) {
+        Ok(lists) => lists,
+        Err(e) => {
+            eprintln!("get: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     // Expand operands: a lone "-" reads s-file pathnames from stdin, and
     // directory operands expand to their sorted s.* members.
@@ -998,7 +967,7 @@ fn main() -> ExitCode {
     let mut exit_code = ExitCode::SUCCESS;
 
     for file_path in &files {
-        match process_file(&args, file_path, multiple_files) {
+        match process_file(&args, &lists, file_path, multiple_files) {
             Ok(true) => {}
             Ok(false) => exit_code = ExitCode::FAILURE,
             // Every later file would fail the same way.

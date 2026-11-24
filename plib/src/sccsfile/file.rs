@@ -527,9 +527,10 @@ impl SccsFile {
     /// tabs.
     ///
     /// A malformed range is a hard error: silently recording the wrong list
-    /// would bake the mistake into the delta table. A token that merely names
-    /// no such delta is returned as unresolved for the caller to report.
-    pub fn resolve_sid_list(&self, list: &str) -> Result<(Vec<u16>, Vec<String>), String> {
+    /// would bake the mistake into the delta table. So is a token that names
+    /// no delta of the file: the version the list describes cannot be made,
+    /// and going on with the rest of the list made a different one.
+    pub fn resolve_sid_list(&self, list: &str) -> Result<Vec<u16>, String> {
         self.resolve_delta_list(list, false)
     }
 
@@ -540,17 +541,12 @@ impl SccsFile {
     /// leak into `get -i`/`-x`: there, `-x2` means the SID `2`, and silently
     /// reading it as serial 2 hands the user a different version than they
     /// asked for with no diagnostic. CSSC treats `-x2` as naming no delta.
-    pub fn resolve_ignore_list(&self, list: &str) -> Result<(Vec<u16>, Vec<String>), String> {
+    pub fn resolve_ignore_list(&self, list: &str) -> Result<Vec<u16>, String> {
         self.resolve_delta_list(list, true)
     }
 
-    fn resolve_delta_list(
-        &self,
-        list: &str,
-        allow_serial: bool,
-    ) -> Result<(Vec<u16>, Vec<String>), String> {
+    fn resolve_delta_list(&self, list: &str, allow_serial: bool) -> Result<Vec<u16>, String> {
         let mut serials = Vec::new();
-        let mut unresolved = Vec::new();
 
         for tok in list.split([',', ' ', '\t']).filter(|s| !s.is_empty()) {
             if let Some((lo, hi)) = tok.split_once('-') {
@@ -581,10 +577,10 @@ impl SccsFile {
 
             match tok.parse::<u16>() {
                 Ok(n) if allow_serial && self.find_delta_by_serial(n).is_some() => serials.push(n),
-                _ => unresolved.push(tok.to_string()),
+                _ => return Err(format!("{tok}: no such delta")),
             }
         }
 
-        Ok((serials, unresolved))
+        Ok(serials)
     }
 }

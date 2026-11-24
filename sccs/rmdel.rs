@@ -167,7 +167,7 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
             .into_iter()
             .flatten()
             .filter_map(|list| sccs.resolve_sid_list(list.as_str()).ok())
-            .any(|(serials, _)| serials.contains(&serial));
+            .any(|serials| serials.contains(&serial));
         if entry.old_sid == *sid || entry.new_sid == *sid || listed {
             diag::error_path(
                 "rmdel",

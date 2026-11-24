@@ -1343,19 +1343,16 @@ fn get_e_allows_a_listed_user_and_a_listed_group() {
 /// Sharing one list resolver between `get -i`/`-x` and `delta -g` brought
 /// delta's historical bare-serial convenience with it, so `get -x2` silently
 /// excluded delta 1.2 -- serial 2 -- and handed back a different version than
-/// the user asked for, with no diagnostic. CSSC treats `-x2` as naming no
-/// delta.
+/// the user asked for, with no diagnostic. `-x2` names no delta, and a list
+/// that names no delta is refused.
 #[test]
 fn get_x_with_a_bare_number_names_a_sid_not_a_serial() {
     let tmp = TempDir::new().unwrap();
     let sfile = three_delta_file(tmp.path(), "bare");
 
     let out = super::common::run_in("get", &["-p", "-s", "-x2", &sfile], tmp.path(), "");
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
-        "a\nb\nc\n",
-        "-x2 names no delta, so nothing is excluded"
-    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.stdout.is_empty(), "-x2 names no delta: {out:?}");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("no such delta"),
         "an unresolvable token must be diagnosed, got {:?}",
@@ -1893,4 +1890,37 @@ fn joint_edits_of_one_delta_get_different_sids() {
     let out = run("delta", &["-s", "-r1.1.1.1", "-yc", "s.j"], "");
     assert!(out.status.success(), "{out:?}");
     assert_eq!(pending(dir), ["1.2", "1.1.2.1"]);
+}
+
+/// A list that names a delta the file does not have is an error, for get's
+/// `-i` and `-x` and for delta's `-g`: the version asked for cannot be
+/// made, and nothing is retrieved, recorded or committed. Each said "no such
+/// delta" and went on with the rest of the list, exit status 0 -- `get -e`
+/// recording in the p-file a list that delta would then refuse for good.
+#[test]
+fn a_list_naming_no_delta_is_an_error() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    assert!(run("admin", &["-i", "s.m"], "one\n").status.success());
+    let refused = |out: std::process::Output, what: &str| {
+        assert_eq!(out.status.code(), Some(1), "{what}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("9.9"),
+            "{what}: {out:?}"
+        );
+        assert!(out.stdout.is_empty(), "{what}: {out:?}");
+    };
+
+    refused(run("get", &["-p", "-s", "-i9.9", "s.m"], ""), "get -i");
+    refused(run("get", &["-p", "-s", "-x1.1,9.9", "s.m"], ""), "get -x");
+    refused(run("get", &["-e", "-i9.9", "s.m"], ""), "get -e -i");
+    assert!(!dir.join("p.m").exists() && !dir.join("m").exists());
+
+    assert!(run("get", &["-e", "-s", "s.m"], "").status.success());
+    std::fs::write(dir.join("m"), "two\n").unwrap();
+    refused(run("delta", &["-yc", "-g9.9", "s.m"], ""), "delta -g");
+    assert!(dir.join("p.m").exists(), "the edit is still pending");
+    let out = run("prs", &["-e", "-d:I:", "s.m"], "");
+    assert_eq!(out.stdout, b"1.1\n");
 }

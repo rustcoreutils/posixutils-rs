@@ -231,15 +231,7 @@ fn resolve_pfile_list(sccs: &SccsFile, list: Option<&SidList>) -> Result<Vec<u16
     // gone the text edited is no longer the version the list describes, and
     // a delta made regardless counted the missing delta's lines as the
     // user's own.
-    let (serials, unresolved) = sccs.resolve_sid_list(list.as_str())?;
-    if !unresolved.is_empty() {
-        return Err(format!(
-            "{}: {}",
-            unresolved.join(", "),
-            gettext("no such delta")
-        ));
-    }
-    Ok(serials)
+    sccs.resolve_sid_list(list.as_str())
 }
 
 /// Diff the base version against the g-file.
@@ -623,20 +615,12 @@ fn process_file(
     let comment = gather_comment(args, stdin_consumed, replies);
 
     // Resolve -g list (SIDs, ranges or serial numbers) into serials to ignore.
-    // A malformed range aborts before anything is written: recording the delta
-    // with a silently wrong ignore-list would bake the mistake into history.
+    // A malformed range, or a name that is no delta's, aborts before anything
+    // is written: recording the delta with a silently wrong ignore-list
+    // would bake the mistake into history.
     let ignored = match &args.glist {
         Some(list) => match sccs.resolve_ignore_list(list) {
-            Ok((serials, unresolved)) => {
-                for tok in unresolved {
-                    diag::error_path(
-                        "delta",
-                        sfile_path,
-                        &format!("{}: {}", tok, gettext("no such delta")),
-                    );
-                }
-                serials
-            }
+            Ok(serials) => serials,
             Err(e) => {
                 diag::error_path("delta", sfile_path, &e);
                 return Ok(false);

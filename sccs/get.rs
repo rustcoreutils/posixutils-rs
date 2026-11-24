@@ -556,22 +556,14 @@ fn process_file(
     let info_to_stderr = args.to_stdout || args.lfile_stdout;
 
     // Resolve -i / -x SID lists into delta serials.
-    // A malformed range is fatal: silently retrieving a version the caller did
-    // not ask for is worse than refusing, and the g-file would otherwise be
-    // written from the wrong delta set.
+    // A malformed range, or a SID that names no delta, is fatal: silently
+    // retrieving a version the caller did not ask for is worse than
+    // refusing, and the g-file would otherwise be written from the wrong
+    // delta set.
     let mut list_error = None;
     let mut resolve = |list: &Option<SidList>| -> Vec<u16> {
         match list.as_ref().map(|l| sccs.resolve_sid_list(l.as_str())) {
-            Some(Ok((serials, unresolved))) => {
-                for tok in unresolved {
-                    diag::error_path(
-                        "get",
-                        sfile_path,
-                        &format!("{}: {}", tok, gettext("no such delta")),
-                    );
-                }
-                serials
-            }
+            Some(Ok(serials)) => serials,
             Some(Err(e)) => {
                 list_error.get_or_insert(e);
                 Vec::new()

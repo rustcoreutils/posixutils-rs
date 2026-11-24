@@ -612,6 +612,24 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
     // Read g-file
     let new_lines = read_gfile_for(&sccs, sfile_path)?;
 
+    // A text line beginning with SOH would be stored as it is and read back
+    // as a control line -- "^AE 1" would end a block early. The results are
+    // unspecified (POSIX delta); refuse rather than store a file that reads
+    // back differently. An encoded file's lines never begin with SOH.
+    if let Some(n) = new_lines.iter().position(|l| l.first() == Some(&0x01)) {
+        diag::error_path(
+            "delta",
+            sfile_path,
+            &format!(
+                "{} {} {}",
+                gettext("line"),
+                n + 1,
+                gettext("begins with a control character (SOH) and cannot be stored")
+            ),
+        );
+        return Ok(false);
+    }
+
     // The edit was made against the version `get -e` produced, which means the
     // -i/-x lists it recorded in the p-file, not the plain base.
     let forced_in = match resolve_pfile_list(&sccs, pfile_entry.included.as_deref(), sfile_path) {

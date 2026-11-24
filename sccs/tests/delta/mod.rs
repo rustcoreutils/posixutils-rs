@@ -1321,3 +1321,32 @@ fn delta_multi_line_comment_is_kept() {
     let out = super::common::run_in("val", &[name], dir, "");
     assert_eq!(out.status.code(), Some(0), "{out:?}");
 }
+
+/// A text line beginning with SOH cannot be stored in a text s-file: it would
+/// read back as a control line, and one such as `^AE 1` would end a block
+/// early. delta refuses it and changes nothing, rather than store a file
+/// that reads back differently.
+#[test]
+fn delta_refuses_a_line_beginning_with_soh() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, pfile, gfile) = setup_sccs_file(&tmp, "soh", "one\ntwo\n");
+    get_for_editing(&sfile);
+    let before = fs::read(&sfile).unwrap();
+    fs::write(&gfile, b"one\n\x01E 1\ntwo\n").unwrap();
+    let dir = sfile.parent().unwrap();
+    let out = super::common::run_in("delta", &["-s", "-yc", "s.soh"], dir, "");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("line 2"),
+        "the line should be named: {out:?}"
+    );
+    assert_eq!(
+        fs::read(&sfile).unwrap(),
+        before,
+        "the s-file must be untouched"
+    );
+    assert!(
+        pfile.exists() && gfile.exists(),
+        "the edit is still pending"
+    );
+}

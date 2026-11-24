@@ -323,38 +323,16 @@ fn test_parse_branched_fixture() {
     }
 }
 
+/// Reading an s-file and writing it back changes nothing: not one byte, for
+/// every fixture. (They were written by CSSC, in the canonical layout.) This
+/// is the invariant every rewrite of an s-file rests on.
 #[test]
-fn test_round_trip_serialization() {
-    let path = fixtures_path().join("s.simple");
-    if !path.exists() {
-        eprintln!("Skipping test: fixture not found at {:?}", path);
-        return;
+fn an_unchanged_file_is_written_back_byte_for_byte() {
+    for name in ["s.simple", "s.multi", "s.keywords", "s.branched"] {
+        let data = std::fs::read(fixtures_path().join(name)).expect(name);
+        let sccs = SccsFile::from_bytes(&data).expect(name);
+        assert_eq!(sccs.to_bytes(), data, "{name} changed on a round trip");
     }
-
-    let sccs = SccsFile::from_path(&path).expect("Failed to parse s.simple");
-
-    // Serialize to bytes
-    let serialized = sccs.to_bytes();
-
-    // Parse again
-    let reparsed = SccsFile::from_bytes(&serialized).expect("Failed to reparse serialized data");
-
-    // Compare structure (not byte-for-byte due to checksum recalculation)
-    assert_eq!(sccs.header.deltas.len(), reparsed.header.deltas.len());
-    assert_eq!(sccs.header.flags.len(), reparsed.header.flags.len());
-    assert_eq!(sccs.body.len(), reparsed.body.len());
-
-    // Verify content is identical
-    let applied = sccs.compute_applied_set(1).unwrap();
-    let content1 = sccs.evaluate_body(&applied);
-
-    let applied2 = reparsed.compute_applied_set(1).unwrap();
-    let content2 = reparsed.evaluate_body(&applied2);
-
-    assert_eq!(
-        content1, content2,
-        "Content should be identical after round-trip"
-    );
 }
 
 /// An s-file image: `content` (everything after the `^Ah` line) with

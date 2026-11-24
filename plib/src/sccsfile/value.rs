@@ -46,14 +46,6 @@ fn refuse<T>(what: &str, bytes: &[u8], why: &str) -> SccsResult<T> {
 macro_rules! stored_value {
     ($name:ident) => {
         impl $name {
-            /// A value read from a file, taken as it stands. Only the
-            /// parser has such values, so only this module's parent can
-            /// make one unchecked.
-            #[allow(dead_code)]
-            pub(super) fn from_stored(bytes: &[u8]) -> Self {
-                $name(bytes.to_vec())
-            }
-
             /// The bytes.
             pub fn as_bytes(&self) -> &[u8] {
                 &self.0
@@ -86,6 +78,19 @@ macro_rules! stored_value {
             }
         }
     };
+    // A kind of value the s-file parser reads.
+    ($name:ident, stored) => {
+        stored_value!($name);
+
+        impl $name {
+            /// A value read from an s-file, taken as it stands. Only the
+            /// parser has such values, so only this module's parent can
+            /// make one unchecked.
+            pub(super) fn from_stored(bytes: &[u8]) -> Self {
+                $name(bytes.to_vec())
+            }
+        }
+    };
 }
 
 /// A login name: the author of a delta, the holder of an edit, an entry of
@@ -97,7 +102,7 @@ macro_rules! stored_value {
 /// space, and does not begin with SOH, which would make a control line of it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Login(Vec<u8>);
-stored_value!(Login);
+stored_value!(Login, stored);
 
 impl Login {
     pub fn new(bytes: &[u8]) -> SccsResult<Self> {
@@ -147,7 +152,7 @@ pub(super) fn login_from(passwd: Option<&[u8]>, env: Option<&[u8]>) -> SccsResul
 /// per line of a longer comment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommentLine(Vec<u8>);
-stored_value!(CommentLine);
+stored_value!(CommentLine, stored);
 
 impl CommentLine {
     pub fn new(bytes: &[u8]) -> SccsResult<Self> {
@@ -172,7 +177,7 @@ impl CommentLine {
 /// blank-separated list, so one holds no white space, and it is not empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MrNumber(Vec<u8>);
-stored_value!(MrNumber);
+stored_value!(MrNumber, stored);
 
 impl MrNumber {
     pub fn new(bytes: &[u8]) -> SccsResult<Self> {

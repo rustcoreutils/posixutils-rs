@@ -1954,3 +1954,40 @@ fn a_delta_being_edited_is_not_edited_again_without_j() {
     let pfile = std::fs::read_to_string(dir.join("p.e")).unwrap();
     assert_eq!(pfile.lines().count(), 1, "{pfile}");
 }
+
+/// `-t` is the most recently created delta "in a given release (for example,
+/// -r1) or release and level (for example, -r1.2)" (POSIX get). The level
+/// was ignored: `-t -r1.2` gave the newest delta anywhere in release 1.
+#[test]
+fn get_t_keeps_to_the_release_and_level_named() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    assert!(run("admin", &["-i", "-fb", "s.t"], "1.1\n")
+        .status
+        .success());
+    // 1.2, 1.3 on the trunk; then, later, 1.1.1.1 and 1.2.1.1 on branches.
+    for (from, text) in [
+        ("1.1", "1.2"),
+        ("1.2", "1.3"),
+        ("1.1", "1.1.1.1"),
+        ("1.2", "1.2.1.1"),
+    ] {
+        let r = format!("-r{from}");
+        assert!(
+            run("get", &["-e", "-s", &r, "s.t"], "").status.success(),
+            "{from}"
+        );
+        std::fs::write(dir.join("t"), format!("{text}\n")).unwrap();
+        assert!(run("delta", &["-s", "-yc", "s.t"], "").status.success());
+    }
+    let top = |args: &[&str]| {
+        let out = run("get", &[&["-p", "-s", "-t"], args, &["s.t"]].concat(), "");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert_eq!(top(&[]), "1.2.1.1\n");
+    assert_eq!(top(&["-r1"]), "1.2.1.1\n");
+    assert_eq!(top(&["-r1.3"]), "1.3\n");
+    assert_eq!(top(&["-r1.2"]), "1.2.1.1\n");
+    assert_eq!(top(&["-r1.1"]), "1.1.1.1\n");
+}

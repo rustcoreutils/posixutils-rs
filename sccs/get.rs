@@ -144,25 +144,28 @@ fn find_target_delta<'a>(
     }
 }
 
-/// Find the most recently created (top) delta. With a requested release, the
-/// search is restricted to deltas in that release; otherwise it considers all
-/// applied (non-removed) deltas in the file.
+/// Find the most recently created (top) delta "in a given release (for
+/// example, -r1) or release and level (for example, -r1.2)" (POSIX get, -t):
+/// among the deltas of that release, and of that level if one is named,
+/// their branches included; among all the file's deltas with no -r.
 fn find_top_delta<'a>(
     sccs: &'a SccsFile,
     requested_sid: Option<&str>,
 ) -> Result<&'a DeltaEntry, String> {
-    let release: Option<u16> = match requested_sid {
+    let named: Option<Sid> = match requested_sid {
         None => None,
-        Some(s) => {
-            let sid: Sid = s
-                .parse()
-                .map_err(|_| format!("{}: {}", gettext("Invalid SID"), s))?;
-            Some(sid.rel)
-        }
+        Some(s) => Some(
+            s.parse()
+                .map_err(|_| format!("{}: {}", gettext("Invalid SID"), s))?,
+        ),
+    };
+    let release = named.map(|sid| sid.rel);
+    let within = |d: &DeltaEntry| {
+        named.is_none_or(|sid| d.sid.rel == sid.rel && (sid.is_partial() || d.sid.lev == sid.lev))
     };
 
     sccs.live_deltas()
-        .filter(|d| release.is_none_or(|r| d.sid.rel == r))
+        .filter(|d| within(d))
         .max_by(|a, b| {
             let ka = (
                 cutoff::full_year(&a.datetime),

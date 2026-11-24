@@ -1568,3 +1568,26 @@ fn an_s_file_is_edited_in_place_not_regenerated() {
     let out = run_in("get", &["-p", "-k", "-s", "s.odd"], tmp.path(), "");
     assert_eq!(out.stdout, b"a\nb\n");
 }
+
+/// A flag given twice is set once, to the value given last, whether the
+/// file is being made or already exists. On a new file both lines were
+/// written, and readers took the first.
+#[test]
+fn admin_a_flag_given_twice_is_set_once() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |args: &[&str]| super::common::run_in("admin", args, dir, "");
+    assert!(run(&["-n", "-fc5", "-fb", "-fc7", "s.new"])
+        .status
+        .success());
+    assert!(run(&["-n", "s.old"]).status.success());
+    assert!(run(&["-fc5", "-fb", "-fc7", "s.old"]).status.success());
+    for name in ["s.new", "s.old"] {
+        let data = fs::read(dir.join(name)).unwrap();
+        let flags: Vec<&[u8]> = data
+            .split(|&b| b == b'\n')
+            .filter(|l| l.starts_with(b"\x01f "))
+            .collect();
+        assert_eq!(flags, [&b"\x01f c 7"[..], b"\x01f b"], "{name}");
+    }
+}

@@ -201,8 +201,16 @@ impl SccsFile {
             content.text(user)?;
         }
         content.line(b"\x01U");
-        for flag in new.flags {
-            content.flag(flag)?;
+        // A flag is set once. Given twice, it is where it first came and
+        // holds what came last, as [`Self::set_flag`] leaves it: both lines
+        // written, a reader took the first.
+        for (at, flag) in new.flags.iter().enumerate() {
+            let letter = flag.flag_char();
+            if new.flags[..at].iter().any(|f| f.flag_char() == letter) {
+                continue;
+            }
+            let last = new.flags.iter().rfind(|f| f.flag_char() == letter);
+            content.flag(last.unwrap_or(flag))?;
         }
         content.line(b"\x01t");
         for line in new.descriptive_text {

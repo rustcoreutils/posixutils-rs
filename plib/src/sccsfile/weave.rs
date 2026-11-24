@@ -193,8 +193,8 @@ impl<'a> Walker<'a> {
         &self.blocks
     }
 
-    /// The record at `index`, with the blocks brought up to date.
-    fn step(&mut self, index: usize, kind: Kind, text: &'a [u8]) -> Result<Rec<'a>, WeaveError> {
+    /// The record of this kind and text, with the blocks brought up to date.
+    fn step(&mut self, kind: Kind, text: &'a [u8]) -> Result<Rec<'a>, WeaveError> {
         let known = |serial: u16| {
             if (1..=self.body.max_serial()).contains(&serial) {
                 Ok(serial)
@@ -202,7 +202,6 @@ impl<'a> Walker<'a> {
                 Err(WeaveError::NoSuchDelta(serial))
             }
         };
-        let _ = index;
         Ok(match kind {
             Kind::Insert(serial) => {
                 self.blocks.open(BlockKind::Insert, known(serial)?)?;
@@ -246,7 +245,7 @@ impl<'a> Iterator for Walker<'a> {
                 .map(|&(serial, _)| Err(WeaveError::NeverClosed(serial).at(index)));
         };
         self.pos += 1;
-        Some(match self.step(index, kind, text) {
+        Some(match self.step(kind, text) {
             Ok(rec) => Ok((index, rec)),
             Err(e) => {
                 self.done = true;

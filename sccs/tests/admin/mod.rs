@@ -1515,3 +1515,59 @@ fn admin_f_replaces_a_flag_in_place() {
         String::from_utf8_lossy(&data)
     );
 }
+
+/// An s-file is edited, not regenerated: admin, delta and rmdel each change
+/// the lines their change names and copy every other line byte for byte.
+/// `s.odd` is valid but far from the canonical layout (unpadded numbers,
+/// doubled blanks, interleaved records, stray lines); a rewrite from the
+/// parsed file used to normalise all of it, and drop the strays, to add one
+/// flag.
+#[test]
+fn an_s_file_is_edited_in_place_not_regenerated() {
+    use super::common::assert_only_changed;
+    let tmp = TempDir::new().unwrap();
+    let s = tmp.path().join("s.odd");
+    fs::copy(fixture_path("s.odd"), &s).unwrap();
+    let ok = |cmd: &str, args: &[&str]| {
+        let out = run_in(cmd, args, tmp.path(), "");
+        assert!(out.status.success(), "{cmd} {args:?}: {out:?}");
+    };
+    let mut before = fs::read(&s).unwrap();
+    let mut step = |cmd: &str, args: &[&str], removed: &[&[u8]], added: &[&[u8]]| {
+        ok(cmd, args);
+        let after = fs::read(&s).unwrap();
+        assert_only_changed(&before, &after, removed, added);
+        before = after;
+    };
+
+    step("admin", &["-fj", "s.odd"], &[], &[b"\x01f j"]);
+    step(
+        "admin",
+        &["-fq y", "s.odd"],
+        &[b"\x01f  q  x"],
+        &[b"\x01f q y"],
+    );
+    step("admin", &["-afred", "s.odd"], &[], &[b"fred"]);
+    step("admin", &["-ebob", "s.odd"], &[b"  bob  "], &[]);
+    step("admin", &["-dj", "s.odd"], &[b"\x01f j"], &[]);
+    // Nothing to change: nothing changes, not even the checksum line.
+    let same = fs::read(&s).unwrap();
+    ok("admin", &["-fb", "-afred", "s.odd"]);
+    assert_eq!(fs::read(&s).unwrap(), same);
+
+    step(
+        "rmdel",
+        &["-r1.2", "s.odd"],
+        &[
+            b"\x01d D 1.2  26/01/02 00:00:00 u 2 1",
+            b"\x01D 02",
+            b"\x01E 02",
+            b"\x01I 2",
+            b"B",
+            b"\x01E 2",
+        ],
+        &[b"\x01d R 1.2  26/01/02 00:00:00 u 2 1"],
+    );
+    let out = run_in("get", &["-p", "-k", "-s", "s.odd"], tmp.path(), "");
+    assert_eq!(out.stdout, b"a\nb\n");
+}

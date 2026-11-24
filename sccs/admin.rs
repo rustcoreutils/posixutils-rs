@@ -307,6 +307,11 @@ fn parse_flag_removal(arg: &str) -> Result<FlagRemoval, String> {
         .map_err(|_| format!("{} '{}'", gettext("Invalid release list"), list))
 }
 
+/// A plib s-file error as the io::Error the utility reports.
+fn invalid_data(e: plib::sccsfile::SccsError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+}
+
 /// Apply one `-d` option to an s-file.
 fn remove_flag(sccs: &mut SccsFile, removal: FlagRemoval) -> io::Result<()> {
     let invalid = |message: String| io::Error::new(io::ErrorKind::InvalidInput, message);
@@ -314,7 +319,9 @@ fn remove_flag(sccs: &mut SccsFile, removal: FlagRemoval) -> io::Result<()> {
         FlagRemoval::Flag(letter) => {
             // A letter that is not a flag is only removable if the file has
             // it, as a flag some other implementation wrote.
-            if !sccs.remove_flag(letter) && !VALID_FLAG_CHARS.contains(&letter) {
+            if !sccs.remove_flag(letter).map_err(invalid_data)?
+                && !VALID_FLAG_CHARS.contains(&letter)
+            {
                 return Err(invalid(unrecognized_flag(letter)));
             }
             return Ok(());
@@ -334,9 +341,10 @@ fn remove_flag(sccs: &mut SccsFile, removal: FlagRemoval) -> io::Result<()> {
                 .filter(|rel| !releases.contains(rel))
                 .collect();
             if rest.is_empty() {
-                sccs.remove_flag('l');
+                sccs.remove_flag('l').map_err(invalid_data)?;
             } else {
-                sccs.set_flag(SccsFlag::LockedReleases(ReleaseLock::List(rest)));
+                sccs.set_flag(SccsFlag::LockedReleases(ReleaseLock::List(rest)))
+                    .map_err(invalid_data)?;
             }
             Ok(())
         }
@@ -587,7 +595,7 @@ fn modify_existing_file(
 
     // Update descriptive text if provided
     if let Some(text) = desc_text {
-        sccs.set_descriptive_text(text);
+        sccs.set_descriptive_text(&text).map_err(invalid_data)?;
     }
 
     // Delete flags
@@ -597,7 +605,7 @@ fn modify_existing_file(
 
     // Add flags
     for flag in add_flags {
-        sccs.set_flag(flag);
+        sccs.set_flag(flag).map_err(invalid_data)?;
     }
 
     // -m needs the v flag: the one this file ends up with, whether it had
@@ -612,12 +620,12 @@ fn modify_existing_file(
 
     // Add users
     for user in add_users {
-        sccs.add_user(user.as_bytes());
+        sccs.add_user(user.as_bytes()).map_err(invalid_data)?;
     }
 
     // Remove users
     for user in remove_users {
-        sccs.remove_user(user.as_bytes());
+        sccs.remove_user(user.as_bytes()).map_err(invalid_data)?;
     }
 
     // Write atomically

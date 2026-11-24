@@ -13,7 +13,7 @@
 use std::str::FromStr;
 
 use super::{
-    control, BodyRecord, DeltaEntry, DeltaStats, DeltaType, SccsDateTime, SccsError, SccsFile,
+    control, DeltaEntry, DeltaStats, DeltaType, Kind, Line, SccsDateTime, SccsError, SccsFile,
     SccsFlag, SccsHeader, SccsResult, SOH,
 };
 
@@ -33,6 +33,8 @@ pub(super) struct SccsParser<'a> {
     line_num: usize,
     /// Refuse lines no record accounts for, rather than skip them.
     strict: bool,
+    /// Every line consumed, in order, with what it was taken for.
+    lines: Vec<Line>,
 }
 
 impl<'a> SccsParser<'a> {
@@ -42,6 +44,14 @@ impl<'a> SccsParser<'a> {
             pos: 0,
             line_num: 0,
             strict,
+            lines: Vec::new(),
+        }
+    }
+
+    /// Record what the line last consumed is. Until told, it is a stray.
+    fn mark(&mut self, kind: Kind) {
+        if let Some(line) = self.lines.last_mut() {
+            line.kind = kind;
         }
     }
 
@@ -78,18 +88,21 @@ impl<'a> SccsParser<'a> {
         let descriptive_text = self.parse_descriptive_text()?;
 
         // Parse body
-        let body = self.parse_body()?;
+        let body_start = self.lines.len();
+        self.parse_body()?;
 
-        Ok(SccsFile {
-            header: SccsHeader {
+        Ok(SccsFile::from_parts(
+            self.data.to_vec(),
+            std::mem::take(&mut self.lines),
+            body_start,
+            SccsHeader {
                 checksum,
                 deltas,
                 users,
                 flags,
                 descriptive_text,
             },
-            body,
-        })
+        ))
     }
 
     fn skip_whitespace(&mut self) {
@@ -119,6 +132,11 @@ impl<'a> SccsParser<'a> {
             self.pos += 1;
         }
         self.line_num += 1;
+        self.lines.push(Line {
+            start,
+            len: end - start,
+            kind: Kind::Stray,
+        });
 
         Some(&self.data[start..end])
     }
@@ -148,6 +166,7 @@ impl<'a> SccsParser<'a> {
                 "File does not start with checksum line".into(),
             ));
         }
+        self.mark(Kind::Checksum);
 
         let sum_str = std::str::from_utf8(&line[2..])
             .map_err(|_| SccsError::InvalidFormat("Invalid checksum encoding".into()))?;
@@ -190,6 +209,7 @@ impl<'a> SccsParser<'a> {
         if stats_line.len() < 3 || stats_line[0] != SOH || stats_line[1] != control::STATS {
             return Err(SccsError::InvalidDelta("Expected stats line".into()));
         }
+        self.mark(Kind::Stats);
         let stats_str = std::str::from_utf8(control_arg(stats_line))
             .map_err(|_| SccsError::InvalidDelta("Invalid stats encoding".into()))?;
         entry.stats = DeltaStats::from_str(stats_str.trim())?;
@@ -201,6 +221,7 @@ impl<'a> SccsParser<'a> {
         if delta_line.len() < 3 || delta_line[0] != SOH || delta_line[1] != control::DELTA {
             return Err(SccsError::InvalidDelta("Expected delta line".into()));
         }
+        self.mark(Kind::DeltaHead);
         // Parse: <type> <sid> <date> <time> <user> <serial> <pred>. The user
         // is a login and kept as its bytes; every other field is ASCII.
         let delta_arg = control_arg(delta_line);
@@ -242,8 +263,12 @@ impl<'a> SccsParser<'a> {
             }
 
             match line[1] {
-                control::END_DELTA => break,
+                control::END_DELTA => {
+                    self.mark(Kind::DeltaEnd);
+                    break;
+                }
                 control::INCLUDE => {
+                    self.mark(Kind::Include);
                     let serials_str = std::str::from_utf8(control_arg(line)).unwrap_or("");
                     for s in serials_str.split_whitespace() {
                         if let Ok(serial) = s.parse() {
@@ -252,6 +277,7 @@ impl<'a> SccsParser<'a> {
                     }
                 }
                 control::EXCLUDE => {
+                    self.mark(Kind::Exclude);
                     let serials_str = std::str::from_utf8(control_arg(line)).unwrap_or("");
                     for s in serials_str.split_whitespace() {
                         if let Ok(serial) = s.parse() {
@@ -260,6 +286,7 @@ impl<'a> SccsParser<'a> {
                     }
                 }
                 control::IGNORE => {
+                    self.mark(Kind::Ignore);
                     let serials_str = std::str::from_utf8(control_arg(line)).unwrap_or("");
                     for s in serials_str.split_whitespace() {
                         if let Ok(serial) = s.parse() {
@@ -268,12 +295,16 @@ impl<'a> SccsParser<'a> {
                     }
                 }
                 control::MR => {
+                    self.mark(Kind::Mr);
                     let mr = control_arg(line).trim_ascii();
                     if !mr.is_empty() {
                         entry.mr_numbers.push(mr.to_vec());
                     }
                 }
-                control::COMMENT => entry.comments.push(control_arg(line).to_vec()),
+                control::COMMENT => {
+                    self.mark(Kind::Comment);
+                    entry.comments.push(control_arg(line).to_vec());
+                }
                 _ => self.stray_line(line)?,
             }
         }
@@ -291,6 +322,7 @@ impl<'a> SccsParser<'a> {
         if line.len() < 2 || line[0] != SOH || line[1] != control::USER_BEGIN {
             return Err(SccsError::InvalidFormat("Expected user list start".into()));
         }
+        self.mark(Kind::UsersBegin);
 
         // Read user names until ^AU
         loop {
@@ -299,8 +331,10 @@ impl<'a> SccsParser<'a> {
                 .ok_or(SccsError::MissingField("user list end".into()))?;
 
             if line.len() >= 2 && line[0] == SOH && line[1] == control::USER_END {
+                self.mark(Kind::UsersEnd);
                 break;
             }
+            self.mark(Kind::User);
 
             let user = line.trim_ascii();
             if !user.is_empty() {
@@ -337,6 +371,7 @@ impl<'a> SccsParser<'a> {
                         .and_then(|s| s.chars().next())
                         .unwrap_or('?');
                     flags.push(SccsFlag::parse(letter, &flag[letter_len..])?);
+                    self.mark(Kind::Flag(letter));
                 }
             } else {
                 self.next_line();
@@ -359,6 +394,7 @@ impl<'a> SccsParser<'a> {
                 "Expected descriptive text start".into(),
             ));
         }
+        self.mark(Kind::DescBegin);
 
         // Read text until ^AT
         loop {
@@ -367,8 +403,10 @@ impl<'a> SccsParser<'a> {
                 .ok_or(SccsError::MissingField("descriptive text end".into()))?;
 
             if line.len() >= 2 && line[0] == SOH && line[1] == control::DESC_END {
+                self.mark(Kind::DescEnd);
                 break;
             }
+            self.mark(Kind::Desc);
 
             text.push(line.to_vec());
         }
@@ -376,53 +414,50 @@ impl<'a> SccsParser<'a> {
         Ok(text)
     }
 
-    fn parse_body(&mut self) -> SccsResult<Vec<BodyRecord>> {
-        let mut body = Vec::new();
+    /// The body: every line is a block marker or text. An unknown control
+    /// line is kept as text.
+    fn parse_body(&mut self) -> SccsResult<()> {
         // Serials of the blocks open so far, for the strict check: an end
         // closes a block of its serial, and none is left open. Blocks need
         // not nest -- one may end inside another.
         let mut open: Vec<u16> = Vec::new();
 
         while let Some(line) = self.next_line() {
-            if line.len() >= 2 && line[0] == SOH {
-                let serial_str = std::str::from_utf8(control_arg(line)).unwrap_or("").trim();
-                let parsed = serial_str.parse::<u16>();
-                let serial = parsed.clone().unwrap_or(0);
-                let is_marker = matches!(
-                    line[1],
-                    control::BODY_INSERT | control::BODY_DELETE | control::BODY_END
-                );
-                if is_marker && parsed.is_err() {
-                    self.stray_line(line)?;
-                }
+            self.mark(Kind::Text);
+            if line.len() < 2 || line[0] != SOH {
+                continue;
+            }
+            let serial_str = std::str::from_utf8(control_arg(line)).unwrap_or("").trim();
+            let parsed = serial_str.parse::<u16>();
+            let serial = parsed.clone().unwrap_or(0);
+            let is_marker = matches!(
+                line[1],
+                control::BODY_INSERT | control::BODY_DELETE | control::BODY_END
+            );
+            if is_marker && parsed.is_err() {
+                self.stray_line(line)?;
+            }
 
-                match line[1] {
-                    control::BODY_INSERT => {
-                        open.push(serial);
-                        body.push(BodyRecord::Insert(serial));
-                    }
-                    control::BODY_DELETE => {
-                        open.push(serial);
-                        body.push(BodyRecord::Delete(serial));
-                    }
-                    control::BODY_END => {
-                        match open.iter().rposition(|&s| s == serial) {
-                            Some(at) => {
-                                open.remove(at);
-                            }
-                            None => self.stray_line(line)?,
-                        }
-                        body.push(BodyRecord::End(serial));
-                    }
-                    _ => {
-                        // Unknown control line in body, treat as text
-                        self.stray_line(line)?;
-                        body.push(BodyRecord::Text(line.to_vec()));
-                    }
+            match line[1] {
+                control::BODY_INSERT => {
+                    open.push(serial);
+                    self.mark(Kind::Insert(serial));
                 }
-            } else {
-                // Text line
-                body.push(BodyRecord::Text(line.to_vec()));
+                control::BODY_DELETE => {
+                    open.push(serial);
+                    self.mark(Kind::Delete(serial));
+                }
+                control::BODY_END => {
+                    match open.iter().rposition(|&s| s == serial) {
+                        Some(at) => {
+                            open.remove(at);
+                        }
+                        None => self.stray_line(line)?,
+                    }
+                    self.mark(Kind::End(serial));
+                }
+                // An unknown control line in the body is kept as text.
+                _ => self.stray_line(line)?,
             }
         }
 
@@ -433,6 +468,6 @@ impl<'a> SccsParser<'a> {
             )));
         }
 
-        Ok(body)
+        Ok(())
     }
 }

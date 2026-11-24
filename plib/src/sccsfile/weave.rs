@@ -23,7 +23,8 @@
 
 use std::collections::HashSet;
 
-use super::{BodyRecord, SccsError, SccsResult};
+use super::edit::Content;
+use super::{Body, Kind, SccsError, SccsResult};
 use crate::linediff::LineOp;
 
 /// What a block's delta did to the lines inside it.
@@ -120,14 +121,14 @@ pub enum Rec<'a> {
 /// line with the verdict of the blocks open around it.
 #[derive(Debug)]
 pub struct Walker<'a> {
-    body: &'a [BodyRecord],
+    body: Body<'a>,
     pos: usize,
     blocks: OpenBlocks<'a>,
 }
 
 impl<'a> Walker<'a> {
     /// Walk `body` for the version made of the deltas `applied`.
-    pub fn new(body: &'a [BodyRecord], applied: &'a HashSet<u16>) -> Self {
+    pub fn new(body: Body<'a>, applied: &'a HashSet<u16>) -> Self {
         Walker {
             body,
             pos: 0,
@@ -147,20 +148,22 @@ impl<'a> Iterator for Walker<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let index = self.pos;
-        let rec = match self.body.get(index)? {
-            BodyRecord::Insert(serial) => {
-                self.blocks.open(BlockKind::Insert, *serial);
-                Rec::Insert(*serial)
+        let (kind, text) = self.body.line(index)?;
+        let rec = match kind {
+            Kind::Insert(serial) => {
+                self.blocks.open(BlockKind::Insert, serial);
+                Rec::Insert(serial)
             }
-            BodyRecord::Delete(serial) => {
-                self.blocks.open(BlockKind::Delete, *serial);
-                Rec::Delete(*serial)
+            Kind::Delete(serial) => {
+                self.blocks.open(BlockKind::Delete, serial);
+                Rec::Delete(serial)
             }
-            BodyRecord::End(serial) => {
-                self.blocks.close(*serial);
-                Rec::End(*serial)
+            Kind::End(serial) => {
+                self.blocks.close(serial);
+                Rec::End(serial)
             }
-            BodyRecord::Text(text) => Rec::Text {
+            // Every other line of a body is text.
+            _ => Rec::Text {
                 text,
                 kept_by: self.blocks.kept_by(),
             },
@@ -170,32 +173,32 @@ impl<'a> Iterator for Walker<'a> {
     }
 }
 
-/// Weave a new delta into `body`.
+/// Weave a new delta into `body`, writing the new body to `out`.
 ///
 /// `base` is the version the delta was made from (its applied deltas), `ops`
 /// the edit script from that version's lines to the new text, and
 /// `new_lines` the new text, which the script's `Insert` steps index. The
-/// result is the body with the delta's changes recorded under `serial`:
+/// new body is the old one with the delta's changes recorded under `serial`:
 /// every line the script deletes inside a `^AD serial` block, every line it
-/// inserts inside a `^AI serial` block, and everything else as it was.
+/// inserts inside a `^AI serial` block, and every other line copied as it
+/// was, byte for byte.
 ///
 /// One pass over the body, with a cursor into the script. A run of inserted
 /// lines goes in ahead of the next line the script keeps (or at the end of
 /// the body); each deleted line gets a block of its own.
 ///
 /// The script must account for exactly the lines of the base version: one
-/// `Keep` or `Delete` each, in order. Anything else is an error, and nothing
-/// is produced.
-pub fn weave_delta(
-    body: &[BodyRecord],
+/// `Keep` or `Delete` each, in order. Anything else is an error.
+pub(super) fn weave_delta(
+    body: Body<'_>,
     base: &HashSet<u16>,
     serial: u16,
     ops: &[LineOp],
     new_lines: &[Vec<u8>],
-) -> SccsResult<Vec<BodyRecord>> {
+    out: &mut Content,
+) -> SccsResult<()> {
     let mismatch =
         || SccsError::InvalidBody("the edit does not fit the version it was made from".into());
-    let mut out = Vec::with_capacity(body.len() + ops.len());
     let mut cursor = 0;
     // Inserted lines (as indices into `new_lines`) waiting for the next kept
     // line.
@@ -206,20 +209,20 @@ pub fn weave_delta(
             *cursor += 1;
         }
     };
-    let flush = |out: &mut Vec<BodyRecord>, pending: &mut Vec<usize>| -> SccsResult<()> {
+    let flush = |out: &mut Content, pending: &mut Vec<usize>| -> SccsResult<()> {
         if pending.is_empty() {
             return Ok(());
         }
-        out.push(BodyRecord::Insert(serial));
+        out.marker(BlockKind::Insert, serial);
         for j in pending.drain(..) {
-            let line = new_lines.get(j).ok_or_else(mismatch)?;
-            out.push(BodyRecord::Text(line.clone()));
+            out.text(new_lines.get(j).ok_or_else(mismatch)?)?;
         }
-        out.push(BodyRecord::End(serial));
+        out.end(serial);
         Ok(())
     };
 
     for (index, rec) in Walker::new(body, base) {
+        let (_, line) = body.line(index).ok_or_else(mismatch)?;
         let kept = matches!(
             rec,
             Rec::Text {
@@ -228,19 +231,19 @@ pub fn weave_delta(
             }
         );
         if !kept {
-            out.push(body[index].clone());
+            out.line(line);
             continue;
         }
         take_inserts(&mut cursor, &mut pending);
         match ops.get(cursor) {
             Some(LineOp::Keep) => {
-                flush(&mut out, &mut pending)?;
-                out.push(body[index].clone());
+                flush(out, &mut pending)?;
+                out.line(line);
             }
             Some(LineOp::Delete) => {
-                out.push(BodyRecord::Delete(serial));
-                out.push(body[index].clone());
-                out.push(BodyRecord::End(serial));
+                out.marker(BlockKind::Delete, serial);
+                out.line(line);
+                out.end(serial);
             }
             _ => return Err(mismatch()),
         }
@@ -250,6 +253,5 @@ pub fn weave_delta(
     if cursor != ops.len() {
         return Err(mismatch());
     }
-    flush(&mut out, &mut pending)?;
-    Ok(out)
+    flush(out, &mut pending)
 }

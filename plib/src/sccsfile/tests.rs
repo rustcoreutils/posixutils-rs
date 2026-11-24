@@ -200,16 +200,20 @@ fn test_parse_simple_fixture() {
     let sccs = SccsFile::from_path(&path).expect("Failed to parse s.simple");
 
     // Should have exactly one delta
-    assert_eq!(sccs.header.deltas.len(), 1, "Expected 1 delta in s.simple");
+    assert_eq!(
+        sccs.header().deltas.len(),
+        1,
+        "Expected 1 delta in s.simple"
+    );
 
     // Delta should be 1.1
-    let delta = &sccs.header.deltas[0];
+    let delta = &sccs.header().deltas[0];
     assert_eq!(delta.sid.to_string(), "1.1");
     assert_eq!(delta.serial, 1);
     assert_eq!(delta.pred_serial, 0);
 
     // Body should have content
-    assert!(!sccs.body.is_empty(), "Body should not be empty");
+    assert!(!sccs.body().is_empty(), "Body should not be empty");
 
     // Evaluate body for delta 1.1
     let applied = sccs
@@ -236,7 +240,7 @@ fn test_parse_multi_fixture() {
 
     // Should have multiple deltas
     assert!(
-        sccs.header.deltas.len() >= 2,
+        sccs.header().deltas.len() >= 2,
         "Expected multiple deltas in s.multi"
     );
 
@@ -268,7 +272,7 @@ fn test_parse_keywords_fixture() {
 
     // Should have at least one delta
     assert!(
-        !sccs.header.deltas.is_empty(),
+        !sccs.header().deltas.is_empty(),
         "Should have at least one delta"
     );
 
@@ -297,17 +301,17 @@ fn test_parse_branched_fixture() {
     let sccs = SccsFile::from_path(&path).expect("Failed to parse s.branched");
 
     // Should have multiple deltas including branch
-    assert!(sccs.header.deltas.len() >= 2, "Expected multiple deltas");
+    assert!(sccs.header().deltas.len() >= 2, "Expected multiple deltas");
 
     // Should have 'b' flag enabled for branches
     assert!(sccs.branch_enabled(), "Branch flag should be enabled");
 
     // Look for a branch delta (SID with 4 components)
-    let has_branch = sccs.header.deltas.iter().any(|d| !d.sid.is_trunk());
+    let has_branch = sccs.header().deltas.iter().any(|d| !d.sid.is_trunk());
     assert!(has_branch, "Should have at least one branch delta");
 
     // Verify we can get different versions
-    for delta in &sccs.header.deltas {
+    for delta in &sccs.header().deltas {
         let applied = sccs.compute_applied_set(delta.serial).unwrap_or_else(|_| {
             panic!("Failed to compute applied set for serial {}", delta.serial)
         });
@@ -326,11 +330,214 @@ fn test_parse_branched_fixture() {
 /// is the invariant every rewrite of an s-file rests on.
 #[test]
 fn an_unchanged_file_is_written_back_byte_for_byte() {
-    for name in ["s.simple", "s.multi", "s.keywords", "s.branched"] {
+    for name in ["s.simple", "s.multi", "s.keywords", "s.branched", "s.odd"] {
         let data = std::fs::read(fixtures_path().join(name)).expect(name);
         let sccs = SccsFile::from_bytes(&data).expect(name);
         assert_eq!(sccs.to_bytes(), data, "{name} changed on a round trip");
     }
+
+    // Not only the canonical layout: blank lines ahead of the checksum line,
+    // a wrong checksum, and a last line with no newline all come back as
+    // they were.
+    for data in [
+        &b"\n\r\n\x01h00000\n\x01s 0/0/0\n\x01d D 1.1 26/01/01 00:00:00 u 1 0\n\x01e\n\
+\x01u\n\x01U\n\x01t\n\x01T\n\x01I 1\nlast line"[..],
+        b"\x01h1\n\x01u\n\x01U\n\x01t\n\x01T",
+    ] {
+        let sccs = SccsFile::from_bytes(data).unwrap();
+        assert_eq!(sccs.to_bytes(), data);
+    }
+}
+
+/// `s.odd`: a valid s-file in anything but the canonical layout -- unpadded
+/// statistics, doubled blanks, comment and MR lines interleaved, text after
+/// the section markers, a padded login, stray lines, markers with extra
+/// blanks and zeros.
+fn odd_file() -> (Vec<u8>, SccsFile) {
+    let data = std::fs::read(fixtures_path().join("s.odd")).unwrap();
+    let sccs = SccsFile::from_bytes(&data).unwrap();
+    (data, sccs)
+}
+
+/// Assert that an edit changed only what it was to change: the lines of
+/// `after`, less the checksum line and the lines `added`, are the lines of
+/// `before`, less the checksum line and the lines `removed`, in order.
+#[track_caller]
+fn assert_only_changed(before: &[u8], after: &[u8], removed: &[&[u8]], added: &[&[u8]]) {
+    let rest = |data: &'_ [u8], without: &[&[u8]]| -> Vec<Vec<u8>> {
+        let mut without = without.to_vec();
+        split_lines(data)
+            .into_iter()
+            .skip(1)
+            .filter(|line| match without.iter().position(|w| w == line) {
+                Some(at) => {
+                    without.remove(at);
+                    false
+                }
+                None => true,
+            })
+            .map(<[u8]>::to_vec)
+            .collect()
+    };
+    let show = |lines: &[Vec<u8>]| {
+        lines
+            .iter()
+            .map(|l| String::from_utf8_lossy(l).into_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        show(&rest(after, added)),
+        show(&rest(before, removed)),
+        "the edit touched lines it was not asked to"
+    );
+    for line in added {
+        assert!(
+            split_lines(after).contains(line),
+            "{:?} was not written",
+            String::from_utf8_lossy(line)
+        );
+    }
+    assert!(stored_checksum_matches(after, stored_body_checksum(after)));
+    assert!(after.starts_with(format!("\x01h{:05}\n", stored_body_checksum(after)).as_bytes()));
+}
+
+/// Each change to the header rewrites the lines it names and no others: the
+/// odd spacing, the stray lines and the record order everywhere else in the
+/// file survive it.
+#[test]
+fn a_header_edit_changes_only_the_lines_it_names() {
+    let (before, original) = odd_file();
+    let edit = |f: &dyn Fn(&mut SccsFile)| -> Vec<u8> {
+        let mut sccs = original.clone();
+        f(&mut sccs);
+        sccs.to_bytes()
+    };
+
+    // A new flag goes after the last flag line.
+    let after = edit(&|s| s.set_flag(SccsFlag::JointEdit).unwrap());
+    assert_only_changed(&before, &after, &[], &[b"\x01f j"]);
+    let lines = split_lines(&after);
+    let at = lines.iter().position(|l| l == b"\x01f j").unwrap();
+    assert_eq!(lines[at - 1], b"\x01f b");
+
+    // A flag set again is replaced where it stands.
+    let after = edit(&|s| s.set_flag(SccsFlag::QText(b"y".to_vec())).unwrap());
+    assert_only_changed(&before, &after, &[b"\x01f  q  x"], &[b"\x01f q y"]);
+    let lines = split_lines(&after);
+    let at = lines.iter().position(|l| l == b"\x01f q y").unwrap();
+    assert_eq!(lines[at + 1], b"\x01f v");
+
+    let after = edit(&|s| assert!(s.remove_flag('v').unwrap()));
+    assert_only_changed(&before, &after, &[b"\x01f v"], &[]);
+
+    let after = edit(&|s| assert!(s.add_user(b"fred").unwrap()));
+    assert_only_changed(&before, &after, &[], &[b"fred"]);
+    let lines = split_lines(&after);
+    let at = lines.iter().position(|l| l == b"fred").unwrap();
+    assert_eq!(
+        (lines[at - 1], lines[at + 1]),
+        (&b"  bob  "[..], &b"\x01U"[..])
+    );
+
+    let after = edit(&|s| assert!(s.remove_user(b"bob").unwrap()));
+    assert_only_changed(&before, &after, &[b"  bob  "], &[]);
+
+    let after = edit(&|s| {
+        s.set_descriptive_text(&[b"new".to_vec(), b"text".to_vec()])
+            .unwrap()
+    });
+    assert_only_changed(&before, &after, &[b"described "], &[b"new", b"text"]);
+    let after = edit(&|s| s.set_descriptive_text(&[]).unwrap());
+    assert_only_changed(&before, &after, &[b"described "], &[]);
+}
+
+/// A change that changes nothing leaves the file as it was, to the byte:
+/// setting a flag to what it is, adding a login already listed, removing
+/// what is not there, replacing the descriptive text with itself.
+#[test]
+fn an_edit_that_changes_nothing_leaves_the_file_alone() {
+    let (before, mut sccs) = odd_file();
+    sccs.set_flag(SccsFlag::BranchEnabled).unwrap();
+    assert!(!sccs.add_user(b"bob").unwrap());
+    assert!(!sccs.remove_user(b"nobody").unwrap());
+    assert!(!sccs.remove_flag('j').unwrap());
+    sccs.set_descriptive_text(&[b"described ".to_vec()])
+        .unwrap();
+    assert_eq!(sccs.to_bytes(), before);
+}
+
+/// Removing a delta changes one byte of its entry, its type, and takes its
+/// markers and inserted lines out of the body; every other line is as it
+/// was. Adding a delta puts its entry first and its blocks in the body, and
+/// copies the rest.
+#[test]
+fn rmdel_and_delta_change_only_their_own_lines() {
+    use crate::linediff::LineOp::{Delete, Insert, Keep};
+    let (before, original) = odd_file();
+
+    let mut sccs = original.clone();
+    sccs.remove_delta(2).unwrap();
+    assert_only_changed(
+        &before,
+        &sccs.to_bytes(),
+        &[
+            b"\x01d D 1.2  26/01/02 00:00:00 u 2 1",
+            b"\x01D 02",
+            b"\x01E 02",
+            b"\x01I 2",
+            b"B",
+            b"\x01E 2",
+        ],
+        &[b"\x01d R 1.2  26/01/02 00:00:00 u 2 1"],
+    );
+    assert_eq!(
+        sccs.evaluate_body(&[1].into()),
+        [b"a".to_vec(), b"b".to_vec()]
+    );
+
+    // 1.2 is "a B"; make 1.3 "a C".
+    let mut sccs = original.clone();
+    let entry = DeltaEntry {
+        sid: Sid::trunk(1, 3),
+        datetime: SccsDateTime::parse("26/01/03", "00:00:00").unwrap(),
+        user: b"u".to_vec(),
+        serial: 3,
+        pred_serial: 2,
+        stats: DeltaStats::new(1, 1, 1),
+        comments: vec![b"third".to_vec()],
+        ..Default::default()
+    };
+    let new_lines = [b"a".to_vec(), b"C".to_vec()];
+    sccs.add_delta(
+        entry,
+        &[1, 2].into(),
+        &[Keep, Delete, Insert(1)],
+        &new_lines,
+    )
+    .unwrap();
+    let after = sccs.to_bytes();
+    assert_only_changed(
+        &before,
+        &after,
+        &[],
+        &[
+            b"\x01s 00001/00001/00001",
+            b"\x01d D 1.3 26/01/03 00:00:00 u 3 2",
+            b"\x01c third",
+            b"\x01e",
+            b"\x01D 3",
+            b"\x01E 3",
+            b"\x01I 3",
+            b"C",
+            b"\x01E 3",
+        ],
+    );
+    assert_eq!(split_lines(&after)[1], b"\x01s 00001/00001/00001");
+    assert_eq!(sccs.evaluate_body(&[1, 2, 3].into()), new_lines);
+    assert_eq!(
+        sccs.evaluate_body(&[1, 2].into()),
+        [b"a".to_vec(), b"B".to_vec()]
+    );
 }
 
 /// An s-file image: `content` (everything after the `^Ah` line) with
@@ -375,9 +582,13 @@ fn short_control_lines_and_odd_flags_do_not_panic() {
 \x01t\n\x01T\n\
 \x01I\n\x01E\n";
     let sccs = SccsFile::from_bytes(&with_checksum(content)).unwrap();
-    assert_eq!(sccs.body, [BodyRecord::Insert(0), BodyRecord::End(0)]);
+    let nothing = HashSet::new();
+    let records: Vec<Rec> = Walker::new(sccs.body(), &nothing)
+        .map(|(_, rec)| rec)
+        .collect();
+    assert_eq!(records, [Rec::Insert(0), Rec::End(0)]);
     assert_eq!(
-        sccs.header.flags,
+        sccs.header().flags,
         [SccsFlag::Unknown('\u{e9}', b"x".to_vec())]
     );
 }
@@ -443,7 +654,7 @@ fn walker_reports_each_line_with_its_inserter() {
     let sccs = SccsFile::from_bytes(&with_checksum(&content)).unwrap();
     let lines = |applied: &[u16]| -> Vec<(Vec<u8>, Option<u16>)> {
         let applied: HashSet<u16> = applied.iter().copied().collect();
-        Walker::new(&sccs.body, &applied)
+        Walker::new(sccs.body(), &applied)
             .filter_map(|(_, rec)| match rec {
                 Rec::Text { text, kept_by } => Some((text.to_vec(), kept_by)),
                 _ => None,
@@ -468,57 +679,192 @@ fn walker_reports_each_line_with_its_inserter() {
         lines(&[1, 2, 3]),
         [l("a", Some(1)), l("b", None), l("c", None), l("d", Some(2))]
     );
-    let indices: Vec<usize> = Walker::new(&sccs.body, &HashSet::new())
+    let indices: Vec<usize> = Walker::new(sccs.body(), &HashSet::new())
         .map(|(i, _)| i)
         .collect();
-    assert_eq!(indices, (0..sccs.body.len()).collect::<Vec<_>>());
+    assert_eq!(indices, (0..sccs.body().len()).collect::<Vec<_>>());
 }
 
-/// Weaving a delta in records its changes and leaves every earlier version
-/// as it was; an edit script that does not account for exactly the lines of
-/// the base version is refused.
+/// Adding a delta records its changes and leaves every earlier version as it
+/// was; an edit script that does not account for exactly the lines of the
+/// base version is refused, and the file is left untouched.
 #[test]
-fn weave_delta_records_the_edit_or_refuses_it() {
+fn add_delta_records_the_edit_or_refuses_it() {
     use crate::linediff::LineOp::{Delete, Insert, Keep};
-    let body = [
-        BodyRecord::Insert(1),
-        BodyRecord::Text(b"a".to_vec()),
-        BodyRecord::Text(b"b".to_vec()),
-        BodyRecord::Text(b"c".to_vec()),
-        BodyRecord::End(1),
-    ];
+    let content = b"\x01s 00003/00000/00000\n\x01d D 1.1 26/01/01 00:00:00 u 1 0\n\x01e\n\
+\x01u\n\x01U\n\x01t\n\x01T\n\x01I 1\na\nb\nc\n\x01E 1\n";
+    let original = SccsFile::from_bytes(&with_checksum(content)).unwrap();
     let v1: HashSet<u16> = [1].into();
-    let text = |body: &[BodyRecord], applied: &[u16]| -> Vec<Vec<u8>> {
-        let applied: HashSet<u16> = applied.iter().copied().collect();
-        Walker::new(body, &applied)
-            .filter_map(|(_, rec)| match rec {
-                Rec::Text {
-                    text,
-                    kept_by: Some(_),
-                } => Some(text.to_vec()),
-                _ => None,
-            })
-            .collect()
+    let entry = || DeltaEntry {
+        sid: Sid::trunk(1, 2),
+        user: b"u".to_vec(),
+        serial: 2,
+        pred_serial: 1,
+        ..Default::default()
     };
 
     // a b c  ->  x a c y
     let new_lines = [b"x".to_vec(), b"a".to_vec(), b"c".to_vec(), b"y".to_vec()];
     let ops = [Insert(0), Keep, Delete, Keep, Insert(3)];
-    let woven = weave_delta(&body, &v1, 2, &ops, &new_lines).unwrap();
-    assert_eq!(text(&woven, &[1, 2]), new_lines);
+    let mut f = original.clone();
+    f.add_delta(entry(), &v1, &ops, &new_lines).unwrap();
+    assert_eq!(f.evaluate_body(&[1, 2].into()), new_lines);
     assert_eq!(
-        text(&woven, &[1]),
+        f.evaluate_body(&v1),
         [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]
     );
+    assert_eq!(f.header().deltas[0].serial, 2, "the new entry comes first");
 
     for bad in [
         &[Keep, Keep][..],              // a line of the base unaccounted for
         &[Keep, Keep, Keep, Keep],      // one line too many
         &[Keep, Keep, Keep, Insert(9)], // an insert of a line that is not there
     ] {
+        let mut f = original.clone();
         assert!(
-            weave_delta(&body, &v1, 2, bad, &new_lines).is_err(),
+            f.add_delta(entry(), &v1, bad, &new_lines).is_err(),
             "{bad:?}"
         );
+        assert_eq!(
+            f.to_bytes(),
+            original.to_bytes(),
+            "{bad:?} changed the file"
+        );
+    }
+}
+
+/// A small deterministic generator (xorshift64*), so the property tests need
+/// no dependency and fail the same way every time.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    /// A number below `n` (which is not zero).
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+/// Random histories through the edit methods: deltas made from any earlier
+/// version, deltas removed, flags and users changed. After every step the
+/// file holds together:
+/// - every version still in it reads back as the text it was given;
+/// - what is written reads back, strictly, as the same file, with the right
+///   checksum;
+/// - the parsed view is the one a fresh parse of the bytes gives.
+#[test]
+fn random_histories_keep_every_version_and_stay_well_formed() {
+    use std::collections::HashMap;
+    for seed in 1..=40u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let entry = |serial: u16, pred: u16| DeltaEntry {
+            sid: Sid::trunk(1, serial),
+            datetime: SccsDateTime::parse("26/01/01", "00:00:00").unwrap(),
+            user: b"u".to_vec(),
+            serial,
+            pred_serial: pred,
+            comments: vec![format!("step {serial}").into_bytes()],
+            ..Default::default()
+        };
+        let first: Vec<Vec<u8>> = (0..rng.below(6))
+            .map(|i| format!("l{i}").into_bytes())
+            .collect();
+        let mut sccs = SccsFile::create(NewFile {
+            delta: entry(1, 0),
+            users: &[],
+            flags: &[],
+            descriptive_text: &[],
+            lines: &first,
+        })
+        .unwrap();
+        // The text each live version was given.
+        let mut model: HashMap<u16, Vec<Vec<u8>>> = HashMap::from([(1, first)]);
+
+        for step in 0..25 {
+            match rng.below(10) {
+                0 => {
+                    let flag = [SccsFlag::BranchEnabled, SccsFlag::JointEdit][rng.below(2)].clone();
+                    if rng.below(2) == 0 {
+                        sccs.set_flag(flag).unwrap();
+                    } else {
+                        sccs.remove_flag(flag.flag_char()).unwrap();
+                    }
+                }
+                1 => {
+                    let login = format!("user{}", rng.below(3)).into_bytes();
+                    if rng.below(2) == 0 {
+                        sccs.add_user(&login).unwrap();
+                    } else {
+                        sccs.remove_user(&login).unwrap();
+                    }
+                }
+                2 => {
+                    // Remove a delta nothing was made from, never the last.
+                    let leaves: Vec<u16> = model
+                        .keys()
+                        .copied()
+                        .filter(|&s| !sccs.live_deltas().any(|d| d.pred_serial == s))
+                        .collect();
+                    if model.len() > 1 && !leaves.is_empty() {
+                        let victim = leaves[rng.below(leaves.len())];
+                        sccs.remove_delta(victim).unwrap();
+                        model.remove(&victim);
+                    }
+                }
+                _ => {
+                    let mut live: Vec<u16> = model.keys().copied().collect();
+                    live.sort_unstable();
+                    let base = live[rng.below(live.len())];
+                    let mut text = model[&base].clone();
+                    for _ in 0..1 + rng.below(3) {
+                        let at = rng.below(text.len() + 1);
+                        if rng.below(2) == 0 && at < text.len() {
+                            let end = (at + 1 + rng.below(3)).min(text.len());
+                            text.drain(at..end);
+                        } else {
+                            let n = 1 + rng.below(3);
+                            text.splice(
+                                at..at,
+                                (0..n).map(|k| format!("s{step}.{k}").into_bytes()),
+                            );
+                        }
+                    }
+                    let serial = sccs.max_serial() + 1;
+                    let applied = sccs.compute_applied_set(base).unwrap();
+                    let ops = crate::linediff::diff(&model[&base], &text);
+                    sccs.add_delta(entry(serial, base), &applied, &ops, &text)
+                        .unwrap();
+                    model.insert(serial, text);
+                }
+            }
+
+            let bytes = sccs.to_bytes();
+            let reread = SccsFile::from_bytes_strict(&bytes)
+                .unwrap_or_else(|e| panic!("seed {seed} step {step}: {e}"));
+            assert_eq!(reread.to_bytes(), bytes, "seed {seed} step {step}");
+            assert_eq!(
+                format!("{:?}", reread.header()),
+                format!("{:?}", sccs.header()),
+                "seed {seed} step {step}: the view is not what the bytes say"
+            );
+            assert!(
+                bytes.starts_with(format!("\x01h{:05}\n", stored_body_checksum(&bytes)).as_bytes()),
+                "seed {seed} step {step}: checksum"
+            );
+            for (serial, text) in &model {
+                let applied = sccs.compute_applied_set(*serial).unwrap();
+                assert_eq!(
+                    &sccs.evaluate_body(&applied),
+                    text,
+                    "seed {seed} step {step}: version {serial}"
+                );
+            }
+        }
     }
 }

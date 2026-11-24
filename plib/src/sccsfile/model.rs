@@ -228,18 +228,50 @@ impl SccsFlag {
     }
 }
 
-/// A record in the body section
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BodyRecord {
-    /// ^AI <serial> - Begin insert block
+/// One line of an s-file: where its bytes are in the file's image, without
+/// the newline that ends it, and what the parser took it for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Line {
+    pub(super) start: usize,
+    pub(super) len: usize,
+    pub(super) kind: Kind,
+}
+
+/// What a line of an s-file is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Kind {
+    /// `^Ah`: the checksum, the first line.
+    Checksum,
+    /// `^As`, `^Ad`: the two lines that open a delta's entry.
+    Stats,
+    DeltaHead,
+    /// `^Ai`, `^Ax`, `^Ag`, `^Am`, `^Ac`: the optional lines of an entry.
+    Include,
+    Exclude,
+    Ignore,
+    Mr,
+    Comment,
+    /// `^Ae`: the end of an entry.
+    DeltaEnd,
+    /// `^Au`, a line of the user list, `^AU`.
+    UsersBegin,
+    User,
+    UsersEnd,
+    /// `^Af`, with the flag's letter.
+    Flag(char),
+    /// `^At`, a line of the descriptive text, `^AT`.
+    DescBegin,
+    Desc,
+    DescEnd,
+    /// `^AI n`, `^AD n`, `^AE n`: the block markers of the body.
     Insert(u16),
-    /// ^AD <serial> - Begin delete block
     Delete(u16),
-    /// ^AE <serial> - End block
     End(u16),
-    /// Plain text line: the bytes stored, which need not be UTF-8 (SCCS
-    /// keeps whatever the file held)
-    Text(Vec<u8>),
+    /// A line of the body's text.
+    Text,
+    /// A header line no record accounts for. It is read around, and kept
+    /// where it is when the file is rewritten.
+    Stray,
 }
 
 /// SCCS file header (everything before the body)

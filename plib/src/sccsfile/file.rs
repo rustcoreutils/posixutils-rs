@@ -11,31 +11,106 @@
 //! The s-file as a whole: reading, writing, the delta graph, the body.
 
 use std::collections::HashSet;
-use std::io::{self, Read, Write};
+use std::io::Read;
 use std::path::Path;
 
 use super::parse::SccsParser;
 use super::{
-    compute_checksum, BodyRecord, DeltaEntry, DeltaType, Rec, ReleaseLock, SccsError, SccsFlag,
-    SccsHeader, SccsResult, Sid, Walker,
+    DeltaEntry, DeltaType, Kind, Line, Rec, ReleaseLock, SccsError, SccsFlag, SccsHeader,
+    SccsResult, Sid, Walker,
 };
 
 /// An s-file.
 ///
-/// Its contents are read through [`header`](Self::header) and the body
-/// evaluators, and changed only through the methods in the `edit` module:
-/// the fields are private so that there is no other way.
+/// It is the file's bytes, kept exactly as they were read, an index of the
+/// lines in them, and a parsed view of the header derived from those lines.
+/// Nothing here regenerates the file from the view: an unchanged file is
+/// written back byte for byte, and a change (the `edit` module holds them
+/// all) replaces only the lines it names, as historical SCCS does when it
+/// copies an s-file to its x-file. Regenerating it instead rewrote spacing,
+/// reordered records and dropped every line the parser reads around.
+///
+/// The fields are private, so there is no way to change the view without
+/// the bytes or the bytes without the view.
 #[derive(Debug, Clone)]
 pub struct SccsFile {
-    pub(super) header: SccsHeader,
-    pub(super) body: Vec<BodyRecord>,
+    /// The file, as read or as last edited.
+    buf: Vec<u8>,
+    /// Every line of `buf` from the checksum line on, in order.
+    lines: Vec<Line>,
+    /// The index in `lines` of the first line of the body.
+    body_start: usize,
+    /// The header those lines hold.
+    header: SccsHeader,
+}
+
+/// The body of an s-file: its lines, for the weave to walk.
+#[derive(Debug, Clone, Copy)]
+pub struct Body<'a> {
+    buf: &'a [u8],
+    lines: &'a [Line],
+}
+
+impl<'a> Body<'a> {
+    /// How many lines it has.
+    pub fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// Whether it has no lines.
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    /// Line `index`: what it is, and its bytes.
+    pub(super) fn line(&self, index: usize) -> Option<(Kind, &'a [u8])> {
+        let line = self.lines.get(index)?;
+        Some((line.kind, &self.buf[line.start..line.start + line.len]))
+    }
 }
 
 impl SccsFile {
+    /// The parser's result: the image it read and what it found there.
+    pub(super) fn from_parts(
+        buf: Vec<u8>,
+        lines: Vec<Line>,
+        body_start: usize,
+        header: SccsHeader,
+    ) -> Self {
+        SccsFile {
+            buf,
+            lines,
+            body_start,
+            header,
+        }
+    }
+
     /// The header: the delta table, the user list, the flags and the
     /// descriptive text.
     pub fn header(&self) -> &SccsHeader {
         &self.header
+    }
+
+    /// The body, for the weave.
+    pub fn body(&self) -> Body<'_> {
+        Body {
+            buf: &self.buf,
+            lines: &self.lines[self.body_start..],
+        }
+    }
+
+    /// The lines of the header after the checksum line, each with its kind.
+    pub(super) fn header_lines(&self) -> impl Iterator<Item = (Kind, &[u8])> {
+        self.lines[1.min(self.body_start)..self.body_start]
+            .iter()
+            .map(|l| (l.kind, &self.buf[l.start..l.start + l.len]))
+    }
+
+    /// The lines of the body, each with its kind.
+    pub(super) fn body_lines(&self) -> impl Iterator<Item = (Kind, &[u8])> {
+        self.lines[self.body_start..]
+            .iter()
+            .map(|l| (l.kind, &self.buf[l.start..l.start + l.len]))
     }
 
     /// Parse SCCS file from bytes
@@ -67,116 +142,9 @@ impl SccsFile {
         Self::from_bytes(&data)
     }
 
-    /// Serialize to bytes
+    /// The file's bytes: exactly those read, or those of the last edit.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut output = Vec::new();
-        self.write_to(&mut output).unwrap();
-        output
-    }
-
-    /// Write to a writer
-    pub fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        // First, serialize content (everything after checksum line)
-        let mut content = Vec::new();
-        self.write_content(&mut content)?;
-
-        // Compute checksum of content
-        let checksum = compute_checksum(&content);
-
-        // Write checksum line
-        writeln!(writer, "\x01h{:05}", checksum)?;
-
-        // Write content
-        writer.write_all(&content)?;
-        Ok(())
-    }
-
-    fn write_content<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        // Write delta table
-        for delta in &self.header.deltas {
-            // Stats line
-            writeln!(writer, "\x01s {}", delta.stats)?;
-
-            // Delta header line
-            write!(
-                writer,
-                "\x01d {} {} {} {} ",
-                delta.delta_type.to_char(),
-                delta.sid,
-                delta.datetime.date_string(),
-                delta.datetime.time_string(),
-            )?;
-            writer.write_all(&delta.user)?;
-            writeln!(writer, " {} {}", delta.serial, delta.pred_serial)?;
-
-            // Included deltas
-            if !delta.included.is_empty() {
-                let serials: Vec<String> = delta.included.iter().map(|s| s.to_string()).collect();
-                writeln!(writer, "\x01i {}", serials.join(" "))?;
-            }
-
-            // Excluded deltas
-            if !delta.excluded.is_empty() {
-                let serials: Vec<String> = delta.excluded.iter().map(|s| s.to_string()).collect();
-                writeln!(writer, "\x01x {}", serials.join(" "))?;
-            }
-
-            // Ignored deltas
-            if !delta.ignored.is_empty() {
-                let serials: Vec<String> = delta.ignored.iter().map(|s| s.to_string()).collect();
-                writeln!(writer, "\x01g {}", serials.join(" "))?;
-            }
-
-            // MR numbers
-            for mr in &delta.mr_numbers {
-                write_record(writer, b"\x01m ", mr)?;
-            }
-
-            // Comments
-            for comment in &delta.comments {
-                write_record(writer, b"\x01c ", comment)?;
-            }
-
-            // End of delta
-            writeln!(writer, "\x01e")?;
-        }
-
-        // User list
-        writeln!(writer, "\x01u")?;
-        for user in &self.header.users {
-            write_record(writer, b"", user)?;
-        }
-        writeln!(writer, "\x01U")?;
-
-        // Flags
-        for flag in &self.header.flags {
-            let value = flag.value();
-            if value.is_empty() {
-                writeln!(writer, "\x01f {}", flag.flag_char())?;
-            } else {
-                write!(writer, "\x01f {} ", flag.flag_char())?;
-                write_record(writer, b"", &value)?;
-            }
-        }
-
-        // Descriptive text
-        writeln!(writer, "\x01t")?;
-        for line in &self.header.descriptive_text {
-            write_record(writer, b"", line)?;
-        }
-        writeln!(writer, "\x01T")?;
-
-        // Body
-        for record in &self.body {
-            match record {
-                BodyRecord::Insert(serial) => writeln!(writer, "\x01I {}", serial)?,
-                BodyRecord::Delete(serial) => writeln!(writer, "\x01D {}", serial)?,
-                BodyRecord::End(serial) => writeln!(writer, "\x01E {}", serial)?,
-                BodyRecord::Text(line) => write_record(writer, b"", line)?,
-            }
-        }
-
-        Ok(())
+        self.buf.clone()
     }
 
     // =========================================================================
@@ -333,7 +301,7 @@ impl SccsFile {
 
     /// Evaluate the body to produce file content for a given set of deltas
     pub fn evaluate_body(&self, applied_set: &HashSet<u16>) -> Vec<Vec<u8>> {
-        Walker::new(&self.body, applied_set)
+        Walker::new(self.body(), applied_set)
             .filter_map(|(_, rec)| match rec {
                 Rec::Text {
                     text,
@@ -347,7 +315,7 @@ impl SccsFile {
     /// [`evaluate_body`](Self::evaluate_body), each line with the serial of
     /// the delta that inserted it (`get -m`).
     pub fn evaluate_body_annotated(&self, applied_set: &HashSet<u16>) -> Vec<(u16, Vec<u8>)> {
-        Walker::new(&self.body, applied_set)
+        Walker::new(self.body(), applied_set)
             .filter_map(|(_, rec)| match rec {
                 Rec::Text {
                     text,
@@ -595,12 +563,4 @@ impl SccsFile {
 
         Ok((serials, unresolved))
     }
-}
-
-/// Write one s-file line: `prefix` (a control code and its blank, or nothing),
-/// the stored bytes, and the newline that ends it.
-fn write_record<W: Write>(writer: &mut W, prefix: &[u8], text: &[u8]) -> io::Result<()> {
-    writer.write_all(prefix)?;
-    writer.write_all(text)?;
-    writer.write_all(b"\n")
 }

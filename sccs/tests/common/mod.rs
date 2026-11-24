@@ -196,3 +196,36 @@ pub const OVERLAP_SFILE: &[u8] = b"\x01s 00000/00002/00002\n\
 \x01d D 1.1 26/01/01 00:00:00 u 1 0\n\x01c one\n\x01e\n\
 \x01u\n\x01U\n\x01t\n\x01T\n\
 \x01I 1\na\n\x01D 3\nb\n\x01E 1\n\x01I 2\nc\n\x01E 3\nd\n\x01E 2\n";
+
+/// Assert that a command changed only what it was to change in an s-file:
+/// the lines of `after`, less the checksum line and the lines `added`, are
+/// the lines of `before`, less the checksum line and the lines `removed`,
+/// in order; and the checksum line is right for the result.
+#[track_caller]
+pub fn assert_only_changed(before: &[u8], after: &[u8], removed: &[&[u8]], added: &[&[u8]]) {
+    let rest = |data: &[u8], without: &[&[u8]]| -> Vec<String> {
+        let mut without = without.to_vec();
+        plib::sccsfile::split_lines(data)
+            .into_iter()
+            .skip(1)
+            .filter(|line| match without.iter().position(|w| w == line) {
+                Some(at) => {
+                    without.remove(at);
+                    false
+                }
+                None => true,
+            })
+            .map(|line| String::from_utf8_lossy(line).into_owned())
+            .collect()
+    };
+    assert_eq!(
+        rest(after, added),
+        rest(before, removed),
+        "the command touched lines it was not asked to"
+    );
+    let sum = plib::sccsfile::stored_body_checksum(after);
+    assert!(
+        after.starts_with(format!("\x01h{sum:05}\n").as_bytes()),
+        "the checksum line is not the checksum of the file"
+    );
+}

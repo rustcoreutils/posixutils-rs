@@ -1,0 +1,31 @@
+h19902
+s 1/1/1
+d D 1.2  26/01/02 00:00:00 u 2 1
+c second
+m MR1
+c more
+e
+stray in the delta table
+s 00002/00000/00000
+d D 1.1 26/01/01 00:00:00 u 1 0
+c first
+e
+u text after the marker
+  bob  
+U
+f  q  x
+f v
+stray among the flags
+f b
+t text after the marker
+described 
+T
+I  1
+a
+D 02
+b
+E 02
+I 2
+B
+E 2
+E  1

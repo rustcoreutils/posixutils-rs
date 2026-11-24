@@ -1581,3 +1581,60 @@ fn delta_gives_every_file_the_reply_it_read() {
         );
     }
 }
+
+/// A delta is made once. Should the p-file still hold an edit whose delta
+/// is already in the s-file -- delta stopped between writing the one and
+/// the other -- running delta again does not make a second delta with the
+/// same SID; it did, and the file then had two live deltas named 1.2.
+#[test]
+fn delta_does_not_make_a_sid_twice() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    assert!(run("admin", &["-i", "s.d"], "one\n").status.success());
+    assert!(run("get", &["-e", "-s", "s.d"], "").status.success());
+    let pending = fs::read(dir.join("p.d")).unwrap();
+    fs::write(dir.join("d"), "two\n").unwrap();
+    assert!(run("delta", &["-s", "-n", "-yc", "s.d"], "")
+        .status
+        .success());
+
+    // As if the p-file had not been updated.
+    fs::write(dir.join("p.d"), &pending).unwrap();
+    let out = run("delta", &["-s", "-yagain", "s.d"], "");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("1.2"),
+        "{out:?}"
+    );
+    let out = run("prs", &["-e", "-d:I:", "s.d"], "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1.2\n1.1\n");
+}
+
+/// With several edits of one delta pending (the `j` flag), the SID they
+/// were made from does not say which is meant: `-r` must name the SID to be
+/// made. The first such edit was taken, whichever one the g-file was.
+#[test]
+fn delta_r_naming_several_edits_is_ambiguous() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    assert!(run("admin", &["-i", "-fj", "s.a"], "one\n")
+        .status
+        .success());
+    assert!(run("get", &["-e", "-s", "s.a"], "").status.success());
+    assert!(run("get", &["-e", "-s", "-g", "s.a"], "").status.success());
+    fs::write(dir.join("a"), "two\n").unwrap();
+
+    let out = run("delta", &["-s", "-yc", "-r1.1", "s.a"], "");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(
+        fs::read_to_string(dir.join("p.a")).unwrap().lines().count(),
+        2
+    );
+    // The SID to be made names one edit.
+    let out = run("delta", &["-s", "-yc", "-r1.1.1.1", "s.a"], "");
+    assert!(out.status.success(), "{out:?}");
+    let out = run("prs", &["-e", "-d:I:", "s.a"], "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1.1.1.1\n1.1\n");
+}

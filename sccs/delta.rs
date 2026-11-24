@@ -22,7 +22,7 @@ use gettextrs::gettext;
 use plib::linediff::LineOp;
 use plib::sccsfile::{
     paths, CommentLine, DeltaEntry, DeltaStats, DeltaType, MrNumber, NotText, PfileEntry,
-    SccsDateTime, SccsFile, SccsFlag, Selection, Sid, SidList,
+    SccsDateTime, SccsFile, SccsFlag, Selection, Sid, SidList, SigintBlock,
 };
 use posixutils_sccs::optscan::{self, Letters};
 use posixutils_sccs::txn::{self, Txn};
@@ -126,17 +126,34 @@ fn find_pfile_entry(txn: &Txn, requested_sid: Option<&Sid>) -> io::Result<PfileE
         ));
     }
 
-    // If SID specified, find matching entry
+    // If SID specified, find matching entry: the edit that will make that
+    // SID, or the one made from it -- if there is one such. With joint
+    // editing several edits may have been made from one delta, and that
+    // delta's SID then does not say which is meant.
     if let Some(sid) = requested_sid {
-        for entry in user_entries {
-            if &entry.new_sid == sid || &entry.old_sid == sid {
-                return Ok(entry);
-            }
+        if let Some(entry) = user_entries.iter().find(|e| &e.new_sid == sid) {
+            return Ok(entry.clone());
         }
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("{} {}", gettext("No edit pending for SID"), sid),
-        ));
+        let mut from: Vec<_> = user_entries
+            .into_iter()
+            .filter(|e| &e.old_sid == sid)
+            .collect();
+        return match from.len() {
+            1 => Ok(from.remove(0)),
+            0 => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} {}", gettext("No edit pending for SID"), sid),
+            )),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} {}{}",
+                    gettext("Several edits of SID"),
+                    sid,
+                    gettext(" are pending; use -r with the SID to be created")
+                ),
+            )),
+        };
     }
 
     // If only one entry, use it
@@ -675,7 +692,11 @@ fn process_file(
 
     // The s-file first, then the p-file, as SCCS orders them: an edit that
     // has become a delta must not be left looking pending for want of the
-    // s-file, and the other way round the delta would be lost.
+    // s-file, and the other way round the delta would be lost. An interrupt
+    // waits until both are written: between the two it left the edit
+    // pending beside its own delta. (Were that to happen all the same,
+    // add_delta refuses to make the SID a second time.)
+    let _interrupt_deferred = SigintBlock::begin();
     txn.write(&sccs)?;
     remove_pfile_entry(&txn, &pfile_entry)?;
 

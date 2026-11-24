@@ -379,6 +379,13 @@ impl SccsFile {
                 self.max_serial() + 1
             )));
         }
+        // A SID names one delta. (A removed delta's is free again.)
+        if entry.delta_type == DeltaType::Normal && self.find_delta_by_sid(&entry.sid).is_some() {
+            return Err(SccsError::InvalidDelta(format!(
+                "the file already has a delta {}",
+                entry.sid
+            )));
+        }
         // Deltas are stored newest first: the entry goes straight after
         // the checksum line.
         let mut content = Content::default();

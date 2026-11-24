@@ -19,8 +19,8 @@ use clap::Parser;
 use gettextrs::gettext;
 use plib::linediff::LineOp;
 use plib::sccsfile::{
-    paths, BodyRecord, DeltaEntry, DeltaStats, DeltaType, NotText, PfileEntry, SccsDateTime,
-    SccsFile, SccsFlag, Sid,
+    paths, DeltaEntry, DeltaStats, DeltaType, NotText, PfileEntry, SccsDateTime, SccsFile,
+    SccsFlag, Sid,
 };
 use posixutils_sccs::{diag, mrlist, operands, pfile, protect, sfio, zlock};
 
@@ -331,109 +331,6 @@ fn print_normal_diff(
     Ok(())
 }
 
-/// Apply diff operations to the SCCS body
-fn apply_diff_to_body(
-    sccs: &SccsFile,
-    applied_set: &HashSet<u16>,
-    new_serial: u16,
-    new_lines: &[Vec<u8>],
-    diff_ops: &[LineOp],
-) -> Vec<BodyRecord> {
-    // First, collect all lines that need to be deleted or kept
-    let mut delete_set = HashSet::new();
-    let mut insert_after: Vec<(usize, Vec<Vec<u8>>)> = Vec::new();
-
-    let mut base_idx = 0;
-    let mut inserts_at_pos: Vec<Vec<u8>> = Vec::new();
-
-    for op in diff_ops {
-        match op {
-            LineOp::Keep => {
-                if !inserts_at_pos.is_empty() {
-                    insert_after.push((base_idx, inserts_at_pos.clone()));
-                    inserts_at_pos.clear();
-                }
-                base_idx += 1;
-            }
-            LineOp::Delete => {
-                delete_set.insert(base_idx);
-                base_idx += 1;
-            }
-            LineOp::Insert(j) => {
-                inserts_at_pos.push(new_lines[*j].clone());
-            }
-        }
-    }
-    // Handle trailing inserts
-    if !inserts_at_pos.is_empty() {
-        insert_after.push((base_idx, inserts_at_pos));
-    }
-
-    // Now rebuild the body with new control records
-    let mut new_body = Vec::new();
-    let mut stack: Vec<(bool, u16)> = Vec::new();
-    let mut current_base_line = 0;
-
-    for record in &sccs.body {
-        match record {
-            BodyRecord::Insert(serial) => {
-                stack.push((true, *serial));
-                new_body.push(record.clone());
-            }
-            BodyRecord::Delete(serial) => {
-                stack.push((false, *serial));
-                new_body.push(record.clone());
-            }
-            BodyRecord::End(serial) => {
-                plib::sccsfile::close_block(&mut stack, *serial);
-                new_body.push(record.clone());
-            }
-            BodyRecord::Text(_line) => {
-                let visible = plib::sccsfile::is_line_visible(&stack, applied_set);
-
-                if visible {
-                    // Check for inserts before this position
-                    for (pos, lines) in &insert_after {
-                        if *pos == current_base_line && !lines.is_empty() {
-                            new_body.push(BodyRecord::Insert(new_serial));
-                            for insert_line in lines {
-                                new_body.push(BodyRecord::Text(insert_line.clone()));
-                            }
-                            new_body.push(BodyRecord::End(new_serial));
-                        }
-                    }
-
-                    // Check if this line should be deleted
-                    if delete_set.contains(&current_base_line) {
-                        new_body.push(BodyRecord::Delete(new_serial));
-                        new_body.push(record.clone());
-                        new_body.push(BodyRecord::End(new_serial));
-                    } else {
-                        new_body.push(record.clone());
-                    }
-
-                    current_base_line += 1;
-                } else {
-                    new_body.push(record.clone());
-                }
-            }
-        }
-    }
-
-    // Handle inserts at the end
-    for (pos, lines) in &insert_after {
-        if *pos == current_base_line && !lines.is_empty() {
-            new_body.push(BodyRecord::Insert(new_serial));
-            for line in lines {
-                new_body.push(BodyRecord::Text(line.clone()));
-            }
-            new_body.push(BodyRecord::End(new_serial));
-        }
-    }
-
-    new_body
-}
-
 /// Remove entry from p-file
 fn remove_pfile_entry(sfile_path: &Path, entry_to_remove: &PfileEntry) -> io::Result<()> {
     let remaining: Vec<_> = pfile::read(sfile_path)?
@@ -731,8 +628,9 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
     }
 
     // Apply diff to body
-    let new_body = apply_diff_to_body(&sccs, &applied_set, new_serial, &new_lines, &diff_ops);
-    sccs.body = new_body;
+    sccs.body =
+        plib::sccsfile::weave_delta(&sccs.body, &applied_set, new_serial, &diff_ops, &new_lines)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
     // Add new delta to header (at the beginning - deltas are stored newest first)
     sccs.header.deltas.insert(0, new_delta);

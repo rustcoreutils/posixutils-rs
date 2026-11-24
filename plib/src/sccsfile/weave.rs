@@ -23,7 +23,8 @@
 
 use std::collections::HashSet;
 
-use super::BodyRecord;
+use super::{BodyRecord, SccsError, SccsResult};
+use crate::linediff::LineOp;
 
 /// What a block's delta did to the lines inside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,4 +168,88 @@ impl<'a> Iterator for Walker<'a> {
         self.pos += 1;
         Some((index, rec))
     }
+}
+
+/// Weave a new delta into `body`.
+///
+/// `base` is the version the delta was made from (its applied deltas), `ops`
+/// the edit script from that version's lines to the new text, and
+/// `new_lines` the new text, which the script's `Insert` steps index. The
+/// result is the body with the delta's changes recorded under `serial`:
+/// every line the script deletes inside a `^AD serial` block, every line it
+/// inserts inside a `^AI serial` block, and everything else as it was.
+///
+/// One pass over the body, with a cursor into the script. A run of inserted
+/// lines goes in ahead of the next line the script keeps (or at the end of
+/// the body); each deleted line gets a block of its own.
+///
+/// The script must account for exactly the lines of the base version: one
+/// `Keep` or `Delete` each, in order. Anything else is an error, and nothing
+/// is produced.
+pub fn weave_delta(
+    body: &[BodyRecord],
+    base: &HashSet<u16>,
+    serial: u16,
+    ops: &[LineOp],
+    new_lines: &[Vec<u8>],
+) -> SccsResult<Vec<BodyRecord>> {
+    let mismatch =
+        || SccsError::InvalidBody("the edit does not fit the version it was made from".into());
+    let mut out = Vec::with_capacity(body.len() + ops.len());
+    let mut cursor = 0;
+    // Inserted lines (as indices into `new_lines`) waiting for the next kept
+    // line.
+    let mut pending: Vec<usize> = Vec::new();
+    let take_inserts = |cursor: &mut usize, pending: &mut Vec<usize>| {
+        while let Some(LineOp::Insert(j)) = ops.get(*cursor) {
+            pending.push(*j);
+            *cursor += 1;
+        }
+    };
+    let flush = |out: &mut Vec<BodyRecord>, pending: &mut Vec<usize>| -> SccsResult<()> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        out.push(BodyRecord::Insert(serial));
+        for j in pending.drain(..) {
+            let line = new_lines.get(j).ok_or_else(mismatch)?;
+            out.push(BodyRecord::Text(line.clone()));
+        }
+        out.push(BodyRecord::End(serial));
+        Ok(())
+    };
+
+    for (index, rec) in Walker::new(body, base) {
+        let kept = matches!(
+            rec,
+            Rec::Text {
+                kept_by: Some(_),
+                ..
+            }
+        );
+        if !kept {
+            out.push(body[index].clone());
+            continue;
+        }
+        take_inserts(&mut cursor, &mut pending);
+        match ops.get(cursor) {
+            Some(LineOp::Keep) => {
+                flush(&mut out, &mut pending)?;
+                out.push(body[index].clone());
+            }
+            Some(LineOp::Delete) => {
+                out.push(BodyRecord::Delete(serial));
+                out.push(body[index].clone());
+                out.push(BodyRecord::End(serial));
+            }
+            _ => return Err(mismatch()),
+        }
+        cursor += 1;
+    }
+    take_inserts(&mut cursor, &mut pending);
+    if cursor != ops.len() {
+        return Err(mismatch());
+    }
+    flush(&mut out, &mut pending)?;
+    Ok(out)
 }

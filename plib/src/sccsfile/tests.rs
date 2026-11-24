@@ -476,3 +476,52 @@ fn walker_reports_each_line_with_its_inserter() {
         .collect();
     assert_eq!(indices, (0..sccs.body.len()).collect::<Vec<_>>());
 }
+
+/// Weaving a delta in records its changes and leaves every earlier version
+/// as it was; an edit script that does not account for exactly the lines of
+/// the base version is refused.
+#[test]
+fn weave_delta_records_the_edit_or_refuses_it() {
+    use crate::linediff::LineOp::{Delete, Insert, Keep};
+    let body = [
+        BodyRecord::Insert(1),
+        BodyRecord::Text(b"a".to_vec()),
+        BodyRecord::Text(b"b".to_vec()),
+        BodyRecord::Text(b"c".to_vec()),
+        BodyRecord::End(1),
+    ];
+    let v1: HashSet<u16> = [1].into();
+    let text = |body: &[BodyRecord], applied: &[u16]| -> Vec<Vec<u8>> {
+        let applied: HashSet<u16> = applied.iter().copied().collect();
+        Walker::new(body, &applied)
+            .filter_map(|(_, rec)| match rec {
+                Rec::Text {
+                    text,
+                    kept_by: Some(_),
+                } => Some(text.to_vec()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // a b c  ->  x a c y
+    let new_lines = [b"x".to_vec(), b"a".to_vec(), b"c".to_vec(), b"y".to_vec()];
+    let ops = [Insert(0), Keep, Delete, Keep, Insert(3)];
+    let woven = weave_delta(&body, &v1, 2, &ops, &new_lines).unwrap();
+    assert_eq!(text(&woven, &[1, 2]), new_lines);
+    assert_eq!(
+        text(&woven, &[1]),
+        [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]
+    );
+
+    for bad in [
+        &[Keep, Keep][..],              // a line of the base unaccounted for
+        &[Keep, Keep, Keep, Keep],      // one line too many
+        &[Keep, Keep, Keep, Insert(9)], // an insert of a line that is not there
+    ] {
+        assert!(
+            weave_delta(&body, &v1, 2, bad, &new_lines).is_err(),
+            "{bad:?}"
+        );
+    }
+}

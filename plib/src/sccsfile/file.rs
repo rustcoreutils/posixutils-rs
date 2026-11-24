@@ -621,42 +621,6 @@ impl SccsFile {
     }
 }
 
-/// Check if a line should be visible given the current stack state
-pub fn is_line_visible(stack: &[(bool, u16)], applied_set: &HashSet<u16>) -> bool {
-    for &(is_insert, serial) in stack {
-        if is_insert {
-            // Insert block: line visible only if serial is in applied set
-            if !applied_set.contains(&serial) {
-                return false;
-            }
-        } else {
-            // Delete block: line hidden if serial is in applied set
-            if applied_set.contains(&serial) {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-/// End block `serial` on a stack of open blocks `(is_insert, serial)`.
-///
-/// `^AE n` ends block n, which need not be the block opened last: blocks
-/// overlap in a real s-file, a delete opening inside one delta's insert and
-/// ending inside another's. Popping the top instead closed the wrong block
-/// there, and every line after it was read under the wrong set of blocks.
-/// An end that matches no open block (a damaged file) closes the last one.
-pub fn close_block(stack: &mut Vec<(bool, u16)>, serial: u16) {
-    match stack.iter().rposition(|&(_, s)| s == serial) {
-        Some(at) => {
-            stack.remove(at);
-        }
-        None => {
-            stack.pop();
-        }
-    }
-}
-
 /// Write one s-file line: `prefix` (a control code and its blank, or nothing),
 /// the stored bytes, and the newline that ends it.
 fn write_record<W: Write>(writer: &mut W, prefix: &[u8], text: &[u8]) -> io::Result<()> {

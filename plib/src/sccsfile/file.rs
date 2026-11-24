@@ -217,6 +217,9 @@ impl SccsFile {
     /// (`get -i`/`-x`, `delta -g`). Returns `None` when either SID is unknown
     /// or `start` is not an ancestor of `end` — the case the spec singles out
     /// for a diagnostic.
+    ///
+    /// The walk ends: a predecessor's serial is smaller than its delta's,
+    /// which the parser checks.
     pub fn ancestor_chain(&self, start: &Sid, end: &Sid) -> Option<Vec<u16>> {
         let start = self.find_delta_by_sid(start)?;
         let end = self.find_delta_by_sid(end)?;
@@ -501,7 +504,8 @@ impl SccsFile {
 
     /// True if `serial` is `ancestor` itself, or has it in its predecessor
     /// chain. Used to cascade `-x` exclusions to descendant deltas for the
-    /// `Excluded:` notation.
+    /// `Excluded:` notation. (The walk ends, as [`Self::ancestor_chain`]'s
+    /// does.)
     pub fn is_descendant_of(&self, serial: u16, ancestor: u16) -> bool {
         let mut cur = serial;
         while cur != 0 {

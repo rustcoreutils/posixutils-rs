@@ -258,6 +258,14 @@ impl<'a> SccsParser<'a> {
             number(6, "predecessor")?,
         );
         entry.stats = stats;
+        // A delta is made from one that was there before it. Followed
+        // without this, a table whose predecessors form a cycle never ends.
+        if entry.serial == 0 || entry.pred_serial >= entry.serial {
+            return Err(SccsError::InvalidDelta(format!(
+                "delta {} (serial {}) has predecessor {}, which is not an older delta",
+                entry.sid, entry.serial, entry.pred_serial
+            )));
+        }
 
         // Parse optional lines until ^Ae
         loop {

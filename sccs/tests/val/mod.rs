@@ -582,3 +582,36 @@ fn a_bad_checksum_is_refused_by_every_reader() {
     assert_eq!(out.stdout, b"ONE %I%\n");
     assert!(run("delta", &["-s", "-yc", "s.sum"]).status.success());
 }
+
+/// A delta's predecessor is an older delta: its serial is smaller. A file
+/// that says otherwise is corrupt, and is refused by every command when it
+/// is read. Nothing checked, so a table whose predecessors formed a cycle
+/// passed `val` and `admin -h`, and `get -i`/`-x`, which follow predecessors,
+/// never returned.
+#[test]
+fn a_predecessor_that_is_not_older_is_corruption() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    // 1.2 (serial 2) names serial 3 as its predecessor: 2 -> 3 -> 2.
+    let table = String::from_utf8(super::common::THREE_DELTAS.to_vec())
+        .unwrap()
+        .replace("26/01/02 00:00:00 u 2 1", "26/01/02 00:00:00 u 2 3");
+    let body = "\x01I 1\none\n\x01E 1\n";
+    super::common::write_sfile(dir, "s.cyc", format!("{table}{body}").as_bytes());
+    let run = |cmd: &str, args: &[&str]| super::common::run_in(cmd, args, dir, "");
+
+    assert_eq!(run("val", &["s.cyc"]).status.code(), Some(0x20));
+    for (cmd, args) in [
+        ("admin", &["-h", "s.cyc"][..]),
+        ("get", &["-p", "-s", "-i1.1-1.3", "s.cyc"]),
+        ("get", &["-p", "-s", "-x1.1", "s.cyc"]),
+        ("prs", &["s.cyc"]),
+    ] {
+        let out = run(cmd, args);
+        assert_eq!(out.status.code(), Some(1), "{cmd} {args:?}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("predecessor"),
+            "{cmd} {args:?}: {out:?}"
+        );
+    }
+}

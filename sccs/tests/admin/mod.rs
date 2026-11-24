@@ -980,7 +980,7 @@ fn admin_runs_the_mr_validation_program() {
     let tmp = TempDir::new().unwrap();
     let out = run_in(
         "admin",
-        &["-n", "-fv/bin/false", "-mMR1", "s.no"],
+        &["-n", "-fv/usr/bin/false", "-mMR1", "s.no"],
         tmp.path(),
         "",
     );
@@ -993,7 +993,7 @@ fn admin_runs_the_mr_validation_program() {
 
     let out = run_in(
         "admin",
-        &["-n", "-fv/bin/true", "-mMR1", "s.yes"],
+        &["-n", "-fv/usr/bin/true", "-mMR1", "s.yes"],
         tmp.path(),
         "",
     );

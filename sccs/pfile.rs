@@ -45,6 +45,10 @@ pub fn path(sfile: &Path) -> PathBuf {
 /// Replace the p-file with `entries`, removing it entirely when none remain.
 /// Only a [`Txn`](crate::txn::Txn), which holds the lock, can do this.
 ///
+/// The new p-file is written as the q-file, "a working copy of the p-file"
+/// (POSIX unget 119295-119296), and renamed into place, so the p-file is
+/// never seen half written.
+///
 /// An empty p-file and an absent one mean different things to `sact` and to
 /// `get -e`, so the empty case must unlink rather than truncate.
 pub(crate) fn write(sfile: &Path, entries: &[PfileEntry]) -> io::Result<()> {
@@ -62,7 +66,12 @@ pub(crate) fn write(sfile: &Path, entries: &[PfileEntry]) -> io::Result<()> {
         body.push_str(&e.to_line());
         body.push('\n');
     }
-    crate::sfio::write_replacing(&path, body.as_bytes(), PFILE_MODE)
+    crate::sfio::write_via(
+        &path,
+        &paths::qfile_from_sfile(sfile),
+        body.as_bytes(),
+        PFILE_MODE,
+    )
 }
 
 /// The entry whose new SID is `new_sid`, if the edit is already pending.

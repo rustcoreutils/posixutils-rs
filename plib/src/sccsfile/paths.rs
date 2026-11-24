@@ -65,6 +65,17 @@ pub fn pfile_from_sfile(sfile: &Path) -> PathBuf {
     sfile.with_file_name(pname)
 }
 
+/// Get the q-file (the working copy the p-file is rewritten through) path
+/// from s-file: s.foo -> q.foo, beside the s-file.
+pub fn qfile_from_sfile(sfile: &Path) -> PathBuf {
+    let name = sfile
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("s.unknown");
+    let qname = format!("q.{}", &name[2..]);
+    sfile.with_file_name(qname)
+}
+
 /// Get the z-file (lock semaphore) path from s-file
 pub fn zfile_from_sfile(sfile: &Path) -> PathBuf {
     let name = sfile

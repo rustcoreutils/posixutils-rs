@@ -486,3 +486,50 @@ fn unget_is_blocked_by_an_existing_zfile() {
 fn option_argument_may_begin_with_hyphen() {
     plib::testing::assert_hyphen_option_argument("unget", &["-r", "-zq", "--help"]);
 }
+
+/// The p-file is rewritten through its working copy, the q-file ("a q-file
+/// (a working copy of the p-file) may be created and deleted", POSIX unget
+/// 119295-119296): created afresh under that name and renamed into place.
+/// Whatever is at the q-file's name beforehand -- one left by a crash, or a
+/// symlink planted there -- is removed, never written through.
+#[test]
+fn the_p_file_is_replaced_through_a_fresh_q_file() {
+    use super::common::run_in as run;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let s = create_sccs_file(&tmp, "q", "one\n");
+    let name = s.file_name().unwrap().to_str().unwrap();
+    let victim = dir.join("victim");
+    std::fs::write(&victim, b"precious\n").unwrap();
+    let plant = || {
+        let _ = std::fs::remove_file(dir.join("q.q"));
+        symlink(&victim, dir.join("q.q")).unwrap();
+    };
+    let check = |what: &str| {
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious\n", "{what}");
+        assert!(
+            std::fs::symlink_metadata(dir.join("q.q")).is_err(),
+            "{what}: the q-file is gone once the p-file is in place"
+        );
+    };
+
+    plant();
+    let out = run("get", &["-e", "-s", name], dir, "");
+    assert!(out.status.success(), "{out:?}");
+    check("get -e");
+    let p = std::fs::metadata(dir.join("p.q")).unwrap();
+    assert!(p.file_type().is_file());
+    assert_eq!(p.permissions().mode() & 0o777, 0o644);
+
+    // A second edit, so that unget rewrites the p-file instead of removing it.
+    let out = run("admin", &["-fj", name], dir, "");
+    assert!(out.status.success(), "{out:?}");
+    let out = run("get", &["-e", "-s", "-g", name], dir, "");
+    assert!(out.status.success(), "{out:?}");
+    plant();
+    let out = run("unget", &["-s", "-r1.2", name], dir, "");
+    assert!(out.status.success(), "{out:?}");
+    check("unget");
+    assert!(dir.join("p.q").exists(), "one edit is still pending");
+}

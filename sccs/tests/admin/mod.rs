@@ -1366,3 +1366,90 @@ fn admin_z_handles_blank_lines_before_the_checksum() {
     let out = run_in("val", &["s.bl"], tmp.path(), "");
     assert_eq!(out.status.code(), Some(0), "{out:?}");
 }
+
+/// A `-f` argument beginning with a character of several bytes is an
+/// unrecognized flag, not a panic.
+#[test]
+fn admin_f_multibyte_letter_is_diagnosed() {
+    let tmp = TempDir::new().unwrap();
+    let out = run_in("admin", &["-n", "-f\u{e9}", "s.x"], tmp.path(), "");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Unrecognized flag"),
+        "{out:?}"
+    );
+}
+
+/// The `e` flag records how the body is stored; admin sets it when it
+/// encodes the text. Setting or removing it by hand would leave the body
+/// stored one way and read the other, so neither `-f` nor `-d` takes it.
+#[test]
+fn admin_does_not_take_the_e_flag() {
+    let tmp = TempDir::new().unwrap();
+    fs::write(tmp.path().join("bin"), b"no newline").unwrap();
+    let out = run_in("admin", &["-ibin", "s.enc"], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    let s = admin_create(tmp.path(), "txt", "text %I%\n");
+
+    for (args, file) in [
+        (["-fe1", "s.txt"], &s),
+        (["-de", "s.enc"], &tmp.path().join("s.enc")),
+    ] {
+        let before = fs::read(file).unwrap();
+        let out = run_in("admin", &args, tmp.path(), "");
+        assert_eq!(out.status.code(), Some(1), "admin {args:?}: {out:?}");
+        assert_eq!(
+            fs::read(file).unwrap(),
+            before,
+            "admin {args:?} wrote the file"
+        );
+    }
+    let out = run_in("get", &["-p", "-s", "s.enc"], tmp.path(), "");
+    assert_eq!(out.stdout, b"no newline");
+}
+
+/// A login is stored without the blanks around it, so what `-a` adds, `-e`
+/// with the same argument removes, and adding it twice stores it once.
+#[test]
+fn admin_login_is_stored_without_surrounding_blanks() {
+    let tmp = TempDir::new().unwrap();
+    let users = || {
+        let out = run_in("prs", &["-d:UN:", "s.u"], tmp.path(), "");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let out = run_in("admin", &["-n", "-a", " bob ", "s.u"], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    assert!(run_in("admin", &["-a", " bob ", "s.u"], tmp.path(), "")
+        .status
+        .success());
+    assert_eq!(users(), "bob");
+    assert!(run_in("admin", &["-e", " bob ", "s.u"], tmp.path(), "")
+        .status
+        .success());
+    assert_eq!(users(), "none");
+
+    let out = run_in("admin", &["-a", "  ", "s.u"], tmp.path(), "");
+    assert_eq!(out.status.code(), Some(1), "an empty login: {out:?}");
+}
+
+/// A flag outside the POSIX set that a file carries -- another
+/// implementation's -- is kept through rewrites and can be removed with
+/// `-d`; only a letter that is neither a flag nor in the file is refused.
+#[test]
+fn admin_d_removes_a_foreign_flag_the_file_has() {
+    let tmp = TempDir::new().unwrap();
+    let s = super::common::write_sfile(
+        tmp.path(),
+        "s.x",
+        b"\x01s 00001/00000/00000\n\x01d D 1.1 26/01/01 00:00:00 u 1 0\n\x01e\n\
+\x01u\n\x01U\n\x01f x foreign\n\x01t\n\x01T\n\x01I 1\nbody %I%\n\x01E 1\n",
+    );
+    let out = run_in("admin", &["-dz", "s.x"], tmp.path(), "");
+    assert_eq!(out.status.code(), Some(1), "not in the file: {out:?}");
+    let out = run_in("admin", &["-fb", "s.x"], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    super::common::assert_sfile_holds(&s, &[b"\x01f x foreign"]);
+    let out = run_in("admin", &["-dx", "s.x"], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    assert!(!fs::read(&s).unwrap().windows(4).any(|w| w == b"\x01f x"));
+}

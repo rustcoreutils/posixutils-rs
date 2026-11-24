@@ -218,10 +218,17 @@ fn parse_sid(s: &str) -> Result<Sid, String> {
 /// The highest release number.
 const MAX_RELEASE: u16 = 9999;
 
-/// Flag letters recognized by the `-f` option (POSIX admin spec).
-const VALID_FLAG_CHARS: &[char] = &[
-    'b', 'c', 'd', 'e', 'f', 'i', 'j', 'l', 'm', 'n', 'q', 't', 'v',
-];
+/// Flag letters recognized by the `-f` option (POSIX admin 84028-84079).
+///
+/// `e`, the encoded-body marker, is not one of them: admin sets it when it
+/// stores a body encoded, and a body is read by it. Set or removed by hand it
+/// would say one thing while the body is stored the other way.
+const VALID_FLAG_CHARS: &[char] = &['b', 'c', 'd', 'f', 'i', 'j', 'l', 'm', 'n', 'q', 't', 'v'];
+
+/// The diagnostic for a letter that is not a flag.
+fn unrecognized_flag(letter: char) -> String {
+    format!("{} '{}'", gettext("Unrecognized flag"), letter)
+}
 
 fn parse_flag(flag_str: &str) -> Result<SccsFlag, String> {
     if flag_str.is_empty() {
@@ -234,17 +241,13 @@ fn parse_flag(flag_str: &str) -> Result<SccsFlag, String> {
     }
 
     let flag_char = flag_str.chars().next().unwrap();
-    let value = if flag_str.len() > 1 {
-        &flag_str[1..]
-    } else {
-        ""
-    };
+    let value = &flag_str[flag_char.len_utf8()..];
 
     // Reject any flag letter not in the spec set. SccsFlag::parse maps unknown
     // letters to SccsFlag::Unknown for lossless reads of existing files, but
     // admin must not write a malformed flag from a bad -f argument.
     if !VALID_FLAG_CHARS.contains(&flag_char) {
-        return Err(format!("{} '{}'", gettext("Unrecognized flag"), flag_char));
+        return Err(unrecognized_flag(flag_char));
     }
 
     let flag = SccsFlag::parse(flag_char, value.as_bytes()).map_err(|e| e.to_string())?;
@@ -273,24 +276,29 @@ fn parse_flag(flag_str: &str) -> Result<SccsFlag, String> {
     Ok(flag)
 }
 
-/// Check a `-a`/`-e` login: it is stored as one line of the user list, so it
-/// cannot hold a newline, nor begin with the SOH that marks a control line
-/// (`^AU` ends the list).
-fn check_login(login: &str) -> Result<(), String> {
-    if login.contains('\n') || login.starts_with('\x01') {
+/// The login a `-a`/`-e` argument names, as it is stored: one line of the
+/// user list, without the blanks around it, which reading the list back
+/// drops -- kept, a login added as " bob " could never be matched again. It
+/// cannot be empty, hold a newline, or begin with the SOH that marks a
+/// control line (`^AU` ends the list).
+fn login_of(arg: &str) -> Result<String, String> {
+    let login = arg.trim_ascii();
+    if login.is_empty() || login.contains('\n') || login.starts_with('\x01') {
         return Err(format!(
-            "{}: {}",
-            login.escape_default(),
+            "'{}': {}",
+            arg.escape_default(),
             gettext("invalid login name")
         ));
     }
-    Ok(())
+    Ok(login.to_string())
 }
 
 /// What one `-d` option removes.
 #[derive(Clone)]
 enum FlagRemoval {
-    /// The flag with this letter, whatever its value.
+    /// The flag with this letter, whatever its value. The letter may be one
+    /// outside the POSIX set, for a flag another implementation left in the
+    /// file ([`remove_flag`] refuses it if the file has no such flag).
     Flag(char),
     /// These releases from the `l` flag's list of locked releases: "the l
     /// list flag gives a list of releases to be unlocked" (POSIX 84082-84083).
@@ -303,8 +311,10 @@ fn parse_flag_removal(arg: &str) -> Result<FlagRemoval, String> {
     let Some(letter) = arg.chars().next() else {
         return Err(gettext("Empty flag"));
     };
-    if !VALID_FLAG_CHARS.contains(&letter) {
-        return Err(format!("{} '{}'", gettext("Unrecognized flag"), letter));
+    if letter == 'e' {
+        return Err(gettext(
+            "The 'e' flag records how the text is stored and cannot be removed",
+        ));
     }
     let list = arg[letter.len_utf8()..].trim();
     if letter != 'l' || list.is_empty() || list == "a" {
@@ -321,6 +331,15 @@ fn parse_flag_removal(arg: &str) -> Result<FlagRemoval, String> {
 fn remove_flag(flags: &mut Vec<SccsFlag>, removal: FlagRemoval) -> io::Result<()> {
     let releases = match removal {
         FlagRemoval::Flag(letter) => {
+            // A letter that is not a flag is only removable if the file has
+            // it, as a flag some other implementation wrote.
+            if !VALID_FLAG_CHARS.contains(&letter) && !flags.iter().any(|f| f.flag_char() == letter)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    unrecognized_flag(letter),
+                ));
+            }
             flags.retain(|f| f.flag_char() != letter);
             return Ok(());
         }
@@ -701,12 +720,15 @@ fn main() -> ExitCode {
         }
     }
 
-    for login in args.add_users.iter().chain(&args.erase_users) {
-        if let Err(e) = check_login(login) {
-            eprintln!("admin: {}", e);
-            return ExitCode::FAILURE;
-        }
-    }
+    let logins = |args: &[String]| args.iter().map(|a| login_of(a)).collect();
+    let (add_users, erase_users): (Vec<String>, Vec<String>) =
+        match (logins(&args.add_users), logins(&args.erase_users)) {
+            (Ok(add), Ok(erase)) => (add, erase),
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!("admin: {}", e);
+                return ExitCode::FAILURE;
+            }
+        };
 
     // The 'v' (MR validation) flag this command line sets, if any: the outer
     // Option is "being set", the inner one its validation program.
@@ -727,6 +749,18 @@ fn main() -> ExitCode {
                 eprintln!("admin: {}", e);
                 return ExitCode::FAILURE;
             }
+        }
+    }
+    // A new file has no flag from elsewhere to remove, so there the letter
+    // must be a flag's.
+    if creating_new {
+        let stranger = delete_flags.iter().find_map(|removal| match removal {
+            FlagRemoval::Flag(letter) if !VALID_FLAG_CHARS.contains(letter) => Some(*letter),
+            _ => None,
+        });
+        if let Some(letter) = stranger {
+            eprintln!("admin: {}", unrecognized_flag(letter));
+            return ExitCode::FAILURE;
         }
     }
 
@@ -880,7 +914,7 @@ fn main() -> ExitCode {
                     comment,
                     desc_text,
                     flags: add_flags.clone(),
-                    users: args.add_users.clone(),
+                    users: add_users.clone(),
                     mr_numbers: mr_numbers.clone(),
                 },
             ) {
@@ -926,8 +960,8 @@ fn main() -> ExitCode {
                 desc_text,
                 add_flags.clone(),
                 delete_flags.clone(),
-                args.add_users.clone(),
-                args.erase_users.clone(),
+                add_users.clone(),
+                erase_users.clone(),
                 args.mrlist.is_some(),
             ) {
                 eprintln!(

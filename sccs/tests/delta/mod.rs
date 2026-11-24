@@ -1638,3 +1638,43 @@ fn delta_r_naming_several_edits_is_ambiguous() {
     let out = run("prs", &["-e", "-d:I:", "s.a"], "");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "1.1.1.1\n1.1\n");
 }
+
+/// The `v` flag's program is run as SCCS and CSSC run it: with the name of
+/// the g-file first, and the MR numbers after it. A validator written for
+/// them drops its first argument as the file name; given the MRs alone, it
+/// dropped the first MR, which went in unchecked.
+#[test]
+fn the_mr_validator_is_given_the_file_name_first() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    let checker = dir.join("check");
+    let log = dir.join("log");
+    fs::write(
+        &checker,
+        format!("#!/bin/sh\necho \"$*\" >> {}\nshift\nfor mr; do case $mr in BAD*) exit 1;; esac; done\n", log.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&checker, fs::Permissions::from_mode(0o755)).unwrap();
+    let v = format!("-fv{}", checker.display());
+
+    assert!(run("admin", &["-i", &v, "-mMR1 MR2", "s.v"], "one\n")
+        .status
+        .success());
+    assert!(run("get", &["-e", "-s", "s.v"], "").status.success());
+    fs::write(dir.join("v"), "two\n").unwrap();
+    let out = run("delta", &["-s", "-yc", "-mBAD1 OK2", "s.v"], "");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a bad first MR is caught: {out:?}"
+    );
+    assert!(run("delta", &["-s", "-yc", "-mMR3", "s.v"], "")
+        .status
+        .success());
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        "v MR1 MR2\nv BAD1 OK2\nv MR3\n"
+    );
+}

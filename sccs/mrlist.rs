@@ -38,8 +38,12 @@ pub fn parse(mrlist: Option<&OsStr>) -> Vec<MrNumber> {
 /// `program` is a pathname as the s-file stores it.
 pub fn validate(utility: &str, sfile: &Path, program: &[u8], mrs: &[MrNumber]) -> bool {
     let program = OsStr::from_bytes(program);
+    // The g-file's name, then the MRs: what SCCS and CSSC give the program.
+    // One written for them drops its first argument as the name, and given
+    // the MRs alone it dropped the first MR.
+    let gfile = plib::sccsfile::paths::gfile_from_sfile(sfile).unwrap_or_default();
     let mrs = mrs.iter().map(|mr| OsStr::from_bytes(mr));
-    match Command::new(program).args(mrs).status() {
+    match Command::new(program).arg(&gfile).args(mrs).status() {
         Ok(status) if status.success() => true,
         Ok(_) => {
             crate::diag::error_path(utility, sfile, &gettext("MR validation failed."));

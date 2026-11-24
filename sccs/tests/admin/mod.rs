@@ -920,3 +920,54 @@ fn admin_records_at_most_99999_lines() {
     let out = super::common::run_in("get", &["-p", "-k", "-s", "s.big"], tmp.path(), "");
     assert_eq!(out.stdout, input.as_bytes());
 }
+
+/// A `-y` comment of several lines is stored as several comment lines, as
+/// delta stores one (POSIX admin 84095-84096). Written as one record, the
+/// lines after the first were bare text in the delta table, which every
+/// reader skipped and the next rewrite deleted.
+#[test]
+fn admin_multi_line_comment_is_kept() {
+    let tmp = TempDir::new().unwrap();
+    let out = super::common::run_in("admin", &["-n", "-yline1\nline2", "s.c"], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    let out = super::common::run_in("prs", &["-d:C:", "s.c"], tmp.path(), "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "line1\nline2\n\n");
+    let out = super::common::run_in("val", &["s.c"], tmp.path(), "");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+}
+
+/// A flag value or a login holding a newline cannot be stored: it would put
+/// a line of its own into the header. It is refused, and nothing is written.
+#[test]
+fn admin_rejects_values_that_would_break_the_header() {
+    let tmp = TempDir::new().unwrap();
+    let s = admin_create(tmp.path(), "inj", "body\n");
+    let before = fs::read(&s).unwrap();
+    for bad in [
+        &["-fqa\nb"][..],
+        &["-fmname\n\x01e"],
+        &["-auser\nother"],
+        &["-euser\nother"],
+        &["-a\x01U"],
+    ] {
+        let mut argv = bad.to_vec();
+        argv.push("s.inj");
+        let out = super::common::run_in("admin", &argv, tmp.path(), "");
+        assert_eq!(out.status.code(), Some(1), "admin {bad:?}: {out:?}");
+        assert!(!out.stderr.is_empty(), "admin {bad:?} must say why");
+        assert_eq!(
+            fs::read(&s).unwrap(),
+            before,
+            "admin {bad:?} wrote the file"
+        );
+
+        argv.pop();
+        argv.extend(["-n", "s.new"]);
+        let out = super::common::run_in("admin", &argv, tmp.path(), "");
+        assert_eq!(out.status.code(), Some(1), "admin -n {bad:?}: {out:?}");
+        assert!(
+            !tmp.path().join("s.new").exists(),
+            "admin -n {bad:?} created it"
+        );
+    }
+}

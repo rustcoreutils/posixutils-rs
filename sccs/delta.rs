@@ -709,7 +709,7 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
         comments: if comment.is_empty() {
             Vec::new()
         } else {
-            vec![comment.into_bytes()]
+            posixutils_sccs::comment_lines(&comment)
         },
     };
 

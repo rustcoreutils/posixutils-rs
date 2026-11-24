@@ -157,6 +157,11 @@ fn parse_flag(flag_str: &str) -> Result<SccsFlag, String> {
     if flag_str.is_empty() {
         return Err(gettext("Empty flag"));
     }
+    // A flag is one line of the s-file; a value holding a newline would put
+    // a line of its own into the header.
+    if flag_str.contains('\n') {
+        return Err(gettext("A flag value cannot contain a newline"));
+    }
 
     let flag_char = flag_str.chars().next().unwrap();
     let value = if flag_str.len() > 1 {
@@ -188,6 +193,20 @@ fn parse_flag(flag_str: &str) -> Result<SccsFlag, String> {
     }
 
     Ok(flag)
+}
+
+/// Check a `-a`/`-e` login: it is stored as one line of the user list, so it
+/// cannot hold a newline, nor begin with the SOH that marks a control line
+/// (`^AU` ends the list).
+fn check_login(login: &str) -> Result<(), String> {
+    if login.contains('\n') || login.starts_with('\x01') {
+        return Err(format!(
+            "{}: {}",
+            login.escape_default(),
+            gettext("invalid login name")
+        ));
+    }
+    Ok(())
 }
 
 /// Inputs for creating a new SCCS file.
@@ -300,7 +319,7 @@ fn create_new_sccs_file(path: &Path, params: NewFileParams) -> io::Result<()> {
         excluded: Vec::new(),
         ignored: Vec::new(),
         mr_numbers: mr_numbers.into_iter().map(String::into_bytes).collect(),
-        comments: vec![comment_text.into_bytes()],
+        comments: posixutils_sccs::comment_lines(&comment_text),
     };
 
     // Create body with insert block
@@ -495,6 +514,13 @@ fn main() -> ExitCode {
                 eprintln!("admin: {}", e);
                 return ExitCode::FAILURE;
             }
+        }
+    }
+
+    for login in args.add_users.iter().chain(&args.erase_users) {
+        if let Err(e) = check_login(login) {
+            eprintln!("admin: {}", e);
+            return ExitCode::FAILURE;
         }
     }
 

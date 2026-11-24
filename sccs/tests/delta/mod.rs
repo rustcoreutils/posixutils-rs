@@ -1304,3 +1304,20 @@ fn delta_and_rmdel_keep_non_utf8_text() {
     run("rmdel", &["-r1.2", "s.l1"]);
     assert_sfile_holds(&s, LATIN1_RECORDS);
 }
+
+/// A `-y` comment of several lines is stored as several comment lines.
+#[test]
+fn delta_multi_line_comment_is_kept() {
+    let tmp = TempDir::new().unwrap();
+    let (sfile, _, gfile) = setup_sccs_file(&tmp, "ml", "one\n");
+    get_for_editing(&sfile);
+    fs::write(&gfile, "two\n").unwrap();
+    let dir = sfile.parent().unwrap();
+    let name = sfile.file_name().unwrap().to_str().unwrap();
+    let out = super::common::run_in("delta", &["-s", "-yline1\nline2", name], dir, "");
+    assert!(out.status.success(), "{out:?}");
+    let out = super::common::run_in("prs", &["-d:C:", "-r1.2", name], dir, "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "line1\nline2\n\n");
+    let out = super::common::run_in("val", &[name], dir, "");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+}

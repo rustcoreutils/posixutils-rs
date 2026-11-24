@@ -39,3 +39,14 @@ pub mod zlock;
 pub fn username() -> String {
     plib::sccsfile::real_login_name()
 }
+
+/// A delta comment as the lines the s-file stores, one `^Ac` record each.
+///
+/// `admin` and `delta` each stored the `-y` text as a single record, so the
+/// lines after the first went into the delta table as bare text, which every
+/// reader skips and the next rewrite of the file deletes. A final newline
+/// ends the last line rather than starting an empty one.
+pub fn comment_lines(text: &str) -> Vec<Vec<u8>> {
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    text.split('\n').map(|l| l.as_bytes().to_vec()).collect()
+}

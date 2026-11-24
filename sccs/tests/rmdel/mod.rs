@@ -121,12 +121,7 @@ fn create_multi_delta(tmp: &TempDir, name: &str, n: usize) -> std::path::PathBuf
             String::from_utf8_lossy(&out.stderr)
         );
         std::fs::write(tmp.path().join(name), format!("v{i}\n")).unwrap();
-        let out = run(
-            "delta",
-            &["-y", "next", &format!("s.{name}")],
-            tmp.path(),
-            "",
-        );
+        let out = run("delta", &["-ynext", &format!("s.{name}")], tmp.path(), "");
         assert!(
             out.status.success(),
             "delta failed: {}",

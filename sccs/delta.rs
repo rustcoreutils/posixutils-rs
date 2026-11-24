@@ -10,8 +10,10 @@
 //! delta - make a delta (change) to an SCCS file
 
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -22,7 +24,7 @@ use plib::sccsfile::{
     paths, CommentLine, DeltaEntry, DeltaStats, DeltaType, MrNumber, NotText, PfileEntry,
     SccsDateTime, SccsFile, SccsFlag, Selection, Sid, SidList,
 };
-use posixutils_sccs::invalid_input;
+use posixutils_sccs::optscan::{self, Letters};
 use posixutils_sccs::txn::{self, Txn};
 use posixutils_sccs::{diag, mrlist, operands, protect, zlock};
 
@@ -32,11 +34,12 @@ fn stdin_is_tty() -> bool {
 }
 
 /// Read a single line from standard input, stripping the trailing newline.
-/// Returns an empty string at EOF.
-fn read_stdin_line() -> String {
-    let mut line = String::new();
-    let _ = io::stdin().lock().read_line(&mut line);
-    while line.ends_with('\n') || line.ends_with('\r') {
+/// Returns an empty line at EOF. The line is bytes: a comment need not be
+/// UTF-8.
+fn read_stdin_line() -> Vec<u8> {
+    let mut line = Vec::new();
+    let _ = io::stdin().lock().read_until(b'\n', &mut line);
+    while line.ends_with(b"\n") || line.ends_with(b"\r") {
         line.pop();
     }
     line
@@ -49,11 +52,14 @@ struct Args {
     #[arg(short = 'r', allow_hyphen_values = true, value_name = "SID", help = gettext("SID of delta to create (if multiple edits pending)"))]
     sid: Option<String>,
 
-    #[arg(short = 'y', value_name = "COMMENT", num_args = 0..=1, default_missing_value = "", help = gettext("Comment for delta"))]
-    comment: Option<String>,
+    /// `-y[comment]`: taken from the command line by [`optscan`], its
+    /// argument being optional and attached. A bare `-y` is an empty comment.
+    #[arg(skip)]
+    comment: Option<OsString>,
 
-    #[arg(short = 'm', value_name = "MRLIST", num_args = 0..=1, default_missing_value = "", help = gettext("Modification request (MR) numbers for delta"))]
-    mrlist: Option<String>,
+    /// `-m[mrlist]`, likewise. A bare `-m` is an empty list.
+    #[arg(skip)]
+    mrlist: Option<OsString>,
 
     #[arg(short = 'g', allow_hyphen_values = true, value_name = "LIST", help = gettext("List of deltas to ignore at this change level"))]
     glist: Option<String>,
@@ -367,7 +373,7 @@ fn gather_mrs(
     sccs: &SccsFile,
     sfile_path: &Path,
     stdin_consumed: bool,
-) -> io::Result<Option<Vec<String>>> {
+) -> io::Result<Option<Vec<MrNumber>>> {
     // Locate the v flag, if any.
     let v_flag = sccs.header().flags.iter().find_map(|f| match f {
         SccsFlag::MrValidation(prog) => Some(prog.clone()),
@@ -376,7 +382,7 @@ fn gather_mrs(
     let v_set = v_flag.is_some();
 
     // Source the raw MR list: -m argument, else (if v is set) a prompt/stdin.
-    let raw: Option<String> = match &args.mrlist {
+    let raw: Option<OsString> = match &args.mrlist {
         Some(s) => Some(s.clone()),
         None => {
             if v_set && !stdin_consumed {
@@ -384,14 +390,14 @@ fn gather_mrs(
                     print!("{}", gettext("MRs? "));
                     io::stdout().flush().ok();
                 }
-                Some(read_stdin_line())
+                Some(OsString::from_vec(read_stdin_line()))
             } else {
                 None
             }
         }
     };
 
-    let mrs: Vec<String> = mrlist::parse(raw.as_deref());
+    let mrs = mrlist::parse(raw.as_deref());
 
     if !v_set {
         // MRs are only meaningful when the v flag is set.
@@ -431,12 +437,12 @@ fn gather_mrs(
 /// Uses `-y` if supplied; otherwise prompts on a terminal (or reads stdin
 /// silently when not a terminal). When the operand was `-`, stdin is already
 /// consumed and the comment defaults to empty.
-fn gather_comment(args: &Args, stdin_consumed: bool) -> String {
+fn gather_comment(args: &Args, stdin_consumed: bool) -> Vec<u8> {
     match &args.comment {
-        Some(c) => c.clone(),
+        Some(c) => c.as_bytes().to_vec(),
         None => {
             if stdin_consumed {
-                String::new()
+                Vec::new()
             } else {
                 if stdin_is_tty() {
                     print!("{}", gettext("comments? "));
@@ -607,15 +613,11 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
         included: forced_in,
         excluded: forced_out,
         ignored,
-        mr_numbers: mrs
-            .iter()
-            .map(|mr| MrNumber::new(mr.as_bytes()))
-            .collect::<Result<_, _>>()
-            .map_err(invalid_input)?,
+        mr_numbers: mrs,
         comments: if comment.is_empty() {
             Vec::new()
         } else {
-            CommentLine::lines(comment.as_bytes())
+            CommentLine::lines(&comment)
         },
         ..DeltaEntry::new(
             DeltaType::Normal,
@@ -666,7 +668,18 @@ fn main() -> ExitCode {
 
     zlock::install_cleanup();
 
-    let args = plib::optarg::parse::<Args>();
+    // -y and -m take an optional argument, attached: the word after a bare
+    // one is an operand. clap cannot say so, and had it swallow that word.
+    let (attached, rest) = optscan::scan(std::env::args_os(), Letters::of("delta"));
+    let mut args =
+        plib::optarg::parse_from::<Args>(plib::optarg::keep_leading_equals::<Args>(rest));
+    let given = |letter| {
+        attached
+            .get(letter)
+            .map(|value| value.unwrap_or_default().to_owned())
+    };
+    args.comment = given(b'y');
+    args.mrlist = given(b'm');
 
     // When the single operand is '-', the spec requires the comment to be
     // supplied via -y (and the MR list via -m if the v flag is set), since

@@ -17,6 +17,7 @@ use std::process::{self, Command, ExitCode};
 
 use gettextrs::gettext;
 use plib::sccsfile::paths;
+use posixutils_sccs::optscan::Letters;
 
 fn usage() -> ! {
     eprintln!(
@@ -83,8 +84,9 @@ fn split_delget_opts<'a>(
         // Does this option consume the next token? Ask the utility that will
         // receive it.
         let attached = rest.len() > 1;
-        let takes_value = (to_delta && option_takes_value("delta", c))
-            || (to_get && option_takes_value("get", c));
+        let letter = u8::try_from(c).unwrap_or(0);
+        let takes_value = (to_delta && Letters::of("delta").takes_next_word(letter))
+            || (to_get && Letters::of("get").takes_next_word(letter));
         if !attached && takes_value {
             if let Some(value) = it.next() {
                 if to_delta {
@@ -184,33 +186,6 @@ fn to_sfile_opt(file: &str, root_dir: &Path, sccs_dir: &str, force_sccs_dir: boo
     }
 }
 
-/// Whether `-<letter>` for `cmd` takes an option-argument that may be given as
-/// a separate token.
-///
-/// The front end used to split argv on a leading '-', which made the value of
-/// any separated option a file operand: `sccs get -r 1.1 f` reached get as
-/// `-r SCCS/s.f SCCS/s.1.1`. Inventing an operand is a worse failure than
-/// diagnosing a missing argument.
-///
-/// The table mirrors how each sibling actually parses, which is the property
-/// that matters -- the front end must not classify a token differently from
-/// the utility it is about to hand it to. `prs -r` is absent deliberately: its
-/// argument is optional and attached-only, and prs rewrites a bare `-r` so
-/// clap cannot swallow the following operand. `admin`'s -i, -t and -y are
-/// absent for the same reason; they are pre-parsed as attached-only forms.
-fn option_takes_value(cmd: &str, letter: char) -> bool {
-    let letters = match cmd {
-        "admin" => "rmfdae",
-        "get" => "rcix",
-        "delta" => "rymg",
-        "prs" => "cd",
-        "rmdel" | "unget" => "r",
-        "val" => "mry",
-        _ => "",
-    };
-    letters.contains(letter)
-}
-
 /// Split argv into options (with their arguments) and file operands.
 fn split_options<'a>(cmd: &str, args: &[&'a str]) -> (Vec<&'a str>, Vec<&'a str>) {
     let mut opts = Vec::new();
@@ -230,17 +205,20 @@ fn split_options<'a>(cmd: &str, args: &[&'a str]) -> (Vec<&'a str>, Vec<&'a str>
 
         opts.push(arg);
 
-        // Short options cluster, so scan for the first letter that takes a
-        // value. If it ends the token, its argument is the next token.
-        let mut chars = arg[1..].chars();
-        let mut consumes = false;
-        for c in chars.by_ref() {
-            if option_takes_value(cmd, c) {
-                // Anything left in this token is the attached argument.
-                consumes = chars.as_str().is_empty();
-                break;
-            }
-        }
+        // Short options cluster, so scan for the first letter that takes an
+        // argument. What is left of the token is that argument; if nothing
+        // is, and the argument is not an optional one, it is the next token.
+        // The utility's own table decides: the front end used to split argv
+        // on a leading '-', which made the value of any separated option a
+        // file operand (`sccs get -r 1.1 f` reached get as
+        // `-r SCCS/s.f SCCS/s.1.1`), and inventing an operand is a worse
+        // failure than diagnosing a missing argument.
+        let letters = Letters::of(cmd);
+        let group = &arg.as_bytes()[1..];
+        let consumes = group
+            .iter()
+            .position(|&c| letters.ends_group(c))
+            .is_some_and(|at| at + 1 == group.len() && letters.takes_next_word(group[at]));
         if consumes {
             if let Some(value) = it.next() {
                 opts.push(value);

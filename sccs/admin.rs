@@ -9,8 +9,10 @@
 
 //! admin - create and administer SCCS files
 
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Read};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -21,6 +23,7 @@ use plib::sccsfile::{
     SccsDateTime, SccsFile, SccsFlag, Sid, TextLine,
 };
 use posixutils_sccs::invalid_input;
+use posixutils_sccs::optscan::{self, Letters};
 use posixutils_sccs::txn::Txn;
 use posixutils_sccs::{diag, idkw, mrlist, zlock};
 
@@ -38,19 +41,19 @@ struct Args {
     initial_sid: Option<String>,
 
     #[arg(short = 'm', value_name = "MRLIST", allow_hyphen_values = true, help = gettext("MR numbers for initial delta"))]
-    mrlist: Option<String>,
+    mrlist: Option<OsString>,
 
     #[arg(short = 'f', value_name = "FLAG", allow_hyphen_values = true, help = gettext("Set flag (can be repeated)"))]
-    set_flags: Vec<String>,
+    set_flags: Vec<OsString>,
 
     #[arg(short = 'd', value_name = "FLAG", allow_hyphen_values = true, help = gettext("Delete flag (can be repeated)"))]
     delete_flags: Vec<String>,
 
     #[arg(short = 'a', value_name = "LOGIN", allow_hyphen_values = true, help = gettext("Add user to authorized list"))]
-    add_users: Vec<String>,
+    add_users: Vec<OsString>,
 
     #[arg(short = 'e', value_name = "LOGIN", allow_hyphen_values = true, help = gettext("Remove user from authorized list"))]
-    erase_users: Vec<String>,
+    erase_users: Vec<OsString>,
 
     #[arg(short = 'h', help = gettext("Check file structure and checksum"))]
     check: bool,
@@ -62,100 +65,9 @@ struct Args {
     files: Vec<PathBuf>,
 }
 
-/// Attached-only optional-value options (`-i`, `-t`, `-y`).
-///
-/// POSIX requires the optional option-arguments for these options to be
-/// presented attached to the option letter (e.g. `-iinput.txt`), never as a
-/// separate following operand. clap cannot express "attached value only", so we
-/// pre-scan argv and strip these tokens before handing the rest to clap.
-///
-/// Each field is:
-/// - `None`         => option not given;
-/// - `Some(None)`   => bare option given (read stdin / clear text / default
-///   comment);
-/// - `Some(Some(s))` => attached value `s`.
-#[derive(Default)]
-struct AttachedOpts {
-    init_file: Option<Option<String>>,
-    desc_text: Option<Option<String>>,
-    comment: Option<Option<String>>,
-}
-
-/// Option letters that take an option-argument, attached or as the next word.
-const ARGUMENT_LETTERS: &str = "rmfdae";
-
-/// Split argv into the attached-only options (`-i`/`-t`/`-y`) and the remaining
-/// words, for clap to parse.
-///
-/// The words are read as the Utility Syntax Guidelines read them (XBD 12.2),
-/// so that only an option is taken for one:
-/// - in a group of letters (`-niin.txt`), `-i`, `-t` or `-y` takes the rest
-///   of the word as its argument, and the flags before it stay for clap;
-/// - a letter that takes an argument ends its group, and the argument --
-///   the rest of the word, or the whole next word -- is passed over unread,
-///   so `-m -yMR` is an MR and not a comment;
-/// - after `--` every word is an operand.
-///
-/// Matching every word that begins `-i`, `-t` or `-y`, as this did, took
-/// option-arguments and operands for options, and missed the grouped forms.
-fn extract_attached_opts<I>(argv: I) -> (AttachedOpts, Vec<String>)
-where
-    I: IntoIterator<Item = String>,
-{
-    let mut opts = AttachedOpts::default();
-    let mut rest = Vec::new();
-    let mut words = argv.into_iter();
-
-    // argv[0] is the utility's name.
-    rest.extend(words.next());
-
-    while let Some(word) = words.next() {
-        if word == "--" {
-            rest.push(word);
-            rest.extend(words);
-            break;
-        }
-        // An operand, a lone "-", or a long option: not a group of letters.
-        if !word.starts_with('-') || word == "-" || word.starts_with("--") {
-            rest.push(word);
-            continue;
-        }
-
-        // What becomes of the word: it goes to clap whole, unless -i, -t or
-        // -y ends it, which leaves clap only the flags grouped before it.
-        let mut for_clap = Some(word.as_str());
-        let mut argument_word = None;
-        for (at, letter) in word.char_indices().skip(1) {
-            let after = at + letter.len_utf8();
-            if ARGUMENT_LETTERS.contains(letter) {
-                // Its argument is the rest of the word, or the next word,
-                // which is passed over unread.
-                if after == word.len() {
-                    argument_word = words.next();
-                }
-                break;
-            }
-            let field = match letter {
-                'i' => &mut opts.init_file,
-                't' => &mut opts.desc_text,
-                'y' => &mut opts.comment,
-                _ => continue, // a flag, or a letter for clap to refuse
-            };
-            let value = &word[after..];
-            *field = Some((!value.is_empty()).then(|| value.to_string()));
-            for_clap = (at > 1).then(|| &word[..at]);
-            break;
-        }
-        rest.extend(for_clap.map(str::to_string));
-        rest.extend(argument_word);
-    }
-
-    (opts, rest)
-}
-
 /// The text for a new file: the `-i` file `path`, or standard input. An
 /// error comes back as the diagnostic's text, naming what could not be read.
-fn read_input_file(path: Option<&str>) -> Result<Vec<u8>, String> {
+fn read_input_file(path: Option<&OsStr>) -> Result<Vec<u8>, String> {
     let read = match path {
         Some(p) => fs::read(p),
         None => {
@@ -166,7 +78,7 @@ fn read_input_file(path: Option<&str>) -> Result<Vec<u8>, String> {
     read.map_err(|e| {
         format!(
             "{}: {}",
-            path.unwrap_or("standard input"),
+            path.map_or("standard input".into(), OsStr::to_string_lossy),
             plib::diag::io_error_text(&e)
         )
     })
@@ -174,9 +86,9 @@ fn read_input_file(path: Option<&str>) -> Result<Vec<u8>, String> {
 
 /// The descriptive text in the `-t` file `path`, as its lines. An error comes
 /// back as the diagnostic's text, naming the file.
-fn read_desc_text(path: &str) -> Result<Vec<TextLine>, String> {
-    let data =
-        fs::read(path).map_err(|e| format!("{}: {}", path, plib::diag::io_error_text(&e)))?;
+fn read_desc_text(path: &OsStr) -> Result<Vec<TextLine>, String> {
+    let data = fs::read(path)
+        .map_err(|e| format!("{}: {}", path.display(), plib::diag::io_error_text(&e)))?;
     // The text sits between ^At and ^AT: a line of it that began with SOH
     // would read as a control line and end it early.
     plib::sccsfile::split_lines(&data)
@@ -186,7 +98,7 @@ fn read_desc_text(path: &str) -> Result<Vec<TextLine>, String> {
             TextLine::new(line).map_err(|_| {
                 format!(
                     "{}: {} {}: {}",
-                    path,
+                    path.display(),
                     gettext("line"),
                     n + 1,
                     gettext("descriptive text cannot begin with a control character")
@@ -215,27 +127,28 @@ fn unrecognized_flag(letter: char) -> String {
     format!("{} '{}'", gettext("Unrecognized flag"), letter)
 }
 
-fn parse_flag(flag_str: &str) -> Result<SccsFlag, String> {
-    if flag_str.is_empty() {
+/// The flag a `-f` argument sets: its letter and then its value, which is
+/// bytes (the text of the q flag, a module name).
+fn parse_flag(flag: &OsStr) -> Result<SccsFlag, String> {
+    let Some((&letter, value)) = flag.as_bytes().split_first() else {
         return Err(gettext("Empty flag"));
-    }
+    };
     // A flag is one line of the s-file; a value holding a newline would put
     // a line of its own into the header.
-    if flag_str.contains('\n') {
+    if value.contains(&b'\n') {
         return Err(gettext("A flag value cannot contain a newline"));
     }
-
-    let flag_char = flag_str.chars().next().unwrap();
-    let value = &flag_str[flag_char.len_utf8()..];
 
     // Reject any flag letter not in the spec set. SccsFlag::parse maps unknown
     // letters to SccsFlag::Unknown for lossless reads of existing files, but
     // admin must not write a malformed flag from a bad -f argument.
+    let flag_char = char::from(letter);
     if !VALID_FLAG_CHARS.contains(&flag_char) {
-        return Err(unrecognized_flag(flag_char));
+        let shown = flag.to_string_lossy().chars().next().unwrap_or(flag_char);
+        return Err(unrecognized_flag(shown));
     }
 
-    let flag = SccsFlag::parse(flag_char, value.as_bytes()).map_err(|e| e.to_string())?;
+    let flag = SccsFlag::parse(flag_char, value).map_err(|e| e.to_string())?;
 
     // The ceiling is "a number less than or equal to 9 999" and the floor
     // "a number greater than 0 but less than 9 999" (POSIX 84030-84034).
@@ -265,11 +178,11 @@ fn parse_flag(flag_str: &str) -> Result<SccsFlag, String> {
 /// user list, without the blanks around it, which reading the list back
 /// drops -- kept, a login added as " bob " could never be matched again.
 /// What a login cannot hold is [`Login`]'s to say.
-fn login_of(arg: &str) -> Result<Login, String> {
-    Login::new(arg.trim_ascii().as_bytes()).map_err(|_| {
+fn login_of(arg: &OsStr) -> Result<Login, String> {
+    Login::new(arg.as_bytes().trim_ascii()).map_err(|_| {
         format!(
             "'{}': {}",
-            arg.escape_default(),
+            arg.as_bytes().escape_ascii(),
             gettext("invalid login name")
         )
     })
@@ -362,11 +275,11 @@ fn mrs_need_v_flag() -> String {
 struct NewFileParams<'a> {
     content: Vec<u8>,
     initial_sid: Option<&'a str>,
-    comment: Option<&'a str>,
+    comment: Option<&'a [u8]>,
     desc_text: Vec<TextLine>,
     flags: Vec<SccsFlag>,
     users: Vec<Login>,
-    mr_numbers: Vec<String>,
+    mr_numbers: Vec<MrNumber>,
 }
 
 /// Whether anything is at `path`: a file, or a symlink even if it dangles.
@@ -422,15 +335,19 @@ fn create_new_sccs_file(path: &Path, params: NewFileParams) -> io::Result<()> {
     let now = SccsDateTime::now();
     let user = posixutils_sccs::username()?;
 
-    // Create default comment if not provided
+    // The default comment names the user, whose login is bytes.
     let comment_text = match comment {
-        Some(c) => c.to_string(),
-        None => format!(
-            "date and time created {} {} by {}",
-            now.date_string(),
-            now.time_string(),
-            user
-        ),
+        Some(c) => c.to_vec(),
+        None => [
+            format!(
+                "date and time created {} {} by ",
+                now.date_string(),
+                now.time_string()
+            )
+            .as_bytes(),
+            &user,
+        ]
+        .concat(),
     };
 
     // Decide whether to store the body uuencoded (binary / no trailing newline).
@@ -472,12 +389,8 @@ fn create_new_sccs_file(path: &Path, params: NewFileParams) -> io::Result<()> {
     // Create delta entry
     let delta = DeltaEntry {
         stats,
-        mr_numbers: mr_numbers
-            .iter()
-            .map(|mr| MrNumber::new(mr.as_bytes()))
-            .collect::<Result<_, _>>()
-            .map_err(invalid_input)?,
-        comments: CommentLine::lines(comment_text.as_bytes()),
+        mr_numbers,
+        comments: CommentLine::lines(&comment_text),
         ..DeltaEntry::new(DeltaType::Normal, sid, now, user, 1, 0)
     };
 
@@ -575,7 +488,10 @@ fn main() -> ExitCode {
 
     // Pre-process argv to strip the attached-only options (-i/-t/-y) before
     // clap parses; clap cannot express "attached value only".
-    let (attached, rest) = extract_attached_opts(plib::optarg::args_utf8("admin"));
+    // -i, -t and -y take an optional argument, attached (`-iinput.txt`),
+    // which clap cannot express: they are taken out of the command line
+    // first.
+    let (attached, rest) = optscan::scan(std::env::args_os(), Letters::of("admin"));
     let args = match Args::try_parse_from(plib::optarg::keep_leading_equals::<Args>(rest)) {
         Ok(a) => a,
         // The version is written to standard output with status 0.
@@ -603,7 +519,7 @@ fn main() -> ExitCode {
     }
 
     // -i implies -n.
-    let creating_new = args.new_file || attached.init_file.is_some();
+    let creating_new = args.new_file || attached.has(b'i');
 
     // Parse flags to add
     let mut add_flags = Vec::new();
@@ -617,7 +533,7 @@ fn main() -> ExitCode {
         }
     }
 
-    let logins = |args: &[String]| args.iter().map(|a| login_of(a)).collect();
+    let logins = |args: &[OsString]| args.iter().map(|a| login_of(a)).collect();
     let (add_users, erase_users): (Vec<Login>, Vec<Login>) =
         match (logins(&args.add_users), logins(&args.erase_users)) {
             (Ok(add), Ok(erase)) => (add, erase),
@@ -635,7 +551,7 @@ fn main() -> ExitCode {
     });
 
     // Parse -m MR numbers (whitespace-separated list).
-    let mr_numbers: Vec<String> = mrlist::parse(args.mrlist.as_deref());
+    let mr_numbers = mrlist::parse(args.mrlist.as_deref());
 
     // Parse flags to delete
     let mut delete_flags = Vec::new();
@@ -681,7 +597,7 @@ fn main() -> ExitCode {
     // first would be made from an input already read to its end. A detached
     // option-argument (`-i name s.file`) lands here too, so the names that
     // are not s-files are diagnosed first.
-    if attached.init_file.is_some() && files.len() > 1 {
+    if attached.has(b'i') && files.len() > 1 {
         files
             .iter()
             .filter(|f| !paths::is_sfile(f))
@@ -738,12 +654,10 @@ fn main() -> ExitCode {
                 continue;
             }
 
-            // Read input content. init_file: None => -n only (empty body);
-            // Some(None) => bare -i (read stdin); Some(Some(p)) => -ip (file,
-            // or stdin if p is empty).
-            let content = match &attached.init_file {
-                Some(Some(path)) if !path.is_empty() => read_input_file(Some(path)),
-                Some(_) => read_input_file(None),
+            // The text: without -i, none (-n only); from standard input
+            // for a bare -i; else from the file -i names.
+            let content = match attached.get(b'i') {
+                Some(path) => read_input_file(path),
                 None => Ok(Vec::new()),
             };
 
@@ -757,8 +671,8 @@ fn main() -> ExitCode {
             };
 
             // Read descriptive text if -t specified with a name.
-            let desc_text = match &attached.desc_text {
-                Some(Some(path)) if !path.is_empty() => read_desc_text(path),
+            let desc_text = match attached.get(b't') {
+                Some(Some(path)) => read_desc_text(path),
                 _ => Ok(Vec::new()),
             };
 
@@ -797,11 +711,9 @@ fn main() -> ExitCode {
 
             // Get comment: bare -y or -ytext both supply an explicit comment
             // (empty for bare -y); absence yields the default comment.
-            let comment: Option<&str> = match &attached.comment {
-                Some(Some(c)) => Some(c.as_str()),
-                Some(None) => Some(""),
-                None => None,
-            };
+            let comment: Option<&[u8]> = attached
+                .get(b'y')
+                .map(|given| given.map_or(&b""[..], OsStr::as_bytes));
 
             if let Err(e) = create_new_sccs_file(
                 file_path,
@@ -836,9 +748,9 @@ fn main() -> ExitCode {
 
             // Get descriptive text if -t specified. -t name replaces; bare -t
             // (or -t with empty value) removes existing descriptive text.
-            let desc_text = match &attached.desc_text {
-                Some(Some(path)) if !path.is_empty() => Some(read_desc_text(path)),
-                Some(_) => Some(Ok(Vec::new())), // remove
+            let desc_text = match attached.get(b't') {
+                Some(Some(path)) => Some(read_desc_text(path)),
+                Some(None) => Some(Ok(Vec::new())), // remove
                 None => None,
             };
 

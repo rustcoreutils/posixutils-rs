@@ -27,6 +27,7 @@ pub mod diag;
 pub mod idkw;
 pub mod mrlist;
 pub mod operands;
+pub mod optscan;
 pub mod pfile;
 pub mod protect;
 pub mod sfio;

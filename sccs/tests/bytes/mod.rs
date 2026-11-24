@@ -116,3 +116,85 @@ fn a_name_without_a_stem_is_not_an_s_file() {
         "nothing was made"
     );
 }
+
+/// `bytes` as one argument word.
+fn word(bytes: &[u8]) -> OsString {
+    OsString::from_vec(bytes.to_vec())
+}
+
+/// What a command line gives to be stored -- a comment, a login, a flag's
+/// text, an MR number -- is stored as given, and file names on it are the
+/// files': none of them has to be UTF-8. An argument that was not UTF-8
+/// used to be refused outright, by admin for the whole command line.
+#[test]
+fn arguments_need_not_be_utf8() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let o = OsStr::new;
+    let s = word(b"s.na\xefve");
+    std::fs::write(dir.join(word(b"in\xff")), b"text\n").unwrap();
+    std::fs::write(dir.join(word(b"desc\xff")), b"about \xe9\n").unwrap();
+
+    ok(
+        "admin",
+        &[
+            &word(b"-iin\xff"),
+            &word(b"-tdesc\xff"),
+            &word(b"-ycr\xe9\xe9"),
+            &word(b"-am\xfcller"),
+            &word(b"-fqqu\xe9"),
+            &word(b"-fmmod\xe9"),
+            o("-fv"),
+            &word(b"-mmr\xe9 mr2"),
+            &s,
+        ],
+        dir,
+    );
+    // (A keyword whose value is lines ends each with a newline.)
+    let show = |spec: &[u8]| ok("prs", &[&word(spec), &s], dir).stdout;
+    assert_eq!(show(b"-d:C:."), b"cr\xe9\xe9\n.\n");
+    assert_eq!(show(b"-d:UN:."), b"m\xfcller\n.\n");
+    assert_eq!(show(b"-d:Q:|:M:"), b"qu\xe9|mod\xe9\n");
+    assert_eq!(show(b"-d:MR:."), b"mr\xe9\nmr2\n.\n");
+    assert_eq!(show(b"-d:FD:."), b"about \xe9\n.\n");
+    // The data specification's own text is bytes too.
+    assert_eq!(show(b"-d\xe9:I:\xff"), b"\xe91.1\xff\n");
+
+    // val matches the module name and type as bytes.
+    ok("val", &[&word(b"-mmod\xe9"), &s], dir);
+    let out = run("val", &[&word(b"-mmod\xe8"), &s], dir);
+    assert_eq!(out.status.code(), Some(0x01), "{out:?}");
+
+    // delta: the comment and the MRs. The user list holds only m\xfcller,
+    // so it is emptied first.
+    ok("admin", &[&word(b"-em\xfcller"), &s], dir);
+    ok("get", &[o("-e"), o("-s"), &s], dir);
+    std::fs::write(dir.join(word(b"na\xefve")), b"more\n").unwrap();
+    ok(
+        "delta",
+        &[o("-s"), &word(b"-ych\xe0nge"), &word(b"-mm\xe93"), &s],
+        dir,
+    );
+    assert_eq!(show(b"-d:C:|:MR:."), b"ch\xe0nge\n|m\xe93\n.\n");
+}
+
+/// The argument of delta's `-y` and `-m` and of prs's `-r` is optional and
+/// attached: the word after the bare option is an operand, not its value.
+#[test]
+fn a_bare_option_leaves_the_next_word_an_operand() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let o = OsStr::new;
+    std::fs::write(dir.join("init"), b"one\n").unwrap();
+    ok("admin", &[o("-iinit"), o("s.f")], dir);
+    ok("get", &[o("-e"), o("-s"), o("s.f")], dir);
+    std::fs::write(dir.join("f"), b"two\n").unwrap();
+
+    // `-y s.f`: an empty comment, and s.f the file. It used to make a
+    // comment of "s.f" and fail for want of a file.
+    ok("delta", &[o("-s"), o("-y"), o("s.f")], dir);
+    let out = ok("prs", &[o("-d:I: [:C:]"), o("-r"), o("s.f")], dir);
+    assert_eq!(out.stdout, b"1.2 []\n");
+    let out = ok("prs", &[o("-d:I:"), o("-r1.1"), o("s.f")], dir);
+    assert_eq!(out.stdout, b"1.1\n");
+}

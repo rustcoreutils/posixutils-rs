@@ -468,7 +468,9 @@ fn sccs_keeps_a_detached_option_argument_out_of_the_file_list() {
     );
 }
 
-/// The same shape with a comment that looks nothing like a filename.
+/// The same shape beside a comment that looks nothing like a filename. The
+/// comment is attached to its `-y`, as delta takes it; `-r`'s argument is the
+/// detached one.
 #[test]
 fn sccs_keeps_a_detached_comment_out_of_the_file_list() {
     let tmp = TempDir::new().unwrap();
@@ -484,7 +486,7 @@ fn sccs_keeps_a_detached_comment_out_of_the_file_list() {
 
     let out = run(
         "sccs",
-        &["delta", "-y", "some comment", "c.txt"],
+        &["delta", "-ysome comment", "-r", "1.2", "c.txt"],
         tmp.path(),
         "",
     );
@@ -656,8 +658,8 @@ fn sccs_create_puts_the_sfile_in_the_sccs_directory() {
 /// option-argument must follow its option rather than being copied into both
 /// phases as a file operand.
 ///
-/// `sccs delget -y c1 g` committed the delta and then ran the get phase on a
-/// nonexistent SCCS/s.c1, exiting 1 -- the same invented-operand failure the
+/// `sccs delget -r 1.2 g` committed the delta and then ran the get phase on a
+/// nonexistent SCCS/s.1.2, exiting 1 -- the same invented-operand failure the
 /// plain subcommands were fixed for.
 #[test]
 fn sccs_delget_keeps_a_detached_option_argument_out_of_the_file_list() {
@@ -672,10 +674,15 @@ fn sccs_delget_keeps_a_detached_option_argument_out_of_the_file_list() {
     );
     std::fs::write(tmp.path().join("dg.txt"), "one\ntwo\n").unwrap();
 
-    let out = run("sccs", &["delget", "-y", "c1", "dg.txt"], tmp.path(), "");
+    let out = run(
+        "sccs",
+        &["delget", "-yc1", "-r", "1.2", "dg.txt"],
+        tmp.path(),
+        "",
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        !stderr.contains("s.c1"),
+        !stderr.contains("s.1.2"),
         "the option-argument must not become an operand: {stderr}"
     );
     assert!(out.status.success(), "sccs delget failed: {stderr}");

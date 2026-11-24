@@ -691,12 +691,6 @@ fn admin_r_keeps_an_explicit_level() {
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3.4");
 }
 
-// An argument that is not valid UTF-8 is reported, not a panic.
-#[test]
-fn admin_non_utf8_argument_is_reported() {
-    plib::testing::assert_non_utf8_argument_rejected("admin", &[]);
-}
-
 /// An -i file that cannot be read is reported by name, with the system's
 /// text for the error and without Rust's "(os error N)" suffix.
 #[test]

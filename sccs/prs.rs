@@ -9,6 +9,7 @@
 
 //! prs - print SCCS file information
 
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -17,6 +18,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use gettextrs::gettext;
 use plib::sccsfile::{paths, DeltaEntry, DeltaType, SccsFile, SccsFlag, Sid};
+use posixutils_sccs::optscan::{self, Letters};
 use posixutils_sccs::{cutoff, diag, idkw, operands};
 
 /// prs - print SCCS file information
@@ -30,7 +32,7 @@ struct Args {
     cutoff: Option<String>,
 
     #[arg(short = 'd', allow_hyphen_values = true, value_name = "DATASPEC", help = gettext("Data format specification"))]
-    dataspec: Option<String>,
+    dataspec: Option<OsString>,
 
     #[arg(short = 'e', help = gettext("Select deltas earlier than or equal to -c or -r"))]
     earlier: bool,
@@ -38,13 +40,10 @@ struct Args {
     #[arg(short = 'l', help = gettext("Select deltas later than or equal to -c or -r"))]
     later: bool,
 
-    #[arg(
-        short = 'r',
-        value_name = "SID",
-        num_args = 0..=1,
-        default_missing_value = "",
-        help = gettext("SID to report on (defaults to most recent delta)")
-    )]
+    /// `-r[SID]`: taken from the command line by [`optscan`], its argument
+    /// being optional and attached. A bare `-r` is the empty string, the
+    /// most recently created delta.
+    #[arg(skip)]
     sid: Option<String>,
 
     #[arg(required = true, help = gettext("SCCS files to process (use - for stdin)"))]
@@ -52,8 +51,8 @@ struct Args {
 }
 
 // Default output format (per POSIX, there's a header and per-delta format)
-const DEFAULT_HEADER_FORMAT: &str = ":PN::\n\n";
-const DEFAULT_DELTA_FORMAT: &str = ":Dt:\t:DL:\nMRs:\n:MR:COMMENTS:\n:C:\n";
+const DEFAULT_HEADER_FORMAT: &[u8] = b":PN::\n\n";
+const DEFAULT_DELTA_FORMAT: &[u8] = b":Dt:\t:DL:\nMRs:\n:MR:COMMENTS:\n:C:\n";
 
 fn flag_yes_no(val: bool) -> &'static str {
     if val {
@@ -131,36 +130,35 @@ fn is_known_keyword(keyword: &str) -> bool {
 /// expanded text along with a flag indicating whether the last token emitted
 /// was a multi-line ("M-format") keyword.
 fn expand_keywords(
-    format: &str,
+    format: &[u8],
     sccs: &SccsFile,
     delta: &DeltaEntry,
     sfile_path: &Path,
 ) -> (Vec<u8>, bool) {
     let mut result: Vec<u8> = Vec::new();
-    let push_char = |result: &mut Vec<u8>, c: char| {
-        result.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes())
-    };
     let mut last_was_multiline = false;
-    let chars: Vec<char> = format.chars().collect();
+    // The specification is bytes: what is not a keyword or an escape is
+    // written as it stands.
+    let chars = format;
     let mut i = 0;
 
     while i < chars.len() {
         let c = chars[i];
-        if c == ':' {
+        if c == b':' {
             // Try to match a recognized keyword: ':' kw ':'.
             let mut j = i + 1;
             while j < chars.len() && chars[j].is_ascii_alphanumeric() {
                 j += 1;
             }
-            let keyword: String = chars[i + 1..j].iter().collect();
+            let keyword = std::str::from_utf8(&chars[i + 1..j]).unwrap_or_default();
             if !keyword.is_empty()
                 && j < chars.len()
-                && chars[j] == ':'
-                && is_known_keyword(&keyword)
+                && chars[j] == b':'
+                && is_known_keyword(keyword)
             {
                 // Recognized keyword - expand it.
-                let value = expand_single_keyword(&keyword, sccs, delta, sfile_path);
-                let multiline = is_multiline_keyword(&keyword);
+                let value = expand_single_keyword(keyword, sccs, delta, sfile_path);
+                let multiline = is_multiline_keyword(keyword);
                 if multiline {
                     // Each value line is newline-terminated; an empty value
                     // (e.g. :MR: for a delta with no MRs) emits nothing, not a
@@ -183,29 +181,29 @@ fn expand_keywords(
             result.push(b':');
             last_was_multiline = false;
             i += 1;
-        } else if c == '\\' {
+        } else if c == b'\\' {
             // Handle escape sequences.
             match chars.get(i + 1) {
-                Some('n') => {
+                Some(b'n') => {
                     result.push(b'\n');
                     i += 2;
                 }
-                Some('t') => {
+                Some(b't') => {
                     result.push(b'\t');
                     i += 2;
                 }
-                Some('\\') => {
+                Some(b'\\') => {
                     result.push(b'\\');
                     i += 2;
                 }
                 _ => {
-                    push_char(&mut result, c);
+                    result.push(c);
                     i += 1;
                 }
             }
             last_was_multiline = false;
         } else {
-            push_char(&mut result, c);
+            result.push(c);
             last_was_multiline = false;
             i += 1;
         }
@@ -499,10 +497,13 @@ fn prs_file(sfile: &Path, args: &Args) -> io::Result<bool> {
     };
 
     let use_default_format = args.dataspec.is_none();
-    let format = args.dataspec.as_deref().unwrap_or(DEFAULT_DELTA_FORMAT);
+    let format = args
+        .dataspec
+        .as_deref()
+        .map_or(DEFAULT_DELTA_FORMAT, OsStr::as_bytes);
 
     // :GB: reads the body, which a damaged weave makes unreadable.
-    if format.contains(":GB:") {
+    if format.windows(4).any(|w| w == b":GB:") {
         if let Err(e) = sccs.check_weave() {
             diag::error_path("prs", sfile, &e.to_string());
             return Ok(false);
@@ -628,13 +629,15 @@ fn prs_file(sfile: &Path, args: &Args) -> io::Result<bool> {
 fn main() -> ExitCode {
     plib::diag::init_locale("prs");
 
-    // The -r option-argument is optional and "cannot be presented as a separate
-    // argument" (POSIX). Rewrite a bare "-r" to "-r=" so clap treats it as an
-    // empty attached value rather than greedily consuming the following operand.
-    let argv = plib::optarg::keep_leading_equals::<Args>(std::env::args_os())
-        .into_iter()
-        .map(|a| if a == "-r" { "-r=".into() } else { a });
-    let args = plib::optarg::parse_from::<Args>(argv);
+    // The -r option-argument is optional and "cannot be presented as a
+    // separate argument" (POSIX): the word after a bare -r is an operand.
+    let (attached, rest) = optscan::scan(std::env::args_os(), Letters::of("prs"));
+    let mut args =
+        plib::optarg::parse_from::<Args>(plib::optarg::keep_leading_equals::<Args>(rest));
+    if let Some(sid) = attached.get(b'r') {
+        // A SID is ASCII; one that is not text is not a SID.
+        args.sid = Some(sid.unwrap_or_default().to_string_lossy().into_owned());
+    }
 
     let mut success = true;
     for path in operands::expand(&args.files) {

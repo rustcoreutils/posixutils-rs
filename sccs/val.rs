@@ -9,7 +9,9 @@
 
 //! val - validate SCCS files
 
-use std::io::{self, BufRead};
+use std::ffi::{OsStr, OsString};
+use std::io::{self, BufRead, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -35,13 +37,13 @@ struct Args {
     silent: bool,
 
     #[arg(short = 'm', value_name = "NAME", help = gettext("Compare module name with %M% keyword"))]
-    module_name: Option<String>,
+    module_name: Option<OsString>,
 
     #[arg(short = 'r', value_name = "SID", help = gettext("Check that SID exists"))]
     sid: Option<String>,
 
     #[arg(short = 'y', value_name = "TYPE", help = gettext("Compare type with %Y% keyword"))]
-    type_name: Option<String>,
+    type_name: Option<OsString>,
 
     #[arg(help = gettext("SCCS files to validate (use - for stdin)"))]
     files: Vec<PathBuf>,
@@ -185,36 +187,54 @@ fn main() -> ExitCode {
 
     let mut exit_code: u8 = 0;
 
+    // What is written to standard output: pathnames and input lines are
+    // bytes, and go out as they are.
+    let mut stdout = io::stdout().lock();
+    let mut write_failed = false;
+    let mut put = |parts: &[&[u8]]| {
+        if !write_failed {
+            if let Err(e) = stdout.write_all(&parts.concat()) {
+                plib::diag::write_error(&e);
+                write_failed = true;
+            }
+        }
+    };
+
     // Check if reading from stdin
-    if args.files.len() == 1 && args.files[0].to_string_lossy() == "-" {
-        // Read command lines from stdin
-        let stdin = io::stdin();
-        for line in stdin.lock().lines() {
-            let line = match line {
-                Ok(l) => l,
-                // A line that is not valid UTF-8 has been consumed; skip it.
-                Err(e) if e.kind() == io::ErrorKind::InvalidData => continue,
-                // Any other error (EISDIR, EIO) would recur on every retry:
-                // report it once and stop reading.
+    if args.files.len() == 1 && args.files[0].as_os_str() == "-" {
+        // Read command lines from stdin. A line is bytes: the pathnames on
+        // it need not be UTF-8. (Such a line used to be skipped unread.)
+        let mut stdin = io::stdin().lock();
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match stdin.read_until(b'\n', &mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
+                // An error (EISDIR, EIO) would recur on every retry: report
+                // it once and stop reading.
                 Err(e) => {
                     eprintln!("val: -: {}", plib::diag::io_error_text(&e));
                     exit_code |= ERR_CANNOT_OPEN;
                     break;
                 }
-            };
-
-            if line.trim().is_empty() {
-                continue;
             }
+            let line = line.strip_suffix(b"\n").unwrap_or(&line);
 
             // Parse the line as arguments.
             // Note: POSIX says no shell expansions are applied.
-            let mut line_args = vec!["val".to_string()];
-            line_args.extend(line.split_whitespace().map(String::from));
+            let words = line
+                .split(u8::is_ascii_whitespace)
+                .filter(|word| !word.is_empty())
+                .map(OsStr::from_bytes);
+            let line_args: Vec<&OsStr> = std::iter::once(OsStr::new("val")).chain(words).collect();
+            if line_args.len() == 1 {
+                continue;
+            }
 
             // Re-parse args for this line. An unknown or duplicate keyletter
             // contributes the 0x40 bit to this line's aggregate code.
-            match Args::try_parse_from(plib::optarg::keep_leading_equals::<Args>(&line_args)) {
+            match Args::try_parse_from(plib::optarg::keep_leading_equals::<Args>(line_args)) {
                 Ok(line_parsed) => {
                     for file in &line_parsed.files {
                         let mut diags: Vec<String> = Vec::new();
@@ -224,10 +244,11 @@ fn main() -> ExitCode {
                             //   "%s\n\n %s: %s\n", <input>, <pathname>, <string>
                             // i.e. the input line, a blank line, then a
                             // SPACE-indented "pathname: discrepancy".
-                            print!("{}\n\n", line);
+                            put(&[line, b"\n\n"]);
                             if !line_parsed.silent {
                                 for diag in &diags {
-                                    println!(" {}: {}", file.display(), diag);
+                                    let name = file.as_os_str().as_bytes();
+                                    put(&[b" ", name, b": ", diag.as_bytes(), b"\n"]);
                                 }
                             }
                         }
@@ -236,7 +257,7 @@ fn main() -> ExitCode {
                 }
                 Err(_) => {
                     // Unknown or duplicate keyletter on this input line.
-                    print!("{}\n\n", line);
+                    put(&[line, b"\n\n"]);
                     exit_code |= ERR_UNKNOWN_OPTION;
                 }
             }
@@ -249,11 +270,15 @@ fn main() -> ExitCode {
             if !args.silent {
                 // Command-line format: "%s: %s\n", <pathname>, <string>
                 for diag in &diags {
-                    println!("{}: {}", file.display(), diag);
+                    let name = file.as_os_str().as_bytes();
+                    put(&[name, b": ", diag.as_bytes(), b"\n"]);
                 }
             }
             exit_code |= file_errors;
         }
+    }
+    if write_failed {
+        exit_code |= ERR_CANNOT_OPEN;
     }
 
     ExitCode::from(exit_code)

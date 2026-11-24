@@ -435,29 +435,28 @@ fn get_cutoff_invalid_field_rejected() {
 
 #[test]
 fn get_lfile_to_stdout() {
-    // -L writes the delta summary table to standard output.
-    let fixture = fixture_path("s.multi");
-    let plan = TestPlan {
-        cmd: String::from("get"),
-        args: vec!["-L".into(), fixture.to_string_lossy().into()],
-        stdin_data: String::new(),
-        expected_out: String::new(),
-        expected_err: String::new(),
-        expected_exit_code: 0,
-    };
-    run_test_with_checker(plan, |_plan: &TestPlan, output: &Output| {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        // Status line: three status columns, a space, the SID, a tab, then
-        // date-time and login.
-        assert!(
-            stdout.contains("    1.3\t25/12/12 22:25:05 jgarzik\n"),
-            "l-file summary line mismatch, got: {stdout}"
-        );
-        assert!(
-            stdout.contains("\tmodified line2\n"),
-            "l-file comment line missing, got: {stdout}"
-        );
-    });
+    // -L writes the delta summary table to standard output. The g-file is
+    // still retrieved, so the fixture is read from a temporary directory:
+    // run beside the fixture, the g-file landed in the source tree.
+    let tmp = TempDir::new().unwrap();
+    std::fs::copy(fixture_path("s.multi"), tmp.path().join("s.multi")).unwrap();
+    let out = super::common::run_in("get", &["-L", "s.multi"], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Status line: three status columns, a space, the SID, a tab, then
+    // date-time and login.
+    assert!(
+        stdout.contains("    1.3\t25/12/12 22:25:05 jgarzik\n"),
+        "l-file summary line mismatch, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("\tmodified line2\n"),
+        "l-file comment line missing, got: {stdout}"
+    );
+    assert!(
+        tmp.path().join("multi").exists(),
+        "the g-file is retrieved too"
+    );
 }
 
 #[test]

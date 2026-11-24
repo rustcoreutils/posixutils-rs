@@ -36,28 +36,35 @@ pub fn write_replacing(path: &Path, data: &[u8], mode: u32) -> io::Result<()> {
 
 /// Write `serialized` to the x-file, apply `perms`, and atomically rename over
 /// `path`. The x-file is registered for SIGINT cleanup for the duration of the
-/// write+rename, and removed on error.
+/// write+rename.
 ///
 /// `admin` factored this out; `delta` and `rmdel` each kept an inline copy,
 /// and the three disagreed about whether a failure to read the s-file's own
 /// mode was fatal.
+///
+/// The x-file is always a new file (`plib::io::write_atomic_named`). It was
+/// opened with `fs::write`, which follows a symlink and truncates what it
+/// points at, and then chmodded by name, which follows it too: a symlink
+/// planted at `x.<name>` by anyone able to write the directory had the next
+/// admin, delta or rmdel overwrite its target with the s-file and make it
+/// read-only. The caller holds the z-file lock, which makes the name its own.
 pub fn write_xfile_atomic(
     path: &Path,
     x_file: &Path,
     serialized: &[u8],
     perms: fs::Permissions,
 ) -> io::Result<()> {
+    debug_assert_eq!(
+        x_file.parent(),
+        path.parent(),
+        "the x-file is beside the s-file"
+    );
+    let x_name = x_file
+        .file_name()
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
     plib::sccsfile::register_cleanup(x_file);
-    let res = (|| -> io::Result<()> {
-        fs::write(x_file, serialized)?;
-        fs::set_permissions(x_file, perms)?;
-        fs::rename(x_file, path)?;
-        Ok(())
-    })();
+    let res = plib::io::write_atomic_named(path, x_name, serialized, perms.mode() & 0o7777);
     plib::sccsfile::unregister_cleanup(x_file);
-    if res.is_err() {
-        let _ = fs::remove_file(x_file);
-    }
     res
 }
 

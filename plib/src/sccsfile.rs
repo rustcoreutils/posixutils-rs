@@ -2117,8 +2117,9 @@ impl ZLock {
             // Record the locking PID, matching historical SCCS / CSSC.
             writeln!(f, "{}", std::process::id())?;
             f.flush()?;
-            // SCCS z-files are read-only (r--r--r--).
-            std::fs::set_permissions(&zfile, std::fs::Permissions::from_mode(0o444))
+            // SCCS z-files are read-only (r--r--r--). Set on the descriptor,
+            // not the name, so it is the file just made that changes.
+            f.set_permissions(std::fs::Permissions::from_mode(0o444))
         })();
         if let Err(e) = filled {
             unregister_cleanup(&zfile);

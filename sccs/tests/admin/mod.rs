@@ -750,3 +750,56 @@ fn admin_rewrite_keeps_non_utf8_text() {
     assert!(out.status.success(), "{out:?}");
     assert_sfile_holds(&s, &[b"\xe9ric", b"fred"]);
 }
+
+/// The x-file is created afresh, never opened through what is at its name: a
+/// symlink planted at `x.<name>` -- by anyone who can write the directory --
+/// must not lead admin, delta or rmdel to overwrite, or chmod, its target.
+#[test]
+fn x_file_symlink_is_not_followed() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let victim = dir.join("victim");
+    let plant = |name: &str| {
+        let _ = fs::remove_file(dir.join(name));
+        fs::write(&victim, b"precious\n").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&victim, dir.join(name)).unwrap();
+    };
+    let check = |what: &str| {
+        assert_eq!(
+            fs::read(&victim).unwrap(),
+            b"precious\n",
+            "{what} wrote through"
+        );
+        let mode = fs::metadata(&victim).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "{what} chmodded the target");
+        let meta = fs::symlink_metadata(dir.join("s.f")).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "{what}: s.f is not a regular file"
+        );
+    };
+    let run = |cmd: &str, args: &[&str]| {
+        let out = super::common::run_in(cmd, args, dir, "");
+        assert!(out.status.success(), "{cmd} {args:?}: {out:?}");
+    };
+
+    plant("x.f");
+    run("admin", &["-n", "s.f"]);
+    check("admin -n");
+
+    plant("x.f");
+    run("admin", &["-fb", "s.f"]);
+    check("admin -fb");
+
+    run("get", &["-e", "-s", "s.f"]);
+    fs::write(dir.join("f"), b"one\n").unwrap();
+    plant("x.f");
+    run("delta", &["-s", "-yc", "s.f"]);
+    check("delta");
+
+    plant("x.f");
+    run("rmdel", &["-r1.2", "s.f"]);
+    check("rmdel");
+}

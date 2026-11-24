@@ -28,7 +28,7 @@ const PFILE_MODE: u32 = 0o644;
 /// Read the p-file beside `sfile`, or an empty list if there is none.
 pub fn read(sfile: &Path) -> io::Result<Vec<PfileEntry>> {
     let path = paths::pfile_from_sfile(sfile);
-    let contents = match fs::read_to_string(&path) {
+    let contents = match fs::read(&path) {
         Ok(c) => c,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
@@ -61,17 +61,12 @@ pub(crate) fn write(sfile: &Path, entries: &[PfileEntry]) -> io::Result<()> {
         };
     }
 
-    let mut body = String::new();
+    let mut body = Vec::new();
     for e in entries {
-        body.push_str(&e.to_line());
-        body.push('\n');
+        body.extend_from_slice(&e.to_line());
+        body.push(b'\n');
     }
-    crate::sfio::write_via(
-        &path,
-        &paths::qfile_from_sfile(sfile),
-        body.as_bytes(),
-        PFILE_MODE,
-    )
+    crate::sfio::write_via(&path, &paths::qfile_from_sfile(sfile), &body, PFILE_MODE)
 }
 
 /// The entry whose new SID is `new_sid`, if the edit is already pending.

@@ -268,7 +268,7 @@ fn expand_single_keyword(
             b" ".to_vec(),
             text("T"),
             b" ".to_vec(),
-            delta.user.clone(),
+            delta.user.to_vec(),
             b" ".to_vec(),
             text("DS"),
             b" ".to_vec(),
@@ -277,7 +277,7 @@ fn expand_single_keyword(
         .concat(),
         "GB" => gotten_body(sccs, delta, sfile_path),
         "MR" => delta.mr_numbers.join(&b"\n"[..]),
-        "P" => delta.user.clone(),
+        "P" => delta.user.to_vec(),
         "W" => [text("Z"), module(), b"\t".to_vec(), text("I")].concat(),
         _ => text(keyword),
     }

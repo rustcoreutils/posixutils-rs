@@ -19,9 +19,10 @@ use clap::Parser;
 use gettextrs::gettext;
 use plib::linediff::LineOp;
 use plib::sccsfile::{
-    paths, DeltaEntry, DeltaStats, DeltaType, NotText, PfileEntry, SccsDateTime, SccsFile,
-    SccsFlag, Selection, Sid,
+    paths, CommentLine, DeltaEntry, DeltaStats, DeltaType, MrNumber, NotText, PfileEntry,
+    SccsDateTime, SccsFile, SccsFlag, Selection, Sid, SidList,
 };
+use posixutils_sccs::invalid_input;
 use posixutils_sccs::txn::{self, Txn};
 use posixutils_sccs::{diag, mrlist, operands, protect, zlock};
 
@@ -86,7 +87,7 @@ fn find_pfile_entry(txn: &Txn, requested_sid: Option<&Sid>) -> io::Result<PfileE
         ));
     }
 
-    let user = posixutils_sccs::username();
+    let user = posixutils_sccs::username()?;
 
     // Filter to this user's entries
     let user_entries: Vec<_> = entries.into_iter().filter(|e| e.user == user).collect();
@@ -197,13 +198,13 @@ fn base_applied_set(
 /// unresolvable token here means the s-file changed underneath the edit.
 fn resolve_pfile_list(
     sccs: &SccsFile,
-    list: Option<&str>,
+    list: Option<&SidList>,
     sfile_path: &Path,
 ) -> Result<Vec<u16>, String> {
     let Some(list) = list else {
         return Ok(Vec::new());
     };
-    let (serials, unresolved) = sccs.resolve_sid_list(list)?;
+    let (serials, unresolved) = sccs.resolve_sid_list(list.as_str())?;
     for tok in unresolved {
         diag::error_path(
             "delta",
@@ -495,9 +496,8 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
     // then made the resulting delta permanently uncommittable, stranding the
     // work behind a p-file lock nothing would clear. CSSC gates the retrieved
     // release too.
-    if let Err(refusal) =
-        protect::check_edit(&sccs, pfile_entry.old_sid.rel, &posixutils_sccs::username())
-    {
+    let user = posixutils_sccs::username()?;
+    if let Err(refusal) = protect::check_edit(&sccs, pfile_entry.old_sid.rel, &user) {
         diag::error_path("delta", sfile_path, &refusal.message());
         return Ok(false);
     }
@@ -542,14 +542,14 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
 
     // The edit was made against the version `get -e` produced, which means the
     // -i/-x lists it recorded in the p-file, not the plain base.
-    let forced_in = match resolve_pfile_list(&sccs, pfile_entry.included.as_deref(), sfile_path) {
+    let forced_in = match resolve_pfile_list(&sccs, pfile_entry.included.as_ref(), sfile_path) {
         Ok(v) => v,
         Err(e) => {
             diag::error_path("delta", sfile_path, &e);
             return Ok(false);
         }
     };
-    let forced_out = match resolve_pfile_list(&sccs, pfile_entry.excluded.as_deref(), sfile_path) {
+    let forced_out = match resolve_pfile_list(&sccs, pfile_entry.excluded.as_ref(), sfile_path) {
         Ok(v) => v,
         Err(e) => {
             diag::error_path("delta", sfile_path, &e);
@@ -600,12 +600,6 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
     // Create new delta entry
     let new_serial = sccs.max_serial() + 1;
     let new_delta = DeltaEntry {
-        delta_type: DeltaType::Normal,
-        sid: pfile_entry.new_sid,
-        datetime: SccsDateTime::now(),
-        user: posixutils_sccs::username().into_bytes(),
-        serial: new_serial,
-        pred_serial: base_serial,
         stats,
         // The forced inclusions and exclusions belong to this delta's
         // provenance: POSIX mandates prs :Dn:/:Dx: report them, and without
@@ -613,12 +607,24 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
         included: forced_in,
         excluded: forced_out,
         ignored,
-        mr_numbers: mrs.into_iter().map(String::into_bytes).collect(),
+        mr_numbers: mrs
+            .iter()
+            .map(|mr| MrNumber::new(mr.as_bytes()))
+            .collect::<Result<_, _>>()
+            .map_err(invalid_input)?,
         comments: if comment.is_empty() {
             Vec::new()
         } else {
-            posixutils_sccs::comment_lines(&comment)
+            CommentLine::lines(comment.as_bytes())
         },
+        ..DeltaEntry::new(
+            DeltaType::Normal,
+            pfile_entry.new_sid,
+            SccsDateTime::now(),
+            user,
+            new_serial,
+            base_serial,
+        )
     };
 
     // Print info. The new SID is printed first, then (with -p) the diff in

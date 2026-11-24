@@ -10,34 +10,54 @@
 
 //! The p-file: one line per edit in progress.
 
-use super::{SccsDateTime, SccsError, SccsResult, Sid};
+use super::{Login, SccsDateTime, SccsError, SccsResult, Sid, SidList};
 
 /// Entry in a p-file (edit lock)
 #[derive(Debug, Clone)]
 pub struct PfileEntry {
     pub old_sid: Sid, // SID being edited (got SID)
     pub new_sid: Sid, // SID that will be created
-    pub user: String, // User who holds the lock
+    pub user: Login,  // User who holds the lock
     pub datetime: SccsDateTime,
-    pub included: Option<String>, // -i option argument
-    pub excluded: Option<String>, // -x option argument
+    pub included: Option<SidList>, // -i option argument
+    pub excluded: Option<SidList>, // -x option argument
 }
 
 impl PfileEntry {
-    /// Parse a p-file entry from a line
-    pub fn parse(line: &str) -> SccsResult<Self> {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 4 {
-            return Err(SccsError::InvalidFormat(format!(
+    /// Parse a p-file entry from a line.
+    ///
+    /// Unlike an s-file, a p-file is written whole from its entries each
+    /// time one is added or removed, so what is read here is written back.
+    /// Each field is therefore checked as it would be if it were new.
+    pub fn parse(line: &[u8]) -> SccsResult<Self> {
+        let invalid = || {
+            SccsError::InvalidFormat(format!(
                 "Invalid p-file entry: {}",
-                line
-            )));
+                String::from_utf8_lossy(line)
+            ))
+        };
+        let parts: Vec<&[u8]> = line
+            .split(u8::is_ascii_whitespace)
+            .filter(|part| !part.is_empty())
+            .collect();
+        if parts.len() < 4 {
+            return Err(invalid());
         }
+        // Every field but the login is ASCII.
+        let text = |part: &[u8]| {
+            std::str::from_utf8(part)
+                .map(str::to_owned)
+                .map_err(|_| invalid())
+        };
 
-        let old_sid: Sid = parts[0].parse()?;
-        let new_sid: Sid = parts[1].parse()?;
-        let user = parts[2].to_string();
-        let datetime = SccsDateTime::parse(parts[3], parts.get(4).unwrap_or(&"00:00:00"))?;
+        let old_sid: Sid = text(parts[0])?.parse()?;
+        let new_sid: Sid = text(parts[1])?.parse()?;
+        let user = Login::new(parts[2])?;
+        let time = match parts.get(4) {
+            Some(time) => text(time)?,
+            None => "00:00:00".to_owned(),
+        };
+        let datetime = SccsDateTime::parse(&text(parts[3])?, &time)?;
 
         // Parse optional -i and -x, accepting both the attached form (`-i1.2`,
         // as written by SCCS / CSSC) and the separated form (`-i 1.2`).
@@ -45,29 +65,22 @@ impl PfileEntry {
         let mut excluded = None;
         let mut i = 5;
         while i < parts.len() {
-            if let Some(rest) = parts[i].strip_prefix("-i") {
-                if !rest.is_empty() {
-                    included = Some(rest.to_string());
+            let slot = match parts[i].get(..2) {
+                Some(b"-i") => &mut included,
+                Some(b"-x") => &mut excluded,
+                _ => {
                     i += 1;
-                } else if i + 1 < parts.len() {
-                    included = Some(parts[i + 1].to_string());
-                    i += 2;
-                } else {
-                    i += 1;
+                    continue;
                 }
-            } else if let Some(rest) = parts[i].strip_prefix("-x") {
-                if !rest.is_empty() {
-                    excluded = Some(rest.to_string());
-                    i += 1;
-                } else if i + 1 < parts.len() {
-                    excluded = Some(parts[i + 1].to_string());
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            } else {
+            };
+            let attached = &parts[i][2..];
+            if !attached.is_empty() {
+                *slot = Some(SidList::new(attached)?);
+            } else if let Some(next) = parts.get(i + 1) {
+                *slot = Some(SidList::new(next)?);
                 i += 1;
             }
+            i += 1;
         }
 
         Ok(Self {
@@ -80,27 +93,26 @@ impl PfileEntry {
         })
     }
 
-    /// Format as a p-file line
-    pub fn to_line(&self) -> String {
-        let mut line = format!(
-            "{} {} {} {}",
-            self.old_sid, self.new_sid, self.user, self.datetime
-        );
-        if let Some(ref inc) = self.included {
-            line.push_str(&format!(" -i{}", inc));
-        }
-        if let Some(ref exc) = self.excluded {
-            line.push_str(&format!(" -x{}", exc));
+    /// Format as a p-file line, without its newline.
+    pub fn to_line(&self) -> Vec<u8> {
+        let mut line = format!("{} {} ", self.old_sid, self.new_sid).into_bytes();
+        line.extend_from_slice(&self.user);
+        line.extend_from_slice(format!(" {}", self.datetime).as_bytes());
+        for (option, list) in [(&b" -i"[..], &self.included), (b" -x", &self.excluded)] {
+            if let Some(list) = list {
+                line.extend_from_slice(option);
+                line.extend_from_slice(list);
+            }
         }
         line
     }
 }
 
 /// Parse all entries from a p-file
-pub fn parse_pfile(contents: &str) -> SccsResult<Vec<PfileEntry>> {
+pub fn parse_pfile(contents: &[u8]) -> SccsResult<Vec<PfileEntry>> {
     contents
-        .lines()
-        .filter(|l| !l.trim().is_empty())
+        .split(|&b| b == b'\n')
+        .filter(|line| !line.trim_ascii().is_empty())
         .map(PfileEntry::parse)
         .collect()
 }

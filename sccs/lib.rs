@@ -33,21 +33,14 @@ pub mod sfio;
 pub mod txn;
 pub mod zlock;
 
-/// The login name to stamp into p-files and delta entries.
-///
-/// Five binaries wrapped `plib::sccsfile::real_login_name` in a private
-/// one-line helper, under two different names.
-pub fn username() -> String {
-    plib::sccsfile::real_login_name()
+/// The login name to stamp into p-files and delta entries: the real user's,
+/// checked as fit to be written (see `plib::sccsfile::real_login_name`).
+pub fn username() -> std::io::Result<plib::sccsfile::Login> {
+    plib::sccsfile::real_login_name().map_err(invalid_input)
 }
 
-/// A delta comment as the lines the s-file stores, one `^Ac` record each.
-///
-/// `admin` and `delta` each stored the `-y` text as a single record, so the
-/// lines after the first went into the delta table as bare text, which every
-/// reader skips and the next rewrite of the file deletes. A final newline
-/// ends the last line rather than starting an empty one.
-pub fn comment_lines(text: &str) -> Vec<Vec<u8>> {
-    let text = text.strip_suffix('\n').unwrap_or(text);
-    text.split('\n').map(|l| l.as_bytes().to_vec()).collect()
+/// The I/O error for a value given to a command that cannot be stored: a
+/// login, comment, MR number or list refused by its type.
+pub fn invalid_input(e: plib::sccsfile::SccsError) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
 }

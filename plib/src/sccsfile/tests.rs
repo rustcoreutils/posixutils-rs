@@ -107,8 +107,90 @@ fn checksummed_part(data: &[u8]) -> &[u8] {
 fn test_real_login_name_nonempty() {
     // Must resolve a name from the passwd database (real uid) regardless of
     // a spoofed/empty USER/LOGNAME environment; never the empty string.
-    let name = real_login_name();
+    let name = real_login_name().unwrap();
     assert!(!name.is_empty());
+}
+
+/// The login comes from the passwd database; the environment stands in only
+/// when that has nothing, and is then checked: it is the caller's to set,
+/// and a blank or newline in it would damage the record it is written to.
+#[test]
+fn a_login_from_the_environment_is_checked() {
+    use super::datetime::login_from;
+    assert_eq!(
+        &*login_from(Some(b"alice"), Some(b"evil x")).unwrap(),
+        b"alice"
+    );
+    assert_eq!(&*login_from(None, Some(b"bob")).unwrap(), b"bob");
+    assert_eq!(&*login_from(Some(b""), Some(b"bob")).unwrap(), b"bob");
+    assert_eq!(&*login_from(None, None).unwrap(), b"unknown");
+    for bad in [&b"two words"[..], b"line\nbreak", b"", b"\x01d"] {
+        assert!(login_from(None, Some(bad)).is_err(), "{bad:?}");
+    }
+}
+
+/// Each kind of stored value refuses the bytes its record cannot hold.
+#[test]
+fn values_refuse_what_their_records_cannot_hold() {
+    assert!(Login::new(b"m\xfcller").is_ok(), "bytes, not UTF-8");
+    assert!(Login::new(b"!1024").is_ok());
+    assert!(CommentLine::new(b"any \x01 text at all").is_ok());
+    assert!(CommentLine::new(b"two\nlines").is_err());
+    let lines = CommentLine::lines(b"one\ntwo\n");
+    assert_eq!(lines.len(), 2);
+    assert_eq!(&*lines[1], b"two");
+    assert_eq!(
+        CommentLine::lines(b"").len(),
+        1,
+        "an empty comment is one empty line"
+    );
+    assert!(MrNumber::new(b"bug-12").is_ok());
+    for bad in [&b""[..], b"a b", b"a\nb"] {
+        assert!(MrNumber::new(bad).is_err(), "{bad:?}");
+    }
+    assert_eq!(MrNumber::list(b" a  b\tc ").len(), 3);
+    assert!(TextLine::new(b"").is_ok());
+    assert!(TextLine::new(b"\x01T").is_err());
+    assert!(TextLine::new(b"a\nb").is_err());
+    assert_eq!(
+        SidList::new(b"1.2 1.3,1.4-1.6").unwrap().as_str(),
+        "1.2,1.3,1.4-1.6"
+    );
+    for bad in [&b""[..], b" , ", b"1.2\n-x", b"-1", b"1.2;x", b"1.2 -x1.1"] {
+        assert!(SidList::new(bad).is_err(), "{bad:?}");
+    }
+}
+
+/// A p-file line keeps its fields through a read and a write, and a line
+/// whose fields could not be written back is refused when read.
+#[test]
+fn a_p_file_entry_reads_back_as_written() {
+    let line = b"1.2 1.3 m\xfcller 26/01/02 03:04:05 -i1.1,1.2 -x1.1";
+    let entry = PfileEntry::parse(line).unwrap();
+    assert_eq!(entry.to_line(), line);
+    assert_eq!(entry.included.as_ref().unwrap().as_str(), "1.1,1.2");
+    // The separated form, as some implementations write it.
+    let entry = PfileEntry::parse(b"1.2 1.3 u 26/01/02 03:04:05 -x 1.1").unwrap();
+    assert_eq!(entry.to_line(), b"1.2 1.3 u 26/01/02 03:04:05 -x1.1");
+    assert!(PfileEntry::parse(b"1.2 1.3 u 26/01/02 03:04:05 -i1.1;x").is_err());
+    assert_eq!(
+        parse_pfile(b"\n1.1 1.2 u 26/01/02 03:04:05\n\n")
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// A delta for the tests that add one: SID, serial and predecessor.
+fn test_delta(sid: Sid, serial: u16, pred: u16) -> DeltaEntry {
+    DeltaEntry::new(
+        DeltaType::Normal,
+        sid,
+        SccsDateTime::parse("26/01/01", "00:00:00").unwrap(),
+        Login::new(b"u").unwrap(),
+        serial,
+        pred,
+    )
 }
 
 #[test]
@@ -430,7 +512,7 @@ fn a_header_edit_changes_only_the_lines_it_names() {
     let after = edit(&|s| assert!(s.remove_flag('v').unwrap()));
     assert_only_changed(&before, &after, &[b"\x01f v"], &[]);
 
-    let after = edit(&|s| assert!(s.add_user(b"fred").unwrap()));
+    let after = edit(&|s| assert!(s.add_user(&Login::new(b"fred").unwrap()).unwrap()));
     assert_only_changed(&before, &after, &[], &[b"fred"]);
     let lines = split_lines(&after);
     let at = lines.iter().position(|l| l == b"fred").unwrap();
@@ -443,8 +525,8 @@ fn a_header_edit_changes_only_the_lines_it_names() {
     assert_only_changed(&before, &after, &[b"  bob  "], &[]);
 
     let after = edit(&|s| {
-        s.set_descriptive_text(&[b"new".to_vec(), b"text".to_vec()])
-            .unwrap()
+        let text = [b"new", &b"text"[..]].map(|l| TextLine::new(l).unwrap());
+        s.set_descriptive_text(&text).unwrap()
     });
     assert_only_changed(&before, &after, &[b"described "], &[b"new", b"text"]);
     let after = edit(&|s| s.set_descriptive_text(&[]).unwrap());
@@ -458,10 +540,10 @@ fn a_header_edit_changes_only_the_lines_it_names() {
 fn an_edit_that_changes_nothing_leaves_the_file_alone() {
     let (before, mut sccs) = odd_file();
     sccs.set_flag(SccsFlag::BranchEnabled).unwrap();
-    assert!(!sccs.add_user(b"bob").unwrap());
+    assert!(!sccs.add_user(&Login::new(b"bob").unwrap()).unwrap());
     assert!(!sccs.remove_user(b"nobody").unwrap());
     assert!(!sccs.remove_flag('j').unwrap());
-    sccs.set_descriptive_text(&[b"described ".to_vec()])
+    sccs.set_descriptive_text(&[TextLine::new(b"described ").unwrap()])
         .unwrap();
     assert_eq!(sccs.to_bytes(), before);
 }
@@ -498,14 +580,10 @@ fn rmdel_and_delta_change_only_their_own_lines() {
     // 1.2 is "a B"; make 1.3 "a C".
     let mut sccs = original.clone();
     let entry = DeltaEntry {
-        sid: Sid::trunk(1, 3),
         datetime: SccsDateTime::parse("26/01/03", "00:00:00").unwrap(),
-        user: b"u".to_vec(),
-        serial: 3,
-        pred_serial: 2,
         stats: DeltaStats::new(1, 1, 1),
-        comments: vec![b"third".to_vec()],
-        ..Default::default()
+        comments: CommentLine::lines(b"third"),
+        ..test_delta(Sid::trunk(1, 3), 3, 2)
     };
     let new_lines = [b"a".to_vec(), b"C".to_vec()];
     sccs.add_delta(
@@ -697,13 +775,7 @@ fn add_delta_records_the_edit_or_refuses_it() {
 \x01u\n\x01U\n\x01t\n\x01T\n\x01I 1\na\nb\nc\n\x01E 1\n";
     let original = SccsFile::from_bytes(&with_checksum(content)).unwrap();
     let v1: HashSet<u16> = [1].into();
-    let entry = || DeltaEntry {
-        sid: Sid::trunk(1, 2),
-        user: b"u".to_vec(),
-        serial: 2,
-        pred_serial: 1,
-        ..Default::default()
-    };
+    let entry = || test_delta(Sid::trunk(1, 2), 2, 1);
 
     // a b c  ->  x a c y
     let new_lines = [b"x".to_vec(), b"a".to_vec(), b"c".to_vec(), b"y".to_vec()];
@@ -766,13 +838,8 @@ fn random_histories_keep_every_version_and_stay_well_formed() {
     for seed in 1..=40u64 {
         let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
         let entry = |serial: u16, pred: u16| DeltaEntry {
-            sid: Sid::trunk(1, serial),
-            datetime: SccsDateTime::parse("26/01/01", "00:00:00").unwrap(),
-            user: b"u".to_vec(),
-            serial,
-            pred_serial: pred,
-            comments: vec![format!("step {serial}").into_bytes()],
-            ..Default::default()
+            comments: CommentLine::lines(format!("step {serial}").as_bytes()),
+            ..test_delta(Sid::trunk(1, serial), serial, pred)
         };
         let first: Vec<Vec<u8>> = (0..rng.below(6))
             .map(|i| format!("l{i}").into_bytes())
@@ -799,7 +866,7 @@ fn random_histories_keep_every_version_and_stay_well_formed() {
                     }
                 }
                 1 => {
-                    let login = format!("user{}", rng.below(3)).into_bytes();
+                    let login = Login::new(format!("user{}", rng.below(3)).as_bytes()).unwrap();
                     if rng.below(2) == 0 {
                         sccs.add_user(&login).unwrap();
                     } else {

@@ -12,7 +12,7 @@
 
 use std::fmt;
 
-use super::{SccsError, SccsResult};
+use super::{Login, SccsError, SccsResult};
 
 /// SCCS date/time format
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -25,20 +25,32 @@ pub struct SccsDateTime {
     pub second: u8,
 }
 
-/// Return the login name of the real user, as SCCS requires for recording
-/// the author of a delta. Uses `getpwuid(getuid())` (the real uid), matching
-/// historical SCCS / CSSC behavior, and falls back to the `LOGNAME`/`USER`
-/// environment and finally `"unknown"` only when the passwd lookup fails.
-pub fn real_login_name() -> String {
+/// The login name of the real user, which SCCS records as the author of a
+/// delta and the holder of an edit.
+///
+/// It is the name `getpwuid(getuid())` gives (the real uid), as in
+/// historical SCCS and CSSC. Only when that lookup finds nothing does the
+/// `LOGNAME` or `USER` environment stand in, and `unknown` when neither is
+/// set. The environment is the caller's to set to anything, so what comes
+/// from it is checked like any other login: a name with a blank or a newline
+/// in it would shift the fields of the delta's line or cut a p-file line in
+/// two, and is refused.
+pub fn real_login_name() -> SccsResult<Login> {
     let uid = unsafe { libc::getuid() };
-    if let Some(user) = crate::user::get_by_uid(uid) {
-        if !user.name.is_empty() {
-            return user.name.to_string_lossy().into_owned();
-        }
+    let passwd = crate::user::get_by_uid(uid).map(|user| user.name.into_encoded_bytes());
+    let env = std::env::var_os("LOGNAME").or_else(|| std::env::var_os("USER"));
+    login_from(
+        passwd.as_deref(),
+        env.as_ref().map(|name| name.as_encoded_bytes()),
+    )
+}
+
+/// [`real_login_name`], given what the lookups found.
+pub(super) fn login_from(passwd: Option<&[u8]>, env: Option<&[u8]>) -> SccsResult<Login> {
+    match (passwd.filter(|name| !name.is_empty()), env) {
+        (Some(name), _) | (None, Some(name)) => Login::new(name),
+        (None, None) => Login::new(b"unknown"),
     }
-    std::env::var("LOGNAME")
-        .or_else(|_| std::env::var("USER"))
-        .unwrap_or_else(|_| "unknown".to_string())
 }
 
 impl SccsDateTime {

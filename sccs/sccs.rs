@@ -285,7 +285,7 @@ fn get_editing_info(
     root_dir: &Path,
     sccs_dir: &str,
     branch_only: bool,
-    user_filter: Option<&str>,
+    user_filter: Option<&[u8]>,
 ) -> Vec<EditInfo> {
     let mut results = Vec::new();
 
@@ -302,7 +302,7 @@ fn get_editing_info(
                     // time, so a line every other utility accepts was silently
                     // dropped here -- and it detected a branch by counting '.'
                     // characters instead of asking the SID.
-                    let entries = fs::read_to_string(&path)
+                    let entries = fs::read(&path)
                         .ok()
                         .and_then(|c| plib::sccsfile::parse_pfile(&c).ok())
                         .unwrap_or_default();
@@ -312,7 +312,7 @@ fn get_editing_info(
                             continue;
                         }
                         if let Some(u) = user_filter {
-                            if entry.user != u {
+                            if entry.user.as_bytes() != u {
                                 continue;
                             }
                         }
@@ -321,7 +321,7 @@ fn get_editing_info(
                             gfile: name_str.strip_prefix("p.").unwrap().to_string(),
                             old_sid: entry.old_sid.to_string(),
                             new_sid: entry.new_sid.to_string(),
-                            user: entry.user,
+                            user: entry.user.to_string(),
                             date: entry.datetime.date_string(),
                             time: entry.datetime.time_string(),
                         });
@@ -587,15 +587,21 @@ fn main() -> ExitCode {
         "info" | "check" | "tell" => {
             // List files being edited
             let mut branch_only = false;
-            let mut user_filter: Option<String> = None;
+            let mut user_filter: Option<Vec<u8>> = None;
 
             for arg in &remaining_args {
                 if *arg == "-b" {
                     branch_only = true;
                 } else if let Some(stripped) = arg.strip_prefix("-u") {
-                    user_filter = Some(stripped.to_string());
+                    user_filter = Some(stripped.as_bytes().to_vec());
                 } else if *arg == "-U" {
-                    user_filter = Some(plib::sccsfile::real_login_name());
+                    match plib::sccsfile::real_login_name() {
+                        Ok(login) => user_filter = Some(login.to_vec()),
+                        Err(e) => {
+                            eprintln!("sccs: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
                 }
             }
 

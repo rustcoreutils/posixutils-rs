@@ -28,6 +28,7 @@ use super::{
     compute_checksum, weave_delta, with_recomputed_checksum, BlockKind, DeltaEntry, DeltaType,
     Kind, Rec, SccsError, SccsFile, SccsFlag, SccsResult, Walker, SOH,
 };
+use super::{Login, TextLine};
 use crate::linediff::LineOp;
 
 /// What a new s-file starts with: its first delta and that delta's text, and
@@ -36,9 +37,9 @@ use crate::linediff::LineOp;
 pub struct NewFile<'a> {
     /// The first delta. Its serial is 1 and it has no predecessor.
     pub delta: DeltaEntry,
-    pub users: &'a [Vec<u8>],
+    pub users: &'a [Login],
     pub flags: &'a [SccsFlag],
-    pub descriptive_text: &'a [Vec<u8>],
+    pub descriptive_text: &'a [TextLine],
     /// The lines of the body as stored: the text, or its encoding.
     pub lines: &'a [Vec<u8>],
 }
@@ -100,13 +101,6 @@ impl Content {
     fn delta(&mut self, delta: &DeltaEntry) -> SccsResult<()> {
         self.line(format!("\x01s {}", delta.stats).as_bytes());
 
-        // The login sits between blank-separated fields.
-        if delta.user.is_empty() || delta.user.iter().any(u8::is_ascii_whitespace) {
-            return Err(SccsError::InvalidDelta(format!(
-                "the login {:?} cannot be stored",
-                String::from_utf8_lossy(&delta.user)
-            )));
-        }
         let mut head = format!(
             "\x01d {} {} {} {} ",
             delta.delta_type.to_char(),
@@ -290,8 +284,8 @@ impl SccsFile {
 
     /// Add a login to the user list, after those there. Returns whether it
     /// was added: a login already on the list is not listed twice.
-    pub fn add_user(&mut self, login: &[u8]) -> SccsResult<bool> {
-        if self.header().users.iter().any(|u| u == login) {
+    pub fn add_user(&mut self, login: &Login) -> SccsResult<bool> {
+        if self.header().users.iter().any(|u| u == login.as_bytes()) {
             return Ok(false);
         }
         self.rewrite_header(|kind, line, out| {
@@ -320,8 +314,13 @@ impl SccsFile {
 
     /// Replace the descriptive text; no lines removes it. The lines that
     /// begin and end it stay as they are.
-    pub fn set_descriptive_text(&mut self, lines: &[Vec<u8>]) -> SccsResult<()> {
-        if self.header().descriptive_text == lines {
+    pub fn set_descriptive_text(&mut self, lines: &[TextLine]) -> SccsResult<()> {
+        if self
+            .header()
+            .descriptive_text
+            .iter()
+            .eq(lines.iter().map(TextLine::as_bytes))
+        {
             return Ok(());
         }
         self.rewrite_header(|kind, line, out| {

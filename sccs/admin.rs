@@ -17,9 +17,10 @@ use std::process::ExitCode;
 use clap::Parser;
 use gettextrs::gettext;
 use plib::sccsfile::{
-    paths, DeltaEntry, DeltaStats, DeltaType, NewFile, ReleaseLock, SccsDateTime, SccsFile,
-    SccsFlag, Sid,
+    paths, CommentLine, DeltaEntry, DeltaStats, DeltaType, Login, MrNumber, NewFile, ReleaseLock,
+    SccsDateTime, SccsFile, SccsFlag, Sid, TextLine,
 };
+use posixutils_sccs::invalid_input;
 use posixutils_sccs::txn::Txn;
 use posixutils_sccs::{diag, idkw, mrlist, zlock};
 
@@ -173,22 +174,26 @@ fn read_input_file(path: Option<&str>) -> Result<Vec<u8>, String> {
 
 /// The descriptive text in the `-t` file `path`, as its lines. An error comes
 /// back as the diagnostic's text, naming the file.
-fn read_desc_text(path: &str) -> Result<Vec<Vec<u8>>, String> {
+fn read_desc_text(path: &str) -> Result<Vec<TextLine>, String> {
     let data =
         fs::read(path).map_err(|e| format!("{}: {}", path, plib::diag::io_error_text(&e)))?;
-    let lines = plib::sccsfile::split_lines(&data);
     // The text sits between ^At and ^AT: a line of it that began with SOH
     // would read as a control line and end it early.
-    if let Some(n) = lines.iter().position(|l| l.first() == Some(&0x01)) {
-        return Err(format!(
-            "{}: {} {}: {}",
-            path,
-            gettext("line"),
-            n + 1,
-            gettext("descriptive text cannot begin with a control character")
-        ));
-    }
-    Ok(lines.into_iter().map(<[u8]>::to_vec).collect())
+    plib::sccsfile::split_lines(&data)
+        .into_iter()
+        .enumerate()
+        .map(|(n, line)| {
+            TextLine::new(line).map_err(|_| {
+                format!(
+                    "{}: {} {}: {}",
+                    path,
+                    gettext("line"),
+                    n + 1,
+                    gettext("descriptive text cannot begin with a control character")
+                )
+            })
+        })
+        .collect()
 }
 
 fn parse_sid(s: &str) -> Result<Sid, String> {
@@ -258,19 +263,16 @@ fn parse_flag(flag_str: &str) -> Result<SccsFlag, String> {
 
 /// The login a `-a`/`-e` argument names, as it is stored: one line of the
 /// user list, without the blanks around it, which reading the list back
-/// drops -- kept, a login added as " bob " could never be matched again. It
-/// cannot be empty, hold a newline, or begin with the SOH that marks a
-/// control line (`^AU` ends the list).
-fn login_of(arg: &str) -> Result<String, String> {
-    let login = arg.trim_ascii();
-    if login.is_empty() || login.contains('\n') || login.starts_with('\x01') {
-        return Err(format!(
+/// drops -- kept, a login added as " bob " could never be matched again.
+/// What a login cannot hold is [`Login`]'s to say.
+fn login_of(arg: &str) -> Result<Login, String> {
+    Login::new(arg.trim_ascii().as_bytes()).map_err(|_| {
+        format!(
             "'{}': {}",
             arg.escape_default(),
             gettext("invalid login name")
-        ));
-    }
-    Ok(login.to_string())
+        )
+    })
 }
 
 /// What one `-d` option removes.
@@ -361,9 +363,9 @@ struct NewFileParams<'a> {
     content: Vec<u8>,
     initial_sid: Option<&'a str>,
     comment: Option<&'a str>,
-    desc_text: Vec<Vec<u8>>,
+    desc_text: Vec<TextLine>,
     flags: Vec<SccsFlag>,
-    users: Vec<String>,
+    users: Vec<Login>,
     mr_numbers: Vec<String>,
 }
 
@@ -418,7 +420,7 @@ fn create_new_sccs_file(path: &Path, params: NewFileParams) -> io::Result<()> {
     }
 
     let now = SccsDateTime::now();
-    let user = posixutils_sccs::username();
+    let user = posixutils_sccs::username()?;
 
     // Create default comment if not provided
     let comment_text = match comment {
@@ -469,31 +471,24 @@ fn create_new_sccs_file(path: &Path, params: NewFileParams) -> io::Result<()> {
 
     // Create delta entry
     let delta = DeltaEntry {
-        delta_type: DeltaType::Normal,
-        sid,
-        datetime: now,
-        user: user.into_bytes(),
-        serial: 1,
-        pred_serial: 0,
         stats,
-        included: Vec::new(),
-        excluded: Vec::new(),
-        ignored: Vec::new(),
-        mr_numbers: mr_numbers.into_iter().map(String::into_bytes).collect(),
-        comments: posixutils_sccs::comment_lines(&comment_text),
+        mr_numbers: mr_numbers
+            .iter()
+            .map(|mr| MrNumber::new(mr.as_bytes()))
+            .collect::<Result<_, _>>()
+            .map_err(invalid_input)?,
+        comments: CommentLine::lines(comment_text.as_bytes()),
+        ..DeltaEntry::new(DeltaType::Normal, sid, now, user, 1, 0)
     };
 
     let sccs = SccsFile::create(NewFile {
         delta,
-        users: &users
-            .into_iter()
-            .map(String::into_bytes)
-            .collect::<Vec<_>>(),
+        users: &users,
         flags: &flags,
         descriptive_text: &desc_text,
         lines: &body_lines,
     })
-    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    .map_err(invalid_input)?;
 
     // Refused if the name has been taken: the check that counts is the one
     // create makes, holding the lock. Made only before the lock, of two
@@ -525,11 +520,11 @@ fn recompute_checksum(path: &Path) -> io::Result<()> {
 
 fn modify_existing_file(
     path: &Path,
-    desc_text: Option<Vec<Vec<u8>>>,
+    desc_text: Option<Vec<TextLine>>,
     add_flags: Vec<SccsFlag>,
     delete_flags: Vec<FlagRemoval>,
-    add_users: Vec<String>,
-    remove_users: Vec<String>,
+    add_users: Vec<Login>,
+    remove_users: Vec<Login>,
     mrs_given: bool,
 ) -> io::Result<()> {
     let txn = Txn::begin(path)?;
@@ -562,12 +557,12 @@ fn modify_existing_file(
 
     // Add users
     for user in add_users {
-        sccs.add_user(user.as_bytes()).map_err(invalid_data)?;
+        sccs.add_user(&user).map_err(invalid_data)?;
     }
 
     // Remove users
     for user in remove_users {
-        sccs.remove_user(user.as_bytes()).map_err(invalid_data)?;
+        sccs.remove_user(&user).map_err(invalid_data)?;
     }
 
     txn.write(&sccs)
@@ -623,7 +618,7 @@ fn main() -> ExitCode {
     }
 
     let logins = |args: &[String]| args.iter().map(|a| login_of(a)).collect();
-    let (add_users, erase_users): (Vec<String>, Vec<String>) =
+    let (add_users, erase_users): (Vec<Login>, Vec<Login>) =
         match (logins(&args.add_users), logins(&args.erase_users)) {
             (Ok(add), Ok(erase)) => (add, erase),
             (Err(e), _) | (_, Err(e)) => {

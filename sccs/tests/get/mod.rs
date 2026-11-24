@@ -1295,7 +1295,7 @@ fn get_e_refuses_a_user_not_on_the_authorized_list() {
 fn get_e_refuses_a_user_denied_with_a_bang() {
     let tmp = TempDir::new().unwrap();
     let sfile = three_delta_file(tmp.path(), "bang");
-    let me = plib::sccsfile::real_login_name();
+    let me = plib::sccsfile::real_login_name().unwrap();
 
     let out = super::common::run_in("admin", &[&format!("-a!{me}"), &sfile], tmp.path(), "");
     assert!(out.status.success());
@@ -1314,7 +1314,7 @@ fn get_e_refuses_a_user_denied_with_a_bang() {
 #[test]
 fn get_e_allows_a_listed_user_and_a_listed_group() {
     let tmp = TempDir::new().unwrap();
-    let me = plib::sccsfile::real_login_name();
+    let me = plib::sccsfile::real_login_name().unwrap();
 
     let sfile = three_delta_file(tmp.path(), "byname");
     let out = super::common::run_in("admin", &[&format!("-a{me}"), &sfile], tmp.path(), "");
@@ -1719,4 +1719,47 @@ fn get_e_locks_before_it_reads_the_s_file() {
         !String::from_utf8_lossy(&out.stderr).contains("being edited"),
         "{out:?}"
     );
+}
+
+/// The `-i` and `-x` lists of an edit are recorded in the p-file for delta,
+/// one line per edit. A list is SIDs and ranges separated by commas (blanks
+/// or a newline are accepted too); it is recorded with commas, so that what
+/// delta reads back is what get resolved, on one line: recorded as given, a
+/// newline cut the p-file line in two and left the p-file unreadable to
+/// every command. A list holding anything else is refused, and nothing is
+/// recorded.
+#[test]
+fn get_e_records_only_a_well_formed_list() {
+    let tmp = TempDir::new().unwrap();
+    let run =
+        |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, tmp.path(), stdin);
+    assert!(run("admin", &["-i", "-fj", "s.l"], "one\n")
+        .status
+        .success());
+    for text in ["two\n", "three\n"] {
+        assert!(run("get", &["-e", "-s", "s.l"], "").status.success());
+        std::fs::write(tmp.path().join("l"), text).unwrap();
+        assert!(run("delta", &["-s", "-yc", "s.l"], "").status.success());
+    }
+
+    for bad in ["1.2;rm", "", "1.2 -x1.1", "1.2\n-junk"] {
+        let out = run("get", &["-e", "-s", "-g", "-x", bad, "s.l"], "");
+        assert_eq!(out.status.code(), Some(1), "-x {bad:?}: {out:?}");
+        assert!(!out.stderr.is_empty(), "-x {bad:?} must say why");
+        assert!(
+            !tmp.path().join("p.l").exists(),
+            "-x {bad:?} recorded an edit"
+        );
+    }
+
+    // SIDs separated by a blank and a newline are one list, recorded with
+    // commas.
+    let out = run("get", &["-e", "-s", "-g", "-x", "1.1 1.2\n1.3", "s.l"], "");
+    assert!(out.status.success(), "{out:?}");
+    let pfile = std::fs::read_to_string(tmp.path().join("p.l")).unwrap();
+    assert_eq!(pfile.lines().count(), 1, "{pfile:?}");
+    assert!(pfile.trim_end().ends_with(" -x1.1,1.2,1.3"), "{pfile:?}");
+    // And every command still reads the p-file.
+    let out = run("sact", &["s.l"], "");
+    assert!(out.status.success(), "{out:?}");
 }

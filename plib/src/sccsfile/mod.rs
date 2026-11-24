@@ -37,6 +37,7 @@ mod pfile;
 mod sid;
 mod text;
 mod uu;
+mod value;
 mod weave;
 mod zlock;
 
@@ -53,6 +54,7 @@ pub use pfile::*;
 pub use sid::*;
 pub use text::*;
 pub use uu::*;
+pub use value::*;
 pub use weave::*;
 pub use zlock::*;
 

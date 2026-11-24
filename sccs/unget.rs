@@ -67,7 +67,7 @@ fn unget_file(sfile: &Path, args: &Args, show_header: bool) -> io::Result<bool> 
         return Ok(false);
     }
 
-    let current_user = posixutils_sccs::username();
+    let current_user = posixutils_sccs::username()?;
 
     // Find the entry to remove
     let target_sid: Option<Sid> = if let Some(ref sid_str) = args.sid {

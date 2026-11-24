@@ -13,8 +13,8 @@
 use std::str::FromStr;
 
 use super::{
-    control, DeltaEntry, DeltaStats, DeltaType, Kind, Line, SccsDateTime, SccsError, SccsFile,
-    SccsFlag, SccsHeader, SccsResult, SOH,
+    control, CommentLine, DeltaEntry, DeltaStats, DeltaType, Kind, Line, Login, MrNumber,
+    SccsDateTime, SccsError, SccsFile, SccsFlag, SccsHeader, SccsResult, SOH,
 };
 
 /// The argument of a control line `^A<c> <arg>`: everything after the
@@ -206,8 +206,6 @@ impl<'a> SccsParser<'a> {
     }
 
     fn parse_delta_entry(&mut self) -> SccsResult<DeltaEntry> {
-        let mut entry = DeltaEntry::default();
-
         // Parse ^As line (stats)
         let stats_line = self
             .next_line()
@@ -218,7 +216,7 @@ impl<'a> SccsParser<'a> {
         self.mark(Kind::Stats);
         let stats_str = std::str::from_utf8(control_arg(stats_line))
             .map_err(|_| SccsError::InvalidDelta("Invalid stats encoding".into()))?;
-        entry.stats = DeltaStats::from_str(stats_str.trim())?;
+        let stats = DeltaStats::from_str(stats_str.trim())?;
 
         // Parse ^Ad line (delta header)
         let delta_line = self
@@ -246,16 +244,20 @@ impl<'a> SccsParser<'a> {
                 .map_err(|_| SccsError::InvalidDelta("Invalid delta encoding".into()))
         };
 
-        entry.delta_type = DeltaType::from_char(field(0)?.chars().next().unwrap_or('D'))?;
-        entry.sid = field(1)?.parse()?;
-        entry.datetime = SccsDateTime::parse(field(2)?, field(3)?)?;
-        entry.user = parts[4].to_vec();
-        entry.serial = field(5)?
-            .parse()
-            .map_err(|_| SccsError::InvalidDelta("Invalid serial".into()))?;
-        entry.pred_serial = field(6)?
-            .parse()
-            .map_err(|_| SccsError::InvalidDelta("Invalid predecessor".into()))?;
+        let number = |i: usize, what: &str| {
+            field(i)?
+                .parse::<u16>()
+                .map_err(|_| SccsError::InvalidDelta(format!("Invalid {what}")))
+        };
+        let mut entry = DeltaEntry::new(
+            DeltaType::from_char(field(0)?.chars().next().unwrap_or('D'))?,
+            field(1)?.parse()?,
+            SccsDateTime::parse(field(2)?, field(3)?)?,
+            Login::from_stored(parts[4]),
+            number(5, "serial")?,
+            number(6, "predecessor")?,
+        );
+        entry.stats = stats;
 
         // Parse optional lines until ^Ae
         loop {
@@ -304,12 +306,14 @@ impl<'a> SccsParser<'a> {
                     self.mark(Kind::Mr);
                     let mr = control_arg(line).trim_ascii();
                     if !mr.is_empty() {
-                        entry.mr_numbers.push(mr.to_vec());
+                        entry.mr_numbers.push(MrNumber::from_stored(mr));
                     }
                 }
                 control::COMMENT => {
                     self.mark(Kind::Comment);
-                    entry.comments.push(control_arg(line).to_vec());
+                    entry
+                        .comments
+                        .push(CommentLine::from_stored(control_arg(line)));
                 }
                 _ => self.stray_line(line)?,
             }

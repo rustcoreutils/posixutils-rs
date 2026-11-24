@@ -10,25 +10,55 @@
 
 //! The parsed records of an s-file: delta entries, flags, the header.
 
-use super::{DeltaStats, DeltaType, SccsDateTime, SccsError, SccsResult, Sid};
+use super::{
+    CommentLine, DeltaStats, DeltaType, Login, MrNumber, SccsDateTime, SccsError, SccsResult, Sid,
+};
 
 /// A single delta entry in the delta table
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DeltaEntry {
     pub delta_type: DeltaType,
     pub sid: Sid,
     pub datetime: SccsDateTime,
     /// Login of the delta's author. Like every text an s-file stores, it
     /// is the bytes written, which need not be UTF-8.
-    pub user: Vec<u8>,
+    pub user: Login,
     pub serial: u16,      // Serial number (unique ID within file)
     pub pred_serial: u16, // Predecessor serial (0 for first delta)
     pub stats: DeltaStats,
-    pub included: Vec<u16>,       // Serial numbers of included deltas (^Ai)
-    pub excluded: Vec<u16>,       // Serial numbers of excluded deltas (^Ax)
-    pub ignored: Vec<u16>,        // Serial numbers of ignored deltas (^Ag)
-    pub mr_numbers: Vec<Vec<u8>>, // Modification request numbers (^Am)
-    pub comments: Vec<Vec<u8>>,   // Comment lines (^Ac)
+    pub included: Vec<u16>,         // Serial numbers of included deltas (^Ai)
+    pub excluded: Vec<u16>,         // Serial numbers of excluded deltas (^Ax)
+    pub ignored: Vec<u16>,          // Serial numbers of ignored deltas (^Ag)
+    pub mr_numbers: Vec<MrNumber>,  // Modification request numbers (^Am)
+    pub comments: Vec<CommentLine>, // Comment lines (^Ac)
+}
+
+impl DeltaEntry {
+    /// A delta with what its `^Ad` line holds, and nothing else yet: no
+    /// counts, lists, MRs or comment.
+    pub fn new(
+        delta_type: DeltaType,
+        sid: Sid,
+        datetime: SccsDateTime,
+        user: Login,
+        serial: u16,
+        pred_serial: u16,
+    ) -> Self {
+        DeltaEntry {
+            delta_type,
+            sid,
+            datetime,
+            user,
+            serial,
+            pred_serial,
+            stats: DeltaStats::default(),
+            included: Vec::new(),
+            excluded: Vec::new(),
+            ignored: Vec::new(),
+            mr_numbers: Vec::new(),
+            comments: Vec::new(),
+        }
+    }
 }
 
 /// The release list carried by the `l` flag (POSIX 84047-84054).

@@ -546,7 +546,10 @@ fn sccs_info_reports_a_pfile_line_without_a_time_field() {
     // What a p-file written by an older SCCS looks like: no time.
     std::fs::write(
         tmp.path().join("SCCS/p.t.txt"),
-        format!("1.1 1.2 {} 26/08/28\n", plib::sccsfile::real_login_name()),
+        format!(
+            "1.1 1.2 {} 26/08/28\n",
+            plib::sccsfile::real_login_name().unwrap()
+        ),
     )
     .unwrap();
 

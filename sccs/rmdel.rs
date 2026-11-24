@@ -87,10 +87,10 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
     //   1. the user who made the delta,
     //   2. the owner of the SCCS file, or
     //   3. the owner of the directory containing the SCCS file.
-    let current_user = posixutils_sccs::username();
+    let current_user = posixutils_sccs::username()?;
     let current_uid = unsafe { libc::getuid() };
 
-    let is_delta_author = sccs.header().deltas[delta_idx].user == current_user.as_bytes();
+    let is_delta_author = sccs.header().deltas[delta_idx].user == current_user;
 
     let owns_sfile = fs::metadata(sfile)
         .map(|m| m.uid() == current_uid)

@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use gettextrs::gettext;
 use plib::sccsfile::{
-    paths, DeltaEntry, PfileEntry, SccsDateTime, SccsFile, SccsFlag, Selection, Sid,
+    paths, DeltaEntry, PfileEntry, SccsDateTime, SccsFile, SccsFlag, Selection, Sid, SidList,
 };
 use posixutils_sccs::txn::{self, Txn};
 use posixutils_sccs::{cutoff, diag, idkw, operands, pfile, protect, sfio, zlock};
@@ -279,13 +279,13 @@ fn create_pfile_entry(
     txn: &Txn,
     old_sid: &Sid,
     new_sid: &Sid,
-    included: Option<String>,
-    excluded: Option<String>,
+    included: Option<SidList>,
+    excluded: Option<SidList>,
 ) -> io::Result<()> {
     let entry = PfileEntry {
         old_sid: *old_sid,
         new_sid: *new_sid,
-        user: posixutils_sccs::username(),
+        user: posixutils_sccs::username()?,
         datetime: SccsDateTime::now(),
         included,
         excluded,
@@ -361,7 +361,33 @@ fn unreadable(e: plib::sccsfile::SccsError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
 }
 
-fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Result<bool> {
+/// The `-i` and `-x` lists of the command line, checked: what the version is
+/// made from, and what an edit records in the p-file for delta.
+struct Lists {
+    include: Option<SidList>,
+    exclude: Option<SidList>,
+}
+
+impl Lists {
+    fn from_args(args: &Args) -> Result<Lists, plib::sccsfile::SccsError> {
+        let list = |arg: &Option<String>| {
+            arg.as_deref()
+                .map(|l| SidList::new(l.as_bytes()))
+                .transpose()
+        };
+        Ok(Lists {
+            include: list(&args.include)?,
+            exclude: list(&args.exclude)?,
+        })
+    }
+}
+
+fn process_file(
+    args: &Args,
+    lists: &Lists,
+    sfile_path: &Path,
+    multiple_files: bool,
+) -> io::Result<bool> {
     // Print filename if multiple files
     if multiple_files && !args.silent {
         let output_stream: &mut dyn Write = if args.to_stdout || args.lfile_stdout {
@@ -429,9 +455,8 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
         // enforced here and not for a plain retrieval: POSIX 99077-99078
         // attaches them to -e. A refusal leaves no p-file entry behind, and
         // the lock goes when this function returns.
-        if let Err(refusal) =
-            protect::check_edit(&sccs, target_sid.rel, &posixutils_sccs::username())
-        {
+        let user = posixutils_sccs::username()?;
+        if let Err(refusal) = protect::check_edit(&sccs, target_sid.rel, &user) {
             diag::error_path("get", sfile_path, &refusal.message());
             return Ok(false);
         }
@@ -459,8 +484,8 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
     // not ask for is worse than refusing, and the g-file would otherwise be
     // written from the wrong delta set.
     let mut list_error = None;
-    let mut resolve = |list: Option<&str>| -> Vec<u16> {
-        match list.map(|l| sccs.resolve_sid_list(l)) {
+    let mut resolve = |list: &Option<SidList>| -> Vec<u16> {
+        match list.as_ref().map(|l| sccs.resolve_sid_list(l.as_str())) {
             Some(Ok((serials, unresolved))) => {
                 for tok in unresolved {
                     diag::error_path(
@@ -478,8 +503,8 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
             None => Vec::new(),
         }
     };
-    let included_serials: Vec<u16> = resolve(args.include.as_deref());
-    let excluded_serials: Vec<u16> = resolve(args.exclude.as_deref());
+    let included_serials: Vec<u16> = resolve(&lists.include);
+    let excluded_serials: Vec<u16> = resolve(&lists.exclude);
     if let Some(e) = list_error {
         diag::error_path("get", sfile_path, &e);
         return Ok(false);
@@ -579,8 +604,8 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
                 txn,
                 &target_sid,
                 &ns,
-                args.include.clone(),
-                args.exclude.clone(),
+                lists.include.clone(),
+                lists.exclude.clone(),
             )?;
         }
     }
@@ -788,6 +813,13 @@ fn main() -> ExitCode {
     zlock::install_cleanup();
 
     let args = plib::optarg::parse::<Args>();
+    let lists = match Lists::from_args(&args) {
+        Ok(lists) => lists,
+        Err(e) => {
+            eprintln!("get: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     // Expand operands: a lone "-" reads s-file pathnames from stdin, and
     // directory operands expand to their sorted s.* members.
@@ -800,7 +832,7 @@ fn main() -> ExitCode {
     let mut exit_code = ExitCode::SUCCESS;
 
     for file_path in &files {
-        match process_file(&args, file_path, multiple_files) {
+        match process_file(&args, &lists, file_path, multiple_files) {
             Ok(true) => {}
             Ok(false) => exit_code = ExitCode::FAILURE,
             // Every later file would fail the same way.

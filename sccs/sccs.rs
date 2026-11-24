@@ -283,13 +283,26 @@ struct EditInfo {
     time: String,
 }
 
+/// What the p-files of an SCCS directory say is being edited.
+struct Editing {
+    /// The edits recorded.
+    edits: Vec<EditInfo>,
+    /// The g-files whose p-file could not be read. Each may be being
+    /// edited: nothing says it is not. They have been diagnosed.
+    unreadable: Vec<OsString>,
+}
+
+/// Read the p-files of the SCCS directory. With `ignore_branches` (`-b`),
+/// edits that will make a branch delta are left out: "to get a list of files
+/// being edited that are not on branches: sccs info -b" (POSIX sccs).
 fn get_editing_info(
     root_dir: &Path,
     sccs_dir: &OsStr,
-    branch_only: bool,
+    ignore_branches: bool,
     user_filter: Option<&[u8]>,
-) -> Vec<EditInfo> {
+) -> Editing {
     let mut results = Vec::new();
+    let mut unreadable = Vec::new();
 
     let sccs_path = root_dir.join(sccs_dir);
     if let Ok(entries) = fs::read_dir(&sccs_path) {
@@ -303,13 +316,28 @@ fn get_editing_info(
                     // time, so a line every other utility accepts was silently
                     // dropped here -- and it detected a branch by counting '.'
                     // characters instead of asking the SID.
-                    let entries = fs::read(&path)
-                        .ok()
-                        .and_then(|c| plib::sccsfile::parse_pfile(&c).ok())
-                        .unwrap_or_default();
+                    //
+                    // A p-file that cannot be read is reported, and its file
+                    // counted as possibly being edited. Taken for "no
+                    // edits", it had `sccs clean` remove the working file.
+                    let entries = fs::read(&path).and_then(|c| {
+                        plib::sccsfile::parse_pfile(&c).map_err(posixutils_sccs::invalid_input)
+                    });
+                    let entries = match entries {
+                        Ok(entries) => entries,
+                        Err(e) => {
+                            eprintln!(
+                                "sccs: {}: {}",
+                                path.display(),
+                                plib::diag::io_error_text(&e)
+                            );
+                            unreadable.push(gfile.to_owned());
+                            continue;
+                        }
+                    };
 
                     for entry in entries {
-                        if branch_only && entry.new_sid.is_trunk() {
+                        if ignore_branches && !entry.new_sid.is_trunk() {
                             continue;
                         }
                         if let Some(u) = user_filter {
@@ -332,7 +360,10 @@ fn get_editing_info(
         }
     }
 
-    results
+    Editing {
+        edits: results,
+        unreadable,
+    }
 }
 
 fn main() -> ExitCode {
@@ -606,21 +637,30 @@ fn main() -> ExitCode {
                 }
             }
 
-            let info = get_editing_info(&root_dir, &sccs_dir, branch_only, user_filter.as_deref());
+            let editing =
+                get_editing_info(&root_dir, &sccs_dir, branch_only, user_filter.as_deref());
+            let info = &editing.edits;
+            // A p-file that could not be read has been reported; the
+            // listing is of the rest, and the status says it is not whole.
+            let status = if editing.unreadable.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            };
 
             if command == "check" {
                 if info.is_empty() {
-                    ExitCode::SUCCESS
+                    status
                 } else {
                     ExitCode::FAILURE
                 }
             } else if command == "tell" {
                 // File names are bytes, and go out as they are.
                 let mut out = std::io::stdout().lock();
-                for e in &info {
+                for e in info {
                     let _ = out.write_all(&[e.gfile.as_bytes(), b"\n"].concat());
                 }
-                ExitCode::SUCCESS
+                status
             } else {
                 // info: report the full p-file detail
                 // (old-SID new-SID user date time).
@@ -628,7 +668,7 @@ fn main() -> ExitCode {
                     println!("{}", gettext("Nothing being edited."));
                 } else {
                     let mut out = std::io::stdout().lock();
-                    for e in &info {
+                    for e in info {
                         let rest = format!(
                             ": {} {} {} ",
                             gettext("being edited:"),
@@ -647,7 +687,7 @@ fn main() -> ExitCode {
                         );
                     }
                 }
-                ExitCode::SUCCESS
+                status
             }
         }
 
@@ -655,7 +695,14 @@ fn main() -> ExitCode {
             // Remove files that can be recreated from SCCS
             let branch_only = remaining_args.iter().any(|a| *a == "-b");
             let info = get_editing_info(&root_dir, &sccs_dir, branch_only, None);
-            let editing: Vec<&OsStr> = info.iter().map(|e| e.gfile.as_os_str()).collect();
+            // A file whose p-file could not be read may be being edited,
+            // and is kept.
+            let editing: Vec<&OsStr> = info
+                .edits
+                .iter()
+                .map(|e| e.gfile.as_os_str())
+                .chain(info.unreadable.iter().map(OsString::as_os_str))
+                .collect();
 
             // Find g-files in current directory
             if let Ok(entries) = fs::read_dir(&root_dir) {
@@ -672,7 +719,11 @@ fn main() -> ExitCode {
                     }
                 }
             }
-            ExitCode::SUCCESS
+            if info.unreadable.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
         }
 
         "diffs" => {

@@ -695,3 +695,69 @@ fn sccs_delget_keeps_a_detached_option_argument_out_of_the_file_list() {
         "delget re-gets the file"
     );
 }
+
+/// A p-file that cannot be read says an edit may be pending; it does not say
+/// none is. `sccs clean` took an unreadable p-file for "not being edited"
+/// and removed the working file, with the work in it; `sccs check` reported
+/// nothing being edited.
+#[test]
+fn sccs_treats_an_unreadable_pfile_as_an_edit() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    setup_project(&tmp, "g", "one\n");
+    assert!(run("sccs", &["edit", "g"], dir, "").status.success());
+    std::fs::write(dir.join("g"), "work in progress\n").unwrap();
+    // Damage the p-file's line: a list that is no list.
+    let pfile = dir.join("SCCS/p.g");
+    let line = std::fs::read_to_string(&pfile).unwrap();
+    std::fs::write(&pfile, format!("{} -xHEAD\n", line.trim_end())).unwrap();
+
+    for command in ["check", "clean", "info", "tell"] {
+        let out = run("sccs", &[command], dir, "");
+        assert_eq!(out.status.code(), Some(1), "sccs {command}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("p.g"),
+            "sccs {command} names the p-file: {out:?}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.join("g")).unwrap(),
+        "work in progress\n",
+        "clean keeps a file that may be being edited"
+    );
+}
+
+/// `-b` ignores branches: "to get a list of files being edited that are not
+/// on branches: sccs info -b" (POSIX sccs, EXAMPLES). It listed the edits on
+/// branches and ignored the others.
+#[test]
+fn sccs_b_ignores_edits_on_branches() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    setup_project(&tmp, "trunk", "one\n");
+    setup_project(&tmp, "branch", "one\n");
+    assert!(run("admin", &["-fb", "SCCS/s.branch"], dir, "")
+        .status
+        .success());
+    assert!(run("sccs", &["edit", "trunk"], dir, "").status.success());
+    assert!(run("sccs", &["edit", "-b", "branch"], dir, "")
+        .status
+        .success());
+
+    let tell = |args: &[&str]| {
+        let out = run("sccs", args, dir, "");
+        let mut names: Vec<String> = String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(tell(&["tell"]), ["branch", "trunk"]);
+    assert_eq!(tell(&["tell", "-b"]), ["trunk"]);
+
+    // clean -b: the branch edit does not count, so its working file goes.
+    assert!(run("sccs", &["clean", "-b"], dir, "").status.success());
+    assert!(dir.join("trunk").exists() && !dir.join("branch").exists());
+}

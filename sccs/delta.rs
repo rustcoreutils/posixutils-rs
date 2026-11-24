@@ -388,8 +388,8 @@ fn apply_diff_to_body(
                 stack.push((false, *serial));
                 new_body.push(record.clone());
             }
-            BodyRecord::End(_serial) => {
-                stack.pop();
+            BodyRecord::End(serial) => {
+                plib::sccsfile::close_block(&mut stack, *serial);
                 new_body.push(record.clone());
             }
             BodyRecord::Text(_line) => {

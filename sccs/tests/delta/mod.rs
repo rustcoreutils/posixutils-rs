@@ -1350,3 +1350,42 @@ fn delta_refuses_a_line_beginning_with_soh() {
         "the edit is still pending"
     );
 }
+
+/// delta and rmdel reweave a body whose blocks overlap without disturbing
+/// the versions already in it.
+#[test]
+fn delta_and_rmdel_keep_overlapping_blocks_intact() {
+    let tmp = TempDir::new().unwrap();
+    super::common::write_sfile(tmp.path(), "s.o", super::common::OVERLAP_SFILE);
+    let run = |cmd: &str, args: &[&str]| {
+        let out = super::common::run_in(cmd, args, tmp.path(), "");
+        assert!(out.status.success(), "{cmd} {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let versions = |with_14: bool| {
+        assert_eq!(run("get", &["-p", "-k", "-s", "-r1.1", "s.o"]), "a\nb\n");
+        assert_eq!(
+            run("get", &["-p", "-k", "-s", "-r1.2", "s.o"]),
+            "a\nb\nc\nd\n"
+        );
+        assert_eq!(run("get", &["-p", "-k", "-s", "-r1.3", "s.o"]), "a\nd\n");
+        if with_14 {
+            assert_eq!(
+                run("get", &["-p", "-k", "-s", "-r1.4", "s.o"]),
+                "a\nx\nd\ne\n"
+            );
+        }
+    };
+
+    run("get", &["-e", "-s", "s.o"]);
+    fs::write(tmp.path().join("o"), b"a\nx\nd\ne\n").unwrap();
+    run("delta", &["-s", "-yfour", "s.o"]);
+    versions(true);
+
+    run("rmdel", &["-r1.4", "s.o"]);
+    versions(false);
+    // And the delta whose blocks overlap can itself be removed.
+    run("rmdel", &["-r1.3", "s.o"]);
+    assert_eq!(run("get", &["-p", "-k", "-s", "s.o"]), "a\nb\nc\nd\n");
+    assert_eq!(run("get", &["-p", "-k", "-s", "-r1.1", "s.o"]), "a\nb\n");
+}

@@ -1150,9 +1150,7 @@ impl SccsFile {
                 BodyRecord::Delete(serial) => {
                     stack.push((false, *serial));
                 }
-                BodyRecord::End(_) => {
-                    stack.pop();
-                }
+                BodyRecord::End(serial) => close_block(&mut stack, *serial),
                 BodyRecord::Text(line) => {
                     if is_line_visible(&stack, applied_set) {
                         output.push(line.clone());
@@ -1176,57 +1174,22 @@ impl SccsFile {
             d.delta_type = DeltaType::Removed;
         }
 
+        // Blocks need not nest, so each of this delta's blocks runs to the
+        // `^AE` carrying its own serial, whatever opens or closes between.
+        // Inside its insert block everything goes; of a delete block only the
+        // two markers go.
         let old = std::mem::take(&mut self.body);
         let mut result = Vec::with_capacity(old.len());
-        let mut i = 0;
-        while i < old.len() {
-            match &old[i] {
-                // Drop this delta's entire insert block, text included.
-                BodyRecord::Insert(s) if *s == serial => {
-                    i += 1;
-                    let mut depth = 0usize;
-                    while i < old.len() {
-                        match &old[i] {
-                            BodyRecord::Insert(_) | BodyRecord::Delete(_) => depth += 1,
-                            BodyRecord::End(_) => {
-                                if depth == 0 {
-                                    i += 1; // consume the matching End and stop
-                                    break;
-                                }
-                                depth -= 1;
-                            }
-                            BodyRecord::Text(_) => {}
-                        }
-                        i += 1;
-                    }
-                }
-                // Drop this delta's delete markers but keep the wrapped text.
-                BodyRecord::Delete(s) if *s == serial => {
-                    i += 1;
-                    let mut depth = 0usize;
-                    while i < old.len() {
-                        match &old[i] {
-                            BodyRecord::Insert(_) | BodyRecord::Delete(_) => {
-                                depth += 1;
-                                result.push(old[i].clone());
-                            }
-                            BodyRecord::End(_) => {
-                                if depth == 0 {
-                                    i += 1; // drop the matching End and stop
-                                    break;
-                                }
-                                depth -= 1;
-                                result.push(old[i].clone());
-                            }
-                            BodyRecord::Text(_) => result.push(old[i].clone()),
-                        }
-                        i += 1;
-                    }
-                }
-                _ => {
-                    result.push(old[i].clone());
-                    i += 1;
-                }
+        let mut in_own_insert = false;
+        for record in old {
+            match record {
+                BodyRecord::Insert(s) if s == serial => in_own_insert = true,
+                BodyRecord::Delete(s) if s == serial && !in_own_insert => {}
+                // Ends this delta's innermost open block: its insert if one
+                // is open, else its delete.
+                BodyRecord::End(s) if s == serial => in_own_insert = false,
+                _ if in_own_insert => {}
+                other => result.push(other),
             }
         }
         self.body = result;
@@ -1487,6 +1450,24 @@ pub fn is_line_visible(stack: &[(bool, u16)], applied_set: &HashSet<u16>) -> boo
         }
     }
     true
+}
+
+/// End block `serial` on a stack of open blocks `(is_insert, serial)`.
+///
+/// `^AE n` ends block n, which need not be the block opened last: blocks
+/// overlap in a real s-file, a delete opening inside one delta's insert and
+/// ending inside another's. Popping the top instead closed the wrong block
+/// there, and every line after it was read under the wrong set of blocks.
+/// An end that matches no open block (a damaged file) closes the last one.
+pub fn close_block(stack: &mut Vec<(bool, u16)>, serial: u16) {
+    match stack.iter().rposition(|&(_, s)| s == serial) {
+        Some(at) => {
+            stack.remove(at);
+        }
+        None => {
+            stack.pop();
+        }
+    }
 }
 
 /// Write one s-file line: `prefix` (a control code and its blank, or nothing),

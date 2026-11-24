@@ -183,3 +183,16 @@ pub const LATIN1_RECORDS: &[&[u8]] = &[
     b"\xe9t\xe9",
     b"caf\xe9 %I%",
 ];
+
+/// An s-file (after its `^Ah` line) whose blocks overlap rather than nest, as
+/// CSSC and historical SCCS weave them: delta 3's delete block opens inside
+/// delta 1's insert and ends inside delta 2's. 1.1 is `a b`, 1.2 is
+/// `a b c d`, and 1.3 deleted `b` and `c`, leaving `a d`.
+pub const OVERLAP_SFILE: &[u8] = b"\x01s 00000/00002/00002\n\
+\x01d D 1.3 26/01/03 00:00:00 u 3 2\n\x01c three\n\x01e\n\
+\x01s 00002/00000/00002\n\
+\x01d D 1.2 26/01/02 00:00:00 u 2 1\n\x01c two\n\x01e\n\
+\x01s 00002/00000/00000\n\
+\x01d D 1.1 26/01/01 00:00:00 u 1 0\n\x01c one\n\x01e\n\
+\x01u\n\x01U\n\x01t\n\x01T\n\
+\x01I 1\na\n\x01D 3\nb\n\x01E 1\n\x01I 2\nc\n\x01E 3\nd\n\x01E 2\n";

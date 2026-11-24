@@ -312,35 +312,21 @@ fn evaluate_body_with_sid(sccs: &SccsFile, applied_set: &HashSet<u16>) -> Vec<(V
 
     let mut output = Vec::new();
     let mut stack: Vec<(bool, u16)> = Vec::new(); // (is_insert, serial)
-    let mut current_insert_serial: Option<u16> = None;
 
     for record in &sccs.body {
         match record {
-            BodyRecord::Insert(serial) => {
-                stack.push((true, *serial));
-                if applied_set.contains(serial) {
-                    current_insert_serial = Some(*serial);
-                }
-            }
-            BodyRecord::Delete(serial) => {
-                stack.push((false, *serial));
-            }
-            BodyRecord::End(_) => {
-                if let Some((is_insert, serial)) = stack.pop() {
-                    if is_insert && Some(serial) == current_insert_serial {
-                        // Find next innermost insert
-                        current_insert_serial = stack
-                            .iter()
-                            .rev()
-                            .find(|(is_ins, s)| *is_ins && applied_set.contains(s))
-                            .map(|(_, s)| *s);
-                    }
-                }
-            }
+            BodyRecord::Insert(serial) => stack.push((true, *serial)),
+            BodyRecord::Delete(serial) => stack.push((false, *serial)),
+            BodyRecord::End(serial) => plib::sccsfile::close_block(&mut stack, *serial),
             BodyRecord::Text(line) => {
                 if plib::sccsfile::is_line_visible(&stack, applied_set) {
-                    // Find which delta inserted this line
-                    let inserting_serial = current_insert_serial.unwrap_or(1);
+                    // The delta that inserted this line: the innermost
+                    // applied insert block open here.
+                    let inserting_serial = stack
+                        .iter()
+                        .rev()
+                        .find(|(is_insert, s)| *is_insert && applied_set.contains(s))
+                        .map_or(1, |&(_, s)| s);
                     let sid = sccs
                         .find_delta_by_serial(inserting_serial)
                         .map(|d| d.sid)

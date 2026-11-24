@@ -1518,3 +1518,35 @@ fn get_expands_keywords_in_one_pass() {
         "m=mod%R% q=%I% w=@(#)mod%R%\t1.1\n"
     );
 }
+
+/// Blocks in an s-file need not nest: a delete may open in one delta's
+/// insert and end in another's, and `^AE n` ends block n, not whichever block
+/// opened last. Every version of such a file -- CSSC writes them -- is
+/// retrieved as it was stored.
+#[test]
+fn get_reads_overlapping_blocks() {
+    let tmp = TempDir::new().unwrap();
+    super::common::write_sfile(tmp.path(), "s.o", super::common::OVERLAP_SFILE);
+    for (rev, want) in [
+        ("-r1.1", "a\nb\n"),
+        ("-r1.2", "a\nb\nc\nd\n"),
+        ("-r1.3", "a\nd\n"),
+    ] {
+        let out = super::common::run_in("get", &["-p", "-k", "-s", rev, "s.o"], tmp.path(), "");
+        assert!(out.status.success(), "{rev}: {out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), want, "get {rev}");
+    }
+    // -m names the delta that inserted each line.
+    let out = super::common::run_in(
+        "get",
+        &["-p", "-k", "-s", "-m", "-r1.2", "s.o"],
+        tmp.path(),
+        "",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1.1\ta\n1.1\tb\n1.2\tc\n1.2\td\n"
+    );
+    let out = super::common::run_in("val", &["s.o"], tmp.path(), "");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+}

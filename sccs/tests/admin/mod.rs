@@ -1110,3 +1110,70 @@ fn admin_i_takes_one_new_file() {
     assert!(!out.stderr.is_empty());
     assert!(!tmp.path().join("s.a").exists() && !tmp.path().join("s.b").exists());
 }
+
+/// `-dl<list>` unlocks the releases listed and leaves the others locked
+/// ("the l list flag gives a list of releases to be unlocked", POSIX admin
+/// 84080-84083); it used to delete the whole lock. `-dl` and `-dla` remove
+/// it. From a lock on every release (`l a`) single releases cannot be
+/// taken out, so that is refused and the file left alone.
+#[test]
+fn admin_dl_unlocks_only_the_listed_releases() {
+    let tmp = TempDir::new().unwrap();
+    let s = admin_create(tmp.path(), "lk", "body\n");
+    let locked = || {
+        let out = run_in("prs", &["-d:LK:", "s.lk"], tmp.path(), "");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let admin = |args: &[&str]| {
+        let mut argv = args.to_vec();
+        argv.push("s.lk");
+        run_in("admin", &argv, tmp.path(), "")
+    };
+
+    assert!(admin(&["-fl1,2,3"]).status.success());
+    assert!(admin(&["-dl2"]).status.success());
+    assert_eq!(locked(), "1,3");
+    assert!(admin(&["-dl1,3"]).status.success());
+    assert_eq!(locked(), "none", "an emptied lock list is no lock");
+
+    assert!(admin(&["-fl4,5"]).status.success());
+    assert!(admin(&["-dl"]).status.success());
+    assert_eq!(locked(), "none");
+
+    assert!(admin(&["-fla"]).status.success());
+    let before = fs::read(&s).unwrap();
+    let out = admin(&["-dl2"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(!out.stderr.is_empty());
+    assert_eq!(
+        fs::read(&s).unwrap(),
+        before,
+        "a refused -dl must not write"
+    );
+    assert_eq!(locked(), "a");
+    assert!(admin(&["-dla"]).status.success());
+    assert_eq!(locked(), "none");
+
+    let out = admin(&["-dlx"]);
+    assert_eq!(out.status.code(), Some(1), "a bad release list: {out:?}");
+}
+
+/// `-d` takes the flag names `-f` does (POSIX admin 84081): a letter that is
+/// not a flag is diagnosed, not silently accepted.
+#[test]
+fn admin_d_rejects_unrecognized_flags() {
+    let tmp = TempDir::new().unwrap();
+    let s = admin_create(tmp.path(), "dz", "body\n");
+    let before = fs::read(&s).unwrap();
+    for bad in ["-dz", "-d4", "-d"] {
+        let args: Vec<&str> = if bad == "-d" {
+            vec!["-d", "", "s.dz"]
+        } else {
+            vec![bad, "s.dz"]
+        };
+        let out = run_in("admin", &args, tmp.path(), "");
+        assert_eq!(out.status.code(), Some(1), "admin {bad}: {out:?}");
+        assert!(!out.stderr.is_empty());
+        assert_eq!(fs::read(&s).unwrap(), before);
+    }
+}

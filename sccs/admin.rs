@@ -18,8 +18,8 @@ use std::process::ExitCode;
 use clap::Parser;
 use gettextrs::gettext;
 use plib::sccsfile::{
-    paths, BodyRecord, DeltaEntry, DeltaStats, DeltaType, SccsDateTime, SccsFile, SccsFlag,
-    SccsHeader, Sid,
+    paths, BodyRecord, DeltaEntry, DeltaStats, DeltaType, ReleaseLock, SccsDateTime, SccsFile,
+    SccsFlag, SccsHeader, Sid,
 };
 use posixutils_sccs::{diag, idkw, mrlist, sfio, zlock};
 
@@ -231,6 +231,72 @@ fn check_login(login: &str) -> Result<(), String> {
             login.escape_default(),
             gettext("invalid login name")
         ));
+    }
+    Ok(())
+}
+
+/// What one `-d` option removes.
+#[derive(Clone)]
+enum FlagRemoval {
+    /// The flag with this letter, whatever its value.
+    Flag(char),
+    /// These releases from the `l` flag's list of locked releases: "the l
+    /// list flag gives a list of releases to be unlocked" (POSIX 84082-84083).
+    Unlock(Vec<u16>),
+}
+
+/// Parse a `-d` option-argument: a flag letter `-f` takes, and for `l` an
+/// optional list of releases to unlock (`a`, or none, unlocks them all).
+fn parse_flag_removal(arg: &str) -> Result<FlagRemoval, String> {
+    let Some(letter) = arg.chars().next() else {
+        return Err(gettext("Empty flag"));
+    };
+    if !VALID_FLAG_CHARS.contains(&letter) {
+        return Err(format!("{} '{}'", gettext("Unrecognized flag"), letter));
+    }
+    let list = arg[letter.len_utf8()..].trim();
+    if letter != 'l' || list.is_empty() || list == "a" {
+        return Ok(FlagRemoval::Flag(letter));
+    }
+    list.split(',')
+        .map(|rel| rel.trim().parse::<u16>())
+        .collect::<Result<Vec<u16>, _>>()
+        .map(FlagRemoval::Unlock)
+        .map_err(|_| format!("{} '{}'", gettext("Invalid release list"), list))
+}
+
+/// Apply one `-d` option to the flags of an s-file.
+fn remove_flag(flags: &mut Vec<SccsFlag>, removal: FlagRemoval) -> io::Result<()> {
+    let releases = match removal {
+        FlagRemoval::Flag(letter) => {
+            flags.retain(|f| f.flag_char() != letter);
+            return Ok(());
+        }
+        FlagRemoval::Unlock(releases) => releases,
+    };
+    let Some(at) = flags
+        .iter()
+        .position(|f| matches!(f, SccsFlag::LockedReleases(_)))
+    else {
+        return Ok(()); // nothing is locked
+    };
+    let SccsFlag::LockedReleases(lock) = &mut flags[at] else {
+        unreachable!("position() found a LockedReleases flag");
+    };
+    match lock {
+        // "Every release" is not a list a release can be taken out of.
+        ReleaseLock::All => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                gettext("every release is locked ('l a'); use -dla to unlock them all"),
+            ));
+        }
+        ReleaseLock::List(locked) => {
+            locked.retain(|rel| !releases.contains(rel));
+            if locked.is_empty() {
+                flags.remove(at);
+            }
+        }
     }
     Ok(())
 }
@@ -447,7 +513,7 @@ fn modify_existing_file(
     path: &Path,
     desc_text: Option<Vec<Vec<u8>>>,
     add_flags: Vec<SccsFlag>,
-    delete_flags: Vec<char>,
+    delete_flags: Vec<FlagRemoval>,
     add_users: Vec<String>,
     remove_users: Vec<String>,
     mrs_given: bool,
@@ -465,8 +531,8 @@ fn modify_existing_file(
     }
 
     // Delete flags
-    for flag_char in delete_flags {
-        sccs.header.flags.retain(|f| f.flag_char() != flag_char);
+    for removal in delete_flags {
+        remove_flag(&mut sccs.header.flags, removal)?;
     }
 
     // Add flags
@@ -577,11 +643,16 @@ fn main() -> ExitCode {
     let mr_numbers: Vec<String> = mrlist::parse(args.mrlist.as_deref());
 
     // Parse flags to delete
-    let delete_flags: Vec<char> = args
-        .delete_flags
-        .iter()
-        .filter_map(|s| s.chars().next())
-        .collect();
+    let mut delete_flags = Vec::new();
+    for arg in &args.delete_flags {
+        match parse_flag_removal(arg) {
+            Ok(removal) => delete_flags.push(removal),
+            Err(e) => {
+                eprintln!("admin: {}", e);
+                return ExitCode::FAILURE;
+            }
+        }
+    }
 
     let mut exit_code = ExitCode::SUCCESS;
 

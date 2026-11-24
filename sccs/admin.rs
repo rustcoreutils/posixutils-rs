@@ -501,37 +501,15 @@ fn create_new_sccs_file(path: &Path, params: NewFileParams) -> io::Result<()> {
     txn.create(&sccs)
 }
 
+/// `admin -h`: check the structure of the file, and its checksum. A
+/// header-only s-file has an empty body, which still has a checksum.
 fn check_sccs_file(path: &Path) -> io::Result<bool> {
     let data = fs::read(path)?;
-
-    // Parse strictly to verify the structure
-    match SccsFile::from_bytes_strict(&data) {
-        Ok(sccs) => {
-            // Verify the checksum. A header-only s-file has an empty body,
-            // which still has a checksum: skipping the check for it let
-            // `admin -h` pass a file `val` rejected.
-            if !plib::sccsfile::stored_checksum_matches(&data, sccs.header().checksum) {
-                let computed = plib::sccsfile::stored_body_checksum(&data);
-                diag::error_path(
-                    "admin",
-                    path,
-                    &format!(
-                        "{} {}, {} {}",
-                        gettext("checksum error: stored"),
-                        sccs.header().checksum,
-                        gettext("computed"),
-                        computed
-                    ),
-                );
-                return Ok(false);
-            }
-            Ok(true)
-        }
-        Err(e) => {
-            diag::error_path("admin", path, &e.to_string());
-            Ok(false)
-        }
+    let checked = SccsFile::from_bytes_strict(&data).and_then(|sccs| sccs.verify_checksum());
+    if let Err(e) = &checked {
+        diag::error_path("admin", path, &e.to_string());
     }
+    Ok(checked.is_ok())
 }
 
 fn recompute_checksum(path: &Path) -> io::Result<()> {
@@ -540,7 +518,7 @@ fn recompute_checksum(path: &Path) -> io::Result<()> {
     // "Use of this option on a truly corrupted file may prevent future
     // detection of the corruption" (POSIX 84112-84113): the file only has to
     // parse, and only its checksum line changes.
-    let mut sccs = txn.read()?;
+    let mut sccs = txn.read_for_repair()?;
     sccs.recompute_checksum().map_err(invalid_data)?;
     txn.write(&sccs)
 }

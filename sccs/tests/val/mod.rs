@@ -528,3 +528,57 @@ fn val_accepts_the_signed_and_unsigned_checksum() {
         "admin must write the signed sum"
     );
 }
+
+/// Every command that reads an s-file checks its checksum first and refuses
+/// a file that fails it, as SCCS does ("Corrupted file"). Only `admin -z`,
+/// whose job is to set the checksum, reads past it. Before, only val and
+/// admin -h looked: get returned text from a damaged file, and an edit by
+/// admin, delta or rmdel gave it a fresh, valid checksum.
+#[test]
+fn a_bad_checksum_is_refused_by_every_reader() {
+    let tmp = TempDir::new().unwrap();
+    let s = create_sccs_file(&tmp, "sum", "one %I%\n");
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str]| super::common::run_in(cmd, args, dir, "");
+
+    // An edit is pending, so that delta has something to do.
+    assert!(run("get", &["-e", "-s", "s.sum"]).status.success());
+    fs::write(dir.join("sum"), b"two\n").unwrap();
+
+    // Damage the body without touching the checksum line.
+    let mut data = fs::read(&s).unwrap();
+    let at = data.windows(3).position(|w| w == b"one").unwrap();
+    data[at..at + 3].copy_from_slice(b"ONE");
+    let mut perms = fs::metadata(&s).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    fs::set_permissions(&s, perms).unwrap();
+    fs::write(&s, &data).unwrap();
+
+    for (cmd, args) in [
+        ("get", &["-p", "-s", "s.sum"][..]),
+        ("prs", &["s.sum"]),
+        ("delta", &["-s", "-yc", "s.sum"]),
+        ("rmdel", &["-r1.1", "s.sum"]),
+        ("admin", &["-fb", "s.sum"]),
+        ("admin", &["-h", "s.sum"]),
+    ] {
+        let out = run(cmd, args);
+        assert_eq!(out.status.code(), Some(1), "{cmd} {args:?}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr)
+                .to_lowercase()
+                .contains("checksum"),
+            "{cmd} {args:?} should name the checksum: {out:?}"
+        );
+        assert_eq!(fs::read(&s).unwrap(), data, "{cmd} {args:?} wrote the file");
+    }
+    assert_eq!(run("val", &["s.sum"]).status.code(), Some(0x20));
+    assert!(dir.join("p.sum").exists(), "the pending edit is untouched");
+
+    // admin -z is the repair; after it everything reads the file again.
+    assert!(run("admin", &["-z", "s.sum"]).status.success());
+    let out = run("get", &["-p", "-k", "-s", "s.sum"]);
+    assert_eq!(out.stdout, b"ONE %I%\n");
+    assert!(run("delta", &["-s", "-yc", "s.sum"]).status.success());
+}

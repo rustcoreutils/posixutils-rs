@@ -67,9 +67,16 @@ impl Txn {
         fs::symlink_metadata(&self.sfile).is_ok()
     }
 
-    /// Read the s-file as it is now, under the lock.
+    /// Read the s-file as it is now, under the lock, checking its checksum.
     pub fn read(&self) -> io::Result<SccsFile> {
         SccsFile::from_path(&self.sfile)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    }
+
+    /// [`read`](Self::read) without the checksum check, for `admin -z`: the
+    /// one command a file with a wrong checksum is meant for.
+    pub fn read_for_repair(&self) -> io::Result<SccsFile> {
+        SccsFile::from_path_unverified(&self.sfile)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
     }
 

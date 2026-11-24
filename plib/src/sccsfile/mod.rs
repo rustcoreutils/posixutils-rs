@@ -117,7 +117,7 @@ impl fmt::Display for SccsError {
             SccsError::ChecksumMismatch { expected, computed } => {
                 write!(
                     f,
-                    "Checksum mismatch: expected {}, computed {}",
+                    "corrupted file: checksum error: stored {}, computed {}",
                     expected, computed
                 )
             }

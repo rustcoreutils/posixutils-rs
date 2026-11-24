@@ -11,13 +11,12 @@
 //! The s-file as a whole: reading, writing, the delta graph, the body.
 
 use std::collections::HashSet;
-use std::io::Read;
 use std::path::Path;
 
 use super::parse::SccsParser;
 use super::{
-    DeltaEntry, DeltaType, Kind, Line, Rec, ReleaseLock, SccsError, SccsFlag, SccsHeader,
-    SccsResult, Sid, Walker,
+    stored_body_checksum, stored_checksum_matches, DeltaEntry, DeltaType, Kind, Line, Rec,
+    ReleaseLock, SccsError, SccsFlag, SccsHeader, SccsResult, Sid, Walker,
 };
 
 /// What a command line adds to the choice of a version: the deltas `-i`
@@ -164,17 +163,37 @@ impl SccsFile {
         SccsParser::new(data, true).parse()
     }
 
-    /// Parse SCCS file from a reader
-    pub fn from_reader<R: Read>(mut reader: R) -> SccsResult<Self> {
-        let mut data = Vec::new();
-        reader.read_to_end(&mut data)?;
+    /// Read the s-file at `path`: parse it and check its checksum.
+    ///
+    /// This is how a command reads an s-file it means to use. SCCS checks
+    /// the checksum of every s-file it reads and stops on a mismatch; reading
+    /// on regardless returned text from a damaged file, and an edit then gave
+    /// that file a fresh checksum that hid the damage for good.
+    pub fn from_path<P: AsRef<Path>>(path: P) -> SccsResult<Self> {
+        let file = Self::from_path_unverified(path)?;
+        file.verify_checksum()?;
+        Ok(file)
+    }
+
+    /// Read the s-file at `path` without checking its checksum: for
+    /// `admin -z`, whose job is to set it.
+    pub fn from_path_unverified<P: AsRef<Path>>(path: P) -> SccsResult<Self> {
+        let data = std::fs::read(path)?;
         Self::from_bytes(&data)
     }
 
-    /// Parse SCCS file from a file path
-    pub fn from_path<P: AsRef<Path>>(path: P) -> SccsResult<Self> {
-        let data = std::fs::read(path)?;
-        Self::from_bytes(&data)
+    /// Check that the checksum line is right for the file. Either sum is
+    /// accepted: see [`stored_checksum_matches`].
+    pub fn verify_checksum(&self) -> SccsResult<()> {
+        let expected = self.header.checksum;
+        if stored_checksum_matches(&self.buf, expected) {
+            Ok(())
+        } else {
+            Err(SccsError::ChecksumMismatch {
+                expected,
+                computed: stored_body_checksum(&self.buf),
+            })
+        }
     }
 
     /// The file's bytes: exactly those read, or those of the last edit.

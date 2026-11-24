@@ -284,7 +284,10 @@ fn get_process_info(pid: pid_t, dev_map: &HashMap<u64, String>) -> Option<Proces
 
     // Get process group ID and session ID
     let pgid = bsd_info.pbi_pgid as pid_t;
-    let sid = unsafe { getsid(pid) };
+    // getsid fails for a zombie, as getpgid did; the kernel's process info
+    // has no session ID to take instead, so it is 0, as Apple's ps shows it,
+    // rather than -1.
+    let sid = unsafe { getsid(pid) }.max(0);
 
     Some(ProcessInfo {
         pid: bsd_info.pbi_pid as pid_t,

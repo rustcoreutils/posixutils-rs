@@ -127,7 +127,7 @@ fn find_pfile_entry(sfile_path: &Path, requested_sid: Option<&Sid>) -> io::Resul
 }
 
 /// Read g-file content
-fn read_gfile(sfile_path: &Path) -> io::Result<Vec<String>> {
+fn read_gfile(sfile_path: &Path) -> io::Result<Vec<Vec<u8>>> {
     let gfile_path = paths::gfile_from_sfile(sfile_path).ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, gettext("Invalid s-file name"))
     })?;
@@ -145,13 +145,10 @@ fn read_gfile(sfile_path: &Path) -> io::Result<Vec<String>> {
     }
 
     let data = fs::read(&gfile_path)?;
-    plib::sccsfile::split_lines(&data)
+    Ok(plib::sccsfile::split_lines(&data)
         .into_iter()
-        .map(|line| {
-            String::from_utf8(line.to_vec())
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-        })
-        .collect()
+        .map(<[u8]>::to_vec)
+        .collect())
 }
 
 /// Read the g-file as the lines to diff against the stored body.
@@ -162,7 +159,7 @@ fn read_gfile(sfile_path: &Path) -> io::Result<Vec<String>> {
 /// raw bytes as UTF-8 lines and diffed them against uuencoded text, so a
 /// binary file could be created and retrieved but never updated -- it failed
 /// with "stream did not contain valid UTF-8".
-fn read_gfile_for(sccs: &SccsFile, sfile_path: &Path) -> io::Result<Vec<String>> {
+fn read_gfile_for(sccs: &SccsFile, sfile_path: &Path) -> io::Result<Vec<Vec<u8>>> {
     if !sccs.is_encoded() {
         return read_gfile(sfile_path);
     }
@@ -221,7 +218,7 @@ fn resolve_pfile_list(
 /// next matching line lay outside that window, and indexed the new text
 /// unguarded once it had run past the end, panicking on any change that
 /// deleted two or more trailing lines.
-fn compute_diff(base_lines: &[String], new_lines: &[String]) -> (DeltaStats, Vec<LineOp>) {
+fn compute_diff(base_lines: &[Vec<u8>], new_lines: &[Vec<u8>]) -> (DeltaStats, Vec<LineOp>) {
     let ops = plib::linediff::diff(base_lines, new_lines);
 
     let mut stats = DeltaStats::default();
@@ -236,7 +233,18 @@ fn compute_diff(base_lines: &[String], new_lines: &[String]) -> (DeltaStats, Vec
     (stats, ops)
 }
 
-fn print_normal_diff(base_lines: &[String], new_lines: &[String], ops: &[LineOp]) {
+fn print_normal_diff(
+    base_lines: &[Vec<u8>],
+    new_lines: &[Vec<u8>],
+    ops: &[LineOp],
+) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    // One "< " or "> " line: the text as stored, which need not be UTF-8.
+    let line = |out: &mut io::StdoutLock, mark: &[u8], text: &[u8]| -> io::Result<()> {
+        out.write_all(mark)?;
+        out.write_all(text)?;
+        out.write_all(b"\n")
+    };
     // Render a single line-range as "a" or "a,b".
     fn range(start: usize, count: usize) -> String {
         if count == 0 {
@@ -266,13 +274,13 @@ fn print_normal_diff(base_lines: &[String], new_lines: &[String], ops: &[LineOp]
                 // or just deletes, or just inserts.
                 let del_start = bi;
                 let ins_start = ni;
-                let mut dels: Vec<String> = Vec::new();
-                let mut inss: Vec<String> = Vec::new();
+                let mut dels: Vec<&[u8]> = Vec::new();
+                let mut inss: Vec<&[u8]> = Vec::new();
 
                 while k < ops.len() {
                     match &ops[k] {
                         LineOp::Delete => {
-                            dels.push(base_lines[bi].clone());
+                            dels.push(&base_lines[bi]);
                             bi += 1;
                             k += 1;
                         }
@@ -282,7 +290,7 @@ fn print_normal_diff(base_lines: &[String], new_lines: &[String], ops: &[LineOp]
                 while k < ops.len() {
                     match &ops[k] {
                         LineOp::Insert(_) => {
-                            inss.push(new_lines[ni].clone());
+                            inss.push(&new_lines[ni]);
                             ni += 1;
                             k += 1;
                         }
@@ -294,31 +302,37 @@ fn print_normal_diff(base_lines: &[String], new_lines: &[String], ops: &[LineOp]
                 let np = inss.len();
                 if nd > 0 && np > 0 {
                     // Change.
-                    println!("{}c{}", range(del_start + 1, nd), range(ins_start + 1, np));
+                    writeln!(
+                        out,
+                        "{}c{}",
+                        range(del_start + 1, nd),
+                        range(ins_start + 1, np)
+                    )?;
                     for l in &dels {
-                        println!("< {}", l);
+                        line(&mut out, b"< ", l)?;
                     }
-                    println!("---");
+                    writeln!(out, "---")?;
                     for l in &inss {
-                        println!("> {}", l);
+                        line(&mut out, b"> ", l)?;
                     }
                 } else if nd > 0 {
                     // Deletion: lines del_start+1..del_start+nd removed after
                     // new line ins_start.
-                    println!("{}d{}", range(del_start + 1, nd), ins_start);
+                    writeln!(out, "{}d{}", range(del_start + 1, nd), ins_start)?;
                     for l in &dels {
-                        println!("< {}", l);
+                        line(&mut out, b"< ", l)?;
                     }
                 } else if np > 0 {
                     // Addition: lines added after base line del_start.
-                    println!("{}a{}", del_start, range(ins_start + 1, np));
+                    writeln!(out, "{}a{}", del_start, range(ins_start + 1, np))?;
                     for l in &inss {
-                        println!("> {}", l);
+                        line(&mut out, b"> ", l)?;
                     }
                 }
             }
         }
     }
+    Ok(())
 }
 
 /// Apply diff operations to the SCCS body
@@ -326,15 +340,15 @@ fn apply_diff_to_body(
     sccs: &SccsFile,
     applied_set: &HashSet<u16>,
     new_serial: u16,
-    new_lines: &[String],
+    new_lines: &[Vec<u8>],
     diff_ops: &[LineOp],
 ) -> Vec<BodyRecord> {
     // First, collect all lines that need to be deleted or kept
     let mut delete_set = HashSet::new();
-    let mut insert_after: Vec<(usize, Vec<String>)> = Vec::new();
+    let mut insert_after: Vec<(usize, Vec<Vec<u8>>)> = Vec::new();
 
     let mut base_idx = 0;
-    let mut inserts_at_pos: Vec<String> = Vec::new();
+    let mut inserts_at_pos: Vec<Vec<u8>> = Vec::new();
 
     for op in diff_ops {
         match op {
@@ -702,7 +716,7 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
         println!("{}", new_delta.sid);
     }
     if args.print_diff {
-        print_normal_diff(&base_lines, &new_lines, &diff_ops);
+        print_normal_diff(&base_lines, &new_lines, &diff_ops)?;
     }
     if !args.silent {
         println!("{} {}", new_delta.stats.inserted, gettext("inserted"));

@@ -72,125 +72,101 @@ struct Args {
     files: Vec<PathBuf>,
 }
 
-/// Expand SCCS keywords in a line
-fn expand_keywords(
-    line: &str,
-    sccs_file: &SccsFile,
-    delta: &DeltaEntry,
-    sfile_path: &Path,
-    line_number: usize,
-) -> String {
-    let mut result = line.to_string();
+/// The value of each identification keyword `%X%` for one retrieval, indexed
+/// by letter; `None` for a letter that is not a keyword. `%C%`, the line
+/// number, is the one value that changes from line to line, so it is filled
+/// in by [`expand_keywords`] itself.
+///
+/// Built once per file: the values do not depend on the line, and `%P%`
+/// resolves the s-file's absolute path, which is not something to redo for
+/// every line of the body.
+struct KeywordValues([Option<Vec<u8>>; 26]);
 
-    // Get module name (from 'm' flag or filename)
-    let module_name = sccs_file
-        .module_name()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| paths::module_name(sfile_path).unwrap_or_else(|| "unknown".to_string()));
+impl KeywordValues {
+    fn new(sccs_file: &SccsFile, delta: &DeltaEntry, sfile_path: &Path) -> Self {
+        // Module name: the 'm' flag, else the s-file name without its "s."
+        let module_name = sccs_file
+            .module_name()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                paths::module_name(sfile_path).unwrap_or_else(|| "unknown".to_string())
+            });
+        let module_type = sccs_file.module_type().unwrap_or("");
+        let q_value = sccs_file
+            .header
+            .flags
+            .iter()
+            .find_map(|f| match f {
+                SccsFlag::QText(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .unwrap_or("");
+        let now = SccsDateTime::now();
+        let sccs_filename = sfile_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("s.unknown");
+        let abs_path = std::fs::canonicalize(sfile_path)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| sfile_path.to_string_lossy().to_string());
+        let mmddyy = |d: &SccsDateTime| format!("{:02}/{:02}/{:02}", d.month, d.day, d.year);
 
-    // Get module type from 't' flag
-    let module_type = sccs_file.module_type().unwrap_or("");
+        let mut values: [Option<Vec<u8>>; 26] = Default::default();
+        let mut set = |key: u8, value: String| values[(key - b'A') as usize] = Some(value.into());
+        set(b'Z', "@(#)".to_string());
+        set(b'M', module_name.clone());
+        set(b'I', delta.sid.to_string());
+        set(b'R', delta.sid.rel.to_string());
+        set(b'L', delta.sid.lev.to_string());
+        set(b'B', delta.sid.br.to_string());
+        set(b'S', delta.sid.seq.to_string());
+        set(b'D', now.date_string());
+        set(b'H', mmddyy(&now));
+        set(b'T', now.time_string());
+        set(b'E', delta.datetime.date_string());
+        set(b'G', mmddyy(&delta.datetime));
+        set(b'U', delta.datetime.time_string());
+        set(b'Y', module_type.to_string());
+        set(b'F', sccs_filename.to_string());
+        set(b'P', abs_path);
+        set(b'Q', q_value.to_string());
+        set(b'W', format!("@(#){}\t{}", module_name, delta.sid));
+        set(
+            b'A',
+            format!("@(#){} {} {}@(#)", module_type, module_name, delta.sid),
+        );
+        KeywordValues(values)
+    }
+}
 
-    // Get Q flag value
-    let q_value = sccs_file
-        .header
-        .flags
-        .iter()
-        .find_map(|f| {
-            if let SccsFlag::QText(s) = f {
-                Some(s.as_str())
+/// Expand the identification keywords in one body line, `line_number` being
+/// its 1-based position (`%C%`).
+///
+/// One pass, left to right: each `%X%` is replaced by its value and the scan
+/// resumes after it, so a value is never itself expanded -- `%M%` with an `m`
+/// flag of `mod%R%` yields `mod%R%`, as CSSC writes it. Expanding by a chain
+/// of whole-line replacements re-expanded any keyword a value contained. A
+/// `%X%` that is not a keyword is left as it is.
+fn expand_keywords(line: &[u8], values: &KeywordValues, line_number: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(line.len());
+    let mut i = 0;
+    while i < line.len() {
+        if let [b'%', key @ b'A'..=b'Z', b'%', ..] = line[i..] {
+            let value = if key == b'C' {
+                Some(line_number.to_string().into_bytes())
             } else {
-                None
+                values.0[(key - b'A') as usize].clone()
+            };
+            if let Some(value) = value {
+                out.extend_from_slice(&value);
+                i += 3;
+                continue;
             }
-        })
-        .unwrap_or("");
-
-    // Current date/time
-    let now = SccsDateTime::now();
-
-    // SCCS filename
-    let sccs_filename = sfile_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("s.unknown");
-
-    // Absolute path
-    let abs_path = std::fs::canonicalize(sfile_path)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| sfile_path.to_string_lossy().to_string());
-
-    // %Z% = @(#)
-    result = result.replace("%Z%", "@(#)");
-
-    // %M% = module name
-    result = result.replace("%M%", &module_name);
-
-    // %I% = SID (full)
-    result = result.replace("%I%", &delta.sid.to_string());
-
-    // %R% = release
-    result = result.replace("%R%", &delta.sid.rel.to_string());
-
-    // %L% = level
-    result = result.replace("%L%", &delta.sid.lev.to_string());
-
-    // %B% = branch
-    result = result.replace("%B%", &delta.sid.br.to_string());
-
-    // %S% = sequence
-    result = result.replace("%S%", &delta.sid.seq.to_string());
-
-    // %D% = current date YY/MM/DD
-    result = result.replace("%D%", &now.date_string());
-
-    // %H% = current date MM/DD/YY
-    result = result.replace(
-        "%H%",
-        &format!("{:02}/{:02}/{:02}", now.month, now.day, now.year),
-    );
-
-    // %T% = current time HH:MM:SS
-    result = result.replace("%T%", &now.time_string());
-
-    // %E% = delta date YY/MM/DD
-    result = result.replace("%E%", &delta.datetime.date_string());
-
-    // %G% = delta date MM/DD/YY
-    result = result.replace(
-        "%G%",
-        &format!(
-            "{:02}/{:02}/{:02}",
-            delta.datetime.month, delta.datetime.day, delta.datetime.year
-        ),
-    );
-
-    // %U% = delta time HH:MM:SS
-    result = result.replace("%U%", &delta.datetime.time_string());
-
-    // %Y% = module type
-    result = result.replace("%Y%", module_type);
-
-    // %F% = SCCS filename
-    result = result.replace("%F%", sccs_filename);
-
-    // %P% = SCCS absolute pathname
-    result = result.replace("%P%", &abs_path);
-
-    // %Q% = q flag value
-    result = result.replace("%Q%", q_value);
-
-    // %C% = current line number
-    result = result.replace("%C%", &line_number.to_string());
-
-    // %W% = @(#)module<tab>SID (shorthand)
-    let w_value = format!("@(#){}\t{}", module_name, delta.sid);
-    result = result.replace("%W%", &w_value);
-
-    // %A% = @(#)type module SID@(#) (shorthand)
-    let a_value = format!("@(#){} {} {}@(#)", module_type, module_name, delta.sid);
-    result = result.replace("%A%", &a_value);
-
-    result
+        }
+        out.push(line[i]);
+        i += 1;
+    }
+    out
 }
 
 /// Applied (non-removed) deltas. A delta withdrawn by `rmdel` keeps its place
@@ -428,7 +404,7 @@ fn create_pfile_entry(
 }
 
 /// Evaluate body with SID tracking for -m option
-fn evaluate_body_with_sid(sccs: &SccsFile, applied_set: &HashSet<u16>) -> Vec<(String, Sid)> {
+fn evaluate_body_with_sid(sccs: &SccsFile, applied_set: &HashSet<u16>) -> Vec<(Vec<u8>, Sid)> {
     use plib::sccsfile::BodyRecord;
 
     let mut output = Vec::new();
@@ -829,56 +805,50 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
     // Track whether any ID keyword (%X%) appeared in the retrieved text.
     let mut had_keyword = false;
 
-    let lines: Vec<String> = if args.show_sid {
-        // Need to track which delta inserted each line
-        let lines_with_sid = evaluate_body_with_sid(&sccs, &applied_set);
-        let target_delta = sccs.find_delta_by_serial(target_serial).unwrap();
+    let target_delta = sccs.find_delta_by_serial(target_serial).unwrap();
+    let keyword_values = KeywordValues::new(&sccs, target_delta, sfile_path);
 
-        lines_with_sid
+    // The body, each line paired with the SID of the delta that inserted it
+    // when -m wants that prefix.
+    let body: Vec<(Vec<u8>, Option<Sid>)> = if args.show_sid {
+        evaluate_body_with_sid(&sccs, &applied_set)
             .into_iter()
-            .enumerate()
-            .map(|(i, (line, sid))| {
-                if idkw::in_line(&line) {
-                    had_keyword = true;
-                }
-                let expanded = if suppress_keywords {
-                    line
-                } else {
-                    expand_keywords(&line, &sccs, target_delta, sfile_path, i + 1)
-                };
-
-                if args.show_module {
-                    format!("{}\t{}\t{}", module_name, sid, expanded)
-                } else {
-                    format!("{}\t{}", sid, expanded)
-                }
-            })
+            .map(|(line, sid)| (line, Some(sid)))
             .collect()
     } else {
-        let content = sccs.evaluate_body(&applied_set);
-        let target_delta = sccs.find_delta_by_serial(target_serial).unwrap();
-
-        content
+        sccs.evaluate_body(&applied_set)
             .into_iter()
-            .enumerate()
-            .map(|(i, line)| {
-                if idkw::in_line(&line) {
-                    had_keyword = true;
-                }
-                let expanded = if suppress_keywords {
-                    line
-                } else {
-                    expand_keywords(&line, &sccs, target_delta, sfile_path, i + 1)
-                };
-
-                if args.show_module {
-                    format!("{}\t{}", module_name, expanded)
-                } else {
-                    expanded
-                }
-            })
+            .map(|line| (line, None))
             .collect()
     };
+
+    let lines: Vec<Vec<u8>> = body
+        .into_iter()
+        .enumerate()
+        .map(|(i, (line, sid))| {
+            if idkw::contains(&line) {
+                had_keyword = true;
+            }
+            let expanded = if suppress_keywords {
+                line
+            } else {
+                expand_keywords(&line, &keyword_values, i + 1)
+            };
+
+            // -n and -m prefixes, each followed by a tab, module name first.
+            let mut out = Vec::new();
+            if args.show_module {
+                out.extend_from_slice(module_name.as_bytes());
+                out.push(b'\t');
+            }
+            if let Some(sid) = sid {
+                out.extend_from_slice(sid.to_string().as_bytes());
+                out.push(b'\t');
+            }
+            out.extend_from_slice(&expanded);
+            out
+        })
+        .collect();
 
     // "No id keywords" handling. When no keyword was present (and keyword
     // expansion was not suppressed), SCCS warns. If the s-file has the 'i'
@@ -912,7 +882,8 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
     // Write output
     if args.to_stdout {
         for line in &lines {
-            writeln!(Stdout, "{}", line)?;
+            Stdout.write_all(line)?;
+            Stdout.write_all(b"\n")?;
         }
     } else {
         // Write to g-file
@@ -925,7 +896,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
         // which made a second `get` of any file impossible.
         let mut content = Vec::new();
         for line in &lines {
-            content.extend_from_slice(line.as_bytes());
+            content.extend_from_slice(line);
             content.push(b'\n');
         }
         let mode = if args.edit { 0o644 } else { 0o444 };

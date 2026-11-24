@@ -266,7 +266,7 @@ fn create_new_sccs_file(path: &Path, params: NewFileParams) -> io::Result<()> {
         );
     }
 
-    let body_lines: Vec<String> = if encoded {
+    let body_lines: Vec<Vec<u8>> = if encoded {
         flags.push(SccsFlag::Encoded(1));
         plib::sccsfile::uuencode_sccs(&content)
     } else {
@@ -274,7 +274,7 @@ fn create_new_sccs_file(path: &Path, params: NewFileParams) -> io::Result<()> {
         // empty element), matching historical line-oriented storage.
         String::from_utf8_lossy(&content)
             .lines()
-            .map(String::from)
+            .map(|line| line.as_bytes().to_vec())
             .collect()
     };
 

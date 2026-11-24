@@ -19,8 +19,3 @@ pub fn contains(data: &[u8]) -> bool {
     data.windows(3)
         .any(|w| w[0] == b'%' && w[1].is_ascii_uppercase() && w[2] == b'%')
 }
-
-/// Whether `line` contains an identification keyword.
-pub fn in_line(line: &str) -> bool {
-    contains(line.as_bytes())
-}

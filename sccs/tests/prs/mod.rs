@@ -721,3 +721,15 @@ fn option_argument_may_begin_with_hyphen() {
         plib::testing::assert_hyphen_option_argument("prs", &[opt, "-zq", "--help"]);
     }
 }
+
+/// `:GB:` is the delta's text as stored, written byte for byte even where it
+/// is not UTF-8. Like every multi-line keyword ending the dataspec, it is
+/// followed by a blank line (as in CSSC).
+#[test]
+fn prs_gotten_body_is_byte_exact() {
+    let tmp = TempDir::new().unwrap();
+    super::common::write_sfile(tmp.path(), "s.l1", super::common::LATIN1_SFILE);
+    let out = run_in("prs", &["-d:GB:", "s.l1"], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(out.stdout, b"caf\xe9 %I%\nline2\n\n");
+}

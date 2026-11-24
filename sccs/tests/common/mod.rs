@@ -144,3 +144,17 @@ pub fn write_sfile(dir: &Path, name: &str, content: &[u8]) -> PathBuf {
     std::fs::write(&path, data).expect("write s-file");
     path
 }
+
+/// An s-file (after its `^Ah` line) whose body, comment and descriptive
+/// text hold Latin-1 bytes that are not valid UTF-8 -- as CSSC or historical
+/// SCCS writes for a Latin-1 source file -- for [`write_sfile`].
+pub const LATIN1_SFILE: &[u8] = b"\x01s 00002/00000/00000\n\
+\x01d D 1.1 26/01/01 00:00:00 u 1 0\n\
+\x01c caf\xe9 comment\n\
+\x01e\n\
+\x01u\n\x01U\n\
+\x01t\n\xe9t\xe9\n\x01T\n\
+\x01I 1\n\
+caf\xe9 %I%\n\
+line2\n\
+\x01E 1\n";

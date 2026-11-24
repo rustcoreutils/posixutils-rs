@@ -1266,3 +1266,22 @@ fn delta_keeps_carriage_returns() {
     let out = run("get", &["-p", "-k", "-s", "s.crlf"]);
     assert_eq!(out.stdout, b"a\r\nB\r\n");
 }
+
+/// A delta to a file whose text is not UTF-8 diffs and records it byte for
+/// byte, and `delta -p` prints the changed lines as they are.
+#[test]
+fn delta_handles_non_utf8_text() {
+    let tmp = TempDir::new().unwrap();
+    super::common::write_sfile(tmp.path(), "s.l1", super::common::LATIN1_SFILE);
+    let run = |cmd: &str, args: &[&str]| {
+        let out = super::common::run_in(cmd, args, tmp.path(), "");
+        assert!(out.status.success(), "{cmd} {args:?}: {out:?}");
+        out
+    };
+    run("get", &["-e", "-s", "s.l1"]);
+    fs::write(tmp.path().join("l1"), b"caf\xe9 %I%\nna\xefve\n").unwrap();
+    let out = run("delta", &["-s", "-p", "-ychange", "s.l1"]);
+    assert_eq!(out.stdout, b"2c2\n< line2\n---\n> na\xefve\n");
+    let out = run("get", &["-p", "-k", "-s", "s.l1"]);
+    assert_eq!(out.stdout, b"caf\xe9 %I%\nna\xefve\n");
+}

@@ -1488,3 +1488,33 @@ fn get_keeps_carriage_returns() {
     assert!(out.status.success(), "{out:?}");
     assert_eq!(out.stdout, b"a %I%\r\nb\r\n");
 }
+
+/// A body line that is not UTF-8 is retrieved byte for byte, keywords and
+/// all.
+#[test]
+fn get_retrieves_non_utf8_text() {
+    let tmp = TempDir::new().unwrap();
+    super::common::write_sfile(tmp.path(), "s.l1", super::common::LATIN1_SFILE);
+    let out = super::common::run_in("get", &["-p", "-s", "s.l1"], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(out.stdout, b"caf\xe9 1.1\nline2\n");
+}
+
+/// Keywords expand in one pass: a keyword's value is not itself expanded,
+/// so an `m` flag of `mod%R%` yields `mod%R%` for `%M%`, as CSSC writes it.
+#[test]
+fn get_expands_keywords_in_one_pass() {
+    let tmp = TempDir::new().unwrap();
+    let out = super::common::run_in(
+        "admin",
+        &["-i", "-fmmod%R%", "-fq%I%", "s.kw"],
+        tmp.path(),
+        "m=%M% q=%Q% w=%W%\n",
+    );
+    assert!(out.status.success(), "{out:?}");
+    let out = super::common::run_in("get", &["-p", "-s", "s.kw"], tmp.path(), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "m=mod%R% q=%I% w=@(#)mod%R%\t1.1\n"
+    );
+}

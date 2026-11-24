@@ -9,7 +9,7 @@
 
 //! prs - print SCCS file information
 
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -134,8 +134,11 @@ fn expand_keywords(
     sccs: &SccsFile,
     delta: &DeltaEntry,
     sfile_path: &Path,
-) -> (String, bool) {
-    let mut result = String::new();
+) -> (Vec<u8>, bool) {
+    let mut result: Vec<u8> = Vec::new();
+    let push_char = |result: &mut Vec<u8>, c: char| {
+        result.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes())
+    };
     let mut last_was_multiline = false;
     let chars: Vec<char> = format.chars().collect();
     let mut i = 0;
@@ -162,13 +165,13 @@ fn expand_keywords(
                     // (e.g. :MR: for a delta with no MRs) emits nothing, not a
                     // blank line.
                     if !value.is_empty() {
-                        for line in value.split('\n') {
-                            result.push_str(line);
-                            result.push('\n');
+                        for line in value.split(|&b| b == b'\n') {
+                            result.extend_from_slice(line);
+                            result.push(b'\n');
                         }
                     }
                 } else {
-                    result.push_str(&value);
+                    result.extend_from_slice(&value);
                 }
                 last_was_multiline = multiline && !value.is_empty();
                 i = j + 1;
@@ -176,32 +179,32 @@ fn expand_keywords(
             }
             // Not a recognized keyword - emit the ':' literally and continue
             // scanning from the next character (so "::" prints verbatim).
-            result.push(':');
+            result.push(b':');
             last_was_multiline = false;
             i += 1;
         } else if c == '\\' {
             // Handle escape sequences.
             match chars.get(i + 1) {
                 Some('n') => {
-                    result.push('\n');
+                    result.push(b'\n');
                     i += 2;
                 }
                 Some('t') => {
-                    result.push('\t');
+                    result.push(b'\t');
                     i += 2;
                 }
                 Some('\\') => {
-                    result.push('\\');
+                    result.push(b'\\');
                     i += 2;
                 }
                 _ => {
-                    result.push(c);
+                    push_char(&mut result, c);
                     i += 1;
                 }
             }
             last_was_multiline = false;
         } else {
-            result.push(c);
+            push_char(&mut result, c);
             last_was_multiline = false;
             i += 1;
         }
@@ -210,12 +213,21 @@ fn expand_keywords(
     (result, last_was_multiline)
 }
 
+/// The value of one data keyword. Most are text prs composes; `:GB:` is the
+/// delta's body as stored, which need not be UTF-8, so the value is bytes.
 fn expand_single_keyword(
     keyword: &str,
     sccs: &SccsFile,
     delta: &DeltaEntry,
     sfile_path: &Path,
-) -> String {
+) -> Vec<u8> {
+    match keyword {
+        "GB" => gotten_body(sccs, delta.serial),
+        _ => keyword_text(keyword, sccs, delta, sfile_path).into_bytes(),
+    }
+}
+
+fn keyword_text(keyword: &str, sccs: &SccsFile, delta: &DeltaEntry, sfile_path: &Path) -> String {
     match keyword {
         // Global keywords
         "BF" => flag_yes_no(has_flag(&sccs.header.flags, |f| {
@@ -300,11 +312,11 @@ fn expand_single_keyword(
         // Version-specific keywords
         "A" => format!(
             "{}{} {} {}{}",
-            expand_single_keyword("Z", sccs, delta, sfile_path),
-            expand_single_keyword("Y", sccs, delta, sfile_path),
-            expand_single_keyword("M", sccs, delta, sfile_path),
-            expand_single_keyword("I", sccs, delta, sfile_path),
-            expand_single_keyword("Z", sccs, delta, sfile_path),
+            keyword_text("Z", sccs, delta, sfile_path),
+            keyword_text("Y", sccs, delta, sfile_path),
+            keyword_text("M", sccs, delta, sfile_path),
+            keyword_text("I", sccs, delta, sfile_path),
+            keyword_text("Z", sccs, delta, sfile_path),
         ),
         "B" => {
             if delta.sid.br > 0 {
@@ -315,7 +327,6 @@ fn expand_single_keyword(
         }
         "C" => delta.comments.join("\n"),
         // Gotten body: reconstruct this delta's source text.
-        "GB" => gotten_body(sccs, delta.serial),
         "D" => delta.datetime.date_string(),
         "Dd" => format!("{:02}", delta.datetime.day),
         "Dg" => delta
@@ -368,13 +379,13 @@ fn expand_single_keyword(
         "DS" => delta.serial.to_string(),
         "Dt" => format!(
             "{} {} {} {} {} {} {}",
-            expand_single_keyword("DT", sccs, delta, sfile_path),
-            expand_single_keyword("I", sccs, delta, sfile_path),
-            expand_single_keyword("D", sccs, delta, sfile_path),
-            expand_single_keyword("T", sccs, delta, sfile_path),
-            expand_single_keyword("P", sccs, delta, sfile_path),
-            expand_single_keyword("DS", sccs, delta, sfile_path),
-            expand_single_keyword("DP", sccs, delta, sfile_path),
+            keyword_text("DT", sccs, delta, sfile_path),
+            keyword_text("I", sccs, delta, sfile_path),
+            keyword_text("D", sccs, delta, sfile_path),
+            keyword_text("T", sccs, delta, sfile_path),
+            keyword_text("P", sccs, delta, sfile_path),
+            keyword_text("DS", sccs, delta, sfile_path),
+            keyword_text("DP", sccs, delta, sfile_path),
         ),
         "DT" => match delta.delta_type {
             DeltaType::Normal => "D",
@@ -409,9 +420,9 @@ fn expand_single_keyword(
         "Ts" => format!("{:02}", delta.datetime.second),
         "W" => format!(
             "{}{}\t{}",
-            expand_single_keyword("Z", sccs, delta, sfile_path),
-            expand_single_keyword("M", sccs, delta, sfile_path),
-            expand_single_keyword("I", sccs, delta, sfile_path),
+            keyword_text("Z", sccs, delta, sfile_path),
+            keyword_text("M", sccs, delta, sfile_path),
+            keyword_text("I", sccs, delta, sfile_path),
         ),
         "Z" => "@(#)".to_string(),
 
@@ -421,24 +432,23 @@ fn expand_single_keyword(
 }
 
 /// Reconstruct the gotten body (source text) of the delta with `serial`.
-fn gotten_body(sccs: &SccsFile, serial: u16) -> String {
+fn gotten_body(sccs: &SccsFile, serial: u16) -> Vec<u8> {
     let applied_set = match sccs.compute_applied_set(serial) {
         Ok(set) => set,
-        Err(_) => return String::new(),
+        Err(_) => return Vec::new(),
     };
 
     if sccs.is_encoded() {
         let encoded = sccs.evaluate_body(&applied_set);
-        let raw = plib::sccsfile::uudecode_sccs(&encoded);
-        let mut s = String::from_utf8_lossy(&raw).into_owned();
+        let mut raw = plib::sccsfile::uudecode_sccs(&encoded);
         // The M-format expander newline-terminates each line, so drop a single
         // trailing newline to avoid emitting a spurious blank line.
-        if s.ends_with('\n') {
-            s.pop();
+        if raw.ends_with(b"\n") {
+            raw.pop();
         }
-        s
+        raw
     } else {
-        sccs.evaluate_body(&applied_set).join("\n")
+        sccs.evaluate_body(&applied_set).join(&b"\n"[..])
     }
 }
 
@@ -483,7 +493,7 @@ fn prs_file(sfile: &Path, args: &Args) -> io::Result<bool> {
         // Since :PN: doesn't depend on delta, use the first one
         if let Some(first_delta) = sccs.header.deltas.first() {
             let (header, _) = expand_keywords(DEFAULT_HEADER_FORMAT, &sccs, first_delta, sfile);
-            print!("{}", header);
+            io::stdout().write_all(&header)?;
         }
     }
 
@@ -583,10 +593,10 @@ fn prs_file(sfile: &Path, args: &Args) -> io::Result<bool> {
     // token was not a multi-line keyword.
     for delta in deltas_to_print {
         let (mut output, last_was_multiline) = expand_keywords(format, &sccs, delta, sfile);
-        if last_was_multiline || !output.ends_with('\n') {
-            output.push('\n');
+        if last_was_multiline || !output.ends_with(b"\n") {
+            output.push(b'\n');
         }
-        print!("{}", output);
+        io::stdout().write_all(&output)?;
     }
 
     Ok(true)

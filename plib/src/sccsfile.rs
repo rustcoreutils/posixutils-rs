@@ -377,13 +377,13 @@ pub fn real_login_name() -> String {
 /// records (of the applied set) in order; decoding uses the historical
 /// `uuencode` mapping (6-bit value `v` encoded as `v + 0x20`, space for zero),
 /// and a count-0 line terminates the stream.
-pub fn uudecode_sccs(lines: &[String]) -> Vec<u8> {
+pub fn uudecode_sccs<L: AsRef<[u8]>>(lines: &[L]) -> Vec<u8> {
     fn dec(c: u8) -> u8 {
         c.wrapping_sub(0x20) & 0x3f
     }
     let mut out = Vec::new();
     for line in lines {
-        let b = line.as_bytes();
+        let b = line.as_ref();
         if b.is_empty() {
             continue;
         }
@@ -422,7 +422,7 @@ pub fn uudecode_sccs(lines: &[String]) -> Vec<u8> {
 
 /// Encode raw bytes into SCCS-uuencoded body text lines (45 bytes per line),
 /// terminated by a count-0 line, matching historical SCCS / CSSC output.
-pub fn uuencode_sccs(data: &[u8]) -> Vec<String> {
+pub fn uuencode_sccs(data: &[u8]) -> Vec<Vec<u8>> {
     fn enc(v: u8) -> u8 {
         (v & 0x3f) + 0x20
     }
@@ -439,10 +439,9 @@ pub fn uuencode_sccs(data: &[u8]) -> Vec<String> {
             line.push(enc((b1 << 2) | (b2 >> 6)));
             line.push(enc(b2));
         }
-        // Bytes are all in 0x20..=0x5f, so this is always valid UTF-8.
-        lines.push(String::from_utf8(line).unwrap());
+        lines.push(line);
     }
-    lines.push(" ".to_string()); // count-0 terminator
+    lines.push(b" ".to_vec()); // count-0 terminator
     lines
 }
 
@@ -813,8 +812,9 @@ pub enum BodyRecord {
     Delete(u16),
     /// ^AE <serial> - End block
     End(u16),
-    /// Plain text line
-    Text(String),
+    /// Plain text line: the bytes stored, which need not be UTF-8 (SCCS
+    /// keeps whatever the file held)
+    Text(Vec<u8>),
 }
 
 // =============================================================================
@@ -967,7 +967,10 @@ impl SccsFile {
                 BodyRecord::Insert(serial) => writeln!(writer, "\x01I {}", serial)?,
                 BodyRecord::Delete(serial) => writeln!(writer, "\x01D {}", serial)?,
                 BodyRecord::End(serial) => writeln!(writer, "\x01E {}", serial)?,
-                BodyRecord::Text(line) => writeln!(writer, "{}", line)?,
+                BodyRecord::Text(line) => {
+                    writer.write_all(line)?;
+                    writer.write_all(b"\n")?;
+                }
             }
         }
 
@@ -1112,7 +1115,7 @@ impl SccsFile {
     // =========================================================================
 
     /// Evaluate the body to produce file content for a given set of deltas
-    pub fn evaluate_body(&self, applied_set: &HashSet<u16>) -> Vec<String> {
+    pub fn evaluate_body(&self, applied_set: &HashSet<u16>) -> Vec<Vec<u8>> {
         let mut output = Vec::new();
         let mut stack: Vec<(bool, u16)> = Vec::new(); // (is_insert, serial)
 
@@ -1834,14 +1837,12 @@ impl<'a> SccsParser<'a> {
                     }
                     _ => {
                         // Unknown control line in body, treat as text
-                        let text = std::str::from_utf8(line).unwrap_or("");
-                        body.push(BodyRecord::Text(text.to_string()));
+                        body.push(BodyRecord::Text(line.to_vec()));
                     }
                 }
             } else {
                 // Text line
-                let text = std::str::from_utf8(line).unwrap_or("");
-                body.push(BodyRecord::Text(text.to_string()));
+                body.push(BodyRecord::Text(line.to_vec()));
             }
         }
 
@@ -2372,8 +2373,8 @@ mod tests {
         // Exact CSSC encoding for this input (space-for-zero uuencode).
         let data = b"\x00\x01hello";
         let enc = uuencode_sccs(data);
-        assert_eq!(enc[0], "'  %H96QL;P  ");
-        assert_eq!(enc[1], " "); // count-0 terminator
+        assert_eq!(enc[0], b"'  %H96QL;P  ");
+        assert_eq!(enc[1], b" "); // count-0 terminator
         assert_eq!(uudecode_sccs(&enc), data);
 
         // Round-trip a range of binary payloads of varying lengths.
@@ -2569,9 +2570,9 @@ mod tests {
 
         // Should have 3 lines: line1, line2, line3
         assert_eq!(content.len(), 3, "Expected 3 lines of content");
-        assert_eq!(content[0], "line1");
-        assert_eq!(content[1], "line2");
-        assert_eq!(content[2], "line3");
+        assert_eq!(content[0], b"line1");
+        assert_eq!(content[1], b"line2");
+        assert_eq!(content[2], b"line3");
     }
 
     #[test]
@@ -2629,7 +2630,7 @@ mod tests {
         let content = sccs.evaluate_body(&applied);
 
         // Content should contain keyword markers
-        let content_str = content.join("\n");
+        let content_str = String::from_utf8(content.join(&b"\n"[..])).unwrap();
         assert!(
             content_str.contains("%"),
             "Content should contain SCCS keyword markers"
@@ -2731,7 +2732,7 @@ mod tests {
         let sccs = SccsFile::from_bytes(&data).unwrap();
         let applied = sccs.compute_applied_set(1).unwrap();
         let body = sccs.evaluate_body(&applied);
-        assert_eq!(body, ["a\r", "b\r"]);
+        assert_eq!(body, [b"a\r", b"b\r"]);
         assert_eq!(sccs.to_bytes(), data, "a rewrite must be byte-identical");
     }
 

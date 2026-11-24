@@ -714,3 +714,20 @@ fn admin_unreadable_input_names_the_system_error() {
         expected_exit_code: 1,
     });
 }
+
+/// Rewriting an s-file (here to set a flag) keeps body text that is not
+/// UTF-8 byte for byte. It used to be decoded as UTF-8 with a fallback of
+/// "", so one `admin -fb` blanked every such line, with a valid checksum.
+#[test]
+fn admin_rewrite_keeps_non_utf8_body() {
+    let tmp = TempDir::new().unwrap();
+    let s = super::common::write_sfile(tmp.path(), "s.l1", super::common::LATIN1_SFILE);
+    let out = super::common::run_in("admin", &["-fb", "s.l1"], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    let data = fs::read(&s).unwrap();
+    assert!(
+        data.windows(14).any(|w| w == b"\ncaf\xe9 %I%\nline"),
+        "body line lost: {:?}",
+        String::from_utf8_lossy(&data)
+    );
+}

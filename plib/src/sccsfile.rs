@@ -2290,8 +2290,22 @@ pub mod paths {
     ///   `s.*` members (sorted; non-SCCS files silently ignored);
     /// - every other operand passes through verbatim, so the caller can still
     ///   diagnose an explicitly named non-SCCS file.
+    ///
+    /// A file the user may not read is dropped from a directory's members and
+    /// from a standard-input list: "non-SCCS files and unreadable files
+    /// shall be silently ignored" there. One named as an operand is kept, for
+    /// the caller to diagnose; so is one that does not exist, which `admin -n`
+    /// is about to create.
     pub fn expand_operands(operands: &[PathBuf]) -> Vec<PathBuf> {
         use std::io::BufRead;
+
+        /// Whether `p` exists but may not be read by this user.
+        fn unreadable(p: &Path) -> bool {
+            matches!(
+                std::fs::File::open(p),
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied
+            )
+        }
 
         fn push(p: PathBuf, out: &mut Vec<PathBuf>) {
             if p.is_dir() {
@@ -2299,7 +2313,7 @@ pub mod paths {
                     let mut members: Vec<PathBuf> = entries
                         .flatten()
                         .map(|e| e.path())
-                        .filter(|q| is_sfile(q))
+                        .filter(|q| is_sfile(q) && !unreadable(q))
                         .collect();
                     members.sort();
                     out.extend(members);
@@ -2322,7 +2336,7 @@ pub mod paths {
                     continue;
                 }
                 let path = PathBuf::from(trimmed);
-                if path.is_dir() || is_sfile(&path) {
+                if path.is_dir() || (is_sfile(&path) && !unreadable(&path)) {
                     push(path, &mut out);
                 }
             }

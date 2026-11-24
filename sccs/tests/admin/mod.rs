@@ -859,3 +859,46 @@ two\n\x01e\n\x01u\n\x01U\n\x01t\n\x01T\n\x01I 1\nbody %I%\n\x01E 1\n",
         fs::remove_file(&s).unwrap();
     }
 }
+
+/// "Non-SCCS files and unreadable files shall be silently ignored" when a
+/// directory, or a list on standard input, names them (POSIX admin
+/// 84116-84123): an s-file the user cannot read is skipped without a
+/// diagnostic, and the others are still processed.
+#[test]
+fn unreadable_members_are_silently_ignored() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root can read anything
+    }
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("d");
+    fs::create_dir(&dir).unwrap();
+    for name in ["s.a", "s.b"] {
+        let out = super::common::run_in("admin", &["-n", name], &dir, "");
+        assert!(out.status.success(), "{out:?}");
+    }
+    fs::set_permissions(dir.join("s.b"), fs::Permissions::from_mode(0o000)).unwrap();
+
+    let check = |out: Output, what: &str| {
+        assert!(out.status.success(), "{what}: {out:?}");
+        assert!(out.stderr.is_empty(), "{what}: {out:?}");
+    };
+    check(
+        super::common::run_in("admin", &["-fb", "d"], tmp.path(), ""),
+        "directory",
+    );
+    check(
+        super::common::run_in("admin", &["-fj", "-"], tmp.path(), "d/s.a\nd/s.b\n"),
+        "stdin list",
+    );
+    check(
+        super::common::run_in("prs", &["-d:I:", "d"], tmp.path(), ""),
+        "prs directory",
+    );
+    let out = super::common::run_in("prs", &["-d:FL:", "d/s.a"], tmp.path(), "");
+    let flags = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        flags.contains("branch") && flags.contains("joint edit"),
+        "{flags}"
+    );
+}

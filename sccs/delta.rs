@@ -12,9 +12,8 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
 use clap::Parser;
 use gettextrs::gettext;
@@ -517,29 +516,8 @@ fn gather_mrs(
 
     // If the v flag names a validation program, run it with the MRs as args.
     if let Some(prog) = v_flag.flatten() {
-        if !prog.is_empty() {
-            // The program is a pathname the s-file stores as bytes.
-            let prog = std::ffi::OsStr::from_bytes(&prog);
-            match Command::new(prog).args(&mrs).status() {
-                Ok(status) if status.success() => {}
-                Ok(_) => {
-                    eprintln!(
-                        "delta: {}: {}",
-                        sfile_path.display(),
-                        gettext("MR validation failed.")
-                    );
-                    return Ok(None);
-                }
-                Err(e) => {
-                    eprintln!(
-                        "delta: {}: {}: {}",
-                        sfile_path.display(),
-                        prog.to_string_lossy(),
-                        plib::diag::io_error_text(&e)
-                    );
-                    return Ok(None);
-                }
-            }
+        if !prog.is_empty() && !mrlist::validate("delta", sfile_path, &prog, &mrs) {
+            return Ok(None);
         }
     }
 

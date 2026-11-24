@@ -971,3 +971,56 @@ fn admin_rejects_values_that_would_break_the_header() {
         );
     }
 }
+
+/// When the `v` flag names a validation program, admin runs it on the MRs of
+/// the initial delta, and "a diagnostic message shall be written if ... MR
+/// validation fails" (POSIX admin 84102-84106): no file is created.
+#[test]
+fn admin_runs_the_mr_validation_program() {
+    let tmp = TempDir::new().unwrap();
+    let out = run_in(
+        "admin",
+        &["-n", "-fv/bin/false", "-mMR1", "s.no"],
+        tmp.path(),
+        "",
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("MR validation failed"),
+        "{out:?}"
+    );
+    assert!(!tmp.path().join("s.no").exists());
+
+    let out = run_in(
+        "admin",
+        &["-n", "-fv/bin/true", "-mMR1", "s.yes"],
+        tmp.path(),
+        "",
+    );
+    assert!(out.status.success(), "{out:?}");
+    let out = run_in("prs", &["-d:MR:", "s.yes"], tmp.path(), "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "MR1");
+}
+
+/// With the `v` flag set on create, "the m option is also used even if its
+/// value is null" (POSIX admin 84077-84079): `-m ''` satisfies it. And on an
+/// existing file, `-m` is diagnosed by whether *that file* has the `v` flag,
+/// not by whether this command line sets it.
+#[test]
+fn admin_m_follows_the_v_flag_of_the_file() {
+    let tmp = TempDir::new().unwrap();
+    let out = run_in("admin", &["-n", "-fv", "-m", "", "s.null"], tmp.path(), "");
+    assert!(out.status.success(), "a null -m must satisfy -fv: {out:?}");
+
+    // The file has v: -m is accepted (it has no initial delta left to mark).
+    let out = run_in("admin", &["-mMR2", "s.null"], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+
+    // A file without v: -m is diagnosed, and the file is untouched.
+    let s = admin_create(tmp.path(), "plain", "body\n");
+    let before = fs::read(&s).unwrap();
+    let out = run_in("admin", &["-mMR2", "-fb", "s.plain"], tmp.path(), "");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("'v' flag"));
+    assert_eq!(fs::read(&s).unwrap(), before);
+}

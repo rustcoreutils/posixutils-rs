@@ -209,6 +209,11 @@ fn check_login(login: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The diagnostic for `-m` without the `v` flag, in CSSC's wording.
+fn mrs_need_v_flag() -> String {
+    gettext("MRs not enabled with 'v' flag, can't use 'm' keyword.")
+}
+
 /// Inputs for creating a new SCCS file.
 struct NewFileParams<'a> {
     content: Vec<u8>,
@@ -419,6 +424,7 @@ fn modify_existing_file(
     delete_flags: Vec<char>,
     add_users: Vec<String>,
     remove_users: Vec<String>,
+    mrs_given: bool,
 ) -> io::Result<()> {
     // Per-command z-file lock around the modify.
     let _zlock = zlock::acquire(path)?;
@@ -443,6 +449,16 @@ fn modify_existing_file(
         let fc = flag.flag_char();
         sccs.header.flags.retain(|f| f.flag_char() != fc);
         sccs.header.flags.push(flag);
+    }
+
+    // -m needs the v flag: the one this file ends up with, whether it had
+    // it already or this command sets it. (There is no initial delta left
+    // for the MRs to mark, so with the flag set they change nothing.)
+    if mrs_given && sccs.mr_program().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            mrs_need_v_flag(),
+        ));
     }
 
     // Add users
@@ -524,24 +540,15 @@ fn main() -> ExitCode {
         }
     }
 
-    // Determine whether the 'v' (MR validation) flag is being set, for -m
-    // consistency checks on create.
-    let setting_v_flag = add_flags
-        .iter()
-        .any(|f| matches!(f, SccsFlag::MrValidation(_)));
+    // The 'v' (MR validation) flag this command line sets, if any: the outer
+    // Option is "being set", the inner one its validation program.
+    let v_flag_set: Option<Option<&[u8]>> = add_flags.iter().find_map(|f| match f {
+        SccsFlag::MrValidation(program) => Some(program.as_deref()),
+        _ => None,
+    });
 
     // Parse -m MR numbers (whitespace-separated list).
     let mr_numbers: Vec<String> = mrlist::parse(args.mrlist.as_deref());
-
-    // -m requires the v flag (spec: "the application shall ensure that the v
-    // flag is set"). Diagnose using cssc-compatible wording.
-    if !mr_numbers.is_empty() && !setting_v_flag {
-        eprintln!(
-            "admin: {}",
-            gettext("MRs not enabled with 'v' flag, can't use 'm' keyword.")
-        );
-        return ExitCode::FAILURE;
-    }
 
     // Parse flags to delete
     let delete_flags: Vec<char> = args
@@ -638,15 +645,28 @@ fn main() -> ExitCode {
                 }
             };
 
-            // v flag set on create requires MR numbers via -m.
-            if setting_v_flag && mr_numbers.is_empty() {
-                eprintln!(
-                    "admin: {}: {}",
-                    file_path.display(),
-                    gettext("MR number(s) must be supplied.")
-                );
+            // -m and the v flag go together on create: "the application
+            // shall ensure that the v flag is set" for -m, and with v "the m
+            // option is also used even if its value is null" (POSIX
+            // 84077-84079, 84102-84106). MRs that are given are validated by
+            // the flag's program, if it names one.
+            let mr_problem = match (v_flag_set, &args.mrlist) {
+                (None, Some(_)) => Some(mrs_need_v_flag()),
+                (Some(_), None) => Some(gettext("MR number(s) must be supplied.")),
+                _ => None,
+            };
+            if let Some(problem) = mr_problem {
+                diag::error_path("admin", file_path, &problem);
                 exit_code = ExitCode::FAILURE;
                 continue;
+            }
+            if let Some(Some(program)) = v_flag_set {
+                if !mr_numbers.is_empty()
+                    && !mrlist::validate("admin", file_path, program, &mr_numbers)
+                {
+                    exit_code = ExitCode::FAILURE;
+                    continue;
+                }
             }
 
             // Get comment: bare -y or -ytext both supply an explicit comment
@@ -713,6 +733,7 @@ fn main() -> ExitCode {
                 delete_flags.clone(),
                 args.add_users.clone(),
                 args.erase_users.clone(),
+                args.mrlist.is_some(),
             ) {
                 eprintln!(
                     "admin: {}: {}",

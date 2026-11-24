@@ -41,7 +41,7 @@ impl ZLock {
     /// [`io::ErrorKind::AlreadyExists`] if another process already holds it.
     pub fn acquire(sfile: &Path) -> io::Result<ZLock> {
         use std::io::Write as _;
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::OpenOptionsExt;
 
         let zfile = paths::zfile_from_sfile(sfile);
 
@@ -52,10 +52,13 @@ impl ZLock {
         // every later `get -e` / `delta` on that file failed with "being
         // edited" until somebody deleted it by hand: exactly the state the
         // registry exists to prevent.
+        // Created read-only (POSIX get 99230), which does not stop this
+        // descriptor writing to it.
         let blocked = SigintBlock::new();
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o444)
             .open(&zfile)?;
         register_cleanup(&zfile);
         drop(blocked);
@@ -63,15 +66,12 @@ impl ZLock {
         // The lock is registered from here on, so an interrupt removes it --
         // but a *failure* has to do the same by hand, or the file it just
         // created outlives the process that failed to fill it in.
-        let filled = (|| -> io::Result<()> {
-            // Record the locking PID, matching historical SCCS / CSSC.
-            writeln!(f, "{}", std::process::id())?;
-            f.flush()?;
-            // SCCS z-files are read-only (r--r--r--). Set on the descriptor,
-            // not the name, so it is the file just made that changes.
-            f.set_permissions(std::fs::Permissions::from_mode(0o444))
-        })();
-        if let Err(e) = filled {
+        //
+        // "Its contents shall be the binary process ID of the command ...
+        // that created it" (POSIX get 99228-99229): the pid_t as it is in
+        // memory, written in one go, as SCCS writes it.
+        let pid: libc::pid_t = unsafe { libc::getpid() };
+        if let Err(e) = f.write_all(&pid.to_ne_bytes()) {
             unregister_cleanup(&zfile);
             let _ = std::fs::remove_file(&zfile);
             return Err(e);

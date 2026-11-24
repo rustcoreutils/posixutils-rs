@@ -937,3 +937,28 @@ fn remove_delta_keeps_other_deltas_markers() {
     );
     sccs.check_weave().unwrap();
 }
+
+/// The z-file is as POSIX describes it (get 99227-99230): "its contents
+/// shall be the binary process ID of the command ... that created it", and
+/// it "shall be created read-only". It lasts as long as the lock is held.
+#[test]
+fn the_z_file_holds_the_binary_process_id() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = crate::tmp::tempdir().unwrap();
+    let sfile = dir.path().join("s.locked");
+    let zfile = dir.path().join("z.locked");
+
+    let lock = ZLock::acquire(&sfile).unwrap();
+    let pid = unsafe { libc::getpid() };
+    assert_eq!(std::fs::read(&zfile).unwrap(), pid.to_ne_bytes());
+    let mode = std::fs::metadata(&zfile).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode & 0o222, 0, "read-only, got {mode:o}");
+
+    // Held: a second lock is refused, and the first is not disturbed.
+    let again = ZLock::acquire(&sfile).unwrap_err();
+    assert_eq!(again.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(zfile.exists());
+
+    drop(lock);
+    assert!(!zfile.exists(), "released with the lock");
+}

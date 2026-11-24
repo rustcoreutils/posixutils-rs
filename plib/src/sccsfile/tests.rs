@@ -868,3 +868,46 @@ fn random_histories_keep_every_version_and_stay_well_formed() {
         }
     }
 }
+
+/// The verdict of the open blocks is that of the newest delta with a say,
+/// whatever order the blocks were opened in: checked against a direct
+/// statement of the rule over random sets of open blocks.
+#[test]
+fn open_blocks_ask_the_newest_delta_with_a_say() {
+    let mut rng = Rng(0x5eed);
+    for _ in 0..2000 {
+        let applied: HashSet<u16> = (1..=8u16).filter(|_| rng.below(2) == 0).collect();
+        let mut serials: Vec<u16> = (1..=8u16).filter(|_| rng.below(2) == 0).collect();
+        // Open them in a random order.
+        for i in (1..serials.len()).rev() {
+            serials.swap(i, rng.below(i + 1));
+        }
+        let kinds: Vec<(u16, BlockKind)> = serials
+            .iter()
+            .map(|&s| (s, [BlockKind::Insert, BlockKind::Delete][rng.below(2)]))
+            .collect();
+        let mut blocks = OpenBlocks::new(&applied);
+        for &(serial, kind) in &kinds {
+            blocks.open(kind, serial);
+        }
+
+        let mut by_serial = kinds.clone();
+        by_serial.sort_by_key(|&(serial, _)| std::cmp::Reverse(serial));
+        let expected = by_serial
+            .iter()
+            .find(|&&(serial, kind)| kind == BlockKind::Insert || applied.contains(&serial))
+            .and_then(|&(serial, kind)| {
+                (kind == BlockKind::Insert && applied.contains(&serial)).then_some(serial)
+            });
+        assert_eq!(blocks.kept_by(), expected, "{kinds:?} applied {applied:?}");
+
+        // Closing a block leaves the verdict of the rest.
+        if let Some(&(gone, _)) = kinds.first() {
+            blocks.close(gone);
+            assert!(
+                !blocks.is_open(BlockKind::Insert, gone)
+                    && !blocks.is_open(BlockKind::Delete, gone)
+            );
+        }
+    }
+}

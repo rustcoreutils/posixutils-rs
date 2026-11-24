@@ -229,3 +229,18 @@ pub fn assert_only_changed(before: &[u8], after: &[u8], removed: &[&[u8]], added
         "the checksum line is not the checksum of the file"
     );
 }
+
+/// The delta table of a three-delta trunk (1.1, 1.2, 1.3; serials 1, 2, 3)
+/// with an empty user list and descriptive text, for hand-built weaves.
+pub const THREE_DELTAS: &[u8] = b"\x01s 00001/00000/00000\n\
+\x01d D 1.3 26/01/03 00:00:00 u 3 2\n\x01c three\n\x01e\n\
+\x01s 00001/00000/00000\n\
+\x01d D 1.2 26/01/02 00:00:00 u 2 1\n\x01c two\n\x01e\n\
+\x01s 00001/00000/00000\n\
+\x01d D 1.1 26/01/01 00:00:00 u 1 0\n\x01c one\n\x01e\n\
+\x01u\n\x01U\n\x01t\n\x01T\n";
+
+/// [`write_sfile`] for a body under [`THREE_DELTAS`].
+pub fn write_weave(dir: &Path, name: &str, body: &[u8]) -> PathBuf {
+    write_sfile(dir, name, &[THREE_DELTAS, body].concat())
+}

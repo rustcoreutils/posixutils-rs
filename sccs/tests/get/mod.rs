@@ -1549,3 +1549,47 @@ fn get_reads_overlapping_blocks() {
     let out = super::common::run_in("val", &["s.o"], tmp.path(), "");
     assert_eq!(out.status.code(), Some(0), "{out:?}");
 }
+
+/// Of the blocks open around a line, the one with the highest serial that
+/// has a say decides whether the line is in the version: an applied insert
+/// keeps it, an insert not applied or an applied delete drops it, and a
+/// delete not applied has no say. That is historical SCCS's rule, and
+/// CSSC's; ours was "every open insert applied and no open delete applied",
+/// which gives another answer as soon as blocks of several deltas are open
+/// at once. The expected text and inserting SIDs are CSSC's.
+#[test]
+fn get_keeps_a_line_by_the_newest_open_block() {
+    let tmp = TempDir::new().unwrap();
+    let get = |file: &str, args: &[&str]| -> String {
+        let mut argv = vec!["-p", "-k", "-s"];
+        argv.extend_from_slice(args);
+        argv.push(file);
+        let out = super::common::run_in("get", &argv, tmp.path(), "");
+        assert!(out.status.success(), "get {args:?} {file}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).replace('\n', ",")
+    };
+
+    // Delta 3 inserted a line inside a block delta 2 deleted.
+    super::common::write_weave(
+        tmp.path(),
+        "s.b",
+        b"\x01I 1\na\n\x01D 2\nb\n\x01I 3\nc\n\x01E 3\nd\n\x01E 2\ne\n\x01E 1\n",
+    );
+    assert_eq!(get("s.b", &["-r1.3"]), "a,c,e,");
+    assert_eq!(get("s.b", &["-r1.3", "-m"]), "1.1\ta,1.3\tc,1.1\te,");
+    assert_eq!(get("s.b", &["-r1.2"]), "a,e,");
+    assert_eq!(get("s.b", &["-r1.3", "-x1.2"]), "a,b,c,d,e,");
+    assert_eq!(get("s.b", &["-r1.3", "-x1.1"]), "c,");
+
+    // Delta 2 inserted a line inside delta 1's block; with 1 excluded, the
+    // line delta 2 inserted is still there.
+    super::common::write_weave(
+        tmp.path(),
+        "s.a",
+        b"\x01I 1\na\n\x01I 2\nb\n\x01E 2\nc\n\x01E 1\n",
+    );
+    assert_eq!(get("s.a", &["-r1.3"]), "a,b,c,");
+    assert_eq!(get("s.a", &["-r1.3", "-x1.1"]), "b,");
+    assert_eq!(get("s.a", &["-r1.3", "-x1.1", "-m"]), "1.2\tb,");
+    assert_eq!(get("s.a", &["-r1.3", "-x1.2"]), "a,c,");
+}

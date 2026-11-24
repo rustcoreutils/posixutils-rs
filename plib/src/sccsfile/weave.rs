@@ -41,7 +41,7 @@ pub enum BlockKind {
 #[derive(Debug)]
 pub struct OpenBlocks<'a> {
     applied: &'a HashSet<u16>,
-    /// In the order opened.
+    /// Highest serial first: the order in which they are asked.
     open: Vec<(u16, BlockKind)>,
 }
 
@@ -56,20 +56,22 @@ impl<'a> OpenBlocks<'a> {
 
     /// `^AI serial` or `^AD serial`.
     pub fn open(&mut self, kind: BlockKind, serial: u16) {
-        self.open.push((serial, kind));
+        let at = self.open.partition_point(|&(s, _)| s > serial);
+        self.open.insert(at, (serial, kind));
     }
 
     /// `^AE serial`: end block `serial`, which need not be the one opened
     /// last. An end that matches no open block (a damaged file) ends the
-    /// last one.
+    /// one opened by the newest delta.
     pub fn close(&mut self, serial: u16) {
-        match self.open.iter().rposition(|&(s, _)| s == serial) {
+        match self.open.iter().position(|&(s, _)| s == serial) {
             Some(at) => {
                 self.open.remove(at);
             }
-            None => {
-                self.open.pop();
+            None if !self.open.is_empty() => {
+                self.open.remove(0);
             }
+            None => {}
         }
     }
 
@@ -81,22 +83,33 @@ impl<'a> OpenBlocks<'a> {
     /// Whether a text line here belongs to the version, and if so the serial
     /// of the delta that inserted it.
     ///
-    /// It belongs when every open insert is applied and no open delete is;
-    /// its inserter is the applied insert opened last (serial 1 where none
-    /// is open).
+    /// The open block of the newest delta that has a say decides. A block
+    /// has a say unless it is a delete by a delta that is not applied:
+    ///
+    /// | block                  | says                         |
+    /// |------------------------|------------------------------|
+    /// | insert, delta applied  | keep; that delta inserted it |
+    /// | insert, not applied    | drop: the line is not there  |
+    /// | delete, delta applied  | drop: it was deleted         |
+    /// | delete, not applied    | nothing                      |
+    ///
+    /// With no block that has a say, the line is dropped: text outside every
+    /// insert belongs to no version. This is the rule of historical SCCS
+    /// (`readmod`'s queue, ordered by serial) and of CSSC. Requiring every
+    /// open insert to be applied and no open delete to be, as this did,
+    /// agrees with it only while the open blocks nest in serial order; it
+    /// lost a line a later delta inserted inside a block an earlier one had
+    /// deleted.
     pub fn kept_by(&self) -> Option<u16> {
-        let applied = |s: &u16| self.applied.contains(s);
-        let kept = self.open.iter().all(|(serial, kind)| match kind {
-            BlockKind::Insert => applied(serial),
-            BlockKind::Delete => !applied(serial),
-        });
-        kept.then(|| {
-            self.open
-                .iter()
-                .rev()
-                .find(|(serial, kind)| *kind == BlockKind::Insert && applied(serial))
-                .map_or(1, |&(serial, _)| serial)
-        })
+        for &(serial, kind) in &self.open {
+            let applied = self.applied.contains(&serial);
+            match (kind, applied) {
+                (BlockKind::Insert, true) => return Some(serial),
+                (BlockKind::Insert, false) | (BlockKind::Delete, true) => return None,
+                (BlockKind::Delete, false) => {}
+            }
+        }
+        None
     }
 }
 

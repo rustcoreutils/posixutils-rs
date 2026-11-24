@@ -367,17 +367,19 @@ fn print_normal_diff(
 }
 
 /// Remove entry from p-file
+///
+/// One delta settles one edit: exactly one entry goes, even if a p-file
+/// written by something else holds several alike.
 fn remove_pfile_entry(txn: &Txn, entry_to_remove: &PfileEntry) -> io::Result<()> {
-    let remaining: Vec<_> = txn
-        .pending()?
-        .into_iter()
-        .filter(|e| {
-            !(e.old_sid == entry_to_remove.old_sid
-                && e.new_sid == entry_to_remove.new_sid
-                && e.user == entry_to_remove.user)
-        })
-        .collect();
-
+    let mut remaining = txn.pending()?;
+    let same = |e: &PfileEntry| {
+        e.old_sid == entry_to_remove.old_sid
+            && e.new_sid == entry_to_remove.new_sid
+            && e.user == entry_to_remove.user
+    };
+    if let Some(at) = remaining.iter().position(same) {
+        remaining.remove(at);
+    }
     txn.set_pending(&remaining)
 }
 

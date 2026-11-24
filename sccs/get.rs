@@ -214,45 +214,63 @@ fn has_successor(sccs: &SccsFile, target: &DeltaEntry) -> bool {
 /// retrieved delta already has a successor; otherwise extend its line. The
 /// special case is a release-only -r naming a release above the newest one,
 /// which forces the first delta of that new release.
+///
+/// `pending` is the new SIDs of the edits already pending, when the `j` flag
+/// lets several edits of one delta be: each must come to a SID of its own.
+/// A SID that is pending is taken, like a delta's, and an edit that would
+/// get one branches instead, as SCCS and CSSC have it ("creating a branch
+/// due to concurrent edit").
 fn compute_new_sid(
     sccs: &SccsFile,
     target: &DeltaEntry,
     create_branch: bool,
     requested_sid: Option<&Sid>,
+    pending: &[Sid],
 ) -> Sid {
     let branching = create_branch && sccs.branch_enabled();
+    // Branch off the retrieved delta: R.L.(mB+1).1
+    let branch_off = || {
+        let max_branch = sccs
+            .live_deltas()
+            .map(|d| &d.sid)
+            .chain(pending)
+            .filter(|sid| sid.rel == target.sid.rel && sid.lev == target.sid.lev)
+            .map(|sid| sid.br)
+            .max()
+            .unwrap_or(0);
+        Sid::new(target.sid.rel, target.sid.lev, max_branch + 1, 1)
+    };
+    let unless_pending = |sid: Sid| {
+        if pending.contains(&sid) {
+            branch_off()
+        } else {
+            sid
+        }
+    };
 
     // "R > mR": force creation of the first delta in a new release (99237).
     // -b outranks it, per 99239.
     if !branching {
         if let Some(req) = requested_sid {
             if req.is_partial() && req.rel > target.sid.rel {
-                return Sid::trunk(req.rel, 1);
+                return unless_pending(Sid::trunk(req.rel, 1));
             }
         }
     }
 
     if branching || has_successor(sccs, target) {
-        // Branch off the retrieved delta: R.L.(mB+1).1
-        let max_branch = sccs
-            .live_deltas()
-            .filter(|d| d.sid.rel == target.sid.rel && d.sid.lev == target.sid.lev)
-            .map(|d| d.sid.br)
-            .max()
-            .unwrap_or(0);
-
-        Sid::new(target.sid.rel, target.sid.lev, max_branch + 1, 1)
+        branch_off()
     } else if !target.sid.is_trunk() {
         // From branch: increment sequence
-        Sid::new(
+        unless_pending(Sid::new(
             target.sid.rel,
             target.sid.lev,
             target.sid.br,
             target.sid.seq + 1,
-        )
+        ))
     } else {
         // From trunk: increment level
-        Sid::trunk(target.sid.rel, target.sid.lev + 1)
+        unless_pending(Sid::trunk(target.sid.rel, target.sid.lev + 1))
     }
 }
 
@@ -513,7 +531,14 @@ fn process_file(
         }
 
         let requested: Option<Sid> = requested_sid.and_then(|s| s.parse().ok());
-        let new_sid = compute_new_sid(&sccs, target, args.branch, requested.as_ref());
+        // With joint editing the SIDs of the pending edits are taken;
+        // without it an edit that would get one is refused, below.
+        let pending: Vec<Sid> = if sccs.joint_edit() {
+            txn.pending()?.iter().map(|e| e.new_sid).collect()
+        } else {
+            Vec::new()
+        };
+        let new_sid = compute_new_sid(&sccs, target, args.branch, requested.as_ref(), &pending);
 
         // Check for existing edit lock (unless joint edit is allowed)
         if !sccs.joint_edit() {

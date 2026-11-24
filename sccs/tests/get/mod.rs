@@ -1849,3 +1849,48 @@ fn get_does_not_replace_a_writable_g_file() {
     assert!(run("get", &["-e", "-g", "-s", "s.w"], "").status.success());
     assert_eq!(std::fs::read(dir.join("w")).unwrap(), b"my edits\n");
 }
+
+/// With the `j` flag several edits of one delta may be pending, and each
+/// is given a SID of its own: the first the next on the line, the others
+/// branches (as SCCS and CSSC do, "creating a branch due to concurrent
+/// edit"). They were all given the same SID; the first delta then removed
+/// every one of the p-file's identical entries, and the other edits were no
+/// longer pending.
+#[test]
+fn joint_edits_of_one_delta_get_different_sids() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    assert!(run("admin", &["-i", "-fj", "s.j"], "one\n")
+        .status
+        .success());
+
+    let mut announced = Vec::new();
+    for _ in 0..3 {
+        let out = run("get", &["-e", "-g", "s.j"], "");
+        assert!(out.status.success(), "{out:?}");
+        announced.push(String::from_utf8(out.stdout).unwrap());
+    }
+    assert_eq!(
+        announced,
+        [
+            "1.1\nnew delta 1.2\n",
+            "1.1\nnew delta 1.1.1.1\n",
+            "1.1\nnew delta 1.1.2.1\n"
+        ]
+    );
+    let pending = |dir: &std::path::Path| -> Vec<String> {
+        std::fs::read_to_string(dir.join("p.j"))
+            .unwrap()
+            .lines()
+            .map(|l| l.split(' ').nth(1).unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(pending(dir), ["1.2", "1.1.1.1", "1.1.2.1"]);
+
+    // One delta settles one edit; the others stay pending.
+    std::fs::write(dir.join("j"), "two\n").unwrap();
+    let out = run("delta", &["-s", "-r1.1.1.1", "-yc", "s.j"], "");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(pending(dir), ["1.2", "1.1.2.1"]);
+}

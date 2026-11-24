@@ -290,40 +290,6 @@ fn create_pfile_entry(
     pfile::append(sfile_path, &entry)
 }
 
-/// Evaluate body with SID tracking for -m option
-fn evaluate_body_with_sid(sccs: &SccsFile, applied_set: &HashSet<u16>) -> Vec<(Vec<u8>, Sid)> {
-    use plib::sccsfile::BodyRecord;
-
-    let mut output = Vec::new();
-    let mut stack: Vec<(bool, u16)> = Vec::new(); // (is_insert, serial)
-
-    for record in &sccs.body {
-        match record {
-            BodyRecord::Insert(serial) => stack.push((true, *serial)),
-            BodyRecord::Delete(serial) => stack.push((false, *serial)),
-            BodyRecord::End(serial) => plib::sccsfile::close_block(&mut stack, *serial),
-            BodyRecord::Text(line) => {
-                if plib::sccsfile::is_line_visible(&stack, applied_set) {
-                    // The delta that inserted this line: the innermost
-                    // applied insert block open here.
-                    let inserting_serial = stack
-                        .iter()
-                        .rev()
-                        .find(|(is_insert, s)| *is_insert && applied_set.contains(s))
-                        .map_or(1, |&(_, s)| s);
-                    let sid = sccs
-                        .find_delta_by_serial(inserting_serial)
-                        .map(|d| d.sid)
-                        .unwrap_or(Sid::trunk(1, 1));
-                    output.push((line.clone(), sid));
-                }
-            }
-        }
-    }
-
-    output
-}
-
 /// Render the delta-summary table (the l-file body). Deltas are listed newest
 /// first. Each entry is a status line followed by comment lines indented one
 /// tab and terminated by a blank line, per the POSIX l-file format:
@@ -674,9 +640,15 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
     // The body, each line paired with the SID of the delta that inserted it
     // when -m wants that prefix.
     let body: Vec<(Vec<u8>, Option<Sid>)> = if args.show_sid {
-        evaluate_body_with_sid(&sccs, &applied_set)
+        sccs.evaluate_body_annotated(&applied_set)
             .into_iter()
-            .map(|(line, sid)| (line, Some(sid)))
+            .map(|(serial, line)| {
+                // The inserting delta, as its SID.
+                let sid = sccs
+                    .find_delta_by_serial(serial)
+                    .map_or(Sid::trunk(1, 1), |d| d.sid);
+                (line, Some(sid))
+            })
             .collect()
     } else {
         sccs.evaluate_body(&applied_set)

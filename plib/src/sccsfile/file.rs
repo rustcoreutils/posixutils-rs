@@ -334,6 +334,20 @@ impl SccsFile {
             .collect()
     }
 
+    /// [`evaluate_body`](Self::evaluate_body), each line with the serial of
+    /// the delta that inserted it (`get -m`).
+    pub fn evaluate_body_annotated(&self, applied_set: &HashSet<u16>) -> Vec<(u16, Vec<u8>)> {
+        Walker::new(&self.body, applied_set)
+            .filter_map(|(_, rec)| match rec {
+                Rec::Text {
+                    text,
+                    kept_by: Some(serial),
+                } => Some((serial, text.to_vec())),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Remove a (leaf) delta: mark its delta-table entry as `Removed` and
     /// reweave the body so the delta's footprint is undone, matching historical
     /// SCCS / CSSC `rmdel`. The delta's own inserted block (`^AI s … ^AE s`) is

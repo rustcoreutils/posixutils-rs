@@ -261,14 +261,21 @@ impl<'a> Iterator for Walker<'a> {
 /// `base` is the version the delta was made from (its applied deltas), `ops`
 /// the edit script from that version's lines to the new text, and
 /// `new_lines` the new text, which the script's `Insert` steps index. The
-/// new body is the old one with the delta's changes recorded under `serial`:
-/// every line the script deletes inside a `^AD serial` block, every line it
-/// inserts inside a `^AI serial` block, and every other line copied as it
-/// was, byte for byte.
+/// new body is the old one with the delta's changes recorded under `serial`,
+/// and every line of the old one copied as it was, byte for byte.
 ///
-/// One pass over the body, with a cursor into the script. A run of inserted
-/// lines goes in ahead of the next line the script keeps (or at the end of
-/// the body); each deleted line gets a block of its own.
+/// The changes are laid out as SCCS and CSSC lay them out, so that the body
+/// is the one they would write:
+/// - A run of deleted lines is one `^AD serial` block. It opens right before
+///   the first deleted line and stays open, over whatever records of other
+///   deltas lie between, until the next line the version keeps. (That is how
+///   blocks come to overlap.)
+/// - Lines inserted go in one `^AI serial` block right before the next line
+///   the version keeps, after the delete block, if any, has closed.
+/// - At the end of the body an open delete block closes, and lines inserted
+///   after the last line follow.
+///
+/// One pass over the body, with a cursor into the script.
 ///
 /// The script must account for exactly the lines of the base version: one
 /// `Keep` or `Delete` each, in order. Anything else is an error.
@@ -284,25 +291,32 @@ pub(super) fn weave_delta(
         || SccsError::InvalidBody("the edit does not fit the version it was made from".into());
     let mut cursor = 0;
     // Inserted lines (as indices into `new_lines`) waiting for the next kept
-    // line.
+    // line, and whether a delete block is open.
     let mut pending: Vec<usize> = Vec::new();
+    let mut deleting = false;
     let take_inserts = |cursor: &mut usize, pending: &mut Vec<usize>| {
         while let Some(LineOp::Insert(j)) = ops.get(*cursor) {
             pending.push(*j);
             *cursor += 1;
         }
     };
-    let flush = |out: &mut Content, pending: &mut Vec<usize>| -> SccsResult<()> {
-        if pending.is_empty() {
-            return Ok(());
-        }
-        out.marker(BlockKind::Insert, serial);
-        for j in pending.drain(..) {
-            out.text(new_lines.get(j).ok_or_else(mismatch)?)?;
-        }
-        out.end(serial);
-        Ok(())
-    };
+    // What happens ahead of a kept line, and at the end of the body: the
+    // delete block closes, and the waiting inserted lines go in.
+    let settle =
+        |out: &mut Content, deleting: &mut bool, pending: &mut Vec<usize>| -> SccsResult<()> {
+            if std::mem::take(deleting) {
+                out.end(serial);
+            }
+            if pending.is_empty() {
+                return Ok(());
+            }
+            out.marker(BlockKind::Insert, serial);
+            for j in pending.drain(..) {
+                out.text(new_lines.get(j).ok_or_else(mismatch)?)?;
+            }
+            out.end(serial);
+            Ok(())
+        };
 
     for step in Walker::new(body, base) {
         let (index, rec) = step?;
@@ -320,22 +334,20 @@ pub(super) fn weave_delta(
         }
         take_inserts(&mut cursor, &mut pending);
         match ops.get(cursor) {
-            Some(LineOp::Keep) => {
-                flush(out, &mut pending)?;
-                out.line(line);
-            }
+            Some(LineOp::Keep) => settle(out, &mut deleting, &mut pending)?,
             Some(LineOp::Delete) => {
-                out.marker(BlockKind::Delete, serial);
-                out.line(line);
-                out.end(serial);
+                if !std::mem::replace(&mut deleting, true) {
+                    out.marker(BlockKind::Delete, serial);
+                }
             }
             _ => return Err(mismatch()),
         }
+        out.line(line);
         cursor += 1;
     }
     take_inserts(&mut cursor, &mut pending);
     if cursor != ops.len() {
         return Err(mismatch());
     }
-    flush(out, &mut pending)
+    settle(out, &mut deleting, &mut pending)
 }

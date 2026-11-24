@@ -1449,3 +1449,66 @@ fn delta_of_an_encoded_file_keeps_a_missing_final_newline() {
     run("delta", &["-s", "-yc", "s.enc"]);
     assert_eq!(run("get", &["-p", "-s", "s.enc"]), b"still\nno newline");
 }
+
+/// delta weaves a change the way SCCS and CSSC lay it out: one delete block
+/// around each run of deleted lines, opened right before the first of them
+/// and closed at the next line the version keeps, and the lines inserted
+/// there in a block of their own just before that line. (It used to wrap
+/// every deleted line in a block of its own.) The body expected here is the
+/// one CSSC writes for the same six steps, byte for byte.
+#[test]
+fn delta_weaves_runs_as_sccs_does() {
+    let tmp = TempDir::new().unwrap();
+    let run = |cmd: &str, args: &[&str], stdin: &str| {
+        let out = super::common::run_in(cmd, args, tmp.path(), stdin);
+        assert!(out.status.success(), "{cmd} {args:?}: {out:?}");
+    };
+    run("admin", &["-i", "-fb", "s.f"], "a\nb\nc\nd\ne\nf\n");
+    let edit = |get_args: &[&str], text: &str, comment: &str| {
+        let mut argv = vec!["-e", "-s"];
+        argv.extend_from_slice(get_args);
+        argv.push("s.f");
+        run("get", &argv, "");
+        fs::write(tmp.path().join("f"), text).unwrap();
+        run("delta", &["-s", &format!("-y{comment}"), "s.f"], "");
+    };
+    edit(&[], "a\nB1\nB2\nc\nd\ne\nf\n", "replace one line with two");
+    edit(&["-r1.1"], "a\nb\nc\nf\n", "delete a run of two");
+    edit(&[], "a\nB1\nc\nd\nX\ne\nf\nZ\n", "delete, insert, append");
+    edit(
+        &["-r1.1.1.1"],
+        "f\n",
+        "delete a run across other deltas' records",
+    );
+    edit(
+        &[],
+        "P\na\nB1\nc\nf\nZ\n",
+        "prepend, and delete across an insert",
+    );
+
+    let data = fs::read(tmp.path().join("s.f")).unwrap();
+    let at = data.windows(3).position(|w| w == b"\x01T\n").unwrap();
+    let body = String::from_utf8_lossy(&data[at + 3..]).replace('\x01', "^A");
+    let cssc = "^AI 1\n^AD 5\n^AI 6\nP\n^AE 6\na\n^AD 2\nb\n^AE 2\n^AI 2\nB1\n^AD 4\nB2\n\
+^AE 2\n^AE 4\nc\n^AD 3\n^AD 6\nd\n^AI 4\nX\n^AE 4\ne\n^AE 3\n^AE 5\n^AE 6\nf\n^AE 1\n\
+^AI 4\nZ\n^AE 4\n";
+    assert_eq!(body, cssc);
+
+    // Every version still reads as it was checked in.
+    for (sid, text) in [
+        ("1.1", "a\nb\nc\nd\ne\nf\n"),
+        ("1.2", "a\nB1\nB2\nc\nd\ne\nf\n"),
+        ("1.1.1.1", "a\nb\nc\nf\n"),
+        ("1.3", "a\nB1\nc\nd\nX\ne\nf\nZ\n"),
+        ("1.1.1.2", "f\n"),
+        ("1.4", "P\na\nB1\nc\nf\nZ\n"),
+    ] {
+        let out = super::common::run_in(
+            "get",
+            &["-p", "-k", "-s", &format!("-r{sid}"), "s.f"],
+            tmp.path(),
+            "",
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), text, "version {sid}");
+    }
+}

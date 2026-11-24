@@ -914,3 +914,26 @@ fn open_blocks_ask_the_newest_delta_with_a_say() {
         }
     }
 }
+
+/// Removing a delta takes out its own markers and the text it inserted; a
+/// marker of another delta inside its insert block stays, so every other
+/// delta's blocks still open and close.
+#[test]
+fn remove_delta_keeps_other_deltas_markers() {
+    let table = b"\x01s 00000/00000/00000\n\x01d D 1.3 26/01/03 00:00:00 u 3 2\n\x01e\n\
+\x01s 00000/00000/00000\n\x01d D 1.2 26/01/02 00:00:00 u 2 1\n\x01e\n\
+\x01s 00000/00000/00000\n\x01d D 1.1 26/01/01 00:00:00 u 1 0\n\x01e\n\
+\x01u\n\x01U\n\x01t\n\x01T\n";
+    let body = b"\x01I 1\nkeep\n\x01E 1\n\x01I 2\na\n\x01D 3\nb\n\x01E 3\nc\n\x01E 2\n";
+    let mut sccs = SccsFile::from_bytes(&with_checksum(&[&table[..], body].concat())).unwrap();
+    sccs.remove_delta(2).unwrap();
+    let written = sccs.to_bytes();
+    let at = written.windows(3).position(|w| w == b"\x01T\n").unwrap();
+    assert_eq!(
+        &written[at + 3..],
+        b"\x01I 1\nkeep\n\x01E 1\n\x01D 3\n\x01E 3\n",
+        "{}",
+        String::from_utf8_lossy(&written)
+    );
+    sccs.check_weave().unwrap();
+}

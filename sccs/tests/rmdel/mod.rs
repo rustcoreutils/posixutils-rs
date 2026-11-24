@@ -425,3 +425,35 @@ fn a_removed_branch_deltas_sid_is_used_again() {
         "the freed branch: {out:?}"
     );
 }
+
+/// A delta that another delta includes or excludes by name cannot be
+/// removed: that delta's text is defined in terms of it. (CSSC refuses the
+/// same.) The delta naming it is reported, and nothing is written.
+#[test]
+fn rmdel_refuses_a_delta_another_delta_names() {
+    let tmp = TempDir::new().unwrap();
+    let sfile = create_multi_delta(&tmp, "ref", 2);
+    let name = sfile.file_name().unwrap().to_str().unwrap();
+    // A branch from 1.1 that includes 1.2 records "^Ai 2".
+    let out = run("get", &["-e", "-s", "-r1.1", "-i1.2", name], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    std::fs::write(tmp.path().join("ref"), b"branch\n").unwrap();
+    let out = run("delta", &["-s", "-yb", name], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+
+    let before = std::fs::read(&sfile).unwrap();
+    // 1.2 is the newest delta on the trunk, but 1.1.1.1 includes it.
+    let out = run("rmdel", &["-r", "1.2", name], tmp.path(), "");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("1.1.1.1"),
+        "the delta naming it should be reported: {out:?}"
+    );
+    assert_eq!(std::fs::read(&sfile).unwrap(), before);
+
+    // With the delta that names it gone, it can be removed.
+    let out = run("rmdel", &["-r", "1.1.1.1", name], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    let out = run("rmdel", &["-r", "1.2", name], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+}

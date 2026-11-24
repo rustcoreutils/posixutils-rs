@@ -134,6 +134,29 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
         return Ok(false);
     }
 
+    // A delta that another delta includes, excludes or ignores by name is
+    // part of what that delta's text is, so it stays (as in CSSC).
+    let named_by = sccs.live_deltas().find(|d| {
+        d.serial != target_serial
+            && [&d.included, &d.excluded, &d.ignored]
+                .iter()
+                .any(|list| list.contains(&target_serial))
+    });
+    if let Some(other) = named_by {
+        diag::error_path(
+            "rmdel",
+            sfile,
+            &format!(
+                "{} {} {} {}",
+                gettext("delta"),
+                sid,
+                gettext("is included or excluded by delta"),
+                other.sid
+            ),
+        );
+        return Ok(false);
+    }
+
     // Check that delta is not checked out for editing
     for entry in pfile::read(sfile)? {
         if entry.old_sid == *sid || entry.new_sid == *sid {

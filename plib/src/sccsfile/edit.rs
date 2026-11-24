@@ -421,8 +421,9 @@ impl SccsFile {
         }
 
         // Each of the delta's blocks runs to the `^AE` carrying its serial,
-        // whatever opens or closes between. Inside its insert block
-        // everything goes; of a delete block only the two markers go.
+        // whatever opens or closes between. Its own markers go, and the text
+        // inside its insert block; a marker of another delta stays wherever
+        // it is, so that delta's blocks still open and close.
         let nothing_applied = HashSet::new();
         let body = self.body();
         let mut walker = Walker::new(body, &nothing_applied);
@@ -431,7 +432,8 @@ impl SccsFile {
             let (index, rec) = step?;
             let own_marker =
                 matches!(rec, Rec::Insert(s) | Rec::Delete(s) | Rec::End(s) if s == serial);
-            if !own_marker && !in_own_insert {
+            let inserted_text = in_own_insert && matches!(rec, Rec::Text { .. });
+            if !own_marker && !inserted_text {
                 if let Some((_, line)) = body.line(index) {
                     content.line(line);
                 }

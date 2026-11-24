@@ -360,7 +360,7 @@ fn gather_mrs(
     stdin_consumed: bool,
 ) -> io::Result<Option<Vec<String>>> {
     // Locate the v flag, if any.
-    let v_flag = sccs.header.flags.iter().find_map(|f| match f {
+    let v_flag = sccs.header().flags.iter().find_map(|f| match f {
         SccsFlag::MrValidation(prog) => Some(prog.clone()),
         _ => None,
     });
@@ -628,12 +628,8 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
     }
 
     // Apply diff to body
-    sccs.body =
-        plib::sccsfile::weave_delta(&sccs.body, &applied_set, new_serial, &diff_ops, &new_lines)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
-    // Add new delta to header (at the beginning - deltas are stored newest first)
-    sccs.header.deltas.insert(0, new_delta);
+    sccs.add_delta(new_delta, &applied_set, &diff_ops, &new_lines)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
     // Write atomically via the x-file, which is registered for SIGINT cleanup
     // around the write+rename so an interrupt removes the temporary.

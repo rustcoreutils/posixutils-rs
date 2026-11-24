@@ -64,7 +64,7 @@ pub fn check_edit(sccs: &SccsFile, release: u16, login: &str) -> Result<(), Refu
         return Err(Refusal::ReleaseLocked);
     }
 
-    if !is_authorized(&sccs.header.users, login) {
+    if !is_authorized(&sccs.header().users, login) {
         return Err(Refusal::NotAuthorized);
     }
 

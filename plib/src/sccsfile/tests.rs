@@ -63,47 +63,44 @@ fn test_prs_fl_line_canonical() {
     assert_eq!(SccsFlag::Encoded(0).prs_fl_line(), None);
 }
 
+/// Removing a delta takes its changes out of the body -- the lines it
+/// inserted go, the lines it deleted are text again -- and keeps its entry,
+/// marked removed. Written back, the file is the one before that delta but
+/// for the entry.
 #[test]
-fn test_remove_delta_reweaves_body() {
-    // Body for: 1.1 inserts a,b,c; 1.2 (serial 2) deletes b and inserts X.
-    let mut f = SccsFile {
-        body: vec![
-            BodyRecord::Insert(1),
-            BodyRecord::Text("a".into()),
-            BodyRecord::Delete(2),
-            BodyRecord::Text("b".into()),
-            BodyRecord::End(2),
-            BodyRecord::Insert(2),
-            BodyRecord::Text("X".into()),
-            BodyRecord::End(2),
-            BodyRecord::Text("c".into()),
-            BodyRecord::End(1),
-        ],
-        ..Default::default()
-    };
-    f.header.deltas.push(DeltaEntry {
-        serial: 2,
-        ..Default::default()
-    });
+fn remove_delta_undoes_the_deltas_changes() {
+    // 1.1 inserts a, b, c; 1.2 (serial 2) deletes b and inserts X.
+    let table = b"\x01s 00001/00001/00002\n\x01d D 1.2 26/01/02 00:00:00 u 2 1\n\x01e\n\
+\x01s 00003/00000/00000\n\x01d D 1.1 26/01/01 00:00:00 u 1 0\n\x01e\n\
+\x01u\n\x01U\n\x01t\n\x01T\n";
+    let with_body = |body: &[u8]| with_checksum(&[&table[..], body].concat());
+    let mut f = SccsFile::from_bytes(&with_body(
+        b"\x01I 1\na\n\x01D 2\nb\n\x01E 2\n\x01I 2\nX\n\x01E 2\nc\n\x01E 1\n",
+    ))
+    .unwrap();
 
-    f.remove_delta(2);
+    f.remove_delta(2).unwrap();
 
-    // Removing serial 2 reverts to 1.1: insert block dropped, deletion undone.
+    let removed = String::from_utf8(with_body(b"\x01I 1\na\nb\nc\n\x01E 1\n"))
+        .unwrap()
+        .replacen("\x01d D 1.2", "\x01d R 1.2", 1);
+    let written = f.to_bytes();
     assert_eq!(
-        f.body,
-        vec![
-            BodyRecord::Insert(1),
-            BodyRecord::Text("a".into()),
-            BodyRecord::Text("b".into()),
-            BodyRecord::Text("c".into()),
-            BodyRecord::End(1),
-        ]
+        checksummed_part(&written),
+        checksummed_part(removed.as_bytes())
     );
-    // Delta-table entry retained as Removed.
     assert_eq!(
-        f.find_delta_by_serial(2).unwrap().delta_type,
-        DeltaType::Removed
+        f.header().deltas[0].delta_type,
+        DeltaType::Removed,
+        "the entry is kept, as removed"
     );
+    assert!(f.remove_delta(2).is_err(), "it cannot be removed twice");
+}
+
+/// An s-file image without its checksum line.
+fn checksummed_part(data: &[u8]) -> &[u8] {
+    let at = data.iter().position(|&b| b == b'\n').unwrap();
+    &data[at + 1..]
 }
 
 #[test]

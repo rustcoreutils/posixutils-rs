@@ -106,7 +106,7 @@ fn validate_file(args: &Args, file_path: &PathBuf, diags: &mut Vec<String>) -> u
     };
 
     // Verify checksum. A header-only file (no body) still has one.
-    if !plib::sccsfile::stored_checksum_matches(&data, sccs.header.checksum) {
+    if !plib::sccsfile::stored_checksum_matches(&data, sccs.header().checksum) {
         diags.push(gettext("corrupted SCCS file (checksum error)"));
         errors |= ERR_CORRUPTED_FILE;
     }

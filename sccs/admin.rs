@@ -18,8 +18,8 @@ use std::process::ExitCode;
 use clap::Parser;
 use gettextrs::gettext;
 use plib::sccsfile::{
-    paths, BodyRecord, DeltaEntry, DeltaStats, DeltaType, ReleaseLock, SccsDateTime, SccsFile,
-    SccsFlag, SccsHeader, Sid,
+    paths, DeltaEntry, DeltaStats, DeltaType, NewFile, ReleaseLock, SccsDateTime, SccsFile,
+    SccsFlag, Sid,
 };
 use posixutils_sccs::{diag, idkw, mrlist, sfio, zlock};
 
@@ -307,49 +307,40 @@ fn parse_flag_removal(arg: &str) -> Result<FlagRemoval, String> {
         .map_err(|_| format!("{} '{}'", gettext("Invalid release list"), list))
 }
 
-/// Apply one `-d` option to the flags of an s-file.
-fn remove_flag(flags: &mut Vec<SccsFlag>, removal: FlagRemoval) -> io::Result<()> {
+/// Apply one `-d` option to an s-file.
+fn remove_flag(sccs: &mut SccsFile, removal: FlagRemoval) -> io::Result<()> {
+    let invalid = |message: String| io::Error::new(io::ErrorKind::InvalidInput, message);
     let releases = match removal {
         FlagRemoval::Flag(letter) => {
             // A letter that is not a flag is only removable if the file has
             // it, as a flag some other implementation wrote.
-            if !VALID_FLAG_CHARS.contains(&letter) && !flags.iter().any(|f| f.flag_char() == letter)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    unrecognized_flag(letter),
-                ));
+            if !sccs.remove_flag(letter) && !VALID_FLAG_CHARS.contains(&letter) {
+                return Err(invalid(unrecognized_flag(letter)));
             }
-            flags.retain(|f| f.flag_char() != letter);
             return Ok(());
         }
         FlagRemoval::Unlock(releases) => releases,
     };
-    let Some(at) = flags
-        .iter()
-        .position(|f| matches!(f, SccsFlag::LockedReleases(_)))
-    else {
-        return Ok(()); // nothing is locked
-    };
-    let SccsFlag::LockedReleases(lock) = &mut flags[at] else {
-        unreachable!("position() found a LockedReleases flag");
-    };
-    match lock {
+    match sccs.locked_releases() {
+        None => Ok(()), // nothing is locked
         // "Every release" is not a list a release can be taken out of.
-        ReleaseLock::All => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                gettext("every release is locked ('l a'); use -dla to unlock them all"),
-            ));
-        }
-        ReleaseLock::List(locked) => {
-            locked.retain(|rel| !releases.contains(rel));
-            if locked.is_empty() {
-                flags.remove(at);
+        Some(ReleaseLock::All) => Err(invalid(gettext(
+            "every release is locked ('l a'); use -dla to unlock them all",
+        ))),
+        Some(ReleaseLock::List(locked)) => {
+            let rest: Vec<u16> = locked
+                .iter()
+                .copied()
+                .filter(|rel| !releases.contains(rel))
+                .collect();
+            if rest.is_empty() {
+                sccs.remove_flag('l');
+            } else {
+                sccs.set_flag(SccsFlag::LockedReleases(ReleaseLock::List(rest)));
             }
+            Ok(())
         }
     }
-    Ok(())
 }
 
 /// The diagnostic for `-m` without the `v` flag, in CSSC's wording.
@@ -496,25 +487,17 @@ fn create_new_sccs_file(path: &Path, params: NewFileParams) -> io::Result<()> {
         comments: posixutils_sccs::comment_lines(&comment_text),
     };
 
-    // Create body with insert block
-    let mut body = Vec::new();
-    body.push(BodyRecord::Insert(1));
-    for line in body_lines {
-        body.push(BodyRecord::Text(line));
-    }
-    body.push(BodyRecord::End(1));
-
-    // Create SCCS file
-    let sccs = SccsFile {
-        header: SccsHeader {
-            checksum: 0, // Will be computed during serialization
-            deltas: vec![delta],
-            users: users.into_iter().map(String::into_bytes).collect(),
-            flags,
-            descriptive_text: desc_text,
-        },
-        body,
-    };
+    let sccs = SccsFile::create(NewFile {
+        delta,
+        users: &users
+            .into_iter()
+            .map(String::into_bytes)
+            .collect::<Vec<_>>(),
+        flags: &flags,
+        descriptive_text: &desc_text,
+        lines: &body_lines,
+    })
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
     // Atomic write: write to x-file, then rename
     let x_file = paths::xfile_from_sfile(path);
@@ -540,7 +523,7 @@ fn check_sccs_file(path: &Path) -> io::Result<bool> {
             // Verify the checksum. A header-only s-file has an empty body,
             // which still has a checksum: skipping the check for it let
             // `admin -h` pass a file `val` rejected.
-            if !plib::sccsfile::stored_checksum_matches(&data, sccs.header.checksum) {
+            if !plib::sccsfile::stored_checksum_matches(&data, sccs.header().checksum) {
                 let computed = plib::sccsfile::stored_body_checksum(&data);
                 diag::error_path(
                     "admin",
@@ -548,7 +531,7 @@ fn check_sccs_file(path: &Path) -> io::Result<bool> {
                     &format!(
                         "{} {}, {} {}",
                         gettext("checksum error: stored"),
-                        sccs.header.checksum,
+                        sccs.header().checksum,
                         gettext("computed"),
                         computed
                     ),
@@ -604,20 +587,17 @@ fn modify_existing_file(
 
     // Update descriptive text if provided
     if let Some(text) = desc_text {
-        sccs.header.descriptive_text = text;
+        sccs.set_descriptive_text(text);
     }
 
     // Delete flags
     for removal in delete_flags {
-        remove_flag(&mut sccs.header.flags, removal)?;
+        remove_flag(&mut sccs, removal)?;
     }
 
     // Add flags
     for flag in add_flags {
-        // Remove existing flag of same type first
-        let fc = flag.flag_char();
-        sccs.header.flags.retain(|f| f.flag_char() != fc);
-        sccs.header.flags.push(flag);
+        sccs.set_flag(flag);
     }
 
     // -m needs the v flag: the one this file ends up with, whether it had
@@ -632,15 +612,12 @@ fn modify_existing_file(
 
     // Add users
     for user in add_users {
-        let user = user.into_bytes();
-        if !sccs.header.users.contains(&user) {
-            sccs.header.users.push(user);
-        }
+        sccs.add_user(user.as_bytes());
     }
 
     // Remove users
     for user in remove_users {
-        sccs.header.users.retain(|u| u != user.as_bytes());
+        sccs.remove_user(user.as_bytes());
     }
 
     // Write atomically

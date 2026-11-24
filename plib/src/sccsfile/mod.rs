@@ -28,6 +28,7 @@
 mod checksum;
 mod cleanup;
 mod datetime;
+mod edit;
 mod file;
 mod model;
 mod parse;
@@ -45,6 +46,7 @@ mod tests;
 pub use checksum::*;
 pub use cleanup::*;
 pub use datetime::*;
+pub use edit::*;
 pub use file::*;
 pub use model::*;
 pub use pfile::*;

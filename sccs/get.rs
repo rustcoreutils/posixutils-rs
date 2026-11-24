@@ -690,7 +690,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
     // flag set, this is escalated to a fatal error: no g-file is written.
     if !had_keyword && !suppress_keywords {
         let has_i_flag = sccs
-            .header
+            .header()
             .flags
             .iter()
             .any(|f| matches!(f, SccsFlag::IdKeywordError(_)));

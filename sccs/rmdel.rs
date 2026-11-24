@@ -62,7 +62,7 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
     // may share the SID, the next delta having taken it; it is looked for
     // only when there is no live one, to say that it is already removed.
     let entry_of = |wanted: DeltaType| {
-        sccs.header
+        sccs.header()
             .deltas
             .iter()
             .position(|d| &d.sid == sid && d.delta_type == wanted)
@@ -89,7 +89,7 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
     let current_user = posixutils_sccs::username();
     let current_uid = unsafe { libc::getuid() };
 
-    let is_delta_author = sccs.header.deltas[delta_idx].user == current_user.as_bytes();
+    let is_delta_author = sccs.header().deltas[delta_idx].user == current_user.as_bytes();
 
     let owns_sfile = fs::metadata(sfile)
         .map(|m| m.uid() == current_uid)
@@ -116,8 +116,8 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
     // Check that delta is a leaf: no delta still in the file was made from
     // it. One already removed does not count -- with 1.3 removed, 1.2 is the
     // newest delta again and can be removed in turn, as CSSC allows.
-    let target_serial = sccs.header.deltas[delta_idx].serial;
-    let has_successors = sccs.header.deltas.iter().any(|d| {
+    let target_serial = sccs.header().deltas[delta_idx].serial;
+    let has_successors = sccs.header().deltas.iter().any(|d| {
         d.pred_serial == target_serial
             && d.serial != target_serial
             && d.delta_type != plib::sccsfile::DeltaType::Removed
@@ -152,7 +152,7 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
     }
 
     // Check delta type - can't remove already removed delta
-    if sccs.header.deltas[delta_idx].delta_type == DeltaType::Removed {
+    if sccs.header().deltas[delta_idx].delta_type == DeltaType::Removed {
         eprintln!(
             "{}: {} {} {}",
             sfile.display(),
@@ -167,8 +167,9 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
     let perms = sfio::sfile_perms(sfile);
 
     // Mark delta as removed and reweave the body so its footprint is undone.
-    let serial = sccs.header.deltas[delta_idx].serial;
-    sccs.remove_delta(serial);
+    let serial = sccs.header().deltas[delta_idx].serial;
+    sccs.remove_delta(serial)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
     sfio::write_xfile_atomic(
         sfile,

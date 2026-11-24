@@ -240,13 +240,13 @@ fn expand_single_keyword(
             .into_bytes(),
     };
     match keyword {
-        "FD" => list_or_none(&sccs.header.descriptive_text),
-        "FL" => format_flags(&sccs.header.flags),
+        "FD" => list_or_none(&sccs.header().descriptive_text),
+        "FL" => format_flags(&sccs.header().flags),
         "KV" => stored(sccs.id_keyword_check().flatten()),
         "M" => module(),
         "MP" => stored(sccs.mr_program().flatten()),
         "Q" => stored(sccs.q_text()),
-        "UN" => list_or_none(&sccs.header.users),
+        "UN" => list_or_none(&sccs.header().users),
         "Y" => stored(sccs.module_type()),
         "A" => [
             text("Z"),
@@ -286,12 +286,12 @@ fn expand_single_keyword(
 fn keyword_text(keyword: &str, sccs: &SccsFile, delta: &DeltaEntry, sfile_path: &Path) -> String {
     match keyword {
         // Global keywords
-        "BF" => flag_yes_no(has_flag(&sccs.header.flags, |f| {
+        "BF" => flag_yes_no(has_flag(&sccs.header().flags, |f| {
             matches!(f, SccsFlag::BranchEnabled)
         }))
         .to_string(),
         "CB" => sccs
-            .header
+            .header()
             .flags
             .iter()
             .find_map(|f| match f {
@@ -308,7 +308,7 @@ fn keyword_text(keyword: &str, sccs: &SccsFile, delta: &DeltaEntry, sfile_path: 
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default(),
         "FB" => sccs
-            .header
+            .header()
             .flags
             .iter()
             .find_map(|f| match f {
@@ -316,11 +316,11 @@ fn keyword_text(keyword: &str, sccs: &SccsFile, delta: &DeltaEntry, sfile_path: 
                 _ => None,
             })
             .unwrap_or_else(|| "none".to_string()),
-        "J" => flag_yes_no(has_flag(&sccs.header.flags, |f| {
+        "J" => flag_yes_no(has_flag(&sccs.header().flags, |f| {
             matches!(f, SccsFlag::JointEdit)
         }))
         .to_string(),
-        "KF" => flag_yes_no(has_flag(&sccs.header.flags, |f| {
+        "KF" => flag_yes_no(has_flag(&sccs.header().flags, |f| {
             matches!(f, SccsFlag::IdKeywordError(_))
         }))
         .to_string(),
@@ -331,11 +331,11 @@ fn keyword_text(keyword: &str, sccs: &SccsFile, delta: &DeltaEntry, sfile_path: 
             .locked_releases()
             .map(|lock| lock.value_string())
             .unwrap_or_else(|| "none".to_string()),
-        "MF" => flag_yes_no(has_flag(&sccs.header.flags, |f| {
+        "MF" => flag_yes_no(has_flag(&sccs.header().flags, |f| {
             matches!(f, SccsFlag::MrValidation(_))
         }))
         .to_string(),
-        "ND" => flag_yes_no(has_flag(&sccs.header.flags, |f| {
+        "ND" => flag_yes_no(has_flag(&sccs.header().flags, |f| {
             matches!(f, SccsFlag::NullDelta)
         }))
         .to_string(),
@@ -505,7 +505,7 @@ fn prs_file(sfile: &Path, args: &Args) -> io::Result<bool> {
     if use_default_format && args.sid.is_none() {
         // We need a dummy delta to expand the header format
         // Since :PN: doesn't depend on delta, use the first one
-        if let Some(first_delta) = sccs.header.deltas.first() {
+        if let Some(first_delta) = sccs.header().deltas.first() {
             let (header, _) = expand_keywords(DEFAULT_HEADER_FORMAT, &sccs, first_delta, sfile);
             io::stdout().write_all(&header)?;
         }
@@ -544,7 +544,7 @@ fn prs_file(sfile: &Path, args: &Args) -> io::Result<bool> {
 
     // Determine which deltas to process
     let deltas: Vec<&DeltaEntry> = sccs
-        .header
+        .header()
         .deltas
         .iter()
         .filter(|d| {

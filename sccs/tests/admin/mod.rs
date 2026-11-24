@@ -1489,3 +1489,29 @@ fn admin_h_checks_the_body_structure() {
         "overlapping blocks are well-formed: {out:?}"
     );
 }
+
+/// Setting a flag the file already has changes that flag's line where it
+/// stands; the other flags keep their lines and their order. (It used to be
+/// removed and re-added after the others.)
+#[test]
+fn admin_f_replaces_a_flag_in_place() {
+    let tmp = TempDir::new().unwrap();
+    let s = admin_create(tmp.path(), "fl", "body %I%\n");
+    for args in [&["-fq first", "-fb", "-fttype"][..], &["-fq second"]] {
+        let mut argv = args.to_vec();
+        argv.push("s.fl");
+        let out = run_in("admin", &argv, tmp.path(), "");
+        assert!(out.status.success(), "admin {args:?}: {out:?}");
+    }
+    let data = fs::read(&s).unwrap();
+    let flags: Vec<&[u8]> = plib::sccsfile::split_lines(&data)
+        .into_iter()
+        .filter(|l| l.starts_with(b"\x01f "))
+        .collect();
+    assert_eq!(
+        flags,
+        [&b"\x01f q second"[..], b"\x01f b", b"\x01f t type"],
+        "{}",
+        String::from_utf8_lossy(&data)
+    );
+}

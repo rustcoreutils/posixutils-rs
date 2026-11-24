@@ -341,8 +341,8 @@ fn create_new_sccs_file(path: &Path, params: NewFileParams) -> io::Result<()> {
 fn check_sccs_file(path: &Path) -> io::Result<bool> {
     let data = fs::read(path)?;
 
-    // Parse to verify structure
-    match SccsFile::from_bytes(&data) {
+    // Parse strictly to verify the structure
+    match SccsFile::from_bytes_strict(&data) {
         Ok(sccs) => {
             // Verify the checksum. A header-only s-file has an empty body,
             // which still has a checksum: skipping the check for it let
@@ -375,13 +375,15 @@ fn recompute_checksum(path: &Path) -> io::Result<()> {
     // Per-command z-file lock around the rewrite.
     let _zlock = zlock::acquire(path)?;
 
-    // Read and parse
-    let sccs = SccsFile::from_path(path)
+    // It must be an s-file, but "use of this option on a truly corrupted file
+    // may prevent future detection of the corruption" (POSIX 84112-84113):
+    // only the checksum line changes. Re-serializing the parsed file instead
+    // silently deleted every line the parser reads around.
+    let data = fs::read(path)?;
+    SccsFile::from_bytes(&data)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
-    // Re-serialize (this recomputes checksum)
     let x_file = paths::xfile_from_sfile(path);
-    let serialized = sccs.to_bytes();
+    let serialized = plib::sccsfile::with_recomputed_checksum(&data);
 
     // Get original permissions
     let original_perms = fs::metadata(path)?.permissions();

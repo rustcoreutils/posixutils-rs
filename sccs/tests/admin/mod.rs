@@ -803,3 +803,59 @@ fn x_file_symlink_is_not_followed() {
     run("rmdel", &["-r1.2", "s.f"]);
     check("rmdel");
 }
+
+/// Lines no s-file record accounts for -- in the delta table, inside a delta
+/// entry, in the flags -- are structural corruption. `admin -h` and `val`
+/// check the structure (POSIX admin 84107) and must report them, though the
+/// checksum is right; `get` still reads around them. `admin -z` recomputes
+/// the checksum and changes nothing else (84111): it used to re-serialize
+/// the file, silently deleting such lines.
+#[test]
+fn admin_h_checks_structure_and_z_changes_only_the_checksum() {
+    let tmp = TempDir::new().unwrap();
+    let strays: [&[u8]; 3] = [
+        // In the delta table, between entries.
+        b"\x01s 00001/00000/00000\n\x01d D 1.1 26/01/01 00:00:00 u 1 0\n\x01e\n\
+STRAY\n\x01u\n\x01U\n\x01t\n\x01T\n\x01I 1\nbody %I%\n\x01E 1\n",
+        // Inside a delta entry: a second comment line lost its ^Ac.
+        b"\x01s 00001/00000/00000\n\x01d D 1.1 26/01/01 00:00:00 u 1 0\n\x01c one\n\
+two\n\x01e\n\x01u\n\x01U\n\x01t\n\x01T\n\x01I 1\nbody %I%\n\x01E 1\n",
+        // In the flags section.
+        b"\x01s 00001/00000/00000\n\x01d D 1.1 26/01/01 00:00:00 u 1 0\n\x01e\n\
+\x01u\n\x01U\n\x01f q a\nb\n\x01t\n\x01T\n\x01I 1\nbody %I%\n\x01E 1\n",
+    ];
+    for content in strays {
+        let s = super::common::write_sfile(tmp.path(), "s.bad", content);
+        let shown = String::from_utf8_lossy(content).into_owned();
+
+        let out = super::common::run_in("admin", &["-h", "s.bad"], tmp.path(), "");
+        assert_eq!(out.status.code(), Some(1), "admin -h passed {shown:?}");
+        assert!(!out.stderr.is_empty());
+        let out = super::common::run_in("val", &["s.bad"], tmp.path(), "");
+        assert_eq!(out.status.code(), Some(0x20), "val passed {shown:?}");
+        let out = super::common::run_in("get", &["-p", "-s", "s.bad"], tmp.path(), "");
+        assert!(out.status.success(), "get must read around it: {out:?}");
+
+        // Break the checksum, then -z: only line 1 may change.
+        let mut data = fs::read(&s).unwrap();
+        data[6] = if data[6] == b'0' { b'1' } else { b'0' };
+        let mut perms = fs::metadata(&s).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        fs::set_permissions(&s, perms).unwrap();
+        fs::write(&s, &data).unwrap();
+        let out = super::common::run_in("admin", &["-z", "s.bad"], tmp.path(), "");
+        assert!(out.status.success(), "{out:?}");
+        let after = fs::read(&s).unwrap();
+        let rest = |d: &[u8]| d[d.iter().position(|&b| b == b'\n').unwrap()..].to_vec();
+        assert_eq!(rest(&after), rest(&data), "-z changed more than line 1");
+        assert!(plib::sccsfile::stored_checksum_matches(
+            &after,
+            plib::sccsfile::stored_body_checksum(&after)
+        ));
+        assert!(after.starts_with(
+            format!("\x01h{:05}\n", plib::sccsfile::stored_body_checksum(&after)).as_bytes()
+        ));
+        fs::remove_file(&s).unwrap();
+    }
+}

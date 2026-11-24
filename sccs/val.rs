@@ -86,26 +86,29 @@ fn validate_file(args: &Args, file_path: &PathBuf, diags: &mut Vec<String>) -> u
         return ERR_CANNOT_OPEN;
     }
 
-    // Try to parse the SCCS file
-    let sccs = match SccsFile::from_path(file_path) {
+    // Read the file once: the structure and the checksum are checked on the
+    // same bytes.
+    let data = match std::fs::read(file_path) {
+        Ok(data) => data,
+        Err(e) => {
+            diags.push(plib::diag::io_error_text(&e));
+            return ERR_CANNOT_OPEN;
+        }
+    };
+
+    // Parse strictly: a line no record accounts for is corruption.
+    let sccs = match SccsFile::from_bytes_strict(&data) {
         Ok(s) => s,
         Err(e) => {
             diags.push(e.to_string());
-            // Determine if it's "cannot open" or "corrupted"
-            if file_path.exists() {
-                return ERR_CORRUPTED_FILE;
-            } else {
-                return ERR_CANNOT_OPEN;
-            }
+            return ERR_CORRUPTED_FILE;
         }
     };
 
     // Verify checksum. A header-only file (no body) still has one.
-    if let Ok(data) = std::fs::read(file_path) {
-        if !plib::sccsfile::stored_checksum_matches(&data, sccs.header.checksum) {
-            diags.push(gettext("corrupted SCCS file (checksum error)"));
-            errors |= ERR_CORRUPTED_FILE;
-        }
+    if !plib::sccsfile::stored_checksum_matches(&data, sccs.header.checksum) {
+        diags.push(gettext("corrupted SCCS file (checksum error)"));
+        errors |= ERR_CORRUPTED_FILE;
     }
 
     // Check -r SID if specified

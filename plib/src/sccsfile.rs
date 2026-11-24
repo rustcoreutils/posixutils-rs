@@ -848,8 +848,18 @@ pub struct SccsFile {
 impl SccsFile {
     /// Parse SCCS file from bytes
     pub fn from_bytes(data: &[u8]) -> SccsResult<Self> {
-        let mut parser = SccsParser::new(data);
-        parser.parse()
+        SccsParser::new(data, false).parse()
+    }
+
+    /// Parse SCCS file from bytes, refusing any line no record accounts for.
+    ///
+    /// [`from_bytes`](Self::from_bytes) reads around a stray line in the
+    /// delta table, in a delta entry or among the flags, so that `get` and
+    /// `prs` still work on a damaged file; this is for `admin -h` and `val`,
+    /// which "check the structure of the SCCS file" (POSIX admin 84107) and
+    /// must report it.
+    pub fn from_bytes_strict(data: &[u8]) -> SccsResult<Self> {
+        SccsParser::new(data, true).parse()
     }
 
     /// Parse SCCS file from a reader
@@ -1507,15 +1517,31 @@ struct SccsParser<'a> {
     data: &'a [u8],
     pos: usize,
     line_num: usize,
+    /// Refuse lines no record accounts for, rather than skip them.
+    strict: bool,
 }
 
 impl<'a> SccsParser<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    fn new(data: &'a [u8], strict: bool) -> Self {
         Self {
             data,
             pos: 0,
             line_num: 0,
+            strict,
         }
+    }
+
+    /// A line that is not part of any record, at `self.line_num`: an error
+    /// when parsing strictly, and otherwise skipped.
+    fn stray_line(&self, line: &[u8]) -> SccsResult<()> {
+        if self.strict {
+            return Err(SccsError::InvalidFormat(format!(
+                "line {}: unexpected line {:?}",
+                self.line_num,
+                String::from_utf8_lossy(line)
+            )));
+        }
+        Ok(())
     }
 
     fn parse(&mut self) -> SccsResult<SccsFile> {
@@ -1632,8 +1658,8 @@ impl<'a> SccsParser<'a> {
                 let delta = self.parse_delta_entry()?;
                 deltas.push(delta);
             } else {
-                // Skip unknown lines
                 self.next_line();
+                self.stray_line(line)?;
             }
         }
 
@@ -1697,6 +1723,7 @@ impl<'a> SccsParser<'a> {
                 .ok_or(SccsError::MissingField("delta end".into()))?;
 
             if line.len() < 2 || line[0] != SOH {
+                self.stray_line(line)?;
                 continue;
             }
 
@@ -1733,7 +1760,7 @@ impl<'a> SccsParser<'a> {
                     }
                 }
                 control::COMMENT => entry.comments.push(control_arg(line).to_vec()),
-                _ => {} // Skip unknown
+                _ => self.stray_line(line)?,
             }
         }
 
@@ -1799,6 +1826,7 @@ impl<'a> SccsParser<'a> {
                 }
             } else {
                 self.next_line();
+                self.stray_line(line)?;
             }
         }
 
@@ -1903,6 +1931,16 @@ pub fn stored_checksum_matches(data: &[u8], stored: u16) -> bool {
         .iter()
         .fold(0u16, |s, &b| s.wrapping_add(u16::from(b)));
     compute_checksum(bytes) == stored || unsigned == stored
+}
+
+/// The s-file `data` with its first line replaced by the `^Ah` line for the
+/// checksum of the rest, which is left byte for byte as it was: what
+/// `admin -z` writes (POSIX 84111).
+pub fn with_recomputed_checksum(data: &[u8]) -> Vec<u8> {
+    let rest = checksummed_bytes(data);
+    let mut out = format!("\x01h{:05}\n", compute_checksum(rest)).into_bytes();
+    out.extend_from_slice(rest);
+    out
 }
 
 /// Compute the SCCS checksum: the sum, modulo 65536, of every byte taken as

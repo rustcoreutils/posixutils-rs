@@ -1552,3 +1552,32 @@ fn delta_reads_escaped_newlines_in_its_replies() {
     let out = run("prs", &["-d:C:|", "-r1.3", "s.r"], "");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "unfinished\n|\n");
 }
+
+/// The comment and the MR list read from standard input are read once, and
+/// are those of every file named: delta of several files asks one question.
+/// It read standard input afresh for each file, so the first got the comment
+/// and the rest got the end of the input, an empty one.
+#[test]
+fn delta_gives_every_file_the_reply_it_read() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    for name in ["a", "b", "c"] {
+        let s = format!("s.{name}");
+        assert!(run("admin", &["-i", "-fv", "-mfirst", &s], "one\n")
+            .status
+            .success());
+        assert!(run("get", &["-e", "-s", &s], "").status.success());
+        std::fs::write(dir.join(name), "two\n").unwrap();
+    }
+    let out = run("delta", &["-s", "s.a", "s.b", "s.c"], "mr7\nthe comment\n");
+    assert!(out.status.success(), "{out:?}");
+    for name in ["a", "b", "c"] {
+        let out = run("prs", &["-d:MR:|:C:|", "-r1.2", &format!("s.{name}")], "");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "mr7\n|the comment\n|\n",
+            "s.{name}"
+        );
+    }
+}

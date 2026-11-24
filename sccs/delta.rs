@@ -383,6 +383,16 @@ fn remove_pfile_entry(txn: &Txn, entry_to_remove: &PfileEntry) -> io::Result<()>
     txn.set_pending(&remaining)
 }
 
+/// What was read from standard input in reply to delta's two questions.
+/// Each is asked once, when a file first needs it, and its reply is every
+/// file's: read again for the next file, the input had nothing left, and
+/// only the first file got the comment.
+#[derive(Default)]
+struct Replies {
+    mrs: Option<OsString>,
+    comment: Option<Vec<u8>>,
+}
+
 /// Determine the MR list for the new delta, honoring the `v` flag.
 ///
 /// Returns `Ok(Some(mrs))` with the (possibly empty) MR list to record, or
@@ -396,6 +406,7 @@ fn gather_mrs(
     sccs: &SccsFile,
     sfile_path: &Path,
     stdin_consumed: bool,
+    replies: &mut Replies,
 ) -> io::Result<Option<Vec<MrNumber>>> {
     // Locate the v flag, if any.
     let v_flag = sccs.header().flags.iter().find_map(|f| match f {
@@ -409,11 +420,14 @@ fn gather_mrs(
         Some(s) => Some(s.clone()),
         None => {
             if v_set && !stdin_consumed {
-                if stdin_is_tty() {
-                    print!("{}", gettext("MRs? "));
-                    io::stdout().flush().ok();
-                }
-                Some(OsString::from_vec(read_stdin_reply()))
+                let reply = replies.mrs.get_or_insert_with(|| {
+                    if stdin_is_tty() {
+                        print!("{}", gettext("MRs? "));
+                        io::stdout().flush().ok();
+                    }
+                    OsString::from_vec(read_stdin_reply())
+                });
+                Some(reply.clone())
             } else {
                 None
             }
@@ -460,24 +474,29 @@ fn gather_mrs(
 /// Uses `-y` if supplied; otherwise prompts on a terminal (or reads stdin
 /// silently when not a terminal). When the operand was `-`, stdin is already
 /// consumed and the comment defaults to empty.
-fn gather_comment(args: &Args, stdin_consumed: bool) -> Vec<u8> {
+fn gather_comment(args: &Args, stdin_consumed: bool, replies: &mut Replies) -> Vec<u8> {
     match &args.comment {
         Some(c) => c.as_bytes().to_vec(),
-        None => {
-            if stdin_consumed {
-                Vec::new()
-            } else {
+        None if stdin_consumed => Vec::new(),
+        None => replies
+            .comment
+            .get_or_insert_with(|| {
                 if stdin_is_tty() {
                     print!("{}", gettext("comments? "));
                     io::stdout().flush().ok();
                 }
                 read_stdin_reply()
-            }
-        }
+            })
+            .clone(),
     }
 }
 
-fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Result<bool> {
+fn process_file(
+    args: &Args,
+    sfile_path: &Path,
+    stdin_consumed: bool,
+    replies: &mut Replies,
+) -> io::Result<bool> {
     // Validate s-file
     if !paths::is_sfile(sfile_path) {
         eprintln!(
@@ -597,11 +616,11 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
 
     // Gather MRs (honoring the v flag) and the comment. The MR prompt, if any,
     // must precede the comment prompt.
-    let mrs = match gather_mrs(args, &sccs, sfile_path, stdin_consumed)? {
+    let mrs = match gather_mrs(args, &sccs, sfile_path, stdin_consumed, replies)? {
         Some(m) => m,
         None => return Ok(false),
     };
-    let comment = gather_comment(args, stdin_consumed);
+    let comment = gather_comment(args, stdin_consumed, replies);
 
     // Resolve -g list (SIDs, ranges or serial numbers) into serials to ignore.
     // A malformed range aborts before anything is written: recording the delta
@@ -717,9 +736,10 @@ fn main() -> ExitCode {
     let files = operands::expand(&args.files);
 
     let mut exit_code = ExitCode::SUCCESS;
+    let mut replies = Replies::default();
 
     for file_path in &files {
-        match process_file(&args, file_path, stdin_consumed) {
+        match process_file(&args, file_path, stdin_consumed, &mut replies) {
             Ok(true) => {}
             Ok(false) => exit_code = ExitCode::FAILURE,
             Err(e) => {

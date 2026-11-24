@@ -636,9 +636,10 @@ fn delta_r_selects_among_multiple_pending_edits() {
         "",
     );
     super::common::run_in("get", &["-e", sfile.to_str().unwrap()], tmp.path(), "");
+    // -g: the first edit's g-file is there, writable, and is not replaced.
     super::common::run_in(
         "get",
-        &["-e", "-b", sfile.to_str().unwrap()],
+        &["-e", "-b", "-g", sfile.to_str().unwrap()],
         tmp.path(),
         "",
     );

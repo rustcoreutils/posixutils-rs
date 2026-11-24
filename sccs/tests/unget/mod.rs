@@ -326,7 +326,13 @@ fn unget_r_selects_one_of_several_pending_edits() {
     assert!(out.status.success(), "admin -fb -fj should succeed");
 
     get_for_editing(&s);
-    let out = sccs_run("get", &["-e", "-b", s.to_str().unwrap()], tmp.path(), "");
+    // -g: the first edit's g-file is there, writable, and is not replaced.
+    let out = sccs_run(
+        "get",
+        &["-e", "-b", "-g", s.to_str().unwrap()],
+        tmp.path(),
+        "",
+    );
     assert!(out.status.success(), "get -e -b should branch");
 
     let pfile = s.with_file_name("p.multi");

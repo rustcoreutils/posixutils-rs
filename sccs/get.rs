@@ -274,6 +274,28 @@ fn check_pfile_lock(txn: &Txn, new_sid: &Sid) -> Result<(), String> {
     }
 }
 
+/// Whether `path` is a file someone may write: a g-file being edited.
+fn is_writable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o222 != 0)
+}
+
+/// Take back the edit [`create_pfile_entry`] recorded: the retrieval it was
+/// for did not happen. The last entry like it goes; with joint editing
+/// there may be others, which are other people's.
+fn withdraw_pfile_entry(txn: &Txn, entry: &PfileEntry) -> io::Result<()> {
+    let mut entries = txn.pending()?;
+    let same = |e: &PfileEntry| {
+        e.old_sid == entry.old_sid && e.new_sid == entry.new_sid && e.user == entry.user
+    };
+    if let Some(at) = entries.iter().rposition(same) {
+        entries.remove(at);
+        txn.set_pending(&entries)?;
+    }
+    Ok(())
+}
+
 /// Record the edit in the p-file, after those already pending.
 fn create_pfile_entry(
     txn: &Txn,
@@ -281,7 +303,7 @@ fn create_pfile_entry(
     new_sid: &Sid,
     included: Option<SidList>,
     excluded: Option<SidList>,
-) -> io::Result<()> {
+) -> io::Result<PfileEntry> {
     let entry = PfileEntry {
         old_sid: *old_sid,
         new_sid: *new_sid,
@@ -292,8 +314,9 @@ fn create_pfile_entry(
     };
 
     let mut entries = txn.pending()?;
-    entries.push(entry);
-    txn.set_pending(&entries)
+    entries.push(entry.clone());
+    txn.set_pending(&entries)?;
+    Ok(entry)
 }
 
 /// Render the delta-summary table (the l-file body). Deltas are listed newest
@@ -429,6 +452,34 @@ fn process_file(
         Some(txn) => txn.read()?,
         None => SccsFile::from_path(sfile_path).map_err(unreadable)?,
     };
+
+    // What would stop the retrieval is looked for before anything is
+    // announced or recorded. A body that cannot be read: found only when
+    // the text was produced, it left an edit announced and pending with no
+    // g-file to go with it.
+    if txn.is_some() {
+        sccs.check_weave().map_err(unreadable)?;
+    }
+    // And a g-file that is writable, which is someone's work in progress
+    // and is not replaced (SCCS: "writable `f' exists"). A read-only one is
+    // an earlier retrieval.
+    if !args.to_stdout && !args.no_get {
+        if let Some(gfile) = paths::gfile_from_sfile(sfile_path) {
+            if is_writable_file(&gfile) {
+                diag::error_path(
+                    "get",
+                    sfile_path,
+                    &format!(
+                        "{} `{}' {}",
+                        gettext("writable"),
+                        gfile.display(),
+                        gettext("exists")
+                    ),
+                );
+                return Ok(false);
+            }
+        }
+    }
 
     // The `d` flag names "the default delta number (SID) to be used by a get
     // command" (POSIX 84036), so it stands in for -r when -r is absent. An
@@ -598,44 +649,175 @@ fn process_file(
     // suppresses the g-file but not the lock, and `get -e -g` announcing a new
     // delta while leaving no p-file behind would hand the caller a lock that
     // does not exist.
+    let mut recorded = None;
     if let Some(txn) = &txn {
         if let Some(ns) = new_sid {
-            create_pfile_entry(
+            recorded = Some(create_pfile_entry(
                 txn,
                 &target_sid,
                 &ns,
                 lists.include.clone(),
                 lists.exclude.clone(),
-            )?;
+            )?);
         }
     }
 
-    // If -g, skip actual retrieval
-    if args.no_get {
-        return Ok(true);
-    }
+    // The retrieval. If it does not happen -- the g-file cannot be made, the
+    // `i` flag refuses a text without keywords -- the edit recorded for it
+    // is taken back, still under the lock: left pending with no g-file, it
+    // refused every later `get -e` until someone ran `unget`.
+    let retrieved = (|| -> io::Result<bool> {
+        // If -g, skip actual retrieval
+        if args.no_get {
+            return Ok(true);
+        }
 
-    // Get module name for -n option
-    let module_name = idkw::module_name_of(&sccs, sfile_path);
+        // Get module name for -n option
+        let module_name = idkw::module_name_of(&sccs, sfile_path);
 
-    // Encoded (binary / no-trailing-newline) bodies: uudecode and emit raw
-    // bytes, with no ID-keyword expansion (the content is opaque).
-    if sccs.is_encoded() {
-        let encoded_lines = sccs.evaluate_body(&applied_set).map_err(unreadable)?;
-        let raw = plib::sccsfile::uudecode_sccs(&encoded_lines);
+        // Encoded (binary / no-trailing-newline) bodies: uudecode and emit raw
+        // bytes, with no ID-keyword expansion (the content is opaque).
+        if sccs.is_encoded() {
+            let encoded_lines = sccs.evaluate_body(&applied_set).map_err(unreadable)?;
+            let raw = plib::sccsfile::uudecode_sccs(&encoded_lines);
 
-        if args.to_stdout {
-            Stdout.write_all(&raw)?;
+            if args.to_stdout {
+                Stdout.write_all(&raw)?;
+            } else {
+                let gfile_path = paths::gfile_from_sfile(sfile_path).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, gettext("Invalid s-file name"))
+                })?;
+                let mode = if args.edit { 0o644 } else { 0o444 };
+                sfio::write_replacing(&gfile_path, &raw, mode)?;
+            }
+
+            if !args.silent {
+                let line_count = raw.iter().filter(|&&b| b == b'\n').count();
+                let output_stream: &mut dyn Write = if info_to_stderr {
+                    &mut io::stderr()
+                } else {
+                    &mut Stdout
+                };
+                writeln!(output_stream, "{} {}", line_count, gettext("lines"))?;
+            }
+
+            return Ok(true);
+        }
+
+        // Evaluate body
+        let suppress_keywords = args.no_keywords || args.edit;
+
+        // Track whether any ID keyword (%X%) appeared in the retrieved text.
+        let mut had_keyword = false;
+
+        let target_delta = sccs.find_delta_by_serial(target_serial).unwrap();
+        let keyword_values = idkw::KeywordValues::new(&sccs, target_delta, sfile_path);
+
+        // The body, each line paired with the SID of the delta that inserted it
+        // when -m wants that prefix.
+        let body: Vec<(Vec<u8>, Option<Sid>)> = if args.show_sid {
+            sccs.evaluate_body_annotated(&applied_set)
+                .map_err(unreadable)?
+                .into_iter()
+                .map(|(serial, line)| {
+                    // The inserting delta, as its SID.
+                    let sid = sccs
+                        .find_delta_by_serial(serial)
+                        .map_or(Sid::trunk(1, 1), |d| d.sid);
+                    (line, Some(sid))
+                })
+                .collect()
         } else {
+            sccs.evaluate_body(&applied_set)
+                .map_err(unreadable)?
+                .into_iter()
+                .map(|line| (line, None))
+                .collect()
+        };
+
+        let lines: Vec<Vec<u8>> = body
+            .into_iter()
+            .enumerate()
+            .map(|(i, (line, sid))| {
+                if idkw::contains(&line) {
+                    had_keyword = true;
+                }
+                let expanded = if suppress_keywords {
+                    line
+                } else {
+                    idkw::expand(&line, &keyword_values, i + 1)
+                };
+
+                // -n and -m prefixes, each followed by a tab, module name first.
+                let mut out = Vec::new();
+                if args.show_module {
+                    out.extend_from_slice(&module_name);
+                    out.push(b'\t');
+                }
+                if let Some(sid) = sid {
+                    out.extend_from_slice(sid.to_string().as_bytes());
+                    out.push(b'\t');
+                }
+                out.extend_from_slice(&expanded);
+                out
+            })
+            .collect();
+
+        // "No id keywords" handling. When no keyword was present (and keyword
+        // expansion was not suppressed), SCCS warns. If the s-file has the 'i'
+        // flag set, this is escalated to a fatal error: no g-file is written.
+        if !had_keyword && !suppress_keywords {
+            let has_i_flag = sccs
+                .header()
+                .flags
+                .iter()
+                .any(|f| matches!(f, SccsFlag::IdKeywordError(_)));
+            if has_i_flag {
+                // Fatal: always reported, even under -s; no g-file is written.
+                eprintln!(
+                    "get: {}: {}",
+                    sfile_path.display(),
+                    gettext("No id keywords.")
+                );
+                return Ok(false);
+            } else if !args.silent {
+                // Warning: suppressed by -s along with other informative output.
+                eprintln!(
+                    "get: warning: {}: {}",
+                    sfile_path.display(),
+                    gettext("No id keywords.")
+                );
+            }
+        }
+
+        let line_count = lines.len();
+
+        // Write output
+        if args.to_stdout {
+            for line in &lines {
+                Stdout.write_all(line)?;
+                Stdout.write_all(b"\n")?;
+            }
+        } else {
+            // Write to g-file
             let gfile_path = paths::gfile_from_sfile(sfile_path).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, gettext("Invalid s-file name"))
             })?;
+
+            // A non-edit g-file is read-only, so the previous run's g-file must be
+            // replaced rather than reopened: `File::create` on it fails EACCES,
+            // which made a second `get` of any file impossible.
+            let mut content = Vec::new();
+            for line in &lines {
+                content.extend_from_slice(line);
+                content.push(b'\n');
+            }
             let mode = if args.edit { 0o644 } else { 0o444 };
-            sfio::write_replacing(&gfile_path, &raw, mode)?;
+            sfio::write_replacing(&gfile_path, &content, mode)?;
         }
 
+        // Print line count (unless silent)
         if !args.silent {
-            let line_count = raw.iter().filter(|&&b| b == b'\n').count();
             let output_stream: &mut dyn Write = if info_to_stderr {
                 &mut io::stderr()
             } else {
@@ -644,132 +826,14 @@ fn process_file(
             writeln!(output_stream, "{} {}", line_count, gettext("lines"))?;
         }
 
-        return Ok(true);
-    }
-
-    // Evaluate body
-    let suppress_keywords = args.no_keywords || args.edit;
-
-    // Track whether any ID keyword (%X%) appeared in the retrieved text.
-    let mut had_keyword = false;
-
-    let target_delta = sccs.find_delta_by_serial(target_serial).unwrap();
-    let keyword_values = idkw::KeywordValues::new(&sccs, target_delta, sfile_path);
-
-    // The body, each line paired with the SID of the delta that inserted it
-    // when -m wants that prefix.
-    let body: Vec<(Vec<u8>, Option<Sid>)> = if args.show_sid {
-        sccs.evaluate_body_annotated(&applied_set)
-            .map_err(unreadable)?
-            .into_iter()
-            .map(|(serial, line)| {
-                // The inserting delta, as its SID.
-                let sid = sccs
-                    .find_delta_by_serial(serial)
-                    .map_or(Sid::trunk(1, 1), |d| d.sid);
-                (line, Some(sid))
-            })
-            .collect()
-    } else {
-        sccs.evaluate_body(&applied_set)
-            .map_err(unreadable)?
-            .into_iter()
-            .map(|line| (line, None))
-            .collect()
-    };
-
-    let lines: Vec<Vec<u8>> = body
-        .into_iter()
-        .enumerate()
-        .map(|(i, (line, sid))| {
-            if idkw::contains(&line) {
-                had_keyword = true;
-            }
-            let expanded = if suppress_keywords {
-                line
-            } else {
-                idkw::expand(&line, &keyword_values, i + 1)
-            };
-
-            // -n and -m prefixes, each followed by a tab, module name first.
-            let mut out = Vec::new();
-            if args.show_module {
-                out.extend_from_slice(&module_name);
-                out.push(b'\t');
-            }
-            if let Some(sid) = sid {
-                out.extend_from_slice(sid.to_string().as_bytes());
-                out.push(b'\t');
-            }
-            out.extend_from_slice(&expanded);
-            out
-        })
-        .collect();
-
-    // "No id keywords" handling. When no keyword was present (and keyword
-    // expansion was not suppressed), SCCS warns. If the s-file has the 'i'
-    // flag set, this is escalated to a fatal error: no g-file is written.
-    if !had_keyword && !suppress_keywords {
-        let has_i_flag = sccs
-            .header()
-            .flags
-            .iter()
-            .any(|f| matches!(f, SccsFlag::IdKeywordError(_)));
-        if has_i_flag {
-            // Fatal: always reported, even under -s; no g-file is written.
-            eprintln!(
-                "get: {}: {}",
-                sfile_path.display(),
-                gettext("No id keywords.")
-            );
-            return Ok(false);
-        } else if !args.silent {
-            // Warning: suppressed by -s along with other informative output.
-            eprintln!(
-                "get: warning: {}: {}",
-                sfile_path.display(),
-                gettext("No id keywords.")
-            );
+        Ok(true)
+    })();
+    if !matches!(retrieved, Ok(true)) {
+        if let (Some(txn), Some(entry)) = (&txn, &recorded) {
+            withdraw_pfile_entry(txn, entry)?;
         }
     }
-
-    let line_count = lines.len();
-
-    // Write output
-    if args.to_stdout {
-        for line in &lines {
-            Stdout.write_all(line)?;
-            Stdout.write_all(b"\n")?;
-        }
-    } else {
-        // Write to g-file
-        let gfile_path = paths::gfile_from_sfile(sfile_path).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, gettext("Invalid s-file name"))
-        })?;
-
-        // A non-edit g-file is read-only, so the previous run's g-file must be
-        // replaced rather than reopened: `File::create` on it fails EACCES,
-        // which made a second `get` of any file impossible.
-        let mut content = Vec::new();
-        for line in &lines {
-            content.extend_from_slice(line);
-            content.push(b'\n');
-        }
-        let mode = if args.edit { 0o644 } else { 0o444 };
-        sfio::write_replacing(&gfile_path, &content, mode)?;
-    }
-
-    // Print line count (unless silent)
-    if !args.silent {
-        let output_stream: &mut dyn Write = if info_to_stderr {
-            &mut io::stderr()
-        } else {
-            &mut Stdout
-        };
-        writeln!(output_stream, "{} {}", line_count, gettext("lines"))?;
-    }
-
-    Ok(true)
+    retrieved
 }
 
 /// Standard output, whose write failures are marked as [`StdoutWriteError`]

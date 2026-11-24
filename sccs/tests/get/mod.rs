@@ -1763,3 +1763,89 @@ fn get_e_records_only_a_well_formed_list() {
     let out = run("sact", &["s.l"], "");
     assert!(out.status.success(), "{out:?}");
 }
+
+/// An edit that cannot be given its g-file is not left pending. `get -e`
+/// records the edit in the p-file before it retrieves the text; when the
+/// retrieval then failed -- a damaged body, a g-file that cannot be made --
+/// the entry stayed, with no g-file to go with it, and every later `get -e`
+/// was refused until someone ran `unget`.
+#[test]
+fn get_e_that_fails_leaves_no_pending_edit() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |args: &[&str], cwd: &std::path::Path| super::common::run_in("get", args, cwd, "");
+
+    // A body whose first block is never closed.
+    super::common::write_weave(dir, "s.bad", b"\x01I 1\none\n");
+    let out = run(&["-e", "s.bad"], dir);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.stdout.is_empty(), "no new delta is announced: {out:?}");
+    assert!(!dir.join("p.bad").exists(), "no edit is pending");
+    assert!(!dir.join("bad").exists() && !dir.join("z.bad").exists());
+
+    // A sound file, in a directory where the g-file cannot be created.
+    super::common::write_weave(dir, "s.ok", b"\x01I 1\none\n\x01E 1\n");
+    let cwd = dir.join("ro");
+    std::fs::create_dir(&cwd).unwrap();
+    std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // (Root creates files anywhere; the case cannot arise for it.)
+    if std::fs::write(cwd.join("probe"), b"").is_err() {
+        let out = run(&["-e", "-s", "../s.ok"], &cwd);
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert!(!dir.join("p.ok").exists(), "no edit is pending: {out:?}");
+    }
+    std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // The same edit, where it can be made, is pending afterwards.
+    assert!(run(&["-e", "-s", "s.ok"], dir).status.success());
+    assert!(dir.join("p.ok").exists());
+}
+
+/// A g-file that is writable holds someone's work: `get` does not replace
+/// it. (SCCS: "writable `f' exists".) It used to be overwritten in silence,
+/// by a plain `get` and by `get -e` alike. `-p` and `-g` write no g-file and
+/// are not affected; a read-only g-file is a previous retrieval and is
+/// replaced.
+#[test]
+fn get_does_not_replace_a_writable_g_file() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    assert!(run("admin", &["-i", "-fj", "s.w"], "one\n")
+        .status
+        .success());
+
+    assert!(run("get", &["-s", "s.w"], "").status.success());
+    assert!(
+        run("get", &["-s", "s.w"], "").status.success(),
+        "read-only: replaced"
+    );
+    assert!(run("get", &["-e", "-s", "s.w"], "").status.success());
+    std::fs::write(dir.join("w"), "my edits\n").unwrap();
+
+    for args in [
+        &["-s", "s.w"][..],
+        &["-e", "-s", "s.w"],
+        &["-k", "-s", "s.w"],
+    ] {
+        let out = run("get", args, "");
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("writable"),
+            "{out:?}"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("w")).unwrap(),
+            b"my edits\n",
+            "{args:?}"
+        );
+    }
+    let pfile = std::fs::read_to_string(dir.join("p.w")).unwrap();
+    assert_eq!(pfile.lines().count(), 1, "the refused edit is not pending");
+
+    let out = run("get", &["-p", "-s", "s.w"], "");
+    assert_eq!(out.stdout, b"one\n");
+    assert!(run("get", &["-e", "-g", "-s", "s.w"], "").status.success());
+    assert_eq!(std::fs::read(dir.join("w")).unwrap(), b"my edits\n");
+}

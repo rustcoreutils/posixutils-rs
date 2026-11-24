@@ -174,6 +174,9 @@ fn parse_sid(s: &str) -> Result<Sid, String> {
     s.parse::<Sid>().map_err(|e| e.to_string())
 }
 
+/// The highest release number.
+const MAX_RELEASE: u16 = 9999;
+
 /// Flag letters recognized by the `-f` option (POSIX admin spec).
 const VALID_FLAG_CHARS: &[char] = &[
     'b', 'c', 'd', 'e', 'f', 'i', 'j', 'l', 'm', 'n', 'q', 't', 'v',
@@ -205,15 +208,23 @@ fn parse_flag(flag_str: &str) -> Result<SccsFlag, String> {
 
     let flag = SccsFlag::parse(flag_char, value.as_bytes()).map_err(|e| e.to_string())?;
 
-    // Spec caps ceiling/floor at 9999.
+    // The ceiling is "a number less than or equal to 9 999" and the floor
+    // "a number greater than 0 but less than 9 999" (POSIX 84030-84034).
+    let out_of_range = |n: u16, range: &str| {
+        format!(
+            "{} '{}' {} ({})",
+            gettext("value"),
+            n,
+            gettext("out of range"),
+            range
+        )
+    };
     match &flag {
-        SccsFlag::Ceiling(n) | SccsFlag::Floor(n) if *n > 9999 => {
-            return Err(format!(
-                "{} '{}' {}",
-                gettext("value"),
-                n,
-                gettext("out of range (max 9999)")
-            ));
+        SccsFlag::Ceiling(n) if *n > MAX_RELEASE => {
+            return Err(out_of_range(*n, "0-9999"));
+        }
+        SccsFlag::Floor(n) if !(1..MAX_RELEASE).contains(n) => {
+            return Err(out_of_range(*n, "1-9998"));
         }
         _ => {}
     }
@@ -341,6 +352,14 @@ fn create_new_sccs_file(path: &Path, params: NewFileParams) -> io::Result<()> {
                 parse_sid(s).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
             if sid.lev == 0 {
                 sid.lev = 1;
+            }
+            // Releases run from 1: a release-0 delta lies below any floor,
+            // so the file could be created but never edited.
+            if !(1..=MAX_RELEASE).contains(&sid.rel) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    gettext("Initial release must be from 1 to 9999"),
+                ));
             }
             sid
         }

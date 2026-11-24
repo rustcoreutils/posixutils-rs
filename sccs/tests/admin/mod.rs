@@ -1177,3 +1177,26 @@ fn admin_d_rejects_unrecognized_flags() {
         assert_eq!(fs::read(&s).unwrap(), before);
     }
 }
+
+/// Releases run from 1 to 9999. `-r0` made a file whose only delta, 0.1, lay
+/// below the floor, so `get -e` refused it forever; and the floor is "a
+/// number greater than 0 but less than 9 999" (POSIX admin 84033-84034).
+/// Each is refused, and nothing is created.
+#[test]
+fn admin_rejects_out_of_range_releases() {
+    let tmp = TempDir::new().unwrap();
+    for bad in ["-r0", "-r0.3", "-r10000", "-ff0", "-ff9999"] {
+        let out = run_in("admin", &["-n", bad, "s.r"], tmp.path(), "");
+        assert_eq!(out.status.code(), Some(1), "admin {bad}: {out:?}");
+        assert!(!out.stderr.is_empty(), "admin {bad} must say why");
+        assert!(
+            !tmp.path().join("s.r").exists(),
+            "admin {bad} created a file"
+        );
+    }
+    for good in ["-r1", "-r9999", "-ff1", "-ff9998", "-fc0", "-fc9999"] {
+        let name = format!("s.ok{}", good.replace('-', ""));
+        let out = run_in("admin", &["-n", good, &name], tmp.path(), "");
+        assert!(out.status.success(), "admin {good}: {out:?}");
+    }
+}

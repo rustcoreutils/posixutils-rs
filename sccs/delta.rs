@@ -223,21 +223,21 @@ fn base_applied_set(
 ///
 /// The list was written by `get -e`, which already validated it, so an
 /// unresolvable token here means the s-file changed underneath the edit.
-fn resolve_pfile_list(
-    sccs: &SccsFile,
-    list: Option<&SidList>,
-    sfile_path: &Path,
-) -> Result<Vec<u16>, String> {
+fn resolve_pfile_list(sccs: &SccsFile, list: Option<&SidList>) -> Result<Vec<u16>, String> {
     let Some(list) = list else {
         return Ok(Vec::new());
     };
+    // Every delta the edit was made with must still be there. With one
+    // gone the text edited is no longer the version the list describes, and
+    // a delta made regardless counted the missing delta's lines as the
+    // user's own.
     let (serials, unresolved) = sccs.resolve_sid_list(list.as_str())?;
-    for tok in unresolved {
-        diag::error_path(
-            "delta",
-            sfile_path,
-            &format!("{}: {}", tok, gettext("no such delta")),
-        );
+    if !unresolved.is_empty() {
+        return Err(format!(
+            "{}: {}",
+            unresolved.join(", "),
+            gettext("no such delta")
+        ));
     }
     Ok(serials)
 }
@@ -571,14 +571,14 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
 
     // The edit was made against the version `get -e` produced, which means the
     // -i/-x lists it recorded in the p-file, not the plain base.
-    let forced_in = match resolve_pfile_list(&sccs, pfile_entry.included.as_ref(), sfile_path) {
+    let forced_in = match resolve_pfile_list(&sccs, pfile_entry.included.as_ref()) {
         Ok(v) => v,
         Err(e) => {
             diag::error_path("delta", sfile_path, &e);
             return Ok(false);
         }
     };
-    let forced_out = match resolve_pfile_list(&sccs, pfile_entry.excluded.as_ref(), sfile_path) {
+    let forced_out = match resolve_pfile_list(&sccs, pfile_entry.excluded.as_ref()) {
         Ok(v) => v,
         Err(e) => {
             diag::error_path("delta", sfile_path, &e);

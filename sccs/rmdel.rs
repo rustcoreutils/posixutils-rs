@@ -158,9 +158,17 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
         return Ok(false);
     }
 
-    // Check that delta is not checked out for editing
+    // Check that delta is not checked out for editing: not the delta an
+    // edit was made from or will make, and not one an edit includes or
+    // excludes, which is as much a part of the version being edited.
+    let serial = sccs.header().deltas[delta_idx].serial;
     for entry in txn.pending()? {
-        if entry.old_sid == *sid || entry.new_sid == *sid {
+        let listed = [&entry.included, &entry.excluded]
+            .into_iter()
+            .flatten()
+            .filter_map(|list| sccs.resolve_sid_list(list.as_str()).ok())
+            .any(|(serials, _)| serials.contains(&serial));
+        if entry.old_sid == *sid || entry.new_sid == *sid || listed {
             diag::error_path(
                 "rmdel",
                 sfile,
@@ -188,7 +196,6 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
     }
 
     // Mark delta as removed and reweave the body so its footprint is undone.
-    let serial = sccs.header().deltas[delta_idx].serial;
     sccs.remove_delta(serial)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 

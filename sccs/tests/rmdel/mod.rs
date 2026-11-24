@@ -452,3 +452,51 @@ fn rmdel_refuses_a_delta_another_delta_names() {
     let out = run("rmdel", &["-r", "1.2", name], tmp.path(), "");
     assert!(out.status.success(), "{out:?}");
 }
+
+/// A delta that a pending edit includes or excludes is part of the version
+/// being edited: rmdel refuses it, as it refuses the delta being edited.
+/// Removed, it left the edit's recorded list naming nothing (or, the SID
+/// being free again, some later delta), and `delta` then said "no such
+/// delta" and committed all the same, counting the included delta's lines
+/// as the user's own.
+#[test]
+fn rmdel_refuses_a_delta_a_pending_edit_names() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    assert!(run("admin", &["-i", "-fb", "s.n"], "one\n")
+        .status
+        .success());
+    // 1.1.1.1, a branch, to include.
+    assert!(run("get", &["-e", "-s", "-b", "s.n"], "").status.success());
+    std::fs::write(dir.join("n"), "one\nbranch\n").unwrap();
+    assert!(run("delta", &["-s", "-yb", "s.n"], "").status.success());
+
+    assert!(run("get", &["-e", "-s", "-i1.1.1.1", "s.n"], "")
+        .status
+        .success());
+    let out = run("rmdel", &["-r1.1.1.1", "s.n"], "");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("being edited"),
+        "{out:?}"
+    );
+
+    // Should the named delta be gone all the same (removed by a tool that
+    // does not look), delta does not make a delta out of half an edit.
+    let pfile = dir.join("p.n");
+    let line = std::fs::read_to_string(&pfile).unwrap();
+    std::fs::write(&pfile, line.replace("-i1.1.1.1", "-i1.1.9.1")).unwrap();
+    let out = run("delta", &["-s", "-yc", "s.n"], "");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("1.1.9.1"),
+        "{out:?}"
+    );
+    assert!(
+        pfile.exists() && dir.join("n").exists(),
+        "the edit is still pending"
+    );
+    let out = run("prs", &["-e", "-d:I:", "s.n"], "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1.1.1.1\n1.1\n");
+}

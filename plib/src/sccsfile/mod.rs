@@ -36,6 +36,7 @@ mod pfile;
 mod sid;
 mod text;
 mod uu;
+mod weave;
 mod zlock;
 
 #[cfg(test)]
@@ -50,6 +51,7 @@ pub use pfile::*;
 pub use sid::*;
 pub use text::*;
 pub use uu::*;
+pub use weave::*;
 pub use zlock::*;
 
 use std::fmt;

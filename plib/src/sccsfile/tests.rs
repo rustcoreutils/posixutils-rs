@@ -9,6 +9,7 @@
 //
 
 use super::*;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -430,4 +431,48 @@ fn not_storable_as_text_names_the_reason() {
         not_storable_as_text(b"a\n\x01b\n"),
         Some(NotText::LeadingSoh(2))
     );
+}
+
+/// The walker reports every record in order, and for each text line of an
+/// overlapping weave the delta that inserted it, or that it is not part of
+/// the version.
+#[test]
+fn walker_reports_each_line_with_its_inserter() {
+    let mut content = b"\x01s 00000/00000/00000\n\x01d D 1.1 26/01/01 00:00:00 u 1 0\n\x01e\n\
+\x01u\n\x01U\n\x01t\n\x01T\n"
+        .to_vec();
+    content
+        .extend_from_slice(b"\x01I 1\na\n\x01D 3\nb\n\x01E 1\n\x01I 2\nc\n\x01E 3\nd\n\x01E 2\n");
+    let sccs = SccsFile::from_bytes(&with_checksum(&content)).unwrap();
+    let lines = |applied: &[u16]| -> Vec<(Vec<u8>, Option<u16>)> {
+        let applied: HashSet<u16> = applied.iter().copied().collect();
+        Walker::new(&sccs.body, &applied)
+            .filter_map(|(_, rec)| match rec {
+                Rec::Text { text, kept_by } => Some((text.to_vec(), kept_by)),
+                _ => None,
+            })
+            .collect()
+    };
+    let l = |t: &str, by: Option<u16>| (t.as_bytes().to_vec(), by);
+    assert_eq!(
+        lines(&[1]),
+        [l("a", Some(1)), l("b", Some(1)), l("c", None), l("d", None)]
+    );
+    assert_eq!(
+        lines(&[1, 2]),
+        [
+            l("a", Some(1)),
+            l("b", Some(1)),
+            l("c", Some(2)),
+            l("d", Some(2))
+        ]
+    );
+    assert_eq!(
+        lines(&[1, 2, 3]),
+        [l("a", Some(1)), l("b", None), l("c", None), l("d", Some(2))]
+    );
+    let indices: Vec<usize> = Walker::new(&sccs.body, &HashSet::new())
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(indices, (0..sccs.body.len()).collect::<Vec<_>>());
 }

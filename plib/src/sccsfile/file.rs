@@ -16,8 +16,8 @@ use std::path::Path;
 
 use super::parse::SccsParser;
 use super::{
-    compute_checksum, BodyRecord, DeltaEntry, DeltaType, ReleaseLock, SccsError, SccsFlag,
-    SccsHeader, SccsResult, Sid,
+    compute_checksum, BlockKind, BodyRecord, DeltaEntry, DeltaType, Rec, ReleaseLock, SccsError,
+    SccsFlag, SccsHeader, SccsResult, Sid, Walker,
 };
 
 /// Complete SCCS file representation
@@ -323,27 +323,15 @@ impl SccsFile {
 
     /// Evaluate the body to produce file content for a given set of deltas
     pub fn evaluate_body(&self, applied_set: &HashSet<u16>) -> Vec<Vec<u8>> {
-        let mut output = Vec::new();
-        let mut stack: Vec<(bool, u16)> = Vec::new(); // (is_insert, serial)
-
-        for record in &self.body {
-            match record {
-                BodyRecord::Insert(serial) => {
-                    stack.push((true, *serial));
-                }
-                BodyRecord::Delete(serial) => {
-                    stack.push((false, *serial));
-                }
-                BodyRecord::End(serial) => close_block(&mut stack, *serial),
-                BodyRecord::Text(line) => {
-                    if is_line_visible(&stack, applied_set) {
-                        output.push(line.clone());
-                    }
-                }
-            }
-        }
-
-        output
+        Walker::new(&self.body, applied_set)
+            .filter_map(|(_, rec)| match rec {
+                Rec::Text {
+                    text,
+                    kept_by: Some(_),
+                } => Some(text.to_vec()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Remove a (leaf) delta: mark its delta-table entry as `Removed` and
@@ -358,25 +346,26 @@ impl SccsFile {
             d.delta_type = DeltaType::Removed;
         }
 
-        // Blocks need not nest, so each of this delta's blocks runs to the
-        // `^AE` carrying its own serial, whatever opens or closes between.
-        // Inside its insert block everything goes; of a delete block only the
-        // two markers go.
-        let old = std::mem::take(&mut self.body);
-        let mut result = Vec::with_capacity(old.len());
+        // Each of this delta's blocks runs to the `^AE` carrying its serial,
+        // whatever opens or closes between. Inside its insert block
+        // everything goes; of a delete block only the two markers go.
+        let nothing_applied = HashSet::new();
+        let mut walker = Walker::new(&self.body, &nothing_applied);
+        let mut keep = Vec::with_capacity(self.body.len());
         let mut in_own_insert = false;
-        for record in old {
-            match record {
-                BodyRecord::Insert(s) if s == serial => in_own_insert = true,
-                BodyRecord::Delete(s) if s == serial && !in_own_insert => {}
-                // Ends this delta's innermost open block: its insert if one
-                // is open, else its delete.
-                BodyRecord::End(s) if s == serial => in_own_insert = false,
-                _ if in_own_insert => {}
-                other => result.push(other),
+        while let Some((index, rec)) = walker.next() {
+            let own_marker =
+                matches!(rec, Rec::Insert(s) | Rec::Delete(s) | Rec::End(s) if s == serial);
+            if !own_marker && !in_own_insert {
+                keep.push(index);
             }
+            in_own_insert = walker.blocks().is_open(BlockKind::Insert, serial);
         }
-        self.body = result;
+        let mut old = std::mem::take(&mut self.body)
+            .into_iter()
+            .map(Some)
+            .collect::<Vec<_>>();
+        self.body = keep.into_iter().filter_map(|i| old[i].take()).collect();
     }
 
     // =========================================================================

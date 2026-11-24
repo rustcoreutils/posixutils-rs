@@ -1,0 +1,170 @@
+//
+// Copyright (c) 2026 Jeff Garzik
+//
+// This file is part of the posixutils-rs project covered under
+// the MIT License.  For the full license text, please see the LICENSE
+// file in the root directory of this project.
+// SPDX-License-Identifier: MIT
+//
+
+//! The weave: the body of an s-file, every version's text interleaved.
+//!
+//! Text lines sit inside blocks. `^AI n` opens a block of lines delta `n`
+//! inserted, `^AD n` one of lines it deleted, and `^AE n` ends block `n`.
+//! Blocks need not nest: a delete may open inside one delta's insert and end
+//! inside another's, so the end marker names the block it ends.
+//!
+//! Which lines make up a version is decided by the blocks open around each
+//! line and the set of deltas applied for that version. That decision, and
+//! the walk over the records that feeds it, are here and nowhere else: `get`,
+//! `get -m`, `delta` and `rmdel` each kept a copy of the walk, and the copies
+//! shared one wrong assumption (that blocks nest) for as long as they were
+//! copies.
+
+use std::collections::HashSet;
+
+use super::BodyRecord;
+
+/// What a block's delta did to the lines inside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockKind {
+    /// `^AI`: the delta inserted them.
+    Insert,
+    /// `^AD`: the delta deleted them.
+    Delete,
+}
+
+/// The blocks open at a point in the weave, and what they make of a text
+/// line there for one version (the set of deltas applied).
+#[derive(Debug)]
+pub struct OpenBlocks<'a> {
+    applied: &'a HashSet<u16>,
+    /// In the order opened.
+    open: Vec<(u16, BlockKind)>,
+}
+
+impl<'a> OpenBlocks<'a> {
+    /// No block open, for the version made of the deltas `applied`.
+    pub fn new(applied: &'a HashSet<u16>) -> Self {
+        OpenBlocks {
+            applied,
+            open: Vec::new(),
+        }
+    }
+
+    /// `^AI serial` or `^AD serial`.
+    pub fn open(&mut self, kind: BlockKind, serial: u16) {
+        self.open.push((serial, kind));
+    }
+
+    /// `^AE serial`: end block `serial`, which need not be the one opened
+    /// last. An end that matches no open block (a damaged file) ends the
+    /// last one.
+    pub fn close(&mut self, serial: u16) {
+        match self.open.iter().rposition(|&(s, _)| s == serial) {
+            Some(at) => {
+                self.open.remove(at);
+            }
+            None => {
+                self.open.pop();
+            }
+        }
+    }
+
+    /// Whether a block of this kind and serial is open.
+    pub fn is_open(&self, kind: BlockKind, serial: u16) -> bool {
+        self.open.contains(&(serial, kind))
+    }
+
+    /// Whether a text line here belongs to the version, and if so the serial
+    /// of the delta that inserted it.
+    ///
+    /// It belongs when every open insert is applied and no open delete is;
+    /// its inserter is the applied insert opened last (serial 1 where none
+    /// is open).
+    pub fn kept_by(&self) -> Option<u16> {
+        let applied = |s: &u16| self.applied.contains(s);
+        let kept = self.open.iter().all(|(serial, kind)| match kind {
+            BlockKind::Insert => applied(serial),
+            BlockKind::Delete => !applied(serial),
+        });
+        kept.then(|| {
+            self.open
+                .iter()
+                .rev()
+                .find(|(serial, kind)| *kind == BlockKind::Insert && applied(serial))
+                .map_or(1, |&(serial, _)| serial)
+        })
+    }
+}
+
+/// One record of the weave, as a [`Walker`] reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rec<'a> {
+    /// `^AI serial`
+    Insert(u16),
+    /// `^AD serial`
+    Delete(u16),
+    /// `^AE serial`
+    End(u16),
+    /// A text line, and the delta that inserted it if it belongs to the
+    /// version walked.
+    Text {
+        text: &'a [u8],
+        kept_by: Option<u16>,
+    },
+}
+
+/// A walk over the weave for one version: every record in order, each text
+/// line with the verdict of the blocks open around it.
+#[derive(Debug)]
+pub struct Walker<'a> {
+    body: &'a [BodyRecord],
+    pos: usize,
+    blocks: OpenBlocks<'a>,
+}
+
+impl<'a> Walker<'a> {
+    /// Walk `body` for the version made of the deltas `applied`.
+    pub fn new(body: &'a [BodyRecord], applied: &'a HashSet<u16>) -> Self {
+        Walker {
+            body,
+            pos: 0,
+            blocks: OpenBlocks::new(applied),
+        }
+    }
+
+    /// The blocks open after the record last returned.
+    pub fn blocks(&self) -> &OpenBlocks<'a> {
+        &self.blocks
+    }
+}
+
+impl<'a> Iterator for Walker<'a> {
+    /// The record's index in the body, and the record.
+    type Item = (usize, Rec<'a>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let index = self.pos;
+        let rec = match self.body.get(index)? {
+            BodyRecord::Insert(serial) => {
+                self.blocks.open(BlockKind::Insert, *serial);
+                Rec::Insert(*serial)
+            }
+            BodyRecord::Delete(serial) => {
+                self.blocks.open(BlockKind::Delete, *serial);
+                Rec::Delete(*serial)
+            }
+            BodyRecord::End(serial) => {
+                self.blocks.close(*serial);
+                Rec::End(*serial)
+            }
+            BodyRecord::Text(text) => Rec::Text {
+                text,
+                kept_by: self.blocks.kept_by(),
+            },
+        };
+        self.pos += 1;
+        Some((index, rec))
+    }
+}

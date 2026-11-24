@@ -1453,3 +1453,39 @@ fn admin_d_removes_a_foreign_flag_the_file_has() {
     assert!(out.status.success(), "{out:?}");
     assert!(!fs::read(&s).unwrap().windows(4).any(|w| w == b"\x01f x"));
 }
+
+/// The structure check covers the body too: a control line that is not a
+/// block marker, a marker without a serial number, an end with no block of
+/// its serial open, and a block never closed are all corruption to
+/// `admin -h` and `val`, whatever the checksum says.
+#[test]
+fn admin_h_checks_the_body_structure() {
+    let tmp = TempDir::new().unwrap();
+    let head: &[u8] = b"\x01s 00001/00000/00000\n\x01d D 1.1 26/01/01 00:00:00 u 1 0\n\x01e\n\
+\x01u\n\x01U\n\x01t\n\x01T\n";
+    let bodies: [&[u8]; 5] = [
+        b"\x01I 1\nbody\n\x01X junk\n\x01E 1\n", // unknown control line
+        b"\x01I x\nbody\n\x01E x\n",             // no serial number
+        b"\x01I 1\nbody\n\x01E 7\n",             // end of a block not open
+        b"\x01I 1\nbody\n",                      // block never closed
+        b"\x01I 1\nbody\n\x01E 1\n\x01E 1\n",    // closed twice
+    ];
+    for body in bodies {
+        let content = [head, body].concat();
+        super::common::write_sfile(tmp.path(), "s.b", &content);
+        let shown = String::from_utf8_lossy(body).into_owned();
+        let out = run_in("admin", &["-h", "s.b"], tmp.path(), "");
+        assert_eq!(out.status.code(), Some(1), "admin -h passed {shown:?}");
+        let out = run_in("val", &["s.b"], tmp.path(), "");
+        assert_eq!(out.status.code(), Some(0x20), "val passed {shown:?}");
+    }
+
+    // Blocks need not nest: one may end inside another.
+    let content = [head, b"\x01I 1\na\n\x01D 2\nb\n\x01E 1\nc\n\x01E 2\n"].concat();
+    super::common::write_sfile(tmp.path(), "s.b", &content);
+    let out = run_in("admin", &["-h", "s.b"], tmp.path(), "");
+    assert!(
+        out.status.success(),
+        "overlapping blocks are well-formed: {out:?}"
+    );
+}

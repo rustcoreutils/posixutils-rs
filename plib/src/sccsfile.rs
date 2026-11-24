@@ -1858,24 +1858,45 @@ impl<'a> SccsParser<'a> {
 
     fn parse_body(&mut self) -> SccsResult<Vec<BodyRecord>> {
         let mut body = Vec::new();
+        // Serials of the blocks open so far, for the strict check: an end
+        // closes a block of its serial, and none is left open. Blocks need
+        // not nest -- one may end inside another.
+        let mut open: Vec<u16> = Vec::new();
 
         while let Some(line) = self.next_line() {
             if line.len() >= 2 && line[0] == SOH {
                 let serial_str = std::str::from_utf8(control_arg(line)).unwrap_or("").trim();
-                let serial: u16 = serial_str.parse().unwrap_or(0);
+                let parsed = serial_str.parse::<u16>();
+                let serial = parsed.clone().unwrap_or(0);
+                let is_marker = matches!(
+                    line[1],
+                    control::BODY_INSERT | control::BODY_DELETE | control::BODY_END
+                );
+                if is_marker && parsed.is_err() {
+                    self.stray_line(line)?;
+                }
 
                 match line[1] {
                     control::BODY_INSERT => {
+                        open.push(serial);
                         body.push(BodyRecord::Insert(serial));
                     }
                     control::BODY_DELETE => {
+                        open.push(serial);
                         body.push(BodyRecord::Delete(serial));
                     }
                     control::BODY_END => {
+                        match open.iter().rposition(|&s| s == serial) {
+                            Some(at) => {
+                                open.remove(at);
+                            }
+                            None => self.stray_line(line)?,
+                        }
                         body.push(BodyRecord::End(serial));
                     }
                     _ => {
                         // Unknown control line in body, treat as text
+                        self.stray_line(line)?;
                         body.push(BodyRecord::Text(line.to_vec()));
                     }
                 }
@@ -1883,6 +1904,13 @@ impl<'a> SccsParser<'a> {
                 // Text line
                 body.push(BodyRecord::Text(line.to_vec()));
             }
+        }
+
+        if self.strict && !open.is_empty() {
+            return Err(SccsError::InvalidBody(format!(
+                "block {} is never closed",
+                open[open.len() - 1]
+            )));
         }
 
         Ok(body)

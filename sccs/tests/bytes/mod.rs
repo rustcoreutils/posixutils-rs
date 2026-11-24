@@ -318,3 +318,27 @@ fn delta_m_takes_a_separate_argument() {
         "1.4 mr4\n.\n1.3 mr3\n.\n1.2 mr1\nmr2\n.\n1.1 first\n.\n"
     );
 }
+
+/// The pathnames read from standard input for a `-` operand are bytes, one
+/// to a line. The list used to be read as text, and ended in silence at the
+/// first name that was not UTF-8: that file and every one after it were
+/// skipped, with exit status 0.
+#[test]
+fn a_list_of_pathnames_on_standard_input_is_bytes() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let o = OsStr::new;
+    for (name, text) in [(&b"one"[..], "1\n"), (b"tw\xe9", "2\n"), (b"three", "3\n")] {
+        std::fs::write(dir.join("init"), text).unwrap();
+        ok("admin", &[o("-iinit"), o("s.x")], dir);
+        std::fs::rename(dir.join("s.x"), dir.join(named("s.", name))).unwrap();
+    }
+    let out = run_bytes(
+        "get",
+        &[o("-s"), o("-p"), o("-")],
+        dir,
+        b"s.one\ns.tw\xe9\n\ns.three\n",
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(out.stdout, b"1\n2\n3\n");
+}

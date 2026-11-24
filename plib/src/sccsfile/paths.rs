@@ -165,13 +165,22 @@ pub fn expand_operands(operands: &[PathBuf]) -> Vec<PathBuf> {
         // (get 99128, delta 92266, unget 119264, admin 84123). A list piped
         // from `ls` or `find` routinely names ordinary files, and
         // diagnosing them would both spam stderr and fail the exit status.
-        let stdin = std::io::stdin();
-        for line in stdin.lock().lines().map_while(Result::ok) {
-            let trimmed = line.trim();
+        //
+        // A pathname is bytes. Read as text, the list ended at the first
+        // name that was not UTF-8, and the rest went unprocessed in silence.
+        let mut stdin = std::io::stdin().lock();
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match stdin.read_until(b'\n', &mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let trimmed = line.trim_ascii();
             if trimmed.is_empty() {
                 continue;
             }
-            let path = PathBuf::from(trimmed);
+            let path = PathBuf::from(OsStr::from_bytes(trimmed));
             if path.is_dir() || (is_sfile(&path) && !unreadable(&path)) {
                 push(path, &mut out);
             }

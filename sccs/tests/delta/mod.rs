@@ -1512,3 +1512,42 @@ fn delta_weaves_runs_as_sccs_does() {
         assert_eq!(String::from_utf8_lossy(&out.stdout), text, "version {sid}");
     }
 }
+
+/// The MR list and the comment read from standard input end at the first
+/// newline that is not escaped; "the escape character is <backslash>"
+/// (POSIX delta, -m and -y). An escaped newline separates MRs, and in a
+/// comment it begins the next line. Reading one line and no more, as this
+/// did, kept the backslash and took the rest of the reply for the answer to
+/// the next question.
+#[test]
+fn delta_reads_escaped_newlines_in_its_replies() {
+    let tmp = TempDir::new().unwrap();
+    let run =
+        |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, tmp.path(), stdin);
+    assert!(run("admin", &["-i", "-fv", "-mfirst", "s.r"], "one\n")
+        .status
+        .success());
+    assert!(run("get", &["-e", "-s", "s.r"], "").status.success());
+    std::fs::write(tmp.path().join("r"), "two\n").unwrap();
+
+    // MRs first, then the comment; each reply may run over several lines.
+    let out = run(
+        "delta",
+        &["-s", "s.r"],
+        "mr1 mr2\\\nmr3\nwhy: \\ a backslash\\\nand a second line\\\n\nnot read\n",
+    );
+    assert!(out.status.success(), "{out:?}");
+    let out = run("prs", &["-d:MR:|:C:|", "-r1.2", "s.r"], "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "mr1\nmr2\nmr3\n|why: \\ a backslash\nand a second line\n|\n"
+    );
+
+    // A reply cut short by the end of the input is taken as far as it goes.
+    assert!(run("get", &["-e", "-s", "s.r"], "").status.success());
+    std::fs::write(tmp.path().join("r"), "three\n").unwrap();
+    let out = run("delta", &["-s", "-mmr9", "s.r"], "unfinished\\\n");
+    assert!(out.status.success(), "{out:?}");
+    let out = run("prs", &["-d:C:|", "-r1.3", "s.r"], "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "unfinished\n|\n");
+}

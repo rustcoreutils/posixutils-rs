@@ -33,16 +33,38 @@ fn stdin_is_tty() -> bool {
     io::stdin().is_terminal()
 }
 
-/// Read a single line from standard input, stripping the trailing newline.
-/// Returns an empty line at EOF. The line is bytes: a comment need not be
-/// UTF-8.
-fn read_stdin_line() -> Vec<u8> {
-    let mut line = Vec::new();
-    let _ = io::stdin().lock().read_until(b'\n', &mut line);
-    while line.ends_with(b"\n") || line.ends_with(b"\r") {
-        line.pop();
+/// Read a reply -- an MR list or a comment -- from standard input.
+///
+/// "An unescaped <newline> shall terminate" it, and "the escape character
+/// is <backslash>" (POSIX delta, -m and -y): a line ending in a backslash
+/// goes on to the next, the backslash dropped and the newline kept, where
+/// it separates two MRs or two lines of a comment. A backslash anywhere
+/// else is itself. The end of the input ends the reply too; nothing read
+/// is an empty reply. The reply is bytes: a comment need not be UTF-8.
+fn read_reply(input: &mut impl BufRead) -> Vec<u8> {
+    let mut reply = Vec::new();
+    loop {
+        let before = reply.len();
+        let _ = input.read_until(b'\n', &mut reply);
+        if reply.len() == before {
+            break; // end of input
+        }
+        if reply.ends_with(b"\\\n") {
+            reply.truncate(reply.len() - 2);
+            reply.push(b'\n');
+            continue;
+        }
+        while reply.ends_with(b"\n") || reply.ends_with(b"\r") {
+            reply.pop();
+        }
+        break;
     }
-    line
+    reply
+}
+
+/// [`read_reply`] from the standard input.
+fn read_stdin_reply() -> Vec<u8> {
+    read_reply(&mut io::stdin().lock())
 }
 
 /// delta - make a delta (change) to an SCCS file
@@ -389,7 +411,7 @@ fn gather_mrs(
                     print!("{}", gettext("MRs? "));
                     io::stdout().flush().ok();
                 }
-                Some(OsString::from_vec(read_stdin_line()))
+                Some(OsString::from_vec(read_stdin_reply()))
             } else {
                 None
             }
@@ -447,7 +469,7 @@ fn gather_comment(args: &Args, stdin_consumed: bool) -> Vec<u8> {
                     print!("{}", gettext("comments? "));
                     io::stdout().flush().ok();
                 }
-                read_stdin_line()
+                read_stdin_reply()
             }
         }
     }

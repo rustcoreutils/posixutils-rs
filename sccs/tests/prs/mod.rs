@@ -785,3 +785,63 @@ fn the_l_flag_is_read_with_blanks_or_commas() {
         assert_eq!(out.status.code(), Some(0), "{name}: {out:?}");
     }
 }
+
+/// Deltas in order of creation: 1.1, 1.1.1.1, 1.2, 1.1.1.2.
+fn branchy(dir: &std::path::Path) {
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    assert!(run("admin", &["-i", "-fb", "s.o"], "1.1\n")
+        .status
+        .success());
+    for (args, text) in [
+        (&["-r1.1", "-b"][..], "1.1.1.1"),
+        (&["-r1.1"], "1.2"),
+        (&["-r1.1.1.1"], "1.1.1.2"),
+    ] {
+        let args = [&["-e", "-s"], args, &["s.o"]].concat();
+        assert!(run("get", &args, "").status.success(), "{args:?}");
+        std::fs::write(dir.join("o"), format!("{text}\n")).unwrap();
+        assert!(run("delta", &["-s", "-yc", "s.o"], "").status.success());
+    }
+}
+
+/// `-e` and `-l` select the deltas "created earlier than and including" and
+/// "created later than and including" the one `-r` names (POSIX prs): by
+/// when they were made. They compared SIDs, which puts a branch delta made
+/// last before a trunk delta made earlier.
+#[test]
+fn prs_e_and_l_go_by_order_of_creation() {
+    let tmp = TempDir::new().unwrap();
+    branchy(tmp.path());
+    let ids = |args: &[&str]| {
+        let args = [args, &["-d:I:", "s.o"]].concat();
+        let out = super::common::run_in("prs", &args, tmp.path(), "");
+        String::from_utf8(out.stdout).unwrap().replace('\n', " ")
+    };
+    assert_eq!(ids(&["-e", "-r1.2"]), "1.2 1.1.1.1 1.1 ");
+    assert_eq!(ids(&["-l", "-r1.2"]), "1.1.1.2 1.2 ");
+    assert_eq!(ids(&["-l", "-r1.1.1.1"]), "1.1.1.2 1.2 1.1.1.1 ");
+    assert_eq!(ids(&["-e", "-r1.1.1.1"]), "1.1.1.1 1.1 ");
+}
+
+/// `-r` with no SID is "the most recently created delta" (POSIX prs), which
+/// need not be on the trunk. It was taken for the newest trunk delta.
+#[test]
+fn prs_r_alone_is_the_most_recently_created_delta() {
+    let tmp = TempDir::new().unwrap();
+    branchy(tmp.path());
+    let out = super::common::run_in("prs", &["-r", "-d:I:", "s.o"], tmp.path(), "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1.1.1.2\n");
+}
+
+/// `:BD:` is the body of the s-file as it is stored (POSIX prs, Data
+/// Keywords): the text of every version, with the records that mark who
+/// inserted and deleted it. It was not a keyword, and printed as itself.
+#[test]
+fn prs_bd_is_the_stored_body() {
+    let tmp = TempDir::new().unwrap();
+    let body = b"\x01I 1\none\n\x01D 2\ntwo\n\x01E 2\n\x01I 2\n2\n\x01E 2\n\x01E 1\n";
+    super::common::write_weave(tmp.path(), "s.bd", body);
+    let out = super::common::run_in("prs", &["-d:BD:", "-r1.3", "s.bd"], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(out.stdout, [&body[..], b"\n"].concat());
+}

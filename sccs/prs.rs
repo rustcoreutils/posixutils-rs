@@ -66,14 +66,15 @@ fn flag_yes_no(val: bool) -> &'static str {
 /// terminated by a `<newline>`, and an M-format keyword appearing as the final
 /// token of a dataspec forces a trailing `<newline>` on the delta's output.
 fn is_multiline_keyword(keyword: &str) -> bool {
-    matches!(keyword, "MR" | "C" | "UN" | "FL" | "FD" | "GB")
+    matches!(keyword, "MR" | "C" | "UN" | "FL" | "FD" | "BD" | "GB")
 }
 
 /// Whether `keyword` is a recognized prs data keyword.
 fn is_known_keyword(keyword: &str) -> bool {
     matches!(
         keyword,
-        "BF" | "CB"
+        "BD" | "BF"
+            | "CB"
             | "Ds"
             | "F"
             | "FB"
@@ -277,6 +278,12 @@ fn expand_single_keyword(
             text("DP"),
         ]
         .concat(),
+        // The body as it is stored: every line, control records included.
+        // (The M-format expander ends each line with its newline.)
+        "BD" => {
+            let body = sccs.stored_body();
+            body.strip_suffix(b"\n").unwrap_or(body).to_vec()
+        }
         "GB" => gotten_body(sccs, delta, sfile_path),
         "MR" => delta.mr_numbers.join(&b"\n"[..]),
         "P" => delta.user.to_vec(),
@@ -521,13 +528,14 @@ fn prs_file(sfile: &Path, args: &Args) -> io::Result<bool> {
         }
     }
 
-    // Parse target SID if specified. An empty -r option-argument (i.e. bare
-    // "-r") selects the most recently created delta (the trunk head).
+    // Parse target SID if specified. With no SID, -r is "the most recently
+    // created delta" (POSIX 112228): the one with the highest serial, on
+    // the trunk or not.
     let target_sid: Option<Sid> = match args.sid {
         Some(ref sid_str) if sid_str.is_empty() => {
-            match sccs.get_trunk_head() {
-                Some(head) => Some(head.sid),
-                // No trunk head: nothing to report on.
+            match sccs.live_deltas().max_by_key(|d| d.serial) {
+                Some(newest) => Some(newest.sid),
+                // No delta: nothing to report on.
                 None => return Ok(true),
             }
         }
@@ -553,6 +561,22 @@ fn prs_file(sfile: &Path, args: &Args) -> io::Result<bool> {
     };
 
     // Determine which deltas to process
+    // -e and -l are "created earlier than" and "created later than" the
+    // delta -r names (POSIX 112230-112233): by serial, the order of
+    // creation. SIDs do not order deltas in time, a branch being made after
+    // the trunk deltas its SID sorts before. The delta named is the live one
+    // of that SID, or with -a a removed one if no live one has it.
+    let target_serial: Option<u16> = target_sid.and_then(|target| {
+        let named = |d: &&DeltaEntry| d.sid == target;
+        sccs.live_deltas()
+            .find(named)
+            .map(|d| d.serial)
+            .or_else(|| {
+                let removed = sccs.header().deltas.iter().find(named);
+                removed.filter(|_| args.all_deltas).map(|d| d.serial)
+            })
+    });
+
     let deltas: Vec<&DeltaEntry> = sccs
         .header()
         .deltas
@@ -565,14 +589,12 @@ fn prs_file(sfile: &Path, args: &Args) -> io::Result<bool> {
 
             // Filter by SID
             if let Some(ref target) = target_sid {
-                if args.earlier {
-                    // Include deltas at or before target SID
-                    if d.sid > *target {
+                if args.earlier || args.later {
+                    // A SID that names no delta selects nothing.
+                    let Some(at) = target_serial else {
                         return false;
-                    }
-                } else if args.later {
-                    // Include deltas at or after target SID
-                    if d.sid < *target {
+                    };
+                    if (args.earlier && d.serial > at) || (!args.earlier && d.serial < at) {
                         return false;
                     }
                 } else {

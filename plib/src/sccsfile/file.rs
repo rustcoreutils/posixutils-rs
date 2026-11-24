@@ -147,6 +147,16 @@ impl SccsFile {
             .map(|l| (l.kind, &self.buf[l.start..l.start + l.len]))
     }
 
+    /// The body as it is stored: its lines, block markers included, each
+    /// with its newline. (`prs`'s `:BD:`.)
+    pub fn stored_body(&self) -> &[u8] {
+        let start = self
+            .lines
+            .get(self.body_start)
+            .map_or(self.buf.len(), |l| l.start);
+        &self.buf[start..]
+    }
+
     /// Parse SCCS file from bytes
     pub fn from_bytes(data: &[u8]) -> SccsResult<Self> {
         SccsParser::new(data, false).parse()

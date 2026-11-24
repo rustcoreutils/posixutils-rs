@@ -697,8 +697,8 @@ fn admin_non_utf8_argument_is_reported() {
     plib::testing::assert_non_utf8_argument_rejected("admin", &[]);
 }
 
-/// An -i file that cannot be read is reported with the system's text for the
-/// error, without Rust's "(os error N)" suffix.
+/// An -i file that cannot be read is reported by name, with the system's
+/// text for the error and without Rust's "(os error N)" suffix.
 #[test]
 fn admin_unreadable_input_names_the_system_error() {
     let tmp = TempDir::new().unwrap();
@@ -710,7 +710,7 @@ fn admin_unreadable_input_names_the_system_error() {
         args: vec![sfile.to_string_lossy().into(), format!("-i{missing}")],
         stdin_data: String::new(),
         expected_out: String::new(),
-        expected_err: format!("admin: {open_error}\n"),
+        expected_err: format!("admin: {missing}: {open_error}\n"),
         expected_exit_code: 1,
     });
 }
@@ -1023,4 +1023,90 @@ fn admin_m_follows_the_v_flag_of_the_file() {
     assert_eq!(out.status.code(), Some(1), "{out:?}");
     assert!(String::from_utf8_lossy(&out.stderr).contains("'v' flag"));
     assert_eq!(fs::read(&s).unwrap(), before);
+}
+
+/// What `admin -i` stores comes back from `get -k` byte for byte, whatever it
+/// holds. Text is stored as text -- lines split at newlines only, so a CR
+/// stays; bytes that are not UTF-8 are text too (the locale decides what a
+/// character is, POSIX admin 84141) -- and so has its keywords expanded. Only
+/// what the line format cannot hold is encoded: a NUL, a line beginning with
+/// SOH, or a missing final newline.
+#[test]
+fn admin_i_round_trips_every_input() {
+    let tmp = TempDir::new().unwrap();
+    let cases: [(&str, &[u8], bool); 7] = [
+        ("crlf", b"a %I%\r\nb\r\n", false),
+        ("latin1", b"caf\xe9 %I%\n", false),
+        ("midsoh", b"mid\x01soh %I%\n", false),
+        ("blank", b"\n\na\n\n", false),
+        ("leadsoh", b"\x01lead\n", true),
+        ("nul", b"nul\x00x\n", true),
+        ("nonl", b"no newline", true),
+    ];
+    for (name, content, encoded) in cases {
+        let input = tmp.path().join(name);
+        fs::write(&input, content).unwrap();
+        let sname = format!("s.{name}");
+        let out = run_in("admin", &[&format!("-i{name}"), &sname], tmp.path(), "");
+        assert!(out.status.success(), "{name}: {out:?}");
+
+        let data = fs::read(tmp.path().join(&sname)).unwrap();
+        let has_e = data.windows(7).any(|w| w == b"\x01f e 1\n");
+        assert_eq!(has_e, encoded, "{name}: encoded flag");
+
+        let out = run_in("get", &["-p", "-k", "-s", &sname], tmp.path(), "");
+        assert_eq!(out.stdout, content, "{name}: get -k");
+        let out = run_in("val", &[&sname], tmp.path(), "");
+        assert_eq!(out.status.code(), Some(0), "{name}: {out:?}");
+    }
+
+    // Text that is not UTF-8 is still text: its keywords are expanded.
+    let out = run_in("get", &["-p", "-s", "s.latin1"], tmp.path(), "");
+    assert_eq!(out.stdout, b"caf\xe9 1.1\n");
+}
+
+/// The `-t` file is text like any other: bytes that are not UTF-8 and CRs
+/// are stored as they are. A line that would read as a control line is
+/// refused, and an unreadable file is reported by name.
+#[test]
+fn admin_t_stores_descriptive_text_as_bytes() {
+    let tmp = TempDir::new().unwrap();
+    fs::write(tmp.path().join("d.txt"), b"d\xe9sc\r\nline2\n").unwrap();
+    let out = run_in("admin", &["-n", "-td.txt", "s.t"], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    let out = run_in("prs", &["-d:FD:", "s.t"], tmp.path(), "");
+    assert_eq!(out.stdout, b"d\xe9sc\r\nline2\n\n");
+
+    // Replacing it on an existing file goes the same way.
+    fs::write(tmp.path().join("d2.txt"), b"\xe9\n").unwrap();
+    let out = run_in("admin", &["-td2.txt", "s.t"], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    let out = run_in("prs", &["-d:FD:", "s.t"], tmp.path(), "");
+    assert_eq!(out.stdout, b"\xe9\n\n");
+
+    let before = fs::read(tmp.path().join("s.t")).unwrap();
+    fs::write(tmp.path().join("bad.txt"), b"ok\n\x01T\n").unwrap();
+    let out = run_in("admin", &["-tbad.txt", "s.t"], tmp.path(), "");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("bad.txt"));
+    assert_eq!(fs::read(tmp.path().join("s.t")).unwrap(), before);
+
+    let out = run_in("admin", &["-tmissing.txt", "s.t"], tmp.path(), "");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).starts_with("admin: missing.txt: "),
+        "{out:?}"
+    );
+}
+
+/// `-i` names the text of one new file (POSIX admin 83983-83984): with more
+/// than one, the second would be created from an input already read. It is
+/// refused before anything is created.
+#[test]
+fn admin_i_takes_one_new_file() {
+    let tmp = TempDir::new().unwrap();
+    let out = run_in("admin", &["-i", "s.a", "s.b"], tmp.path(), "x %I%\n");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(!out.stderr.is_empty());
+    assert!(!tmp.path().join("s.a").exists() && !tmp.path().join("s.b").exists());
 }

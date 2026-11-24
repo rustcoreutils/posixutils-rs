@@ -9,8 +9,8 @@
 
 //! admin - create and administer SCCS files
 
-use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader};
+use std::fs;
+use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -111,37 +111,63 @@ where
     (opts, rest)
 }
 
-fn read_input_file(path: Option<&str>) -> io::Result<Vec<u8>> {
-    let mut reader: Box<dyn BufRead> = match path {
-        Some(p) => Box::new(BufReader::new(File::open(p)?)),
-        None => Box::new(BufReader::new(io::stdin())),
+/// The text for a new file: the `-i` file `path`, or standard input. An
+/// error comes back as the diagnostic's text, naming what could not be read.
+fn read_input_file(path: Option<&str>) -> Result<Vec<u8>, String> {
+    let read = match path {
+        Some(p) => fs::read(p),
+        None => {
+            let mut data = Vec::new();
+            io::stdin().lock().read_to_end(&mut data).map(|_| data)
+        }
     };
-    let mut data = Vec::new();
-    reader.read_to_end(&mut data)?;
-    Ok(data)
+    read.map_err(|e| {
+        format!(
+            "{}: {}",
+            path.unwrap_or("standard input"),
+            plib::diag::io_error_text(&e)
+        )
+    })
 }
 
-/// Whether the initial content must be uuencoded (the `e` flag): non-empty
-/// input that is binary (invalid UTF-8 or contains NUL/SOH, which would corrupt
-/// the s-file format) or lacks a trailing newline — matching CSSC's trigger.
+/// Whether the initial content must be uuencoded (the `e` flag): what the
+/// line format of an s-file cannot hold as text. That is a NUL, a line
+/// beginning with SOH (it would read as a control line), or a last line with
+/// no newline to end it.
+///
+/// Bytes that are not UTF-8 are text: what a character is belongs to the
+/// locale (POSIX admin 84141), a Latin-1 source file is a text file, and
+/// encoding it turned off keyword expansion and line-by-line deltas for it.
+/// CSSC stores it as text too.
 fn content_needs_encoding(data: &[u8]) -> bool {
     if data.is_empty() {
         return false;
     }
-    if !data.ends_with(b"\n") {
-        return true;
-    }
-    std::str::from_utf8(data).is_err() || data.iter().any(|&b| b == 0x00 || b == 0x01)
+    !data.ends_with(b"\n")
+        || data.contains(&0x00)
+        || plib::sccsfile::split_lines(data)
+            .iter()
+            .any(|line| line.first() == Some(&0x01))
 }
 
-fn read_desc_text(path: Option<&str>) -> io::Result<Vec<Vec<u8>>> {
-    match path {
-        Some(p) => {
-            let content = fs::read_to_string(p)?;
-            Ok(content.lines().map(|l| l.as_bytes().to_vec()).collect())
-        }
-        None => Ok(Vec::new()),
+/// The descriptive text in the `-t` file `path`, as its lines. An error comes
+/// back as the diagnostic's text, naming the file.
+fn read_desc_text(path: &str) -> Result<Vec<Vec<u8>>, String> {
+    let data =
+        fs::read(path).map_err(|e| format!("{}: {}", path, plib::diag::io_error_text(&e)))?;
+    let lines = plib::sccsfile::split_lines(&data);
+    // The text sits between ^At and ^AT: a line of it that began with SOH
+    // would read as a control line and end it early.
+    if let Some(n) = lines.iter().position(|l| l.first() == Some(&0x01)) {
+        return Err(format!(
+            "{}: {} {}: {}",
+            path,
+            gettext("line"),
+            n + 1,
+            gettext("descriptive text cannot begin with a control character")
+        ));
     }
+    Ok(lines.into_iter().map(<[u8]>::to_vec).collect())
 }
 
 fn parse_sid(s: &str) -> Result<Sid, String> {
@@ -294,11 +320,11 @@ fn create_new_sccs_file(path: &Path, params: NewFileParams) -> io::Result<()> {
         flags.push(SccsFlag::Encoded(1));
         plib::sccsfile::uuencode_sccs(&content)
     } else {
-        // Plain text: split into lines (drops the trailing newline, no final
-        // empty element), matching historical line-oriented storage.
-        String::from_utf8_lossy(&content)
-            .lines()
-            .map(|line| line.as_bytes().to_vec())
+        // Plain text: its lines, each ending at a newline. A CR before the
+        // newline is part of the line.
+        plib::sccsfile::split_lines(&content)
+            .into_iter()
+            .map(<[u8]>::to_vec)
             .collect()
     };
 
@@ -564,14 +590,35 @@ fn main() -> ExitCode {
     // separate (operands here are never `-` when creating from stdin).
     let files = paths::expand_operands(&args.files);
 
+    // The message for a name that is not an s-file's.
+    let not_an_sfile = |path: &Path| {
+        diag::error_path(
+            "admin",
+            path,
+            &gettext("SCCS file names must begin with 's.'"),
+        )
+    };
+
+    // -i gives the text of one new file: with more, every file after the
+    // first would be made from an input already read to its end. A detached
+    // option-argument (`-i name s.file`) lands here too, so the names that
+    // are not s-files are diagnosed first.
+    if attached.init_file.is_some() && files.len() > 1 {
+        files
+            .iter()
+            .filter(|f| !paths::is_sfile(f))
+            .for_each(|f| not_an_sfile(f));
+        eprintln!(
+            "admin: {}",
+            gettext("the -i option cannot be used with more than one file")
+        );
+        return ExitCode::FAILURE;
+    }
+
     for file_path in &files {
         // Validate file name starts with s.
         if !paths::is_sfile(file_path) {
-            eprintln!(
-                "admin: {}: {}",
-                file_path.display(),
-                gettext("SCCS file names must begin with 's.'")
-            );
+            not_an_sfile(file_path);
             exit_code = ExitCode::FAILURE;
             continue;
         }
@@ -624,7 +671,7 @@ fn main() -> ExitCode {
             let content = match content {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("admin: {}", plib::diag::io_error_text(&e));
+                    eprintln!("admin: {}", e);
                     exit_code = ExitCode::FAILURE;
                     continue;
                 }
@@ -632,14 +679,14 @@ fn main() -> ExitCode {
 
             // Read descriptive text if -t specified with a name.
             let desc_text = match &attached.desc_text {
-                Some(Some(path)) if !path.is_empty() => read_desc_text(Some(path)),
+                Some(Some(path)) if !path.is_empty() => read_desc_text(path),
                 _ => Ok(Vec::new()),
             };
 
             let desc_text = match desc_text {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("admin: {}", plib::diag::io_error_text(&e));
+                    eprintln!("admin: {}", e);
                     exit_code = ExitCode::FAILURE;
                     continue;
                 }
@@ -711,7 +758,7 @@ fn main() -> ExitCode {
             // Get descriptive text if -t specified. -t name replaces; bare -t
             // (or -t with empty value) removes existing descriptive text.
             let desc_text = match &attached.desc_text {
-                Some(Some(path)) if !path.is_empty() => Some(read_desc_text(Some(path))),
+                Some(Some(path)) if !path.is_empty() => Some(read_desc_text(path)),
                 Some(_) => Some(Ok(Vec::new())), // remove
                 None => None,
             };
@@ -719,7 +766,7 @@ fn main() -> ExitCode {
             let desc_text = match desc_text {
                 Some(Ok(t)) => Some(t),
                 Some(Err(e)) => {
-                    eprintln!("admin: {}", plib::diag::io_error_text(&e));
+                    eprintln!("admin: {}", e);
                     exit_code = ExitCode::FAILURE;
                     continue;
                 }

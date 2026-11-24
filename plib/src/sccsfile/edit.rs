@@ -427,7 +427,8 @@ impl SccsFile {
         let body = self.body();
         let mut walker = Walker::new(body, &nothing_applied);
         let mut in_own_insert = false;
-        while let Some((index, rec)) = walker.next() {
+        while let Some(step) = walker.next() {
+            let (index, rec) = step?;
             let own_marker =
                 matches!(rec, Rec::Insert(s) | Rec::Delete(s) | Rec::End(s) if s == serial);
             if !own_marker && !in_own_insert {

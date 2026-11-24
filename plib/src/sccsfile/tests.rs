@@ -219,7 +219,7 @@ fn test_parse_simple_fixture() {
     let applied = sccs
         .compute_applied_set(1)
         .expect("Failed to compute applied set");
-    let content = sccs.evaluate_body(&applied);
+    let content = sccs.evaluate_body(&applied).unwrap();
 
     // Should have 3 lines: line1, line2, line3
     assert_eq!(content.len(), 3, "Expected 3 lines of content");
@@ -253,7 +253,7 @@ fn test_parse_multi_fixture() {
     let applied = sccs
         .compute_applied_set(head_serial)
         .expect("Failed to compute applied set");
-    let content = sccs.evaluate_body(&applied);
+    let content = sccs.evaluate_body(&applied).unwrap();
     assert!(
         !content.is_empty(),
         "Content should not be empty for latest version"
@@ -280,7 +280,7 @@ fn test_parse_keywords_fixture() {
     let applied = sccs
         .compute_applied_set(1)
         .expect("Failed to compute applied set");
-    let content = sccs.evaluate_body(&applied);
+    let content = sccs.evaluate_body(&applied).unwrap();
 
     // Content should contain keyword markers
     let content_str = String::from_utf8(content.join(&b"\n"[..])).unwrap();
@@ -315,7 +315,7 @@ fn test_parse_branched_fixture() {
         let applied = sccs.compute_applied_set(delta.serial).unwrap_or_else(|_| {
             panic!("Failed to compute applied set for serial {}", delta.serial)
         });
-        let content = sccs.evaluate_body(&applied);
+        let content = sccs.evaluate_body(&applied).unwrap();
         // Each version should produce some content
         assert!(
             !content.is_empty(),
@@ -491,7 +491,7 @@ fn rmdel_and_delta_change_only_their_own_lines() {
         &[b"\x01d R 1.2  26/01/02 00:00:00 u 2 1"],
     );
     assert_eq!(
-        sccs.evaluate_body(&[1].into()),
+        sccs.evaluate_body(&[1].into()).unwrap(),
         [b"a".to_vec(), b"b".to_vec()]
     );
 
@@ -533,9 +533,9 @@ fn rmdel_and_delta_change_only_their_own_lines() {
         ],
     );
     assert_eq!(split_lines(&after)[1], b"\x01s 00001/00001/00001");
-    assert_eq!(sccs.evaluate_body(&[1, 2, 3].into()), new_lines);
+    assert_eq!(sccs.evaluate_body(&[1, 2, 3].into()).unwrap(), new_lines);
     assert_eq!(
-        sccs.evaluate_body(&[1, 2].into()),
+        sccs.evaluate_body(&[1, 2].into()).unwrap(),
         [b"a".to_vec(), b"B".to_vec()]
     );
 }
@@ -564,7 +564,7 @@ fn carriage_returns_survive_a_round_trip() {
     let data = with_checksum(&content);
     let sccs = SccsFile::from_bytes(&data).unwrap();
     let applied = sccs.compute_applied_set(1).unwrap();
-    let body = sccs.evaluate_body(&applied);
+    let body = sccs.evaluate_body(&applied).unwrap();
     assert_eq!(body, [b"a\r", b"b\r"]);
     assert_eq!(sccs.to_bytes(), data, "a rewrite must be byte-identical");
 }
@@ -582,11 +582,10 @@ fn short_control_lines_and_odd_flags_do_not_panic() {
 \x01t\n\x01T\n\
 \x01I\n\x01E\n";
     let sccs = SccsFile::from_bytes(&with_checksum(content)).unwrap();
-    let nothing = HashSet::new();
-    let records: Vec<Rec> = Walker::new(sccs.body(), &nothing)
-        .map(|(_, rec)| rec)
-        .collect();
-    assert_eq!(records, [Rec::Insert(0), Rec::End(0)]);
+    // The header is read; the body, with markers that name no block, is
+    // not: it is an error to whoever reads it, not a panic.
+    assert!(sccs.check_weave().is_err());
+    assert!(sccs.evaluate_body(&HashSet::new()).is_err());
     assert_eq!(
         sccs.header().flags,
         [SccsFlag::Unknown('\u{e9}', b"x".to_vec())]
@@ -646,7 +645,9 @@ fn not_storable_as_text_names_the_reason() {
 /// the version.
 #[test]
 fn walker_reports_each_line_with_its_inserter() {
-    let mut content = b"\x01s 00000/00000/00000\n\x01d D 1.1 26/01/01 00:00:00 u 1 0\n\x01e\n\
+    let mut content = b"\x01s 00000/00000/00000\n\x01d D 1.3 26/01/03 00:00:00 u 3 2\n\x01e\n\
+\x01s 00000/00000/00000\n\x01d D 1.2 26/01/02 00:00:00 u 2 1\n\x01e\n\
+\x01s 00000/00000/00000\n\x01d D 1.1 26/01/01 00:00:00 u 1 0\n\x01e\n\
 \x01u\n\x01U\n\x01t\n\x01T\n"
         .to_vec();
     content
@@ -655,6 +656,7 @@ fn walker_reports_each_line_with_its_inserter() {
     let lines = |applied: &[u16]| -> Vec<(Vec<u8>, Option<u16>)> {
         let applied: HashSet<u16> = applied.iter().copied().collect();
         Walker::new(sccs.body(), &applied)
+            .map(Result::unwrap)
             .filter_map(|(_, rec)| match rec {
                 Rec::Text { text, kept_by } => Some((text.to_vec(), kept_by)),
                 _ => None,
@@ -680,7 +682,7 @@ fn walker_reports_each_line_with_its_inserter() {
         [l("a", Some(1)), l("b", None), l("c", None), l("d", Some(2))]
     );
     let indices: Vec<usize> = Walker::new(sccs.body(), &HashSet::new())
-        .map(|(i, _)| i)
+        .map(|step| step.unwrap().0)
         .collect();
     assert_eq!(indices, (0..sccs.body().len()).collect::<Vec<_>>());
 }
@@ -708,9 +710,9 @@ fn add_delta_records_the_edit_or_refuses_it() {
     let ops = [Insert(0), Keep, Delete, Keep, Insert(3)];
     let mut f = original.clone();
     f.add_delta(entry(), &v1, &ops, &new_lines).unwrap();
-    assert_eq!(f.evaluate_body(&[1, 2].into()), new_lines);
+    assert_eq!(f.evaluate_body(&[1, 2].into()).unwrap(), new_lines);
     assert_eq!(
-        f.evaluate_body(&v1),
+        f.evaluate_body(&v1).unwrap(),
         [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]
     );
     assert_eq!(f.header().deltas[0].serial, 2, "the new entry comes first");
@@ -860,7 +862,7 @@ fn random_histories_keep_every_version_and_stay_well_formed() {
             for (serial, text) in &model {
                 let applied = sccs.compute_applied_set(*serial).unwrap();
                 assert_eq!(
-                    &sccs.evaluate_body(&applied),
+                    &sccs.evaluate_body(&applied).unwrap(),
                     text,
                     "seed {seed} step {step}: version {serial}"
                 );
@@ -888,7 +890,7 @@ fn open_blocks_ask_the_newest_delta_with_a_say() {
             .collect();
         let mut blocks = OpenBlocks::new(&applied);
         for &(serial, kind) in &kinds {
-            blocks.open(kind, serial);
+            blocks.open(kind, serial).unwrap();
         }
 
         let mut by_serial = kinds.clone();
@@ -903,7 +905,8 @@ fn open_blocks_ask_the_newest_delta_with_a_say() {
 
         // Closing a block leaves the verdict of the rest.
         if let Some(&(gone, _)) = kinds.first() {
-            blocks.close(gone);
+            blocks.close(gone).unwrap();
+            assert_eq!(blocks.close(gone), Err(WeaveError::NotOpen(gone)));
             assert!(
                 !blocks.is_open(BlockKind::Insert, gone)
                     && !blocks.is_open(BlockKind::Delete, gone)

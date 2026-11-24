@@ -1628,3 +1628,63 @@ fn get_i_includes_only_the_deltas_named() {
     // Named by both, a delta is applied: -i outranks -x.
     assert_eq!(get("s.b", &["-r1.3", "-x1.2", "-i1.2"]), "a,c,e,");
 }
+
+/// A body whose block structure is broken cannot be read reliably: which
+/// lines belong to a version depends on which blocks are open. Historical
+/// SCCS treats it as a format error in every command that reads the body,
+/// and so do get, prs :GB:, delta and rmdel here, instead of reading the
+/// text under whatever blocks happened to be open.
+#[test]
+fn a_damaged_weave_is_refused_by_every_reader() {
+    let tmp = TempDir::new().unwrap();
+    let bodies: [(&str, &[u8]); 7] = [
+        (
+            "unknown control line",
+            b"\x01I 1\nbody\n\x01X junk\n\x01E 1\n",
+        ),
+        ("marker without a serial", b"\x01I x\nbody\n\x01E x\n"),
+        (
+            "end of a block not open",
+            b"\x01I 1\nbody\n\x01E 2\n\x01E 1\n",
+        ),
+        ("block never closed", b"\x01I 1\nbody\n"),
+        ("block closed twice", b"\x01I 1\nbody\n\x01E 1\n\x01E 1\n"),
+        (
+            "block opened twice",
+            b"\x01I 1\n\x01I 1\nbody\n\x01E 1\n\x01E 1\n",
+        ),
+        (
+            "serial of no delta",
+            b"\x01I 1\nbody\n\x01D 9\nx\n\x01E 9\n\x01E 1\n",
+        ),
+    ];
+    for (what, body) in bodies {
+        let s = super::common::write_weave(tmp.path(), "s.w", body);
+        let refused = |cmd: &str, args: &[&str]| {
+            let out = super::common::run_in(cmd, args, tmp.path(), "");
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "{what}: {cmd} {args:?}: {out:?}"
+            );
+            assert!(!out.stderr.is_empty(), "{what}: {cmd} must say why");
+        };
+        refused("get", &["-p", "-s", "s.w"]);
+        refused("get", &["-p", "-s", "-m", "s.w"]);
+        refused("prs", &["-d:GB:", "s.w"]);
+        let before = std::fs::read(&s).unwrap();
+        refused("rmdel", &["-r1.3", "s.w"]);
+        assert_eq!(
+            std::fs::read(&s).unwrap(),
+            before,
+            "{what}: rmdel wrote the file"
+        );
+        // What does not read the body is not affected.
+        let out = super::common::run_in("prs", &["-d:I:", "s.w"], tmp.path(), "");
+        assert!(
+            out.status.success(),
+            "{what}: prs without the body: {out:?}"
+        );
+        std::fs::remove_file(&s).unwrap();
+    }
+}

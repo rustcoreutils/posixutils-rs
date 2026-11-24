@@ -27,6 +27,39 @@ use super::edit::Content;
 use super::{Body, Kind, SccsError, SccsResult};
 use crate::linediff::LineOp;
 
+/// Damage to the weave: a body that cannot be read, because which lines
+/// make up a version depends on blocks that do not hold together.
+/// Historical SCCS calls each of these a format error, in every command that
+/// reads the body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeaveError {
+    /// `^AI n` or `^AD n` while block `n` is open.
+    OpenedTwice(u16),
+    /// `^AE n` with no block `n` open.
+    NotOpen(u16),
+    /// The body ends with block `n` open.
+    NeverClosed(u16),
+    /// A marker naming a serial no delta has.
+    NoSuchDelta(u16),
+    /// A control line that is not a block marker, or a marker with no
+    /// serial.
+    BadControl,
+}
+
+impl WeaveError {
+    /// The error for line `index` of the body.
+    fn at(self, index: usize) -> SccsError {
+        let what = match self {
+            WeaveError::OpenedTwice(n) => format!("block {n} is opened twice"),
+            WeaveError::NotOpen(n) => format!("block {n} is ended but not open"),
+            WeaveError::NeverClosed(n) => format!("block {n} is never closed"),
+            WeaveError::NoSuchDelta(n) => format!("a block of delta {n}, which is not in the file"),
+            WeaveError::BadControl => "a control line that is not a block marker".to_string(),
+        };
+        SccsError::InvalidBody(format!("line {} of the body: {what}", index + 1))
+    }
+}
+
 /// What a block's delta did to the lines inside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockKind {
@@ -54,25 +87,27 @@ impl<'a> OpenBlocks<'a> {
         }
     }
 
-    /// `^AI serial` or `^AD serial`.
-    pub fn open(&mut self, kind: BlockKind, serial: u16) {
+    /// `^AI serial` or `^AD serial`. A delta has at most one block open at
+    /// a time; a second is an error.
+    pub fn open(&mut self, kind: BlockKind, serial: u16) -> Result<(), WeaveError> {
         let at = self.open.partition_point(|&(s, _)| s > serial);
+        if self.open.get(at).is_some_and(|&(s, _)| s == serial) {
+            return Err(WeaveError::OpenedTwice(serial));
+        }
         self.open.insert(at, (serial, kind));
+        Ok(())
     }
 
     /// `^AE serial`: end block `serial`, which need not be the one opened
-    /// last. An end that matches no open block (a damaged file) ends the
-    /// one opened by the newest delta.
-    pub fn close(&mut self, serial: u16) {
-        match self.open.iter().position(|&(s, _)| s == serial) {
-            Some(at) => {
-                self.open.remove(at);
-            }
-            None if !self.open.is_empty() => {
-                self.open.remove(0);
-            }
-            None => {}
-        }
+    /// last. An end with no block of its serial open is an error.
+    pub fn close(&mut self, serial: u16) -> Result<(), WeaveError> {
+        let at = self
+            .open
+            .iter()
+            .position(|&(s, _)| s == serial)
+            .ok_or(WeaveError::NotOpen(serial))?;
+        self.open.remove(at);
+        Ok(())
     }
 
     /// Whether a block of this kind and serial is open.
@@ -131,12 +166,15 @@ pub enum Rec<'a> {
 }
 
 /// A walk over the weave for one version: every record in order, each text
-/// line with the verdict of the blocks open around it.
+/// line with the verdict of the blocks open around it. Damage to the weave
+/// ends the walk with an error.
 #[derive(Debug)]
 pub struct Walker<'a> {
     body: Body<'a>,
     pos: usize,
     blocks: OpenBlocks<'a>,
+    /// Set once the walk has ended, in an error or at the end of the body.
+    done: bool,
 }
 
 impl<'a> Walker<'a> {
@@ -146,6 +184,7 @@ impl<'a> Walker<'a> {
             body,
             pos: 0,
             blocks: OpenBlocks::new(applied),
+            done: false,
         }
     }
 
@@ -153,36 +192,67 @@ impl<'a> Walker<'a> {
     pub fn blocks(&self) -> &OpenBlocks<'a> {
         &self.blocks
     }
-}
 
-impl<'a> Iterator for Walker<'a> {
-    /// The record's index in the body, and the record.
-    type Item = (usize, Rec<'a>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let index = self.pos;
-        let (kind, text) = self.body.line(index)?;
-        let rec = match kind {
+    /// The record at `index`, with the blocks brought up to date.
+    fn step(&mut self, index: usize, kind: Kind, text: &'a [u8]) -> Result<Rec<'a>, WeaveError> {
+        let known = |serial: u16| {
+            if (1..=self.body.max_serial()).contains(&serial) {
+                Ok(serial)
+            } else {
+                Err(WeaveError::NoSuchDelta(serial))
+            }
+        };
+        let _ = index;
+        Ok(match kind {
             Kind::Insert(serial) => {
-                self.blocks.open(BlockKind::Insert, serial);
+                self.blocks.open(BlockKind::Insert, known(serial)?)?;
                 Rec::Insert(serial)
             }
             Kind::Delete(serial) => {
-                self.blocks.open(BlockKind::Delete, serial);
+                self.blocks.open(BlockKind::Delete, known(serial)?)?;
                 Rec::Delete(serial)
             }
             Kind::End(serial) => {
-                self.blocks.close(serial);
+                self.blocks.close(serial)?;
                 Rec::End(serial)
             }
+            Kind::BadControl => return Err(WeaveError::BadControl),
             // Every other line of a body is text.
             _ => Rec::Text {
                 text,
                 kept_by: self.blocks.kept_by(),
             },
+        })
+    }
+}
+
+impl<'a> Iterator for Walker<'a> {
+    /// The record's index in the body, and the record; or what is wrong
+    /// with the weave there.
+    type Item = SccsResult<(usize, Rec<'a>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let index = self.pos;
+        let Some((kind, text)) = self.body.line(index) else {
+            // The end of the body: no block may be left open.
+            self.done = true;
+            return self
+                .blocks
+                .open
+                .first()
+                .map(|&(serial, _)| Err(WeaveError::NeverClosed(serial).at(index)));
         };
         self.pos += 1;
-        Some((index, rec))
+        Some(match self.step(index, kind, text) {
+            Ok(rec) => Ok((index, rec)),
+            Err(e) => {
+                self.done = true;
+                Err(e.at(index))
+            }
+        })
     }
 }
 
@@ -234,7 +304,8 @@ pub(super) fn weave_delta(
         Ok(())
     };
 
-    for (index, rec) in Walker::new(body, base) {
+    for step in Walker::new(body, base) {
+        let (index, rec) = step?;
         let (_, line) = body.line(index).ok_or_else(mismatch)?;
         let kept = matches!(
             rec,

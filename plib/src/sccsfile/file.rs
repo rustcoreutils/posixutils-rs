@@ -61,6 +61,9 @@ pub struct SccsFile {
 pub struct Body<'a> {
     buf: &'a [u8],
     lines: &'a [Line],
+    /// The highest serial in the delta table: a block marker can name no
+    /// higher one.
+    max_serial: u16,
 }
 
 impl<'a> Body<'a> {
@@ -72,6 +75,11 @@ impl<'a> Body<'a> {
     /// Whether it has no lines.
     pub fn is_empty(&self) -> bool {
         self.lines.is_empty()
+    }
+
+    /// The highest serial a marker may name.
+    pub(super) fn max_serial(&self) -> u16 {
+        self.max_serial
     }
 
     /// Line `index`: what it is, and its bytes.
@@ -108,7 +116,22 @@ impl SccsFile {
         Body {
             buf: &self.buf,
             lines: &self.lines[self.body_start..],
+            max_serial: self
+                .header
+                .deltas
+                .iter()
+                .map(|d| d.serial)
+                .max()
+                .unwrap_or(0),
         }
+    }
+
+    /// Check that the weave holds together: every block marker usable, every
+    /// block opened once and closed. A body that passes can be read for any
+    /// version.
+    pub fn check_weave(&self) -> SccsResult<()> {
+        let nothing_applied = HashSet::new();
+        Walker::new(self.body(), &nothing_applied).try_for_each(|step| step.map(|_| ()))
     }
 
     /// The lines of the header after the checksum line, each with its kind.
@@ -306,31 +329,36 @@ impl SccsFile {
     // Body Evaluation
     // =========================================================================
 
-    /// Evaluate the body to produce file content for a given set of deltas
-    pub fn evaluate_body(&self, applied_set: &HashSet<u16>) -> Vec<Vec<u8>> {
-        Walker::new(self.body(), applied_set)
-            .filter_map(|(_, rec)| match rec {
-                Rec::Text {
-                    text,
-                    kept_by: Some(_),
-                } => Some(text.to_vec()),
-                _ => None,
-            })
-            .collect()
+    /// The text of the version made of the deltas `applied_set`, as its
+    /// lines. A damaged weave is an error: there is no reading it.
+    pub fn evaluate_body(&self, applied_set: &HashSet<u16>) -> SccsResult<Vec<Vec<u8>>> {
+        Ok(self
+            .evaluate_body_annotated(applied_set)?
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect())
     }
 
     /// [`evaluate_body`](Self::evaluate_body), each line with the serial of
     /// the delta that inserted it (`get -m`).
-    pub fn evaluate_body_annotated(&self, applied_set: &HashSet<u16>) -> Vec<(u16, Vec<u8>)> {
-        Walker::new(self.body(), applied_set)
-            .filter_map(|(_, rec)| match rec {
+    pub fn evaluate_body_annotated(
+        &self,
+        applied_set: &HashSet<u16>,
+    ) -> SccsResult<Vec<(u16, Vec<u8>)>> {
+        let mut lines = Vec::new();
+        for step in Walker::new(self.body(), applied_set) {
+            if let (
+                _,
                 Rec::Text {
                     text,
                     kept_by: Some(serial),
-                } => Some((serial, text.to_vec())),
-                _ => None,
-            })
-            .collect()
+                },
+            ) = step?
+            {
+                lines.push((serial, text.to_vec()));
+            }
+        }
+        Ok(lines)
     }
 
     // =========================================================================

@@ -1481,8 +1481,11 @@ fn admin_h_checks_the_body_structure() {
     }
 
     // Blocks need not nest: one may end inside another.
-    let content = [head, b"\x01I 1\na\n\x01D 2\nb\n\x01E 1\nc\n\x01E 2\n"].concat();
-    super::common::write_sfile(tmp.path(), "s.b", &content);
+    super::common::write_weave(
+        tmp.path(),
+        "s.b",
+        b"\x01I 1\na\n\x01D 2\nb\n\x01E 1\n\x01I 3\nc\n\x01E 2\n\x01E 3\n",
+    );
     let out = run_in("admin", &["-h", "s.b"], tmp.path(), "");
     assert!(
         out.status.success(),

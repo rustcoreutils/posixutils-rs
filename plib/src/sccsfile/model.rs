@@ -269,6 +269,10 @@ pub(super) enum Kind {
     End(u16),
     /// A line of the body's text.
     Text,
+    /// A line of the body that begins like a control line and is neither
+    /// text nor a usable block marker: a marker with no serial number, or
+    /// some other control line. The body cannot be read past it.
+    BadControl,
     /// A header line no record accounts for. It is read around, and kept
     /// where it is when the file is rewritten.
     Stray,

@@ -352,6 +352,11 @@ fn write_lfile(
     Ok(())
 }
 
+/// An s-file that cannot be read, as the error get reports.
+fn unreadable(e: plib::sccsfile::SccsError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+}
+
 fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Result<bool> {
     // Print filename if multiple files
     if multiple_files && !args.silent {
@@ -584,7 +589,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
     // Encoded (binary / no-trailing-newline) bodies: uudecode and emit raw
     // bytes, with no ID-keyword expansion (the content is opaque).
     if sccs.is_encoded() {
-        let encoded_lines = sccs.evaluate_body(&applied_set);
+        let encoded_lines = sccs.evaluate_body(&applied_set).map_err(unreadable)?;
         let raw = plib::sccsfile::uudecode_sccs(&encoded_lines);
 
         if args.to_stdout {
@@ -623,6 +628,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
     // when -m wants that prefix.
     let body: Vec<(Vec<u8>, Option<Sid>)> = if args.show_sid {
         sccs.evaluate_body_annotated(&applied_set)
+            .map_err(unreadable)?
             .into_iter()
             .map(|(serial, line)| {
                 // The inserting delta, as its SID.
@@ -634,6 +640,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
             .collect()
     } else {
         sccs.evaluate_body(&applied_set)
+            .map_err(unreadable)?
             .into_iter()
             .map(|line| (line, None))
             .collect()

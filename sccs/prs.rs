@@ -440,14 +440,17 @@ fn keyword_text(keyword: &str, sccs: &SccsFile, delta: &DeltaEntry, sfile_path: 
 /// The gotten body of `delta`: its text as `get` retrieves it, with the
 /// identification keywords expanded. An encoded file's bytes are opaque and
 /// have none.
+///
+/// The body is known to be readable: `prs_file` checks the weave before it
+/// expands a dataspec that asks for `:GB:`.
 fn gotten_body(sccs: &SccsFile, delta: &DeltaEntry, sfile_path: &Path) -> Vec<u8> {
-    let applied_set = match sccs.compute_applied_set(delta.serial) {
-        Ok(set) => set,
-        Err(_) => return Vec::new(),
+    let Ok(applied_set) = sccs.compute_applied_set(delta.serial) else {
+        return Vec::new();
     };
+    let lines = sccs.evaluate_body(&applied_set).unwrap_or_default();
 
     if sccs.is_encoded() {
-        let encoded = sccs.evaluate_body(&applied_set);
+        let encoded = lines;
         let mut raw = plib::sccsfile::uudecode_sccs(&encoded);
         // The M-format expander newline-terminates each line, so drop a single
         // trailing newline to avoid emitting a spurious blank line.
@@ -457,7 +460,7 @@ fn gotten_body(sccs: &SccsFile, delta: &DeltaEntry, sfile_path: &Path) -> Vec<u8
         raw
     } else {
         let values = idkw::KeywordValues::new(sccs, delta, sfile_path);
-        sccs.evaluate_body(&applied_set)
+        lines
             .iter()
             .enumerate()
             .map(|(i, line)| idkw::expand(line, &values, i + 1))
@@ -499,6 +502,14 @@ fn prs_file(sfile: &Path, args: &Args) -> io::Result<bool> {
 
     let use_default_format = args.dataspec.is_none();
     let format = args.dataspec.as_deref().unwrap_or(DEFAULT_DELTA_FORMAT);
+
+    // :GB: reads the body, which a damaged weave makes unreadable.
+    if format.contains(":GB:") {
+        if let Err(e) = sccs.check_weave() {
+            diag::error_path("prs", sfile, &e.to_string());
+            return Ok(false);
+        }
+    }
 
     // The default header (":PN::\n\n") is only emitted when neither -d nor -r
     // is specified (POSIX SYNOPSIS).

@@ -89,9 +89,9 @@ impl<'a> SccsParser<'a> {
 
         // Parse body
         let body_start = self.lines.len();
-        self.parse_body()?;
+        self.parse_body();
 
-        Ok(SccsFile::from_parts(
+        let file = SccsFile::from_parts(
             self.data.to_vec(),
             std::mem::take(&mut self.lines),
             body_start,
@@ -102,7 +102,13 @@ impl<'a> SccsParser<'a> {
                 flags,
                 descriptive_text,
             },
-        ))
+        );
+        // The structure check covers the body too: the weave must hold
+        // together, whichever version is read from it.
+        if self.strict {
+            file.check_weave()?;
+        }
+        Ok(file)
     }
 
     fn skip_whitespace(&mut self) {
@@ -414,60 +420,25 @@ impl<'a> SccsParser<'a> {
         Ok(text)
     }
 
-    /// The body: every line is a block marker or text. An unknown control
-    /// line is kept as text.
-    fn parse_body(&mut self) -> SccsResult<()> {
-        // Serials of the blocks open so far, for the strict check: an end
-        // closes a block of its serial, and none is left open. Blocks need
-        // not nest -- one may end inside another.
-        let mut open: Vec<u16> = Vec::new();
-
+    /// The body: every line is a block marker or text. A line that begins
+    /// like a control line and is neither is recorded as such: the header
+    /// is still read, and whoever reads the body finds out there.
+    fn parse_body(&mut self) {
         while let Some(line) = self.next_line() {
-            self.mark(Kind::Text);
-            if line.len() < 2 || line[0] != SOH {
-                continue;
-            }
-            let serial_str = std::str::from_utf8(control_arg(line)).unwrap_or("").trim();
-            let parsed = serial_str.parse::<u16>();
-            let serial = parsed.clone().unwrap_or(0);
-            let is_marker = matches!(
-                line[1],
-                control::BODY_INSERT | control::BODY_DELETE | control::BODY_END
-            );
-            if is_marker && parsed.is_err() {
-                self.stray_line(line)?;
-            }
-
-            match line[1] {
-                control::BODY_INSERT => {
-                    open.push(serial);
-                    self.mark(Kind::Insert(serial));
+            let kind = if line.first() != Some(&SOH) {
+                Kind::Text
+            } else {
+                let serial = std::str::from_utf8(control_arg(line))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u16>().ok());
+                match (line.get(1), serial) {
+                    (Some(&control::BODY_INSERT), Some(serial)) => Kind::Insert(serial),
+                    (Some(&control::BODY_DELETE), Some(serial)) => Kind::Delete(serial),
+                    (Some(&control::BODY_END), Some(serial)) => Kind::End(serial),
+                    _ => Kind::BadControl,
                 }
-                control::BODY_DELETE => {
-                    open.push(serial);
-                    self.mark(Kind::Delete(serial));
-                }
-                control::BODY_END => {
-                    match open.iter().rposition(|&s| s == serial) {
-                        Some(at) => {
-                            open.remove(at);
-                        }
-                        None => self.stray_line(line)?,
-                    }
-                    self.mark(Kind::End(serial));
-                }
-                // An unknown control line in the body is kept as text.
-                _ => self.stray_line(line)?,
-            }
+            };
+            self.mark(kind);
         }
-
-        if self.strict && !open.is_empty() {
-            return Err(SccsError::InvalidBody(format!(
-                "block {} is never closed",
-                open[open.len() - 1]
-            )));
-        }
-
-        Ok(())
     }
 }

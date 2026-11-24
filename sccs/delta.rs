@@ -558,7 +558,9 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
 
     // Reconstruct base version
     let applied_set = base_applied_set(&sccs, base_serial, &forced_in, &forced_out)?;
-    let base_lines = sccs.evaluate_body(&applied_set);
+    let base_lines = sccs
+        .evaluate_body(&applied_set)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
     // Compute diff
     let (stats, diff_ops) = compute_diff(&base_lines, &new_lines);

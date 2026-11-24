@@ -1336,3 +1336,33 @@ fn admin_option_arguments_are_not_options() {
     let out = run_in("admin", &["-n", "--", "s.c"], tmp.path(), "");
     assert!(out.status.success(), "{out:?}");
 }
+
+/// Blank lines before the checksum line are not part of the s-file: the
+/// reader skips them, so the checksum does not cover them and `admin -z`
+/// writes the file without them -- not a second checksum line after the
+/// first, which no later -h, val or -z could get past.
+#[test]
+fn admin_z_handles_blank_lines_before_the_checksum() {
+    let tmp = TempDir::new().unwrap();
+    let s = admin_create(tmp.path(), "bl", "body\n");
+    let good = fs::read(&s).unwrap();
+    let mut padded = b"\n\n".to_vec();
+    padded.extend_from_slice(&good);
+    let mut perms = fs::metadata(&s).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    fs::set_permissions(&s, perms).unwrap();
+    fs::write(&s, &padded).unwrap();
+
+    let out = run_in("admin", &["-h", "s.bl"], tmp.path(), "");
+    assert!(out.status.success(), "-h before -z: {out:?}");
+    let out = run_in("admin", &["-z", "s.bl"], tmp.path(), "");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        fs::read(&s).unwrap(),
+        good,
+        "-z must write one checksum line"
+    );
+    let out = run_in("val", &["s.bl"], tmp.path(), "");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+}

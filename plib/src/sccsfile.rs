@@ -1912,9 +1912,16 @@ impl<'a> SccsParser<'a> {
 // Checksum
 // =============================================================================
 
-/// The stored bytes the checksum covers: everything after the first line,
-/// which is the `^Ah` checksum line itself.
+/// The stored bytes the checksum covers: everything after the `^Ah` checksum
+/// line. That is the first line once the blank lines the parser skips ahead
+/// of it (`SccsParser::skip_whitespace`) are passed over; counting them as
+/// the first line had the checksum cover the `^Ah` line itself.
 fn checksummed_bytes(data: &[u8]) -> &[u8] {
+    let start = data
+        .iter()
+        .position(|&b| b != b'\n' && b != b'\r')
+        .unwrap_or(data.len());
+    let data = &data[start..];
     let newline_pos = data.iter().position(|&b| b == b'\n').unwrap_or(data.len());
     data.get(newline_pos + 1..).unwrap_or(&[])
 }

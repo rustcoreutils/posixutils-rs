@@ -246,7 +246,35 @@ fn test_path_utilities() {
 
     assert_eq!(
         paths::module_name(Path::new("s.foo.c")),
-        Some("foo.c".to_string())
+        Some(&b"foo.c"[..])
+    );
+
+    // A name is bytes: one that is not UTF-8 is a name like any other.
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let odd = Path::new(OsStr::from_bytes(b"d/s.caf\xe9"));
+    assert!(paths::is_sfile(odd));
+    assert_eq!(paths::module_name(odd), Some(&b"caf\xe9"[..]));
+    assert_eq!(
+        paths::zfile_from_sfile(odd),
+        Path::new(OsStr::from_bytes(b"d/z.caf\xe9"))
+    );
+    assert_eq!(
+        paths::lfile_from_sfile(odd),
+        Path::new(OsStr::from_bytes(b"l.caf\xe9"))
+    );
+
+    // `s.` and nothing after it names no module, so it is no s-file; nor is
+    // a path with no final component.
+    for not in ["s.", "s", "/", "..", "dir/s./"] {
+        assert!(!paths::is_sfile(Path::new(not)), "{not}");
+        assert_eq!(paths::gfile_from_sfile(Path::new(not)), None, "{not}");
+    }
+    // Derived from something that is no s-file, a name is still not the
+    // file's own.
+    assert_eq!(
+        paths::xfile_from_sfile(Path::new("d/foo")),
+        Path::new("d/x.foo")
     );
 }
 

@@ -10,7 +10,34 @@
 
 //! Names of the files that go with an s-file, and operand expansion.
 
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+
+/// What an s-file's name is made of: the bytes after its `s.` prefix, which
+/// the names of the files that go with it share. `None` if `path` does not
+/// name an s-file: no final component, no prefix, or nothing after it.
+///
+/// A file name is bytes. These helpers took it for text and treated a name
+/// that was not UTF-8 as no s-file at all, or as one called `s.unknown`.
+fn stem(path: &Path) -> Option<&[u8]> {
+    path.file_name()?
+        .as_bytes()
+        .strip_prefix(b"s.")
+        .filter(|stem| !stem.is_empty())
+}
+
+/// The file name `<letter>.<stem>` for the s-file `sfile`.
+///
+/// Callers have checked [`is_sfile`]; for a path that is not one, the whole
+/// final component stands in for the stem, so that what comes back is
+/// still a name of its own and never the s-file's.
+fn aux_name(sfile: &Path, letter: u8) -> OsString {
+    let stem = stem(sfile)
+        .or_else(|| sfile.file_name().map(OsStr::as_bytes))
+        .unwrap_or_default();
+    OsString::from_vec([&[letter, b'.'], stem].concat())
+}
 
 /// Get the g-file (gotten file) path from an s-file path.
 ///
@@ -31,18 +58,14 @@ use std::path::{Path, PathBuf};
 /// `delta` and `unget` read and remove the g-file through this same
 /// helper, so all three agree on where it lives.
 pub fn gfile_from_sfile(sfile: &Path) -> Option<PathBuf> {
-    let name = sfile.file_name()?.to_str()?;
-    name.strip_prefix("s.").map(PathBuf::from)
+    stem(sfile).map(|stem| PathBuf::from(OsStr::from_bytes(stem)))
 }
 
 /// Get the s-file path from g-file path
 /// foo -> SCCS/s.foo (if SCCS exists) or s.foo
 pub fn sfile_from_gfile(gfile: &Path) -> PathBuf {
-    let name = gfile
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown");
-    let sname = format!("s.{}", name);
+    let name = gfile.file_name().map(OsStr::as_bytes).unwrap_or_default();
+    let sname = OsString::from_vec([b"s.", name].concat());
 
     // Check for SCCS subdirectory
     let parent = gfile.parent().unwrap_or(Path::new("."));
@@ -57,33 +80,18 @@ pub fn sfile_from_gfile(gfile: &Path) -> PathBuf {
 /// Get the p-file (lock file) path from s-file
 /// s.foo -> p.foo (in same directory as s-file)
 pub fn pfile_from_sfile(sfile: &Path) -> PathBuf {
-    let name = sfile
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("s.unknown");
-    let pname = format!("p.{}", &name[2..]);
-    sfile.with_file_name(pname)
+    sfile.with_file_name(aux_name(sfile, b'p'))
 }
 
 /// Get the q-file (the working copy the p-file is rewritten through) path
 /// from s-file: s.foo -> q.foo, beside the s-file.
 pub fn qfile_from_sfile(sfile: &Path) -> PathBuf {
-    let name = sfile
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("s.unknown");
-    let qname = format!("q.{}", &name[2..]);
-    sfile.with_file_name(qname)
+    sfile.with_file_name(aux_name(sfile, b'q'))
 }
 
 /// Get the z-file (lock semaphore) path from s-file
 pub fn zfile_from_sfile(sfile: &Path) -> PathBuf {
-    let name = sfile
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("s.unknown");
-    let zname = format!("z.{}", &name[2..]);
-    sfile.with_file_name(zname)
+    sfile.with_file_name(aux_name(sfile, b'z'))
 }
 
 /// Get the l-file (delta summary) path from an s-file.
@@ -91,36 +99,24 @@ pub fn zfile_from_sfile(sfile: &Path) -> PathBuf {
 /// Like the g-file, "the l-file shall be created in the current directory
 /// if the -l option is used" (get, 99192-99194) — not beside the s-file.
 pub fn lfile_from_sfile(sfile: &Path) -> PathBuf {
-    let name = sfile
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("s.unknown");
-    PathBuf::from(format!("l.{}", &name[2..]))
+    PathBuf::from(aux_name(sfile, b'l'))
 }
 
 /// Get the x-file (temporary) path from s-file
 pub fn xfile_from_sfile(sfile: &Path) -> PathBuf {
-    let name = sfile
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("s.unknown");
-    let xname = format!("x.{}", &name[2..]);
-    sfile.with_file_name(xname)
+    sfile.with_file_name(aux_name(sfile, b'x'))
 }
 
-/// Check if a path is an SCCS s-file
+/// Check if a path is an SCCS s-file: its final component is `s.` and then
+/// a name.
 pub fn is_sfile(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .map(|n| n.starts_with("s."))
-        .unwrap_or(false)
+    stem(path).is_some()
 }
 
 /// Get module name from s-file path
 /// SCCS/s.foo.c -> foo.c
-pub fn module_name(sfile: &Path) -> Option<String> {
-    let name = sfile.file_name()?.to_str()?;
-    name.strip_prefix("s.").map(|s| s.to_string())
+pub fn module_name(sfile: &Path) -> Option<&[u8]> {
+    stem(sfile)
 }
 
 /// Expand SCCS file operands per POSIX, returning the flat list of paths to

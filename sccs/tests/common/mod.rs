@@ -28,12 +28,19 @@
 #![allow(dead_code)]
 
 use plib::testing::TestPlan;
+use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 /// Run a built SCCS utility with an explicit working directory.
 pub fn run_in(cmd: &str, args: &[&str], cwd: &Path, stdin: &str) -> Output {
+    let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+    run_bytes(cmd, &args, cwd, stdin.as_bytes())
+}
+
+/// [`run_in`] with arguments and input that need not be UTF-8.
+pub fn run_bytes(cmd: &str, args: &[&OsStr], cwd: &Path, stdin: &[u8]) -> Output {
     let mut child = Command::new(plib::testing::get_binary_path(cmd))
         .args(args)
         .current_dir(cwd)
@@ -47,7 +54,7 @@ pub fn run_in(cmd: &str, args: &[&str], cwd: &Path, stdin: &str) -> Output {
     // the child behaving correctly, not a test failure, so only a genuine I/O
     // error is worth panicking over.
     let mut sink = child.stdin.take().expect("piped stdin");
-    match sink.write_all(stdin.as_bytes()) {
+    match sink.write_all(stdin) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
         Err(e) => panic!("write stdin to {cmd}: {e}"),

@@ -10,6 +10,7 @@
 //! prs - print SCCS file information
 
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -223,7 +224,7 @@ fn expand_single_keyword(
     delta: &DeltaEntry,
     sfile_path: &Path,
 ) -> Vec<u8> {
-    let text = |kw: &str| keyword_text(kw, sccs, delta, sfile_path).into_bytes();
+    let text = |kw: &str| keyword_text(kw, sccs, delta).into_bytes();
     let stored = |v: Option<&[u8]>| v.unwrap_or(b"").to_vec();
     // A list, one entry per line, or "none" when there is no entry.
     let list_or_none = |v: &[Vec<u8>]| {
@@ -233,17 +234,20 @@ fn expand_single_keyword(
             v.join(&b"\n"[..])
         }
     };
-    let module = || match sccs.module_name() {
-        Some(name) => name.to_vec(),
-        None => paths::module_name(sfile_path)
-            .unwrap_or_default()
-            .into_bytes(),
-    };
+    let module = || idkw::module_name_of(sccs, sfile_path);
     match keyword {
         "FD" => list_or_none(&sccs.header().descriptive_text),
         "FL" => format_flags(&sccs.header().flags),
         "KV" => stored(sccs.id_keyword_check().flatten()),
         "M" => module(),
+        // Names are bytes. :PN: is "the SCCS-file pathname" as given (the
+        // operand), not resolved.
+        "F" => sfile_path
+            .file_name()
+            .unwrap_or_default()
+            .as_bytes()
+            .to_vec(),
+        "PN" => sfile_path.as_os_str().as_bytes().to_vec(),
         "MP" => stored(sccs.mr_program().flatten()),
         "Q" => stored(sccs.q_text()),
         "UN" => list_or_none(&sccs.header().users),
@@ -283,7 +287,7 @@ fn expand_single_keyword(
     }
 }
 
-fn keyword_text(keyword: &str, sccs: &SccsFile, delta: &DeltaEntry, sfile_path: &Path) -> String {
+fn keyword_text(keyword: &str, sccs: &SccsFile, delta: &DeltaEntry) -> String {
     match keyword {
         // Global keywords
         "BF" => flag_yes_no(has_flag(&sccs.header().flags, |f| {
@@ -303,10 +307,6 @@ fn keyword_text(keyword: &str, sccs: &SccsFile, delta: &DeltaEntry, sfile_path: 
             .default_sid()
             .map(|s| s.to_string())
             .unwrap_or_else(|| "none".to_string()),
-        "F" => sfile_path
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default(),
         "FB" => sccs
             .header()
             .flags
@@ -339,8 +339,6 @@ fn keyword_text(keyword: &str, sccs: &SccsFile, delta: &DeltaEntry, sfile_path: 
             matches!(f, SccsFlag::NullDelta)
         }))
         .to_string(),
-        // POSIX: the SCCS-file pathname as given (the operand), not resolved.
-        "PN" => sfile_path.to_string_lossy().to_string(),
 
         // Version-specific keywords
         "B" => {

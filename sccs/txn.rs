@@ -26,7 +26,7 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use plib::sccsfile::{PfileEntry, SccsFile, ZLock};
+use plib::sccsfile::{paths, PfileEntry, SccsFile, ZLock};
 
 use crate::{pfile, sfio, zlock};
 
@@ -49,7 +49,17 @@ pub fn is_locked(e: &io::Error) -> bool {
 
 impl Txn {
     /// Take the lock on `sfile`. Nothing of the file is read yet.
+    ///
+    /// The names of the lock and of every file written are made from the
+    /// s-file's, so a path that does not name an s-file is refused here,
+    /// whatever the caller checked.
     pub fn begin(sfile: &Path) -> io::Result<Txn> {
+        if !paths::is_sfile(sfile) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                gettextrs::gettext("not an SCCS file"),
+            ));
+        }
         Ok(Txn {
             sfile: sfile.to_path_buf(),
             _lock: zlock::acquire(sfile)?,

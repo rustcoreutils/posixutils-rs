@@ -10,6 +10,7 @@
 mod common;
 
 mod admin;
+mod bytes;
 mod delta;
 mod get;
 mod prs;

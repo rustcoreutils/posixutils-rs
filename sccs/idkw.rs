@@ -13,6 +13,7 @@
 //! pattern, with bodies identical modulo the input type. Scanning bytes serves
 //! both: a keyword is ASCII, and an s-file body need not be UTF-8.
 
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 
 use plib::sccsfile::{paths, DeltaEntry, SccsDateTime, SccsFile};
@@ -40,13 +41,12 @@ impl KeywordValues {
         let module_type = sccs_file.module_type().unwrap_or(b"");
         let q_value = sccs_file.q_text().unwrap_or(b"");
         let now = SccsDateTime::now();
-        let sccs_filename = sfile_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("s.unknown");
+        // Names are bytes, and go into the text as they are.
+        let sccs_filename = sfile_path.file_name().unwrap_or_default().as_bytes();
         let abs_path = std::fs::canonicalize(sfile_path)
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| sfile_path.to_string_lossy().to_string());
+            .unwrap_or_else(|_| sfile_path.to_path_buf())
+            .into_os_string()
+            .into_vec();
         let mmddyy = |d: &SccsDateTime| format!("{:02}/{:02}/{:02}", d.month, d.day, d.year);
 
         let mut values: [Option<Vec<u8>>; 26] = Default::default();
@@ -73,8 +73,8 @@ impl KeywordValues {
         set(b'G', mmddyy(&delta.datetime).into_bytes());
         set(b'U', delta.datetime.time_string().into_bytes());
         set(b'Y', module_type.to_vec());
-        set(b'F', sccs_filename.as_bytes().to_vec());
-        set(b'P', abs_path.into_bytes());
+        set(b'F', sccs_filename.to_vec());
+        set(b'P', abs_path);
         set(b'Q', q_value.to_vec());
         set(b'W', what(&[&module_name, b"\t", sid.as_bytes()]));
         set(
@@ -96,9 +96,7 @@ impl KeywordValues {
 pub fn module_name_of(sccs: &SccsFile, sfile_path: &Path) -> Vec<u8> {
     match sccs.module_name() {
         Some(name) => name.to_vec(),
-        None => paths::module_name(sfile_path)
-            .unwrap_or_else(|| "unknown".to_string())
-            .into_bytes(),
+        None => paths::module_name(sfile_path).unwrap_or_default().to_vec(),
     }
 }
 

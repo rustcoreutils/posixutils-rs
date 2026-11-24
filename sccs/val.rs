@@ -140,12 +140,7 @@ fn validate_file(args: &Args, file_path: &PathBuf, diags: &mut Vec<String>) -> u
 
     // Check -m module name if specified
     if let Some(ref expected_name) = args.module_name {
-        let actual_name = match sccs.module_name() {
-            Some(name) => name.to_vec(),
-            None => paths::module_name(file_path)
-                .unwrap_or_else(|| "unknown".to_string())
-                .into_bytes(),
-        };
+        let actual_name = posixutils_sccs::idkw::module_name_of(&sccs, file_path);
 
         if actual_name != expected_name.as_bytes() {
             diags.push(gettext("%M%, -m mismatch"));

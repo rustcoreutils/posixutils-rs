@@ -25,8 +25,8 @@ use std::collections::HashSet;
 
 use super::parse::SccsParser;
 use super::{
-    compute_checksum, weave_delta, BlockKind, DeltaEntry, DeltaType, Kind, Rec, SccsError,
-    SccsFile, SccsFlag, SccsResult, Walker, SOH,
+    compute_checksum, weave_delta, with_recomputed_checksum, BlockKind, DeltaEntry, DeltaType,
+    Kind, Rec, SccsError, SccsFile, SccsFlag, SccsResult, Walker, SOH,
 };
 use crate::linediff::LineOp;
 
@@ -337,6 +337,17 @@ impl SccsFile {
             }
             Ok(())
         })
+    }
+
+    /// Set the checksum line from the file as it stands, and change nothing
+    /// else: what `admin -z` does (POSIX admin 84111). Blank lines ahead of
+    /// the checksum line, which are not part of the file, go.
+    pub fn recompute_checksum(&mut self) -> SccsResult<()> {
+        let image = with_recomputed_checksum(&self.to_bytes());
+        if image != self.to_bytes() {
+            *self = SccsParser::new(&image, false).parse()?;
+        }
+        Ok(())
     }
 
     /// Add a delta: its entry at the head of the delta table, and its

@@ -52,9 +52,9 @@ pub fn stored_checksum_matches(data: &[u8], stored: u16) -> bool {
 }
 
 /// The s-file `data` with its first line replaced by the `^Ah` line for the
-/// checksum of the rest, which is left byte for byte as it was: what
-/// `admin -z` writes (POSIX 84111).
-pub fn with_recomputed_checksum(data: &[u8]) -> Vec<u8> {
+/// checksum of the rest, which is left byte for byte as it was
+/// ([`SccsFile::recompute_checksum`](super::SccsFile::recompute_checksum)).
+pub(super) fn with_recomputed_checksum(data: &[u8]) -> Vec<u8> {
     let rest = checksummed_bytes(data);
     let mut out = format!("\x01h{:05}\n", compute_checksum(rest)).into_bytes();
     out.extend_from_slice(rest);

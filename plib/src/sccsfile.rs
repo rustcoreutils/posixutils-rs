@@ -300,12 +300,25 @@ impl FromStr for DeltaStats {
     }
 }
 
+impl DeltaStats {
+    /// The most the s-file records for one count: its fields are five digits.
+    pub const MAX_RECORDED: u32 = 99_999;
+}
+
+/// The `^As` line's `inserted/deleted/unchanged`, each count recorded as at
+/// most 99 999: "if this file contains more than 99 999 lines, the number of
+/// lines recorded in the header for this file shall be 99 999 for this
+/// delta" (POSIX admin 84132-84133). The struct keeps the true counts, which
+/// `delta` reports to the user.
 impl fmt::Display for DeltaStats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cap = |n: u32| n.min(Self::MAX_RECORDED);
         write!(
             f,
             "{:05}/{:05}/{:05}",
-            self.inserted, self.deleted, self.unchanged
+            cap(self.inserted),
+            cap(self.deleted),
+            cap(self.unchanged)
         )
     }
 }
@@ -2876,5 +2889,13 @@ mod tests {
         assert!(stored_checksum_matches(&file(signed), signed));
         assert!(stored_checksum_matches(&file(unsigned), unsigned));
         assert!(!stored_checksum_matches(&file(1), 1));
+    }
+
+    /// A count above 99 999 is recorded as 99 999 (POSIX admin 84132-84133):
+    /// the fields of the `^As` line are five digits wide.
+    #[test]
+    fn delta_stats_are_recorded_capped_at_99999() {
+        let stats = DeltaStats::new(100_005, 99_999, 7);
+        assert_eq!(stats.to_string(), "99999/99999/00007");
     }
 }

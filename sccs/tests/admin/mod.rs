@@ -902,3 +902,21 @@ fn unreadable_members_are_silently_ignored() {
         "{flags}"
     );
 }
+
+/// "If this file contains more than 99 999 lines, the number of lines
+/// recorded in the header for this file shall be 99 999 for this delta"
+/// (POSIX admin 84132-84133). The text itself is all kept.
+#[test]
+fn admin_records_at_most_99999_lines() {
+    let tmp = TempDir::new().unwrap();
+    let input: String = (0..100_001).map(|i| format!("{i} %I%\n")).collect();
+    let out = super::common::run_in("admin", &["-i", "s.big"], tmp.path(), &input);
+    assert!(out.status.success(), "{out:?}");
+    let data = fs::read(tmp.path().join("s.big")).unwrap();
+    assert!(
+        data.windows(21).any(|w| w == b"\x01s 99999/00000/00000\n"),
+        "the header must record 99999 lines"
+    );
+    let out = super::common::run_in("get", &["-p", "-k", "-s", "s.big"], tmp.path(), "");
+    assert_eq!(out.stdout, input.as_bytes());
+}

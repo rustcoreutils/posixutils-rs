@@ -160,6 +160,11 @@ fn find_top_delta<'a>(
                 .map_err(|_| format!("{}: {}", gettext("Invalid SID"), s))?,
         ),
     };
+    // A SID that names a branch, or a delta on one, is that branch or
+    // delta: there is no "top" to look for beyond it.
+    if named.is_some_and(|sid| sid.br != 0) {
+        return find_target_delta(sccs, requested_sid);
+    }
     let release = named.map(|sid| sid.rel);
     let within = |d: &DeltaEntry| {
         named.is_none_or(|sid| d.sid.rel == sid.rel && (sid.is_partial() || d.sid.lev == sid.lev))
@@ -252,12 +257,27 @@ fn compute_new_sid(
         }
     };
 
-    // "R > mR": force creation of the first delta in a new release (99237).
-    // -b outranks it, per 99239.
+    // A release-only -r naming a release above the delta retrieved, which
+    // is then the newest delta of the nearest release below. -b outranks
+    // both rows, per 99239.
     if !branching {
         if let Some(req) = requested_sid {
             if req.is_partial() && req.rel > target.sid.rel {
-                return unless_pending(Sid::trunk(req.rel, 1));
+                let newest_release = sccs
+                    .live_deltas()
+                    .filter(|d| d.sid.is_trunk())
+                    .map(|d| d.sid.rel)
+                    .max()
+                    .unwrap_or(0);
+                return if req.rel > newest_release {
+                    // "R > mR": the first delta of a new release (99237).
+                    unless_pending(Sid::trunk(req.rel, 1))
+                } else {
+                    // "R < mR and R does not exist": hR.mL.(mB+1).1, a
+                    // branch (99241). R.1 here would be a trunk delta
+                    // between two releases, made from neither's newest.
+                    branch_off()
+                };
             }
         }
     }
@@ -300,6 +320,17 @@ fn check_pfile_lock(txn: &Txn, got: &Sid, new_sid: &Sid) -> Result<(), String> {
             entry.user
         )),
         None => Ok(()),
+    }
+}
+
+/// The mode of the g-file: "read-only unless -k is used or implied" (POSIX
+/// get), -e implying it. One made with -k is for editing too: it is how
+/// the g-file of an edit is got back.
+fn gfile_mode(args: &Args) -> u32 {
+    if args.edit || args.no_keywords {
+        0o644
+    } else {
+        0o444
     }
 }
 
@@ -377,9 +408,13 @@ fn render_lfile(sccs: &SccsFile, applied_set: &HashSet<u16>) -> Vec<u8> {
         );
         out.extend_from_slice(&d.user);
         out.push(b'\n');
-        for c in &d.comments {
+        // "The comments and MR data shall follow on subsequent lines,
+        // indented one <tab>" (99209): in the order the s-file has them,
+        // MRs and then comments.
+        let mrs = d.mr_numbers.iter().map(|mr| mr.as_bytes());
+        for line in mrs.chain(d.comments.iter().map(|c| c.as_bytes())) {
             out.push(b'\t');
-            out.extend_from_slice(c);
+            out.extend_from_slice(line);
             out.push(b'\n');
         }
         out.push(b'\n');
@@ -723,7 +758,7 @@ fn process_file(
                 let gfile_path = paths::gfile_from_sfile(sfile_path).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, gettext("Invalid s-file name"))
                 })?;
-                let mode = if args.edit { 0o644 } else { 0o444 };
+                let mode = gfile_mode(args);
                 sfio::write_replacing(&gfile_path, &raw, mode)?;
             }
 
@@ -848,7 +883,7 @@ fn process_file(
                 content.extend_from_slice(line);
                 content.push(b'\n');
             }
-            let mode = if args.edit { 0o644 } else { 0o444 };
+            let mode = gfile_mode(args);
             sfio::write_replacing(&gfile_path, &content, mode)?;
         }
 

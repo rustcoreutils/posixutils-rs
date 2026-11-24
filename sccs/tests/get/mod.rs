@@ -1991,3 +1991,105 @@ fn get_t_keeps_to_the_release_and_level_named() {
     assert_eq!(top(&["-r1.2"]), "1.2.1.1\n");
     assert_eq!(top(&["-r1.1"]), "1.1.1.1\n");
 }
+
+/// `-t` is for a release, or a release and level. A SID that names a
+/// branch or a delta on one is that branch or delta, with -t as without:
+/// `-t -r1.1.1.1` retrieved, and with -e edited, the newest delta of some
+/// other branch of 1.1.
+#[test]
+fn get_t_does_not_leave_the_branch_named() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    assert!(run("admin", &["-i", "-fb", "s.b"], "1.1\n")
+        .status
+        .success());
+    for (args, text) in [
+        (&["-r1.1"][..], "1.2"),
+        (&["-r1.1", "-b"], "1.1.1.1"),
+        (&["-r1.1", "-b"], "1.1.2.1"),
+    ] {
+        let args = [&["-e", "-s"], args, &["s.b"]].concat();
+        assert!(run("get", &args, "").status.success(), "{args:?}");
+        std::fs::write(dir.join("b"), format!("{text}\n")).unwrap();
+        assert!(run("delta", &["-s", "-yc", "s.b"], "").status.success());
+    }
+    for sid in ["-r1.1.1.1", "-r1.1.1"] {
+        let out = run("get", &["-p", "-s", "-t", sid, "s.b"], "");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "1.1.1.1\n", "{sid}");
+    }
+    let out = run("get", &["-e", "-g", "-t", "-r1.1.1.1", "s.b"], "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1.1.1.1\nnew delta 1.1.1.2\n"
+    );
+}
+
+/// `-e -rR` where release R does not exist and a higher one does: the
+/// delta retrieved is hR.mL and the one to be created hR.mL.(mB+1).1, a
+/// branch (POSIX get, the table of SIDs). The first delta of release R
+/// was created instead, on the trunk between two releases that exist.
+#[test]
+fn get_e_of_a_skipped_release_branches() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    assert!(run("admin", &["-i", "s.s"], "1.1\n").status.success());
+    assert!(run("get", &["-e", "-s", "-r3", "s.s"], "").status.success());
+    std::fs::write(dir.join("s"), "3.1\n").unwrap();
+    assert!(run("delta", &["-s", "-yc", "s.s"], "").status.success());
+
+    let out = run("get", &["-e", "-g", "-r2", "s.s"], "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "1.1\nnew delta 1.1.1.1\n"
+    );
+    assert!(run("unget", &["-s", "s.s"], "").status.success());
+    // A release above the newest still begins that release.
+    let out = run("get", &["-e", "-g", "-r4", "s.s"], "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3.1\nnew delta 4.1\n");
+}
+
+/// A g-file made with `-k` is writable by its owner, like one made for
+/// editing (POSIX get: read-only "unless -k is used or implied"): it is
+/// what one edits after losing an edit's g-file. It was made read-only.
+#[test]
+fn get_k_makes_a_writable_g_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    assert!(run("admin", &["-i", "s.k"], "%I%\n").status.success());
+    let mode = |name: &str| {
+        std::fs::metadata(dir.join(name))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    assert!(run("get", &["-s", "s.k"], "").status.success());
+    assert_eq!(mode("k"), 0o444);
+    assert!(run("get", &["-s", "-k", "s.k"], "").status.success());
+    assert_eq!(mode("k"), 0o644);
+    assert_eq!(std::fs::read(dir.join("k")).unwrap(), b"%I%\n");
+}
+
+/// The l-file lists each delta with "the comments and MR data ... on
+/// subsequent lines, indented one <tab>" (POSIX get). The MRs were left out.
+#[test]
+fn get_l_lists_the_mrs() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let run = |cmd: &str, args: &[&str], stdin: &str| super::common::run_in(cmd, args, dir, stdin);
+    assert!(run(
+        "admin",
+        &["-i", "-fv", "-mMR7 MR8", "-yinit", "s.l"],
+        "one\n"
+    )
+    .status
+    .success());
+    let out = run("get", &["-s", "-L", "-g", "s.l"], "");
+    let text = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(&lines[1..], ["\tMR7", "\tMR8", "\tinit", ""], "{text:?}");
+}

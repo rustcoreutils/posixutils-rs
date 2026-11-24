@@ -1688,3 +1688,35 @@ fn a_damaged_weave_is_refused_by_every_reader() {
         std::fs::remove_file(&s).unwrap();
     }
 }
+
+/// `get -e` takes the lock before it opens the s-file, as every command that
+/// changes SCCS state does: what it decides (the new SID, whether the edit
+/// is allowed) must come from the file as it is while it holds the lock. It
+/// used to read the file first and lock afterwards, so a delta committed in
+/// between was never seen.
+///
+/// The order shows when the lock is held by someone else and the s-file
+/// cannot be parsed: a command that locks first reports the lock.
+#[test]
+fn get_e_locks_before_it_reads_the_s_file() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("s.f"), b"not an s-file at all\n").unwrap();
+    std::fs::write(tmp.path().join("z.f"), b"held").unwrap();
+    let out = super::common::run_in("get", &["-e", "s.f"], tmp.path(), "");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("being edited"),
+        "the lock should be reported, not the file: {out:?}"
+    );
+    assert!(
+        tmp.path().join("z.f").exists(),
+        "someone else's lock is left alone"
+    );
+
+    // A plain get changes nothing, takes no lock, and reads the file.
+    let out = super::common::run_in("get", &["-p", "s.f"], tmp.path(), "");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("being edited"),
+        "{out:?}"
+    );
+}

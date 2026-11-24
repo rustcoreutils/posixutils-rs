@@ -382,9 +382,27 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
         return Ok(false);
     }
 
-    // Parse SCCS file
-    let sccs = SccsFile::from_path(sfile_path)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    // An edit changes SCCS state (the p-file), so it takes the lock before
+    // the s-file is opened and holds it until this function returns: the
+    // new SID, the edit's permission and the p-file entry are all decided
+    // from the file as it is under the lock. A plain retrieval changes
+    // nothing and takes no lock.
+    let txn = if args.edit {
+        match Txn::begin(sfile_path) {
+            Ok(txn) => Some(txn),
+            Err(e) if txn::is_locked(&e) => {
+                diag::error_path("get", sfile_path, &gettext("being edited"));
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
+        }
+    } else {
+        None
+    };
+    let sccs = match &txn {
+        Some(txn) => txn.read()?,
+        None => SccsFile::from_path(sfile_path).map_err(unreadable)?,
+    };
 
     // The `d` flag names "the default delta number (SID) to be used by a get
     // command" (POSIX 84036), so it stands in for -r when -r is absent. An
@@ -405,18 +423,12 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
     let target_serial = target.serial;
     let target_sid = target.sid;
 
-    // If editing, acquire the per-command z-file lock (held until this
-    // function returns, then released so a later delta/unget can run), compute
-    // the new SID and check for the p-file edit lock.
-    //
-    // `txn` is bound at function scope so the lock is held across the
-    // early-return (encoded) path below and released on every return.
-    let mut txn: Option<Txn> = None;
-    let new_sid = if args.edit {
+    // If editing, compute the new SID and check for the p-file edit lock.
+    let new_sid = if let Some(txn) = &txn {
         // Ceiling, floor, locked releases and the authorized-user list are
         // enforced here and not for a plain retrieval: POSIX 99077-99078
-        // attaches them to -e. Checked before the lock is taken so a refusal
-        // leaves no z-file and no p-file entry behind.
+        // attaches them to -e. A refusal leaves no p-file entry behind, and
+        // the lock goes when this function returns.
         if let Err(refusal) =
             protect::check_edit(&sccs, target_sid.rel, &posixutils_sccs::username())
         {
@@ -424,21 +436,12 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
             return Ok(false);
         }
 
-        txn = match Txn::begin(sfile_path) {
-            Ok(txn) => Some(txn),
-            Err(e) if txn::is_locked(&e) => {
-                diag::error_path("get", sfile_path, &gettext("being edited"));
-                return Ok(false);
-            }
-            Err(e) => return Err(e),
-        };
-
         let requested: Option<Sid> = requested_sid.and_then(|s| s.parse().ok());
         let new_sid = compute_new_sid(&sccs, target, args.branch, requested.as_ref());
 
         // Check for existing edit lock (unless joint edit is allowed)
         if !sccs.joint_edit() {
-            check_pfile_lock(txn.as_ref().expect("just taken"), &new_sid)
+            check_pfile_lock(txn, &new_sid)
                 .map_err(|e| io::Error::new(io::ErrorKind::AlreadyExists, e))?;
         }
 
@@ -570,10 +573,10 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
     // suppresses the g-file but not the lock, and `get -e -g` announcing a new
     // delta while leaving no p-file behind would hand the caller a lock that
     // does not exist.
-    if args.edit {
+    if let Some(txn) = &txn {
         if let Some(ns) = new_sid {
             create_pfile_entry(
-                txn.as_ref().expect("an edit holds the lock"),
+                txn,
                 &target_sid,
                 &ns,
                 args.include.clone(),

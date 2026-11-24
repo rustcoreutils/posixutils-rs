@@ -83,7 +83,13 @@ impl ZLock {
 
 impl Drop for ZLock {
     fn drop(&mut self) {
-        unregister_cleanup(&self.zfile);
+        // The lock goes, and the registry forgets it, as one step: an
+        // interrupt between the two either found nothing registered and
+        // left the lock behind for good, or -- done the other way round --
+        // could remove a lock another command had just taken under the
+        // same name.
+        let _blocked = SigintBlock::begin();
         let _ = std::fs::remove_file(&self.zfile);
+        unregister_cleanup(&self.zfile);
     }
 }

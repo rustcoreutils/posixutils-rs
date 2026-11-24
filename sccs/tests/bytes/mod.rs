@@ -25,6 +25,25 @@ fn named(prefix: &str, name: &[u8]) -> OsString {
     OsString::from_vec([prefix.as_bytes(), name].concat())
 }
 
+/// A file name for these tests: `stem`, a byte that is not ASCII, `suffix`.
+///
+/// Where the file system takes any bytes for a name, the name is not UTF-8.
+/// Some do not: APFS refuses such a name outright ("Illegal byte sequence").
+/// There the name is UTF-8 with a character outside ASCII, which is as far
+/// from text-as-ASCII as that file system lets a name be, and the utilities
+/// are still held to carrying it through byte for byte.
+fn odd_name(dir: &Path, stem: &str, suffix: &str) -> Vec<u8> {
+    let probe = dir.join(named("probe", b"\xff"));
+    let any_bytes = std::fs::write(&probe, b"").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    let odd: &[u8] = if any_bytes {
+        b"\xe9"
+    } else {
+        "\u{e9}".as_bytes()
+    };
+    [stem.as_bytes(), odd, suffix.as_bytes()].concat()
+}
+
 fn run(cmd: &str, args: &[&OsStr], dir: &Path) -> Output {
     run_bytes(cmd, args, dir, b"")
 }
@@ -43,7 +62,7 @@ fn ok(cmd: &str, args: &[&OsStr], dir: &Path) -> Output {
 fn an_s_file_name_need_not_be_utf8() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path();
-    let name = b"caf\xe9.c";
+    let name = &odd_name(dir, "caf", ".c")[..];
     let s = named("s.", name);
     let g = dir.join(named("", name));
     let o = OsStr::new;
@@ -55,11 +74,11 @@ fn an_s_file_name_need_not_be_utf8() {
 
     ok("val", &[&s], dir);
     let out = ok("get", &[o("-p"), o("-s"), &s], dir);
-    assert_eq!(out.stdout, [&name[..], b" s.", name, b"\n"].concat());
+    assert_eq!(out.stdout, [name, b" s.", name, b"\n"].concat());
     let out = ok("prs", &[o("-d:M: :F: :PN:"), &s], dir);
     assert_eq!(
         out.stdout,
-        [&name[..], b" s.", name, b" s.", name, b"\n"].concat()
+        [name, b" s.", name, b" s.", name, b"\n"].concat()
     );
 
     ok("get", &[o("-e"), o("-s"), &s], dir);
@@ -131,15 +150,19 @@ fn arguments_need_not_be_utf8() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path();
     let o = OsStr::new;
-    let s = word(b"s.na\xefve");
-    std::fs::write(dir.join(word(b"in\xff")), b"text\n").unwrap();
-    std::fs::write(dir.join(word(b"desc\xff")), b"about \xe9\n").unwrap();
+    // The files named on the command line: the s-file and its g-file, the
+    // -i file and the -t file.
+    let gfile = odd_name(dir, "na", "ve");
+    let s = named("s.", &gfile);
+    let (input, desc) = (odd_name(dir, "in", ""), odd_name(dir, "desc", ""));
+    std::fs::write(dir.join(word(&input)), b"text\n").unwrap();
+    std::fs::write(dir.join(word(&desc)), b"about \xe9\n").unwrap();
 
     ok(
         "admin",
         &[
-            &word(b"-iin\xff"),
-            &word(b"-tdesc\xff"),
+            &named("-i", &input),
+            &named("-t", &desc),
             &word(b"-ycr\xe9\xe9"),
             &word(b"-am\xfcller"),
             &word(b"-fqqu\xe9"),
@@ -169,7 +192,7 @@ fn arguments_need_not_be_utf8() {
     // so it is emptied first.
     ok("admin", &[&word(b"-em\xfcller"), &s], dir);
     ok("get", &[o("-e"), o("-s"), &s], dir);
-    std::fs::write(dir.join(word(b"na\xefve")), b"more\n").unwrap();
+    std::fs::write(dir.join(word(&gfile)), b"more\n").unwrap();
     ok(
         "delta",
         &[o("-s"), &word(b"-ych\xe0nge"), &word(b"-mm\xe93"), &s],
@@ -207,7 +230,7 @@ fn the_front_end_passes_bytes_through() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path();
     let o = OsStr::new;
-    let name = b"na\xefve.c";
+    let name = &odd_name(dir, "na", "ve.c")[..];
     let file = word(name);
     std::fs::write(dir.join(&file), b"one\n").unwrap();
 
@@ -217,12 +240,9 @@ fn the_front_end_passes_bytes_through() {
 
     ok("sccs", &[o("edit"), &file], dir);
     let out = ok("sccs", &[o("tell")], dir);
-    assert_eq!(out.stdout, [&name[..], b"\n"].concat());
+    assert_eq!(out.stdout, [name, b"\n"].concat());
     let out = ok("sccs", &[o("info")], dir);
-    assert!(
-        out.stdout.starts_with(&[&name[..], b": "].concat()),
-        "{out:?}"
-    );
+    assert!(out.stdout.starts_with(&[name, b": "].concat()), "{out:?}");
 
     std::fs::write(dir.join(&file), b"one\ntwo\n").unwrap();
     ok("sccs", &[o("delget"), &word(b"-yfix\xe9"), &file], dir);
@@ -252,7 +272,8 @@ fn a_pathname_is_written_as_its_bytes() {
     let dir = tmp.path();
     let o = OsStr::new;
     let mut files = Vec::new();
-    for name in [&b"a\xe9"[..], b"b\xff"] {
+    for name in [odd_name(dir, "a", ""), odd_name(dir, "b", "")] {
+        let name = &name[..];
         std::fs::write(dir.join("init"), b"@(#)id\n").unwrap();
         ok("admin", &[o("-iinit"), o("s.x")], dir);
         let s = named("s.", name);
@@ -328,7 +349,8 @@ fn a_list_of_pathnames_on_standard_input_is_bytes() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path();
     let o = OsStr::new;
-    for (name, text) in [(&b"one"[..], "1\n"), (b"tw\xe9", "2\n"), (b"three", "3\n")] {
+    let two = odd_name(dir, "tw", "");
+    for (name, text) in [(&b"one"[..], "1\n"), (&two, "2\n"), (b"three", "3\n")] {
         std::fs::write(dir.join("init"), text).unwrap();
         ok("admin", &[o("-iinit"), o("s.x")], dir);
         std::fs::rename(dir.join("s.x"), dir.join(named("s.", name))).unwrap();
@@ -337,7 +359,7 @@ fn a_list_of_pathnames_on_standard_input_is_bytes() {
         "get",
         &[o("-s"), o("-p"), o("-")],
         dir,
-        b"s.one\ns.tw\xe9\n\ns.three\n",
+        &[b"s.one\ns.", &two[..], b"\n\ns.three\n"].concat(),
     );
     assert!(out.status.success(), "{out:?}");
     assert_eq!(out.stdout, b"1\n2\n3\n");

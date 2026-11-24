@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use gettextrs::gettext;
 use plib::sccsfile::{paths, DeltaEntry, DeltaType, SccsFile, SccsFlag, Sid};
-use posixutils_sccs::{cutoff, diag, operands};
+use posixutils_sccs::{cutoff, diag, idkw, operands};
 
 /// prs - print SCCS file information
 #[derive(Parser)]
@@ -275,7 +275,7 @@ fn expand_single_keyword(
             text("DP"),
         ]
         .concat(),
-        "GB" => gotten_body(sccs, delta.serial),
+        "GB" => gotten_body(sccs, delta, sfile_path),
         "MR" => delta.mr_numbers.join(&b"\n"[..]),
         "P" => delta.user.clone(),
         "W" => [text("Z"), module(), b"\t".to_vec(), text("I")].concat(),
@@ -437,9 +437,11 @@ fn keyword_text(keyword: &str, sccs: &SccsFile, delta: &DeltaEntry, sfile_path: 
     }
 }
 
-/// Reconstruct the gotten body (source text) of the delta with `serial`.
-fn gotten_body(sccs: &SccsFile, serial: u16) -> Vec<u8> {
-    let applied_set = match sccs.compute_applied_set(serial) {
+/// The gotten body of `delta`: its text as `get` retrieves it, with the
+/// identification keywords expanded. An encoded file's bytes are opaque and
+/// have none.
+fn gotten_body(sccs: &SccsFile, delta: &DeltaEntry, sfile_path: &Path) -> Vec<u8> {
+    let applied_set = match sccs.compute_applied_set(delta.serial) {
         Ok(set) => set,
         Err(_) => return Vec::new(),
     };
@@ -454,7 +456,13 @@ fn gotten_body(sccs: &SccsFile, serial: u16) -> Vec<u8> {
         }
         raw
     } else {
-        sccs.evaluate_body(&applied_set).join(&b"\n"[..])
+        let values = idkw::KeywordValues::new(sccs, delta, sfile_path);
+        sccs.evaluate_body(&applied_set)
+            .iter()
+            .enumerate()
+            .map(|(i, line)| idkw::expand(line, &values, i + 1))
+            .collect::<Vec<_>>()
+            .join(&b"\n"[..])
     }
 }
 

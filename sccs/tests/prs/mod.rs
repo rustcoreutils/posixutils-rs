@@ -722,16 +722,17 @@ fn option_argument_may_begin_with_hyphen() {
     }
 }
 
-/// `:GB:` is the delta's text as stored, written byte for byte even where it
+/// `:GB:` is the gotten body: the delta's text as `get` retrieves it, its
+/// identification keywords expanded, and written byte for byte even where it
 /// is not UTF-8. Like every multi-line keyword ending the dataspec, it is
-/// followed by a blank line (as in CSSC).
+/// followed by a blank line. (CSSC prints the same.)
 #[test]
 fn prs_gotten_body_is_byte_exact() {
     let tmp = TempDir::new().unwrap();
     super::common::write_sfile(tmp.path(), "s.l1", super::common::LATIN1_SFILE);
     let out = run_in("prs", &["-d:GB:", "s.l1"], tmp.path(), "");
     assert!(out.status.success(), "{out:?}");
-    assert_eq!(out.stdout, b"caf\xe9 %I%\nline2\n\n");
+    assert_eq!(out.stdout, b"caf\xe9 1.1\nline2\n\n");
 }
 
 /// Keywords that print what the s-file stores print it byte for byte.

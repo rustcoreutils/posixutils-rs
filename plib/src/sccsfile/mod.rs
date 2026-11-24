@@ -8,22 +8,55 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! SCCS file format parser and serializer
+//! SCCS files: the s-file and the files that go with it.
 //!
-//! This module provides support for reading and writing SCCS (Source Code
-//! Control System) files as defined in POSIX.2024.
+//! This module reads and changes SCCS (Source Code Control System) files as
+//! POSIX.1-2024 describes them, and as SCCS and CSSC have written them.
 //!
-//! # File Format
+//! # File format
 //!
-//! SCCS files consist of control lines prefixed with SOH (0x01, displayed as ^A)
-//! and text lines. The structure is:
+//! An s-file is lines. Control lines begin with SOH (0x01, shown as `^A`);
+//! the rest is text. In order:
 //!
-//! - Checksum line: `^Ah<5-digit-sum>`
-//! - Delta table: Series of delta entries
-//! - User list: Authorized users
-//! - Flags: File configuration flags
-//! - Descriptive text: Comments about the file
-//! - Body: Interleaved delta content with ^AI/^AD/^AE control records
+//! - the checksum line, `^Ah<5-digit-sum>`;
+//! - the delta table, one entry per delta, newest first;
+//! - the list of authorized users;
+//! - the flags;
+//! - the descriptive text;
+//! - the body: every version's text interleaved (the weave), in blocks
+//!   marked by `^AI`, `^AD` and `^AE` records.
+//!
+//! # Design
+//!
+//! **The file is kept as read.** [`SccsFile`] holds the file's bytes and an
+//! index of its lines; the typed header ([`SccsHeader`]) is a view derived
+//! from them by the one parser. A file read and written back is the same
+//! bytes. A change (`set_flag`, `add_user`, `add_delta`, `remove_delta`,
+//! ...) copies every line it does not concern, writes the ones it does and a
+//! fresh checksum line, and parses the result again, so the view is always
+//! what a reader of the bytes would see. Lines this implementation does not
+//! know stay where they are.
+//!
+//! **One walk over the weave.** [`Walker`] yields the body's records in
+//! order, each text line with the verdict of the blocks open around it
+//! ([`OpenBlocks`]): the open block of the newest delta that has a say
+//! decides, as in SCCS and CSSC. Retrieval, annotated retrieval, the
+//! structural check, `add_delta` and `remove_delta` are all that walk.
+//! Blocks need not nest; damage to the weave is an error for every reader.
+//!
+//! **Values are checked where they are made.** A login, a comment line, an
+//! MR number, a line of descriptive text and a list of deltas are types
+//! ([`Login`], [`CommentLine`], [`MrNumber`], [`TextLine`], [`SidList`])
+//! that refuse what their record cannot hold; the records that are written
+//! take those types. All of them are bytes, as are file names ([`paths`]):
+//! none of it has to be UTF-8.
+//!
+//! **The checksum is checked on every read** ([`SccsFile::from_path`]),
+//! signed or unsigned sum alike; only `admin -z` reads past it.
+//!
+//! Locking, and the order in which the s-file and p-file are read and
+//! written under the lock, are the `posixutils-sccs` crate's transaction
+//! type; the lock file itself is [`ZLock`].
 
 mod checksum;
 mod cleanup;

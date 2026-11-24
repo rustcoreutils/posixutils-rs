@@ -114,6 +114,34 @@ impl Login {
     }
 }
 
+/// The login name of the real user, which SCCS records as the author of a
+/// delta and the holder of an edit.
+///
+/// It is the name `getpwuid(getuid())` gives (the real uid), as in
+/// historical SCCS and CSSC. Only when that lookup finds nothing does the
+/// `LOGNAME` or `USER` environment stand in, and `unknown` when neither is
+/// set. The environment is the caller's to set to anything, so what comes
+/// from it is checked like any other login: a name with a blank or a newline
+/// in it would shift the fields of the delta's line or cut a p-file line in
+/// two, and is refused.
+pub fn real_login_name() -> SccsResult<Login> {
+    let uid = unsafe { libc::getuid() };
+    let passwd = crate::user::get_by_uid(uid).map(|user| user.name.into_encoded_bytes());
+    let env = std::env::var_os("LOGNAME").or_else(|| std::env::var_os("USER"));
+    login_from(
+        passwd.as_deref(),
+        env.as_ref().map(|name| name.as_encoded_bytes()),
+    )
+}
+
+/// [`real_login_name`], given what the lookups found.
+pub(super) fn login_from(passwd: Option<&[u8]>, env: Option<&[u8]>) -> SccsResult<Login> {
+    match (passwd.filter(|name| !name.is_empty()), env) {
+        (Some(name), _) | (None, Some(name)) => Login::new(name),
+        (None, None) => Login::new(b"unknown"),
+    }
+}
+
 /// One line of a delta's comment (`^Ac`). It is the rest of its line, so the
 /// one thing it cannot hold is a newline; [`CommentLine::lines`] makes one
 /// per line of a longer comment.

@@ -55,7 +55,7 @@ pub fn delta_key(delta: &DeltaEntry) -> (u16, u8, u8, u8, u8, u8) {
 
 /// Parse a `-c cutoff` date-time string.
 ///
-/// Digits are grouped YY[MM[DD[HH[MM[SS]]]]] with non-numeric separators
+/// Digits are grouped `YY[MM[DD[HH[MM[SS]]]]]` with non-numeric separators
 /// ignored. The 2-digit-year POSIX pivot applies: 69-99 => 1900+, 00-68 =>
 /// 2000+. Units omitted from the cutoff default to their maximum possible
 /// value (so `-c 7502` means up to the end of February 1975), per the spec.

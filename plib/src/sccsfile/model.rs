@@ -100,31 +100,31 @@ impl ReleaseLock {
 /// SCCS file flags (from ^Af lines)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SccsFlag {
-    /// 'b' - Allow branches
+    /// `b`: allow branches
     BranchEnabled,
-    /// 'c' <ceil> - Ceiling release
+    /// `c <ceil>`: ceiling release
     Ceiling(u16),
-    /// 'd' <sid> - Default SID for get
+    /// `d <sid>`: default SID for get
     DefaultSid(Sid),
-    /// 'e' <value> - Encoded file flag
+    /// `e <value>`: encoded file flag
     Encoded(u8),
-    /// 'f' <floor> - Floor release
+    /// `f <floor>`: floor release
     Floor(u16),
-    /// 'i' [str] - ID keyword error
+    /// `i [str]`: ID keyword error
     IdKeywordError(Option<Vec<u8>>),
-    /// 'j' - Joint edit allowed
+    /// `j`: joint edit allowed
     JointEdit,
-    /// 'l' <list> - Locked releases (`a` == all, see [`ReleaseLock`])
+    /// `l <list>`: locked releases (`a` == all, see [`ReleaseLock`])
     LockedReleases(ReleaseLock),
-    /// 'm' <name> - Module name
+    /// `m <name>`: module name
     ModuleName(Vec<u8>),
-    /// 'n' - Create null deltas
+    /// `n`: create null deltas
     NullDelta,
-    /// 'q' <text> - User-defined flag for %Q%
+    /// `q <text>`: user-defined flag for %Q%
     QText(Vec<u8>),
-    /// 't' <type> - Module type for %Y%
+    /// `t <type>`: module type for %Y%
     ModuleType(Vec<u8>),
-    /// 'v' [pgm] - MR validation program
+    /// `v [pgm]`: MR validation program
     MrValidation(Option<Vec<u8>>),
     /// Unknown flag (for lossless preservation)
     Unknown(char, Vec<u8>),

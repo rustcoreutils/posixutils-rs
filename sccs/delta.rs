@@ -35,8 +35,8 @@ fn stdin_is_tty() -> bool {
 
 /// Read a reply -- an MR list or a comment -- from standard input.
 ///
-/// "An unescaped <newline> shall terminate" it, and "the escape character
-/// is <backslash>" (POSIX delta, -m and -y): a line ending in a backslash
+/// "An unescaped `<newline>` shall terminate" it, and "the escape character
+/// is `<backslash>`" (POSIX delta, -m and -y): a line ending in a backslash
 /// goes on to the next, the backslash dropped and the newline kept, where
 /// it separates two MRs or two lines of a comment. A backslash anywhere
 /// else is itself. The end of the input ends the reply too; nothing read

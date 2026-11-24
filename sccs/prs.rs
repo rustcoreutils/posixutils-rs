@@ -63,8 +63,8 @@ fn flag_yes_no(val: bool) -> &'static str {
 }
 
 /// Multi-line ("M-format") keywords. Their values are emitted with each line
-/// terminated by a <newline>, and an M-format keyword appearing as the final
-/// token of a dataspec forces a trailing <newline> on the delta's output.
+/// terminated by a `<newline>`, and an M-format keyword appearing as the final
+/// token of a dataspec forces a trailing `<newline>` on the delta's output.
 fn is_multiline_keyword(keyword: &str) -> bool {
     matches!(keyword, "MR" | "C" | "UN" | "FL" | "FD" | "GB")
 }

@@ -116,7 +116,7 @@ fn test_real_login_name_nonempty() {
 /// and a blank or newline in it would damage the record it is written to.
 #[test]
 fn a_login_from_the_environment_is_checked() {
-    use super::datetime::login_from;
+    use super::value::login_from;
     assert_eq!(
         &*login_from(Some(b"alice"), Some(b"evil x")).unwrap(),
         b"alice"

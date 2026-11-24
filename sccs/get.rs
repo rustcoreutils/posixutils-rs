@@ -16,7 +16,9 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use gettextrs::gettext;
-use plib::sccsfile::{paths, DeltaEntry, PfileEntry, SccsDateTime, SccsFile, SccsFlag, Sid};
+use plib::sccsfile::{
+    paths, DeltaEntry, PfileEntry, SccsDateTime, SccsFile, SccsFlag, Selection, Sid,
+};
 use posixutils_sccs::{cutoff, diag, idkw, operands, pfile, protect, sfio, zlock};
 
 /// get - get a version of an SCCS file
@@ -471,37 +473,32 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
         return Ok(false);
     }
 
-    // Compute applied set, then apply -c cutoff and -i/-x adjustments.
-    let mut applied_set = sccs
-        .compute_applied_set(target_serial)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
-    // -c cutoff: drop any applied delta created after the cutoff date-time.
-    if let Some(cutoff_str) = args.cutoff.as_deref() {
-        let cutoff = cutoff::parse(cutoff_str).ok_or_else(|| {
+    // The deltas applied: the target's line of predecessors, as cut off by
+    // -c and adjusted by -i and -x.
+    let cutoff = match args.cutoff.as_deref() {
+        Some(text) => Some(cutoff::parse(text).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("{}: '{}'", gettext("Invalid cutoff date"), cutoff_str),
+                format!("{}: '{}'", gettext("Invalid cutoff date"), text),
             )
-        })?;
-        applied_set.retain(|&serial| {
-            sccs.find_delta_by_serial(serial)
-                .map(|d| !cutoff.is_after(d))
-                .unwrap_or(false)
-        });
-    }
+        })?),
+        None => None,
+    };
+    let after_cutoff = |delta: &DeltaEntry| cutoff.is_some_and(|c| c.is_after(delta));
+    let selection = Selection {
+        included: &included_serials,
+        excluded: &excluded_serials,
+        cutoff: Some(&after_cutoff),
+    };
+    let applied_set = sccs
+        .applied_set(target_serial, &selection)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
-    // -x: force-exclude the listed deltas. Only the named deltas are dropped
-    // from the applied set (descendant deltas remain applied); the Excluded:
-    // notation, however, additionally lists descendants of the excluded
-    // deltas, matching historical SCCS bookkeeping.
+    // The Excluded: notation lists each excluded delta and every delta made
+    // from one, matching historical SCCS bookkeeping; only the deltas named
+    // are left out of the version.
     let mut excluded_effective: Vec<u16> = Vec::new();
     if !excluded_serials.is_empty() {
-        for &x in &excluded_serials {
-            applied_set.remove(&x);
-        }
-        // Notation set: each excluded delta plus any (applied or not) delta
-        // whose predecessor chain passes through an excluded delta.
         excluded_effective = sccs
             .live_deltas()
             .map(|d| d.serial)
@@ -516,21 +513,6 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
                 .map(|d| d.sid)
                 .unwrap_or_default()
         });
-    }
-
-    // -i: force-include the listed deltas and their predecessor chains. This
-    // runs after -x, not before: -i is "forced to be applied" (99084), so a
-    // delta named by both options ends up applied. CSSC resolves the overlap
-    // the same way.
-    for &inc in &included_serials {
-        let mut cur = inc;
-        while cur != 0 {
-            applied_set.insert(cur);
-            match sccs.find_delta_by_serial(cur) {
-                Some(d) => cur = d.pred_serial,
-                None => break,
-            }
-        }
     }
 
     // Print SID info and -i/-x notation (unless silent)

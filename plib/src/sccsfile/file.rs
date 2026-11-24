@@ -20,6 +20,18 @@ use super::{
     SccsResult, Sid, Walker,
 };
 
+/// What a command line adds to the choice of a version: the deltas `-i`
+/// forces in and `-x` forces out, and the `-c` cutoff.
+#[derive(Default, Clone, Copy)]
+pub struct Selection<'a> {
+    /// Serials named by `-i`.
+    pub included: &'a [u16],
+    /// Serials named by `-x`.
+    pub excluded: &'a [u16],
+    /// Whether a delta was created after the `-c` cutoff, if there is one.
+    pub cutoff: Option<&'a dyn Fn(&DeltaEntry) -> bool>,
+}
+
 /// An s-file.
 ///
 /// It is the file's bytes, kept exactly as they were read, an index of the
@@ -220,79 +232,74 @@ impl SccsFile {
             .unwrap_or(0)
     }
 
-    /// Compute the "applied set" - serial numbers of deltas needed to reconstruct a version
-    pub fn compute_applied_set(&self, target_serial: u16) -> SccsResult<HashSet<u16>> {
-        let mut applied = HashSet::new();
-        let mut stack = vec![target_serial];
-        let mut visited = HashSet::new();
-
-        while let Some(serial) = stack.pop() {
-            if visited.contains(&serial) || serial == 0 {
-                continue;
-            }
-            visited.insert(serial);
-
-            let delta = self
-                .find_delta_by_serial(serial)
-                .ok_or_else(|| SccsError::InvalidSerial(format!("Serial {} not found", serial)))?;
-
-            // Skip removed deltas
-            if delta.delta_type == DeltaType::Removed {
-                continue;
-            }
-
-            // Add this delta
-            applied.insert(serial);
-
-            // Process predecessor
-            if delta.pred_serial > 0 {
-                stack.push(delta.pred_serial);
-            }
-
-            // Process included deltas
-            for &inc in &delta.included {
-                stack.push(inc);
-            }
+    /// The deltas applied for a version: the ones whose changes make it up.
+    ///
+    /// `target` is the delta retrieved; `selection` is what the command line
+    /// adds (`-i`, `-x`, `-c`). Each delta is decided once, and the first
+    /// decision stands, as in historical SCCS (`setup`):
+    ///
+    /// 1. The command line: a delta named by `-i` is applied, one named by
+    ///    `-x` is not. Named by both, it is applied ("forced to be applied",
+    ///    POSIX get 99084).
+    /// 2. Then, from the newest delta to the oldest: a delta in the line of
+    ///    predecessors from the target is applied, unless `-c` cuts it off;
+    ///    any other is not. And each delta that is applied decides, for the
+    ///    deltas its own lists name: its included ones are applied, its
+    ///    excluded and ignored ones are not.
+    ///
+    /// Going from newest to oldest is what lets a later delta's lists
+    /// override an earlier one's, and both override the line of
+    /// predecessors. An included delta brings its own lists with it, but not
+    /// its predecessors: including 1.3 into 1.1 applies 1.3, not 1.2.
+    pub fn applied_set(&self, target: u16, selection: &Selection<'_>) -> SccsResult<HashSet<u16>> {
+        if !self.live_deltas().any(|d| d.serial == target) {
+            return Err(SccsError::InvalidSerial(format!(
+                "Serial {} not found",
+                target
+            )));
+        }
+        // Decided deltas: applied or not.
+        let mut decided: std::collections::HashMap<u16, bool> = std::collections::HashMap::new();
+        for &serial in selection.included {
+            decided.entry(serial).or_insert(true);
+        }
+        for &serial in selection.excluded {
+            decided.entry(serial).or_insert(false);
         }
 
-        // Remove excluded deltas.
-        //
-        // Every delta reached contributes its exclusion list, not just the
-        // target: an exclusion recorded on an ancestor is part of what that
-        // ancestor's content *is*. Honoring it only at the target -- while
-        // honoring `included` at every delta, since those are pushed during
-        // the walk -- meant a delta made with `get -e -x` produced correct
-        // content itself, and then its own successor resurrected the excluded
-        // lines. That was latent for as long as delta recorded no exclusions.
-        for serial in &visited {
-            let Some(delta) = self.find_delta_by_serial(*serial) else {
-                continue;
-            };
-            for &exc in &delta.excluded {
-                applied.remove(&exc);
+        let mut newest_first: Vec<&DeltaEntry> = self.live_deltas().collect();
+        newest_first.sort_by_key(|d| std::cmp::Reverse(d.serial));
+        let mut in_line: HashSet<u16> = HashSet::from([target]);
+        for delta in newest_first {
+            let on_the_line = in_line.contains(&delta.serial);
+            if on_the_line {
+                in_line.insert(delta.pred_serial);
             }
-        }
-
-        // An inclusion outranks an exclusion, matching POSIX 99084 ("forced to
-        // be applied") and `applied_set_with`, which layers the command-line
-        // -i/-x on top of this set and must not resolve the overlap the other
-        // way.
-        for serial in &visited {
-            let Some(delta) = self.find_delta_by_serial(*serial) else {
-                continue;
-            };
-            for &inc in &delta.included {
-                let mut cur = inc;
-                while cur != 0 && applied.insert(cur) {
-                    match self.find_delta_by_serial(cur) {
-                        Some(d) => cur = d.pred_serial,
-                        None => break,
-                    }
+            let cut_off = selection.cutoff.is_some_and(|after| after(delta));
+            let applied = *decided
+                .entry(delta.serial)
+                .or_insert(on_the_line && !cut_off);
+            if applied {
+                for &serial in &delta.included {
+                    decided.entry(serial).or_insert(true);
+                }
+                for &serial in delta.excluded.iter().chain(&delta.ignored) {
+                    decided.entry(serial).or_insert(false);
                 }
             }
         }
 
-        Ok(applied)
+        Ok(self
+            .live_deltas()
+            .map(|d| d.serial)
+            .filter(|serial| decided.get(serial) == Some(&true))
+            .collect())
+    }
+
+    /// [`applied_set`](Self::applied_set) for the version as recorded: no
+    /// `-i`, `-x` or `-c`.
+    pub fn compute_applied_set(&self, target: u16) -> SccsResult<HashSet<u16>> {
+        self.applied_set(target, &Selection::default())
     }
 
     // =========================================================================
@@ -443,40 +450,6 @@ impl SccsFile {
             SccsFlag::IdKeywordError(s) => Some(s.as_deref()),
             _ => None,
         })
-    }
-
-    /// The set of deltas applied when reconstructing `base_serial`, adjusted
-    /// by forced `-i` inclusions and `-x` exclusions.
-    ///
-    /// `-i` is applied *after* `-x` because POSIX 99084 defines the included
-    /// list as "forced to be applied": a delta named by both options ends up
-    /// applied. CSSC resolves the overlap the same way. Including a delta
-    /// pulls in its whole predecessor chain; excluding one drops only the
-    /// named delta, since its descendants may still be wanted.
-    pub fn applied_set_with(
-        &self,
-        base_serial: u16,
-        included: &[u16],
-        excluded: &[u16],
-    ) -> SccsResult<HashSet<u16>> {
-        let mut set = self.compute_applied_set(base_serial)?;
-
-        for x in excluded {
-            set.remove(x);
-        }
-
-        for &inc in included {
-            let mut cur = inc;
-            while cur != 0 {
-                set.insert(cur);
-                match self.find_delta_by_serial(cur) {
-                    Some(d) => cur = d.pred_serial,
-                    None => break,
-                }
-            }
-        }
-
-        Ok(set)
     }
 
     /// True if `serial` is `ancestor` itself, or has it in its predecessor

@@ -20,7 +20,7 @@ use gettextrs::gettext;
 use plib::linediff::LineOp;
 use plib::sccsfile::{
     paths, DeltaEntry, DeltaStats, DeltaType, NotText, PfileEntry, SccsDateTime, SccsFile,
-    SccsFlag, Sid,
+    SccsFlag, Selection, Sid,
 };
 use posixutils_sccs::{diag, mrlist, operands, pfile, protect, sfio, zlock};
 
@@ -180,7 +180,12 @@ fn base_applied_set(
     included: &[u16],
     excluded: &[u16],
 ) -> io::Result<HashSet<u16>> {
-    sccs.applied_set_with(base_serial, included, excluded)
+    let selection = Selection {
+        included,
+        excluded,
+        cutoff: None,
+    };
+    sccs.applied_set(base_serial, &selection)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
 }
 

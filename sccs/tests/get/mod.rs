@@ -1593,3 +1593,38 @@ fn get_keeps_a_line_by_the_newest_open_block() {
     assert_eq!(get("s.a", &["-r1.3", "-x1.1", "-m"]), "1.2\tb,");
     assert_eq!(get("s.a", &["-r1.3", "-x1.2"]), "a,c,");
 }
+
+/// `-i` applies the deltas it names and no others: including 1.3 into 1.1
+/// does not bring 1.2 with it. (It used to pull in the whole chain of
+/// ancestors of each included delta.) The expected text is CSSC's.
+#[test]
+fn get_i_includes_only_the_deltas_named() {
+    let tmp = TempDir::new().unwrap();
+    let get = |file: &str, args: &[&str]| -> String {
+        let mut argv = vec!["-p", "-k", "-s"];
+        argv.extend_from_slice(args);
+        argv.push(file);
+        let out = super::common::run_in("get", &argv, tmp.path(), "");
+        assert!(out.status.success(), "get {args:?} {file}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).replace('\n', ",")
+    };
+    // 1.2 inserted b inside 1.1's block; 1.3 changed nothing.
+    super::common::write_weave(
+        tmp.path(),
+        "s.a",
+        b"\x01I 1\na\n\x01I 2\nb\n\x01E 2\nc\n\x01E 1\n",
+    );
+    assert_eq!(get("s.a", &["-r1.1", "-i1.3"]), "a,c,");
+    assert_eq!(get("s.a", &["-r1.1", "-i1.2"]), "a,b,c,");
+
+    // 1.2 deleted b..d; 1.3 inserted c inside that.
+    super::common::write_weave(
+        tmp.path(),
+        "s.b",
+        b"\x01I 1\na\n\x01D 2\nb\n\x01I 3\nc\n\x01E 3\nd\n\x01E 2\ne\n\x01E 1\n",
+    );
+    assert_eq!(get("s.b", &["-r1.1", "-i1.3"]), "a,b,c,d,e,");
+    assert_eq!(get("s.b", &["-r1.1", "-i1.2"]), "a,e,");
+    // Named by both, a delta is applied: -i outranks -x.
+    assert_eq!(get("s.b", &["-r1.3", "-x1.2", "-i1.2"]), "a,c,e,");
+}

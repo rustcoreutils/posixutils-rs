@@ -43,10 +43,11 @@ pub fn path(sfile: &Path) -> PathBuf {
 }
 
 /// Replace the p-file with `entries`, removing it entirely when none remain.
+/// Only a [`Txn`](crate::txn::Txn), which holds the lock, can do this.
 ///
 /// An empty p-file and an absent one mean different things to `sact` and to
 /// `get -e`, so the empty case must unlink rather than truncate.
-pub fn write(sfile: &Path, entries: &[PfileEntry]) -> io::Result<()> {
+pub(crate) fn write(sfile: &Path, entries: &[PfileEntry]) -> io::Result<()> {
     let path = paths::pfile_from_sfile(sfile);
     if entries.is_empty() {
         return match fs::remove_file(&path) {
@@ -62,13 +63,6 @@ pub fn write(sfile: &Path, entries: &[PfileEntry]) -> io::Result<()> {
         body.push('\n');
     }
     crate::sfio::write_replacing(&path, body.as_bytes(), PFILE_MODE)
-}
-
-/// Append one pending-edit record.
-pub fn append(sfile: &Path, entry: &PfileEntry) -> io::Result<()> {
-    let mut entries = read(sfile)?;
-    entries.push(entry.clone());
-    write(sfile, &entries)
 }
 
 /// The entry whose new SID is `new_sid`, if the edit is already pending.

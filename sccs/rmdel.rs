@@ -17,8 +17,9 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use gettextrs::gettext;
-use plib::sccsfile::{paths, DeltaType, SccsFile, Sid};
-use posixutils_sccs::{diag, operands, pfile, sfio, zlock};
+use plib::sccsfile::{paths, DeltaType, Sid};
+use posixutils_sccs::txn::{self, Txn};
+use posixutils_sccs::{diag, operands, zlock};
 
 /// rmdel - remove a delta from an SCCS file
 #[derive(Parser)]
@@ -38,11 +39,11 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
         return Ok(false);
     }
 
-    // Acquire the per-command z-file lock around the read-modify-write. If
-    // another SCCS command already holds it, report and skip.
-    let _zlock = match zlock::acquire(sfile) {
-        Ok(z) => z,
-        Err(e) if zlock::is_held(&e) => {
+    // Take the lock before anything is read. If another SCCS command already
+    // holds it, report and skip.
+    let txn = match Txn::begin(sfile) {
+        Ok(txn) => txn,
+        Err(e) if txn::is_locked(&e) => {
             diag::error_path("rmdel", sfile, &gettext("being edited"));
             return Ok(false);
         }
@@ -50,10 +51,10 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
     };
 
     // Parse the SCCS file
-    let mut sccs = match SccsFile::from_path(sfile) {
+    let mut sccs = match txn.read() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("{}: {}", sfile.display(), e);
+            eprintln!("{}: {}", sfile.display(), plib::diag::io_error_text(&e));
             return Ok(false);
         }
     };
@@ -158,7 +159,7 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
     }
 
     // Check that delta is not checked out for editing
-    for entry in pfile::read(sfile)? {
+    for entry in txn.pending()? {
         if entry.old_sid == *sid || entry.new_sid == *sid {
             diag::error_path(
                 "rmdel",
@@ -186,20 +187,12 @@ fn rmdel_file(sfile: &Path, sid: &Sid) -> io::Result<bool> {
         return Ok(false);
     }
 
-    // Preserve the s-file's own mode across the rewrite.
-    let perms = sfio::sfile_perms(sfile);
-
     // Mark delta as removed and reweave the body so its footprint is undone.
     let serial = sccs.header().deltas[delta_idx].serial;
     sccs.remove_delta(serial)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
-    sfio::write_xfile_atomic(
-        sfile,
-        &paths::xfile_from_sfile(sfile),
-        &sccs.to_bytes(),
-        perms,
-    )?;
+    txn.write(&sccs)?;
 
     Ok(true)
 }

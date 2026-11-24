@@ -11,7 +11,6 @@
 
 use std::fs;
 use std::io::{self, Read};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -21,7 +20,8 @@ use plib::sccsfile::{
     paths, DeltaEntry, DeltaStats, DeltaType, NewFile, ReleaseLock, SccsDateTime, SccsFile,
     SccsFlag, Sid,
 };
-use posixutils_sccs::{diag, idkw, mrlist, sfio, zlock};
+use posixutils_sccs::txn::Txn;
+use posixutils_sccs::{diag, idkw, mrlist, zlock};
 
 /// admin - create and administer SCCS files
 #[derive(Parser)]
@@ -373,19 +373,7 @@ fn name_is_taken(path: &Path) -> bool {
 }
 
 fn create_new_sccs_file(path: &Path, params: NewFileParams) -> io::Result<()> {
-    // Per-command z-file lock around the create.
-    let _zlock = zlock::acquire(path)?;
-
-    // The check that counts is this one, made holding the lock: whoever
-    // creates the file holds it too, so the name cannot be taken between
-    // here and the rename. Checked only before the lock, of two creations
-    // racing the second replaced the first's file.
-    if name_is_taken(path) {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            gettext("file already exists"),
-        ));
-    }
+    let txn = Txn::begin(path)?;
 
     let NewFileParams {
         content,
@@ -507,19 +495,10 @@ fn create_new_sccs_file(path: &Path, params: NewFileParams) -> io::Result<()> {
     })
     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
-    // Atomic write: write to x-file, then rename
-    let x_file = paths::xfile_from_sfile(path);
-    let serialized = sccs.to_bytes();
-
-    // SCCS s-files are read-only (r--r--r--).
-    sfio::write_xfile_atomic(
-        path,
-        &x_file,
-        &serialized,
-        fs::Permissions::from_mode(0o444),
-    )?;
-
-    Ok(())
+    // Refused if the name has been taken: the check that counts is the one
+    // create makes, holding the lock. Made only before the lock, of two
+    // creations racing the second replaced the first's file.
+    txn.create(&sccs)
 }
 
 fn check_sccs_file(path: &Path) -> io::Result<bool> {
@@ -556,23 +535,14 @@ fn check_sccs_file(path: &Path) -> io::Result<bool> {
 }
 
 fn recompute_checksum(path: &Path) -> io::Result<()> {
-    // Per-command z-file lock around the rewrite.
-    let _zlock = zlock::acquire(path)?;
+    let txn = Txn::begin(path)?;
 
     // "Use of this option on a truly corrupted file may prevent future
     // detection of the corruption" (POSIX 84112-84113): the file only has to
     // parse, and only its checksum line changes.
-    let mut sccs = SccsFile::from_path(path).map_err(invalid_data)?;
+    let mut sccs = txn.read()?;
     sccs.recompute_checksum().map_err(invalid_data)?;
-    let x_file = paths::xfile_from_sfile(path);
-    let serialized = sccs.to_bytes();
-
-    // Get original permissions
-    let original_perms = fs::metadata(path)?.permissions();
-
-    sfio::write_xfile_atomic(path, &x_file, &serialized, original_perms)?;
-
-    Ok(())
+    txn.write(&sccs)
 }
 
 fn modify_existing_file(
@@ -584,12 +554,8 @@ fn modify_existing_file(
     remove_users: Vec<String>,
     mrs_given: bool,
 ) -> io::Result<()> {
-    // Per-command z-file lock around the modify.
-    let _zlock = zlock::acquire(path)?;
-
-    // Read existing file
-    let mut sccs = SccsFile::from_path(path)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let txn = Txn::begin(path)?;
+    let mut sccs = txn.read()?;
 
     // Update descriptive text if provided
     if let Some(text) = desc_text {
@@ -626,14 +592,7 @@ fn modify_existing_file(
         sccs.remove_user(user.as_bytes()).map_err(invalid_data)?;
     }
 
-    // Write atomically
-    let x_file = paths::xfile_from_sfile(path);
-    let original_perms = fs::metadata(path)?.permissions();
-
-    let serialized = sccs.to_bytes();
-    sfio::write_xfile_atomic(path, &x_file, &serialized, original_perms)?;
-
-    Ok(())
+    txn.write(&sccs)
 }
 
 fn main() -> ExitCode {

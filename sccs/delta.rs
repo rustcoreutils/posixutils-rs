@@ -22,7 +22,8 @@ use plib::sccsfile::{
     paths, DeltaEntry, DeltaStats, DeltaType, NotText, PfileEntry, SccsDateTime, SccsFile,
     SccsFlag, Selection, Sid,
 };
-use posixutils_sccs::{diag, mrlist, operands, pfile, protect, sfio, zlock};
+use posixutils_sccs::txn::{self, Txn};
+use posixutils_sccs::{diag, mrlist, operands, protect, zlock};
 
 /// True if standard input is a terminal.
 fn stdin_is_tty() -> bool {
@@ -70,8 +71,9 @@ struct Args {
 }
 
 /// Find the p-file entry for this user
-fn find_pfile_entry(sfile_path: &Path, requested_sid: Option<&Sid>) -> io::Result<PfileEntry> {
-    let entries = pfile::read(sfile_path)?;
+fn find_pfile_entry(txn: &Txn, requested_sid: Option<&Sid>) -> io::Result<PfileEntry> {
+    let sfile_path = txn.sfile();
+    let entries = txn.pending()?;
     if entries.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -337,8 +339,9 @@ fn print_normal_diff(
 }
 
 /// Remove entry from p-file
-fn remove_pfile_entry(sfile_path: &Path, entry_to_remove: &PfileEntry) -> io::Result<()> {
-    let remaining: Vec<_> = pfile::read(sfile_path)?
+fn remove_pfile_entry(txn: &Txn, entry_to_remove: &PfileEntry) -> io::Result<()> {
+    let remaining: Vec<_> = txn
+        .pending()?
         .into_iter()
         .filter(|e| {
             !(e.old_sid == entry_to_remove.old_sid
@@ -347,7 +350,7 @@ fn remove_pfile_entry(sfile_path: &Path, entry_to_remove: &PfileEntry) -> io::Re
         })
         .collect();
 
-    pfile::write(sfile_path, &remaining)
+    txn.set_pending(&remaining)
 }
 
 /// Determine the MR list for the new delta, honoring the `v` flag.
@@ -455,11 +458,11 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
         return Ok(false);
     }
 
-    // Acquire the per-command z-file lock around the s-file rewrite (POSIX
-    // `shall`). If another SCCS command holds it, report and skip.
-    let _zlock = match zlock::acquire(sfile_path) {
-        Ok(z) => z,
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+    // Take the lock before anything of the s-file or p-file is read. If
+    // another SCCS command holds it, report and skip.
+    let txn = match Txn::begin(sfile_path) {
+        Ok(txn) => txn,
+        Err(e) if txn::is_locked(&e) => {
             eprintln!(
                 "delta: {}: {}",
                 sfile_path.display(),
@@ -478,11 +481,9 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
         .transpose()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, gettext("Invalid SID")))?;
 
-    let pfile_entry = find_pfile_entry(sfile_path, requested_sid.as_ref())?;
+    let pfile_entry = find_pfile_entry(&txn, requested_sid.as_ref())?;
 
-    // Parse SCCS file
-    let mut sccs = SccsFile::from_path(sfile_path)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let mut sccs = txn.read()?;
 
     // The user list can be narrowed while an edit is outstanding, so the
     // p-file lock taken by an earlier `get -e` is no evidence of present
@@ -638,17 +639,11 @@ fn process_file(args: &Args, sfile_path: &Path, stdin_consumed: bool) -> io::Res
     sccs.add_delta(new_delta, &applied_set, &diff_ops, &new_lines)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
-    // Write atomically via the x-file, which is registered for SIGINT cleanup
-    // around the write+rename so an interrupt removes the temporary.
-    sfio::write_xfile_atomic(
-        sfile_path,
-        &paths::xfile_from_sfile(sfile_path),
-        &sccs.to_bytes(),
-        sfio::sfile_perms(sfile_path),
-    )?;
-
-    // Remove p-file entry
-    remove_pfile_entry(sfile_path, &pfile_entry)?;
+    // The s-file first, then the p-file, as SCCS orders them: an edit that
+    // has become a delta must not be left looking pending for want of the
+    // s-file, and the other way round the delta would be lost.
+    txn.write(&sccs)?;
+    remove_pfile_entry(&txn, &pfile_entry)?;
 
     // Remove g-file (unless -n)
     if !args.keep_gfile {

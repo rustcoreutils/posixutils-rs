@@ -19,6 +19,7 @@ use gettextrs::gettext;
 use plib::sccsfile::{
     paths, DeltaEntry, PfileEntry, SccsDateTime, SccsFile, SccsFlag, Selection, Sid,
 };
+use posixutils_sccs::txn::{self, Txn};
 use posixutils_sccs::{cutoff, diag, idkw, operands, pfile, protect, sfio, zlock};
 
 /// get - get a version of an SCCS file
@@ -256,9 +257,10 @@ fn compute_new_sid(
 }
 
 /// Check if there's an existing p-file entry for this SID
-fn check_pfile_lock(sfile_path: &Path, new_sid: &Sid) -> Result<(), String> {
-    let entries =
-        pfile::read(sfile_path).map_err(|e| format!("{}: {}", gettext("Invalid p-file"), e))?;
+fn check_pfile_lock(txn: &Txn, new_sid: &Sid) -> Result<(), String> {
+    let entries = txn
+        .pending()
+        .map_err(|e| format!("{}: {}", gettext("Invalid p-file"), e))?;
 
     match pfile::find_by_new_sid(&entries, new_sid) {
         Some(entry) => Err(format!(
@@ -272,9 +274,9 @@ fn check_pfile_lock(sfile_path: &Path, new_sid: &Sid) -> Result<(), String> {
     }
 }
 
-/// Create or append to p-file
+/// Record the edit in the p-file, after those already pending.
 fn create_pfile_entry(
-    sfile_path: &Path,
+    txn: &Txn,
     old_sid: &Sid,
     new_sid: &Sid,
     included: Option<String>,
@@ -289,7 +291,9 @@ fn create_pfile_entry(
         excluded,
     };
 
-    pfile::append(sfile_path, &entry)
+    let mut entries = txn.pending()?;
+    entries.push(entry);
+    txn.set_pending(&entries)
 }
 
 /// Render the delta-summary table (the l-file body). Deltas are listed newest
@@ -405,9 +409,9 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
     // function returns, then released so a later delta/unget can run), compute
     // the new SID and check for the p-file edit lock.
     //
-    // `_zlock` is bound at function scope so the z-file persists across the
-    // early-return (encoded) path below and is removed on every return.
-    let _zlock;
+    // `txn` is bound at function scope so the lock is held across the
+    // early-return (encoded) path below and released on every return.
+    let mut txn: Option<Txn> = None;
     let new_sid = if args.edit {
         // Ceiling, floor, locked releases and the authorized-user list are
         // enforced here and not for a plain retrieval: POSIX 99077-99078
@@ -420,9 +424,9 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
             return Ok(false);
         }
 
-        _zlock = match zlock::acquire(sfile_path) {
-            Ok(z) => z,
-            Err(e) if zlock::is_held(&e) => {
+        txn = match Txn::begin(sfile_path) {
+            Ok(txn) => Some(txn),
+            Err(e) if txn::is_locked(&e) => {
                 diag::error_path("get", sfile_path, &gettext("being edited"));
                 return Ok(false);
             }
@@ -434,7 +438,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
 
         // Check for existing edit lock (unless joint edit is allowed)
         if !sccs.joint_edit() {
-            check_pfile_lock(sfile_path, &new_sid)
+            check_pfile_lock(txn.as_ref().expect("just taken"), &new_sid)
                 .map_err(|e| io::Error::new(io::ErrorKind::AlreadyExists, e))?;
         }
 
@@ -569,7 +573,7 @@ fn process_file(args: &Args, sfile_path: &Path, multiple_files: bool) -> io::Res
     if args.edit {
         if let Some(ns) = new_sid {
             create_pfile_entry(
-                sfile_path,
+                txn.as_ref().expect("an edit holds the lock"),
                 &target_sid,
                 &ns,
                 args.include.clone(),

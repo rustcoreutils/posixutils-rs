@@ -48,7 +48,7 @@ pub fn write_replacing(path: &Path, data: &[u8], mode: u32) -> io::Result<()> {
 /// planted at `x.<name>` by anyone able to write the directory had the next
 /// admin, delta or rmdel overwrite its target with the s-file and make it
 /// read-only. The caller holds the z-file lock, which makes the name its own.
-pub fn write_xfile_atomic(
+pub(crate) fn write_xfile_atomic(
     path: &Path,
     x_file: &Path,
     serialized: &[u8],
@@ -66,15 +66,4 @@ pub fn write_xfile_atomic(
     let res = plib::io::write_atomic_named(path, x_name, serialized, perms.mode() & 0o7777);
     plib::sccsfile::unregister_cleanup(x_file);
     res
-}
-
-/// The mode to give a rewritten s-file: whatever the original carried.
-///
-/// A missing or unreadable s-file mode is not a reason to abandon the write,
-/// but it is a reason not to invent a permissive one, so it falls back to
-/// read-only.
-pub fn sfile_perms(path: &Path) -> fs::Permissions {
-    fs::metadata(path)
-        .map(|m| m.permissions())
-        .unwrap_or_else(|_| fs::Permissions::from_mode(0o444))
 }

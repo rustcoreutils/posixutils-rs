@@ -30,6 +30,7 @@ pub mod operands;
 pub mod pfile;
 pub mod protect;
 pub mod sfio;
+pub mod txn;
 pub mod zlock;
 
 /// The login name to stamp into p-files and delta entries.

@@ -17,7 +17,8 @@ use std::process::ExitCode;
 use clap::Parser;
 use gettextrs::gettext;
 use plib::sccsfile::{paths, Sid};
-use posixutils_sccs::{diag, operands, pfile, zlock};
+use posixutils_sccs::txn::{self, Txn};
+use posixutils_sccs::{diag, operands, zlock};
 
 /// unget - undo a previous get of an SCCS file
 #[derive(Parser)]
@@ -47,16 +48,16 @@ fn unget_file(sfile: &Path, args: &Args, show_header: bool) -> io::Result<bool> 
     // it needs the same lock every other mutating utility takes. Without it a
     // concurrent `get -e` appending to the p-file between the read and the
     // write had its edit record silently dropped.
-    let _zlock = match zlock::acquire(sfile) {
-        Ok(z) => z,
-        Err(e) if zlock::is_held(&e) => {
+    let txn = match Txn::begin(sfile) {
+        Ok(txn) => txn,
+        Err(e) if txn::is_locked(&e) => {
             diag::error_path("unget", sfile, &gettext("being edited"));
             return Ok(false);
         }
         Err(e) => return Err(e),
     };
 
-    let mut entries = pfile::read(sfile)?;
+    let mut entries = txn.pending()?;
     if entries.is_empty() {
         diag::error_path(
             "unget",
@@ -138,7 +139,7 @@ fn unget_file(sfile: &Path, args: &Args, show_header: bool) -> io::Result<bool> 
 
     // Update or remove the p-file. An empty p-file and an absent one are
     // different states, so the writer unlinks rather than truncating.
-    pfile::write(sfile, &entries)?;
+    txn.set_pending(&entries)?;
 
     Ok(true)
 }

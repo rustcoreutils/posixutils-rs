@@ -30,6 +30,7 @@ use super::{paths, register_cleanup, unregister_cleanup};
 /// caller should diagnose the s-file as being edited / locked and skip it. The
 /// z-file path is registered with the SIGINT cleanup registry so an interrupt
 /// removes it.
+#[derive(Debug)]
 pub struct ZLock {
     zfile: std::path::PathBuf,
 }
